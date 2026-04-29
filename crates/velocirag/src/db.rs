@@ -105,6 +105,17 @@ impl Database {
         Ok(db)
     }
 
+    /// Wrap an existing SQLite connection as a VelociRAG Database.
+    ///
+    /// Runs `init_schema()` with `CREATE TABLE IF NOT EXISTS`, so this
+    /// is safe to call on a database that already has the velocirag tables
+    /// (e.g., an Axel `.r8` brain file).
+    pub fn from_connection(conn: Connection, path: PathBuf) -> Result<Self> {
+        let mut db = Self { conn, path };
+        db.init_schema()?;
+        Ok(db)
+    }
+
     /// Open an in-memory database (for tests).
     pub fn open_memory() -> Result<Self> {
         let conn = Connection::open_in_memory()?;

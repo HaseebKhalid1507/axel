@@ -143,16 +143,24 @@ impl Brain {
 
     /// Update the last_modified timestamp and counts.
     pub fn touch(&mut self) -> Result<()> {
-        let doc_count: i64 = self.conn.query_row(
-            "SELECT COUNT(*) FROM documents",
-            [],
-            |r| r.get(0),
-        )?;
         let mem_count: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM memories",
             [],
             |r| r.get(0),
         )?;
+
+        // documents table may not exist if velocirag hasn't been initialized
+        let doc_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='documents'",
+            [],
+            |r| r.get(0),
+        ).and_then(|exists: i64| {
+            if exists > 0 {
+                self.conn.query_row("SELECT COUNT(*) FROM documents", [], |r| r.get(0))
+            } else {
+                Ok(0)
+            }
+        })?;
 
         self.meta.document_count = doc_count;
         self.meta.memory_count = mem_count;
@@ -167,108 +175,24 @@ impl Brain {
     }
 
     /// Initialize the complete schema for a new brain.
+    ///
+    /// Creates only the Memkoshi + Axel-specific tables. VelociRAG tables
+    /// (documents, FTS, nodes, edges, tags, etc.) are created separately
+    /// when a `velocirag::db::Database` is constructed via `from_connection()`.
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
 
         conn.execute_batch(
             "
             -- Brain metadata (key-value, single row for 'meta')
-            CREATE TABLE brain_meta (
+            CREATE TABLE IF NOT EXISTS brain_meta (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
 
-            -- ═══ VelociRAG Layer ═══
-
-            -- Documents with embedded vectors
-            CREATE TABLE documents (
-                id        INTEGER PRIMARY KEY,
-                doc_id    TEXT UNIQUE NOT NULL,
-                content   TEXT NOT NULL,
-                metadata  TEXT DEFAULT '{}',
-                embedding BLOB,
-                file_path TEXT,
-                created   TEXT DEFAULT (datetime('now'))
-            );
-            CREATE INDEX idx_documents_doc_id ON documents(doc_id);
-            CREATE INDEX idx_documents_file_path ON documents(file_path);
-
-            -- FTS5 full-text index for BM25 keyword search
-            CREATE VIRTUAL TABLE documents_fts USING fts5(
-                content,
-                content=documents,
-                content_rowid=id
-            );
-
-            -- Triggers to keep FTS in sync
-            CREATE TRIGGER documents_ai AFTER INSERT ON documents BEGIN
-                INSERT INTO documents_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-            CREATE TRIGGER documents_ad AFTER DELETE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, content) VALUES('delete', old.id, old.content);
-            END;
-            CREATE TRIGGER documents_au AFTER UPDATE ON documents BEGIN
-                INSERT INTO documents_fts(documents_fts, rowid, content) VALUES('delete', old.id, old.content);
-                INSERT INTO documents_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-
-            -- ═══ Knowledge Graph ═══
-
-            CREATE TABLE nodes (
-                id        TEXT PRIMARY KEY,
-                node_type TEXT NOT NULL,
-                title     TEXT NOT NULL,
-                metadata  TEXT DEFAULT '{}',
-                source    TEXT
-            );
-            CREATE INDEX idx_nodes_type ON nodes(node_type);
-            CREATE INDEX idx_nodes_title ON nodes(title);
-
-            CREATE TABLE edges (
-                id         TEXT PRIMARY KEY,
-                source_id  TEXT NOT NULL REFERENCES nodes(id),
-                target_id  TEXT NOT NULL REFERENCES nodes(id),
-                edge_type  TEXT NOT NULL,
-                weight     REAL DEFAULT 1.0,
-                confidence REAL DEFAULT 1.0,
-                metadata   TEXT DEFAULT '{}'
-            );
-            CREATE INDEX idx_edges_source ON edges(source_id);
-            CREATE INDEX idx_edges_target ON edges(target_id);
-            CREATE INDEX idx_edges_type ON edges(edge_type);
-
-            -- ═══ Metadata Layer ═══
-
-            CREATE TABLE tags (
-                id   INTEGER PRIMARY KEY,
-                name TEXT UNIQUE NOT NULL
-            );
-
-            CREATE TABLE document_tags (
-                document_id INTEGER NOT NULL REFERENCES documents(id),
-                tag_id      INTEGER NOT NULL REFERENCES tags(id),
-                PRIMARY KEY (document_id, tag_id)
-            );
-
-            CREATE TABLE cross_refs (
-                source_doc TEXT NOT NULL,
-                target_doc TEXT NOT NULL,
-                ref_type   TEXT DEFAULT 'reference',
-                weight     REAL DEFAULT 1.0,
-                PRIMARY KEY (source_doc, target_doc, ref_type)
-            );
-
-            -- File cache for incremental indexing
-            CREATE TABLE file_cache (
-                path      TEXT PRIMARY KEY,
-                mtime     TEXT NOT NULL,
-                cache_key TEXT,
-                doc_count INTEGER DEFAULT 0
-            );
-
             -- ═══ Memkoshi Layer ═══
 
-            CREATE TABLE memories (
+            CREATE TABLE IF NOT EXISTS memories (
                 id              TEXT PRIMARY KEY,
                 category        TEXT NOT NULL,
                 topic           TEXT NOT NULL,
@@ -285,11 +209,11 @@ impl Brain {
                 trust_level     REAL DEFAULT 1.0,
                 signature       TEXT
             );
-            CREATE INDEX idx_memories_category ON memories(category);
-            CREATE INDEX idx_memories_importance ON memories(importance);
-            CREATE INDEX idx_memories_created ON memories(created);
+            CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+            CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+            CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created);
 
-            CREATE TABLE staged_memories (
+            CREATE TABLE IF NOT EXISTS staged_memories (
                 id              TEXT PRIMARY KEY,
                 category        TEXT NOT NULL,
                 topic           TEXT NOT NULL,
@@ -310,17 +234,17 @@ impl Brain {
                 staged_at       TEXT NOT NULL
             );
 
-            CREATE TABLE memory_access (
+            CREATE TABLE IF NOT EXISTS memory_access (
                 id          INTEGER PRIMARY KEY,
                 memory_id   TEXT NOT NULL,
                 access_type TEXT NOT NULL,
                 timestamp   TEXT DEFAULT (datetime('now'))
             );
-            CREATE INDEX idx_memory_access_id ON memory_access(memory_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_access_id ON memory_access(memory_id);
 
             -- ═══ Session Intelligence ═══
 
-            CREATE TABLE sessions (
+            CREATE TABLE IF NOT EXISTS sessions (
                 id               TEXT PRIMARY KEY,
                 source           TEXT,
                 session_date     TEXT,
@@ -333,7 +257,7 @@ impl Brain {
 
             -- ═══ Patterns & Events ═══
 
-            CREATE TABLE events (
+            CREATE TABLE IF NOT EXISTS events (
                 id         INTEGER PRIMARY KEY,
                 event_type TEXT NOT NULL,
                 target_id  TEXT,
@@ -341,10 +265,10 @@ impl Brain {
                 metadata   TEXT DEFAULT '{}',
                 timestamp  TEXT DEFAULT (datetime('now'))
             );
-            CREATE INDEX idx_events_type ON events(event_type);
-            CREATE INDEX idx_events_timestamp ON events(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_events_type ON events(event_type);
+            CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
 
-            CREATE TABLE patterns (
+            CREATE TABLE IF NOT EXISTS patterns (
                 id           INTEGER PRIMARY KEY,
                 pattern_type TEXT NOT NULL,
                 name         TEXT NOT NULL,
@@ -357,20 +281,12 @@ impl Brain {
 
             -- ═══ Context ═══
 
-            CREATE TABLE context_data (
+            CREATE TABLE IF NOT EXISTS context_data (
                 key     TEXT NOT NULL,
                 value   TEXT NOT NULL,
                 layer   TEXT NOT NULL DEFAULT 'session',
                 updated TEXT DEFAULT (datetime('now')),
                 PRIMARY KEY (key, layer)
-            );
-
-            -- Usage tracking
-            CREATE TABLE usage_log (
-                id        INTEGER PRIMARY KEY,
-                doc_id    TEXT,
-                query     TEXT,
-                timestamp TEXT DEFAULT (datetime('now'))
             );
             ",
         )?;
@@ -453,12 +369,6 @@ mod tests {
         let (_dir, path) = tmp_brain();
         let mut brain = Brain::create(&path, None).unwrap();
 
-        // Insert a document directly
-        brain.conn().execute(
-            "INSERT INTO documents (doc_id, content) VALUES ('d1', 'hello world')",
-            [],
-        ).unwrap();
-
         // Insert a memory directly
         brain.conn().execute(
             "INSERT INTO memories (id, category, topic, title, content, created)
@@ -467,22 +377,22 @@ mod tests {
         ).unwrap();
 
         brain.touch().unwrap();
-        assert_eq!(brain.meta().document_count, 1);
         assert_eq!(brain.meta().memory_count, 1);
     }
 
     #[test]
-    fn fts_triggers_work() {
+    fn memory_table_works() {
         let (_dir, path) = tmp_brain();
         let brain = Brain::create(&path, None).unwrap();
 
         brain.conn().execute(
-            "INSERT INTO documents (doc_id, content) VALUES ('d1', 'the quick brown fox')",
+            "INSERT INTO memories (id, category, topic, title, content, created)
+             VALUES ('mem_00000001', 'events', 'test', 'Test Memory', 'content here', datetime('now'))",
             [],
         ).unwrap();
 
         let count: i64 = brain.conn().query_row(
-            "SELECT COUNT(*) FROM documents_fts WHERE documents_fts MATCH 'brown'",
+            "SELECT COUNT(*) FROM memories",
             [],
             |r| r.get(0),
         ).unwrap();
@@ -504,11 +414,12 @@ mod tests {
                 .collect()
         };
 
+        // Only Memkoshi + Axel tables — velocirag tables are added later
+        // via Database::from_connection()
         let expected = vec![
-            "brain_meta", "context_data", "cross_refs", "document_tags",
-            "documents", "documents_fts", "edges", "events", "file_cache",
-            "memories", "memory_access", "nodes", "patterns",
-            "sessions", "staged_memories", "tags", "usage_log",
+            "brain_meta", "context_data", "events",
+            "memories", "memory_access",
+            "patterns", "sessions", "staged_memories",
         ];
 
         for table in &expected {
