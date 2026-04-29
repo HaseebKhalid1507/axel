@@ -277,7 +277,7 @@ fn cmd_remember(
     }
 
     // Store
-    let mut storage = MemoryStorage::open(&path)?;
+    let mut storage = MemoryStorage::open_existing(&path)?;
     let staged = storage.stage_memory(&mem)?;
     storage.approve(&staged.memory.id)?;
 
@@ -296,7 +296,7 @@ fn cmd_recall(cli: &Cli, query_parts: &[String]) -> Result<ExitCode, Box<dyn std
 
     if query_parts.is_empty() {
         // Boot context
-        let storage = MemoryStorage::open(&path)?;
+        let storage = MemoryStorage::open_existing(&path)?;
         let stats = storage.stats()?;
         let mut has_content = false;
 
@@ -381,7 +381,7 @@ fn cmd_extract(cli: &Cli, input_parts: &[String]) -> Result<ExitCode, Box<dyn st
     }
 
     // Store accepted memories
-    let mut storage = MemoryStorage::open(&path)?;
+    let mut storage = MemoryStorage::open_existing(&path)?;
     let mut search = BrainSearch::open(&path)?;
     let mut stored = 0;
     let pipeline = MemoryPipeline::new();
@@ -410,7 +410,7 @@ fn cmd_extract(cli: &Cli, input_parts: &[String]) -> Result<ExitCode, Box<dyn st
 fn cmd_handoff(cli: &Cli, action: &str, content_parts: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = brain_path(cli);
     ensure_brain(&path)?;
-    let storage = MemoryStorage::open(&path)?;
+    let storage = MemoryStorage::open_existing(&path)?;
 
     const MAX_HANDOFF_CHARS: usize = 4096;
 
@@ -462,7 +462,7 @@ fn cmd_forget(cli: &Cli, id: &str) -> Result<ExitCode, Box<dyn std::error::Error
     let path = brain_path(cli);
     ensure_brain(&path)?;
 
-    let storage = MemoryStorage::open(&path)?;
+    let storage = MemoryStorage::open_existing(&path)?;
     if storage.delete_memory(id)? {
         println!("✓ Forgotten: {id}");
         Ok(ExitCode::SUCCESS)
@@ -483,7 +483,7 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         "SELECT COUNT(*) FROM documents", [], |r| r.get(0)
     ).unwrap_or(0);
 
-    let storage = MemoryStorage::open(&path)?;
+    let storage = MemoryStorage::open_existing(&path)?;
     let stats = storage.stats()?;
     let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
 
@@ -505,7 +505,7 @@ fn cmd_memories(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error:
     let path = brain_path(cli);
     ensure_brain(&path)?;
 
-    let storage = MemoryStorage::open(&path)?;
+    let storage = MemoryStorage::open_existing(&path)?;
     let memories = storage.list_memories(limit)?;
 
     if memories.is_empty() {

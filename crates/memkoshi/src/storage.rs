@@ -48,6 +48,19 @@ impl MemoryStorage {
         Ok(storage)
     }
 
+    /// Open an existing database WITHOUT running schema migrations.
+    ///
+    /// Use this when the schema is already managed by a higher-level
+    /// component (e.g., Axel's Brain creates all tables). Avoids dual
+    /// schema ownership where two components both try to create tables
+    /// with potentially different column definitions.
+    pub fn open_existing(path: &Path) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "foreign_keys", "ON")?;
+        Ok(Self { conn })
+    }
+
     /// Create the schema if absent and verify the on-disk version.
     pub fn migrate(&mut self) -> Result<()> {
         let tx = self.conn.transaction()?;
