@@ -64,7 +64,7 @@ impl MemoryStorage {
                 category        TEXT NOT NULL,
                 topic           TEXT NOT NULL,
                 title           TEXT NOT NULL,
-                abstract        TEXT NOT NULL,
+                abstract_text   TEXT NOT NULL,
                 content         TEXT NOT NULL,
                 confidence      TEXT NOT NULL,
                 importance      REAL NOT NULL,
@@ -86,7 +86,7 @@ impl MemoryStorage {
                 category        TEXT NOT NULL,
                 topic           TEXT NOT NULL,
                 title           TEXT NOT NULL,
-                abstract        TEXT NOT NULL,
+                abstract_text   TEXT NOT NULL,
                 content         TEXT NOT NULL,
                 confidence      TEXT NOT NULL,
                 importance      REAL NOT NULL,
@@ -167,7 +167,7 @@ impl MemoryStorage {
     pub fn store_memory(&self, memory: &Memory) -> Result<()> {
         self.conn.execute(
             r#"INSERT OR REPLACE INTO memories
-                (id, category, topic, title, abstract, content, confidence,
+                (id, category, topic, title, abstract_text, content, confidence,
                  importance, source_sessions, tags, related_topics, created,
                  updated, trust_level, signature)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
@@ -196,7 +196,7 @@ impl MemoryStorage {
     /// Fetch a memory by id.
     pub fn get_memory(&self, id: &str) -> Result<Option<Memory>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, category, topic, title, abstract, content, confidence,
+            r#"SELECT id, category, topic, title, abstract_text, content, confidence,
                        importance, source_sessions, tags, related_topics, created,
                        updated, trust_level, signature
                   FROM memories WHERE id = ?1"#,
@@ -210,7 +210,7 @@ impl MemoryStorage {
     /// List the most recent `limit` memories by `created` descending.
     pub fn list_memories(&self, limit: usize) -> Result<Vec<Memory>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, category, topic, title, abstract, content, confidence,
+            r#"SELECT id, category, topic, title, abstract_text, content, confidence,
                        importance, source_sessions, tags, related_topics, created,
                        updated, trust_level, signature
                   FROM memories
@@ -240,7 +240,7 @@ impl MemoryStorage {
         let staged = StagedMemory::pending(memory.clone());
         self.conn.execute(
             r#"INSERT OR REPLACE INTO staged_memories
-                (id, category, topic, title, abstract, content, confidence,
+                (id, category, topic, title, abstract_text, content, confidence,
                  importance, source_sessions, tags, related_topics, created,
                  updated, trust_level, signature, review_status, reviewer_notes,
                  staged_at)
@@ -273,7 +273,7 @@ impl MemoryStorage {
     /// List every staged memory ordered by `staged_at` descending.
     pub fn list_staged(&self) -> Result<Vec<StagedMemory>> {
         let mut stmt = self.conn.prepare(
-            r#"SELECT id, category, topic, title, abstract, content, confidence,
+            r#"SELECT id, category, topic, title, abstract_text, content, confidence,
                        importance, source_sessions, tags, related_topics, created,
                        updated, trust_level, signature, review_status,
                        reviewer_notes, staged_at
@@ -294,7 +294,7 @@ impl MemoryStorage {
         let tx = self.conn.transaction()?;
         let staged: Option<std::result::Result<StagedMemory, MemkoshiError>> = {
             let mut stmt = tx.prepare(
-                r#"SELECT id, category, topic, title, abstract, content, confidence,
+                r#"SELECT id, category, topic, title, abstract_text, content, confidence,
                            importance, source_sessions, tags, related_topics, created,
                            updated, trust_level, signature, review_status,
                            reviewer_notes, staged_at
@@ -311,7 +311,7 @@ impl MemoryStorage {
         let memory = staged.memory.clone();
         tx.execute(
             r#"INSERT OR REPLACE INTO memories
-                (id, category, topic, title, abstract, content, confidence,
+                (id, category, topic, title, abstract_text, content, confidence,
                  importance, source_sessions, tags, related_topics, created,
                  updated, trust_level, signature)
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,

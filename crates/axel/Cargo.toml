@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Portable agent intelligence — search, memory, session awareness in one .r8 file"
 
+[[bin]]
+name = "axel"
+path = "src/main.rs"
+
 [dependencies]
 velocirag = { path = "../velocirag" }
 axel-memkoshi = { path = "../memkoshi" }
@@ -20,6 +24,7 @@ dirs = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
+walkdir = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
