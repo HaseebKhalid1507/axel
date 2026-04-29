@@ -40,6 +40,7 @@ fn main() {
         "recall" => cmd_recall(&args[2..]),
         "handoff" => cmd_handoff(&args[2..]),
         "forget" => cmd_forget(&args[2..]),
+        "extract" => cmd_extract(&args[2..]),
         "stats" => cmd_stats(),
         "memories" => cmd_memories(&args[2..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
@@ -65,6 +66,7 @@ fn print_usage() {
     eprintln!("  axel search <query> [--limit N] [--json]  Search the brain");
     eprintln!("  axel remember [--category C] [--topic T] <content>  Store a memory");
     eprintln!("  axel recall [query]               Get relevant context");
+    eprintln!("  axel extract <file_or_text>       Extract memories from text/transcript");
     eprintln!("  axel handoff [set|get|clear] [content]  Manage session handoff");
     eprintln!("  axel forget <memory_id>           Delete a memory");
     eprintln!("  axel stats                        Show brain stats");
@@ -381,6 +383,73 @@ fn cmd_memories(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         }
         println!();
     }
+    Ok(())
+}
+
+fn cmd_extract(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("Usage: axel extract <file_or_text>");
+        eprintln!("  Extracts memories from a transcript or text file using regex patterns.");
+        eprintln!("  Extracted memories are staged, validated, and stored in the brain.");
+        std::process::exit(1);
+    }
+
+    let path = brain_path();
+    ensure_brain(&path)?;
+
+    // Read from file or treat args as inline text
+    let text = if Path::new(&args[0]).exists() {
+        std::fs::read_to_string(&args[0])?
+    } else {
+        args.join(" ")
+    };
+
+    // Extract via regex
+    let raw_memories = axel_stelline::extractor::extract_regex(&text);
+    if raw_memories.is_empty() {
+        println!("No memories extracted from input.");
+        return Ok(());
+    }
+
+    // Quality gate
+    let result = axel_stelline::quality::quality_gate(raw_memories);
+
+    println!("Extracted: {} accepted, {} rejected\n", result.accepted.len(), result.rejected.len());
+
+    for (mem, reason) in &result.rejected {
+        eprintln!("  ✗ Rejected: {} ({})", mem.title, reason);
+    }
+
+    if result.accepted.is_empty() {
+        println!("No memories passed quality gate.");
+        return Ok(());
+    }
+
+    // Store accepted memories
+    let mut storage = MemoryStorage::open(&path)?;
+    let mut search = BrainSearch::open(&path)?;
+    let mut stored = 0;
+
+    for mem in &result.accepted {
+        // Validate through pipeline
+        use axel_memkoshi::pipeline::MemoryPipeline;
+        let pipeline = MemoryPipeline::new();
+        if pipeline.validate(mem).is_err() {
+            continue;
+        }
+
+        match storage.stage_memory(mem) {
+            Ok(staged) => {
+                let _ = storage.approve(&staged.memory.id);
+                let _ = search.index_memory(mem);
+                stored += 1;
+                println!("  ✓ [{:?}] {}", mem.category, mem.title);
+            }
+            Err(e) => eprintln!("  ✗ Failed to store: {e}"),
+        }
+    }
+
+    println!("\n✓ Stored {stored} memories");
     Ok(())
 }
 
