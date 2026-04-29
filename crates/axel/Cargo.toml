@@ -25,6 +25,7 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
+clap = { version = "4", features = ["derive", "env"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }

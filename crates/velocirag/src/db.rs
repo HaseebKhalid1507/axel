@@ -647,10 +647,10 @@ impl Database {
              FROM documents d
              JOIN document_tags dt ON d.id = dt.doc_id
              JOIN tags t ON dt.tag_id = t.id
-             WHERE LOWER(t.name) LIKE LOWER(?1)
+             WHERE LOWER(t.name) LIKE LOWER(?1) ESCAPE '\\'
              LIMIT ?2"
         )?;
-        let rows = stmt.query_map(params![format!("%{}%", tag_pattern), limit as i64], |row| {
+        let rows = stmt.query_map(params![format!("%{}%", escape_like(tag_pattern)), limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -662,10 +662,10 @@ impl Database {
             "SELECT d.doc_id, d.content
              FROM documents d
              JOIN cross_refs cr ON d.id = cr.doc_id
-             WHERE LOWER(cr.ref_target) LIKE LOWER(?1)
+             WHERE LOWER(cr.ref_target) LIKE LOWER(?1) ESCAPE '\\'
              LIMIT ?2"
         )?;
-        let rows = stmt.query_map(params![format!("%{}%", target_pattern), limit as i64], |row| {
+        let rows = stmt.query_map(params![format!("%{}%", escape_like(target_pattern)), limit as i64], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })?;
         Ok(rows.filter_map(|r| r.ok()).collect())
@@ -727,6 +727,14 @@ impl Database {
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Escape SQLite LIKE metacharacters so user input cannot alter the pattern.
+///
+/// Uses `\` as the escape character, which must be declared in the SQL clause
+/// with `ESCAPE '\\'`.
+fn escape_like(input: &str) -> String {
+    input.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_")
+}
 
 /// Convert f32 slice to bytes for BLOB storage.
 fn embedding_to_blob(embedding: &[f32]) -> Vec<u8> {

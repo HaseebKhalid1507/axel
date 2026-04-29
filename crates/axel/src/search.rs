@@ -3,7 +3,7 @@
 //! The Brain owns the SQLite file. VelociRAG opens a second read connection
 //! to the same file (SQLite WAL supports unlimited concurrent readers).
 //! The HNSW vector index is built in memory from stored embeddings on first
-//! search, then cached for the session.
+//! search, then persisted to disk for fast warm starts on subsequent opens.
 
 use std::path::{Path, PathBuf};
 
@@ -18,12 +18,16 @@ use crate::error::{AxelError, Result};
 ///
 /// Owns a VelociRAG Database (second connection to the .r8 file),
 /// an Embedder (ONNX model), and a VectorIndex (HNSW, built from
-/// stored embeddings on first use).
+/// stored embeddings on first use and persisted to disk).
 pub struct BrainSearch {
     db: Database,
     embedder: Embedder,
     index: VectorIndex,
     index_built: bool,
+    /// Path where the HNSW index is persisted: `<brain>.r8.hnsw`
+    cache_path: PathBuf,
+    /// Set to true when the live index has been modified since the last save.
+    cache_stale: bool,
 }
 
 impl BrainSearch {
@@ -31,6 +35,8 @@ impl BrainSearch {
     ///
     /// Opens a second SQLite connection (read-only for search).
     /// Downloads the embedding model on first use if not cached.
+    /// If a matching on-disk HNSW cache exists, loads it instead of
+    /// rebuilding from raw embeddings.
     pub fn open(brain_path: &Path) -> Result<Self> {
         // VelociRAG's Database::open expects a directory and creates velocirag.db inside it.
         // For .r8 files, we need from_connection with the actual file path.
@@ -47,16 +53,57 @@ impl BrainSearch {
         let db = Database::from_connection(conn, brain_path.to_path_buf())
             .map_err(|e| AxelError::Search(e.to_string()))?;
 
-        let embedder = Embedder::new(None, None, true);
+        // Wire embedding cache: persist to ~/.cache/axel/embeddings so
+        // repeated embed() calls for the same content are free across sessions.
+        let embedding_cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("axel")
+            .join("embeddings");
 
-        let index = VectorIndex::new()
-            .map_err(|e| AxelError::Search(format!("Failed to create index: {e}")))?;
+        let embedder = Embedder::new(Some(embedding_cache_dir), None, true);
+
+        // Derive the HNSW index cache path from the brain file path.
+        let cache_path = brain_path.with_extension("r8.hnsw");
+
+        // Try to load a warm index from disk if it exists and the vector
+        // count matches what the database currently holds.
+        let (index, index_built) = if cache_path.exists() {
+            let db_count = db
+                .document_count()
+                .unwrap_or(0);
+
+            match VectorIndex::load(&cache_path) {
+                Ok(loaded) if loaded.len() == db_count && db_count > 0 => {
+                    eprintln!("Loading cached index ({} vectors)...", loaded.len());
+                    (loaded, true)
+                }
+                Ok(_) => {
+                    // Count mismatch — stale cache. Fall back to empty; build_index() rebuilds.
+                    tracing::debug!("HNSW cache count mismatch, will rebuild on next search.");
+                    let idx = VectorIndex::new()
+                        .map_err(|e| AxelError::Search(format!("Failed to create index: {e}")))?;
+                    (idx, false)
+                }
+                Err(e) => {
+                    tracing::warn!("Failed to load HNSW cache, will rebuild: {e}");
+                    let idx = VectorIndex::new()
+                        .map_err(|e| AxelError::Search(format!("Failed to create index: {e}")))?;
+                    (idx, false)
+                }
+            }
+        } else {
+            let idx = VectorIndex::new()
+                .map_err(|e| AxelError::Search(format!("Failed to create index: {e}")))?;
+            (idx, false)
+        };
 
         Ok(Self {
             db,
             embedder,
             index,
-            index_built: false,
+            index_built,
+            cache_path,
+            cache_stale: false,
         })
     }
 
@@ -65,6 +112,7 @@ impl BrainSearch {
     /// This is the "cold start" path — loads all embeddings from the database
     /// and builds an in-memory HNSW index. For 7K docs this takes ~70ms.
     /// Called automatically on first search if not already built.
+    /// After building, persists the index to `<brain>.r8.hnsw`.
     pub fn build_index(&mut self) -> Result<()> {
         if self.index_built {
             return Ok(());
@@ -84,6 +132,29 @@ impl BrainSearch {
 
         self.index_built = true;
         tracing::info!(count = embeddings.len(), "HNSW index built from stored embeddings");
+
+        // Persist the freshly built index so the next open() is a warm load.
+        if let Err(e) = self.index.save(&self.cache_path) {
+            tracing::warn!("Failed to persist HNSW index cache: {e}");
+        } else {
+            tracing::debug!("HNSW index saved to {}", self.cache_path.display());
+        }
+        self.cache_stale = false;
+
+        Ok(())
+    }
+
+    /// Flush any pending index changes to disk.
+    ///
+    /// Called automatically on drop if the cache is stale, but can also be
+    /// called explicitly after bulk `index_document()` operations.
+    pub fn flush(&mut self) -> Result<()> {
+        if self.cache_stale && self.index_built {
+            self.index.save(&self.cache_path)
+                .map_err(|e| AxelError::Search(format!("Failed to flush HNSW cache: {e}")))?;
+            self.cache_stale = false;
+            tracing::debug!("HNSW index flushed to {}", self.cache_path.display());
+        }
         Ok(())
     }
 
@@ -111,6 +182,9 @@ impl BrainSearch {
     }
 
     /// Index a document into the brain (embed + store + FTS).
+    ///
+    /// After adding to the live index the on-disk cache is marked stale.
+    /// Call `flush()` to persist immediately, or rely on the `Drop` impl.
     pub fn index_document(
         &mut self,
         doc_id: &str,
@@ -129,11 +203,12 @@ impl BrainSearch {
             file_path,
         ).map_err(|e| AxelError::Search(format!("Insert failed: {e}")))?;
 
-        // Add to live index so it's searchable immediately
+        // Add to live index so it's searchable immediately.
         self.index.add(rowid as u64, &embedding)
             .map_err(|e| AxelError::Search(format!("Index add failed: {e}")))?;
 
         self.index_built = true; // mark as built since we have at least one vector
+        self.cache_stale = true; // on-disk cache is now behind the live index
         Ok(())
     }
 
@@ -157,6 +232,18 @@ impl BrainSearch {
     /// Get a reference to the underlying database.
     pub fn db(&self) -> &Database {
         &self.db
+    }
+}
+
+impl Drop for BrainSearch {
+    /// Flush a stale HNSW cache to disk on drop so we don't lose incremental
+    /// index_document() additions across sessions.
+    fn drop(&mut self) {
+        if self.cache_stale && self.index_built {
+            if let Err(e) = self.index.save(&self.cache_path) {
+                tracing::warn!("Failed to persist HNSW index on drop: {e}");
+            }
+        }
     }
 }
 
@@ -242,5 +329,51 @@ mod tests {
 
         let results = search.search("anything", 5).unwrap();
         assert!(results.results.is_empty());
+    }
+
+    #[test]
+    fn cache_stale_flag_set_after_index_document() {
+        let (_dir, path) = tmp_brain_with_search();
+        let mut search = BrainSearch::open(&path).unwrap();
+
+        assert!(!search.cache_stale, "Cache should start clean");
+        search.index_document("d1", "hello world", None, None).unwrap();
+        assert!(search.cache_stale, "Cache should be stale after indexing");
+    }
+
+    #[test]
+    fn flush_clears_stale_flag() {
+        let (_dir, path) = tmp_brain_with_search();
+        let mut search = BrainSearch::open(&path).unwrap();
+
+        search.index_document("d1", "hello world", None, None).unwrap();
+        assert!(search.cache_stale);
+
+        search.flush().unwrap();
+        assert!(!search.cache_stale, "Cache should be clean after flush");
+    }
+
+    #[test]
+    fn warm_load_matches_cold_build() {
+        let (dir, path) = tmp_brain_with_search();
+
+        // Cold build: index two docs, flush cache.
+        {
+            let mut search = BrainSearch::open(&path).unwrap();
+            search.index_document("a", "alpha document", None, None).unwrap();
+            search.index_document("b", "beta document", None, None).unwrap();
+            search.flush().unwrap();
+        } // drop also saves, but flush already did it cleanly
+
+        // Warm load: cache file should exist and count should match.
+        let cache_path = path.with_extension("r8.hnsw");
+        assert!(cache_path.exists(), "HNSW cache file should exist after flush");
+
+        let search = BrainSearch::open(&path).unwrap();
+        assert!(search.index_built, "Index should be pre-built from warm cache");
+        assert_eq!(search.index.len(), 2, "Warm load should have 2 vectors");
+
+        // Suppress unused variable warning — dir must stay alive for path to be valid.
+        drop(dir);
     }
 }

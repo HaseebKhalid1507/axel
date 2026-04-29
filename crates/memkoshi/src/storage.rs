@@ -461,7 +461,7 @@ impl MemoryStorage {
     }
 
     /// Borrow the underlying connection (used by sibling modules).
-    pub(crate) fn conn(&self) -> &Connection {
+    pub fn conn(&self) -> &Connection {
         &self.conn
     }
 }
