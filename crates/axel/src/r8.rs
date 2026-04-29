@@ -52,6 +52,10 @@ pub struct BrainMeta {
     pub last_modified: String,
     pub document_count: i64,
     pub memory_count: i64,
+    /// Hex-encoded HMAC signing key (auto-generated on brain creation).
+    /// Used to sign memories and detect tampering.
+    #[serde(default)]
+    pub signing_key: Option<String>,
 }
 
 /// Handle to an open `.r8` brain file.
@@ -80,6 +84,17 @@ impl Brain {
         Self::init_schema(&conn)?;
 
         let now = Utc::now().to_rfc3339();
+
+        // Generate a random 32-byte signing key for HMAC-SHA256
+        let signing_key = {
+            let mut key = [0u8; 32];
+            use std::io::Read;
+            std::fs::File::open("/dev/urandom")
+                .and_then(|mut f| f.read_exact(&mut key))
+                .map_err(|e| AxelError::Other(format!("Failed to generate signing key: {e}")))?;
+            hex::encode(key)
+        };
+
         let meta = BrainMeta {
             schema_version: SCHEMA_VERSION,
             embedder_model: DEFAULT_EMBEDDER.to_string(),
@@ -89,6 +104,7 @@ impl Brain {
             last_modified: now,
             document_count: 0,
             memory_count: 0,
+            signing_key: Some(signing_key),
         };
 
         conn.execute(
@@ -134,6 +150,15 @@ impl Brain {
     /// Get a reference to the brain metadata.
     pub fn meta(&self) -> &BrainMeta {
         &self.meta
+    }
+
+    /// Get a MemorySigner using this brain's signing key.
+    /// Returns None if the brain has no signing key (legacy brains).
+    pub fn signer(&self) -> Option<axel_memkoshi::security::MemorySigner> {
+        self.meta.signing_key.as_ref().map(|hex_key| {
+            let key = hex::decode(hex_key).unwrap_or_else(|_| hex_key.as_bytes().to_vec());
+            axel_memkoshi::security::MemorySigner::new(&key)
+        })
     }
 
     /// Get a reference to the underlying SQLite connection.

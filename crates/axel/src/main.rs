@@ -264,7 +264,7 @@ fn cmd_remember(
     ensure_brain(&path)?;
 
     let title: String = content.chars().take(60).collect();
-    let mem = Memory::new(category, topic, &title, &content);
+    let mut mem = Memory::new(category, topic, &title, &content);
 
     // Validate
     let pipeline = MemoryPipeline::new();
@@ -275,6 +275,13 @@ fn cmd_remember(
         }
         return Ok(ExitCode::FAILURE);
     }
+
+    // Sign if brain has a signing key
+    let brain = Brain::open(&path)?;
+    if let Some(signer) = brain.signer() {
+        mem.signature = Some(signer.sign(&mem));
+    }
+    drop(brain);
 
     // Store
     let mut storage = MemoryStorage::open_existing(&path)?;
@@ -381,6 +388,10 @@ fn cmd_extract(cli: &Cli, input_parts: &[String]) -> Result<ExitCode, Box<dyn st
     }
 
     // Store accepted memories
+    let brain = Brain::open(&path)?;
+    let signer = brain.signer();
+    drop(brain);
+
     let mut storage = MemoryStorage::open_existing(&path)?;
     let mut search = BrainSearch::open(&path)?;
     let mut stored = 0;
@@ -392,10 +403,16 @@ fn cmd_extract(cli: &Cli, input_parts: &[String]) -> Result<ExitCode, Box<dyn st
             continue;
         }
 
-        match storage.stage_memory(mem) {
+        // Sign if brain has a signing key
+        let mut signed_mem = mem.clone();
+        if let Some(ref s) = signer {
+            signed_mem.signature = Some(s.sign(&signed_mem));
+        }
+
+        match storage.stage_memory(&signed_mem) {
             Ok(staged) => {
                 let _ = storage.approve(&staged.memory.id);
-                let _ = search.index_memory(mem);
+                let _ = search.index_memory(&signed_mem);
                 stored += 1;
                 println!("  ✓ [{:?}] {}", mem.category, mem.title);
             }
@@ -505,6 +522,10 @@ fn cmd_memories(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error:
     let path = brain_path(cli);
     ensure_brain(&path)?;
 
+    let brain = Brain::open(&path)?;
+    let signer = brain.signer();
+    drop(brain);
+
     let storage = MemoryStorage::open_existing(&path)?;
     let memories = storage.list_memories(limit)?;
 
@@ -514,7 +535,13 @@ fn cmd_memories(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error:
     }
 
     for mem in &memories {
-        println!("[{}] {} (importance: {:.1})", mem.id, mem.title, mem.importance);
+        let sig_status = match (&signer, &mem.signature) {
+            (Some(s), Some(_)) => if s.verify(mem) { "✓" } else { "⚠ TAMPERED" },
+            (Some(_), None) => "⚠ UNSIGNED",
+            (None, _) => "",
+        };
+
+        println!("[{}] {} (importance: {:.1}) {}", mem.id, mem.title, mem.importance, sig_status);
         println!("  category: {:?} | topic: {} | tags: {:?}", mem.category, mem.topic, mem.tags);
         if !mem.abstract_text.is_empty() {
             println!("  {}", mem.abstract_text);
