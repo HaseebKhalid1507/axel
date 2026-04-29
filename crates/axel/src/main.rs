@@ -139,10 +139,11 @@ fn cmd_index(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("Usage: axel search <query> [--limit N]");
+        eprintln!("Usage: axel search <query> [--limit N] [--json]");
         std::process::exit(1);
     }
 
+    let json_mode = args.iter().any(|a| a == "--json");
     let limit = args.iter()
         .position(|a| a == "--limit")
         .and_then(|i| args.get(i + 1))
@@ -150,7 +151,8 @@ fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or(5);
 
     let query: String = args.iter()
-        .take_while(|a| a.as_str() != "--limit")
+        .filter(|a| a.as_str() != "--json" && a.as_str() != "--limit")
+        .take_while(|a| a.parse::<usize>().is_err() || args.iter().position(|x| x == "--limit").map_or(true, |li| args.iter().position(|x| x.as_str() == a.as_str()).unwrap() != li + 1))
         .cloned()
         .collect::<Vec<_>>()
         .join(" ");
@@ -163,6 +165,23 @@ fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let response = search.search(&query, limit)?;
     let ms = start.elapsed().as_millis();
 
+    if json_mode {
+        let results: Vec<serde_json::Value> = response.results.iter().map(|r| {
+            serde_json::json!({
+                "doc_id": r.doc_id,
+                "score": r.score,
+                "content": strip_frontmatter(&r.content),
+            })
+        }).collect();
+        println!("{}", serde_json::json!({
+            "query": query,
+            "count": results.len(),
+            "ms": ms,
+            "results": results,
+        }));
+        return Ok(());
+    }
+
     if response.results.is_empty() {
         println!("No results for \"{query}\"");
         return Ok(());
@@ -170,9 +189,10 @@ fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     println!("🔍 \"{}\" — {} results ({ms}ms)\n", query, response.results.len());
     for (i, result) in response.results.iter().enumerate() {
-        let preview: String = result.content
+        let clean = strip_frontmatter(&result.content);
+        let preview: String = clean
             .lines()
-            .filter(|l| !l.starts_with("---") && !l.starts_with("title:") && !l.starts_with("tags:"))
+            .filter(|l| !l.trim().is_empty())
             .take(3)
             .collect::<Vec<_>>()
             .join(" ")
@@ -314,4 +334,15 @@ fn ensure_brain(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// Strip YAML frontmatter (--- ... ---) from markdown content.
+fn strip_frontmatter(content: &str) -> String {
+    let trimmed = content.trim_start();
+    if trimmed.starts_with("---") {
+        if let Some(end) = trimmed[3..].find("---") {
+            return trimmed[end + 6..].trim_start().to_string();
+        }
+    }
+    content.to_string()
 }
