@@ -207,28 +207,80 @@ fn cmd_search(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 fn cmd_remember(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     if args.is_empty() {
-        eprintln!("Usage: axel remember <content>");
+        eprintln!("Usage: axel remember [--category CAT] [--topic TOPIC] <content>");
+        eprintln!("  Categories: events, preferences, entities, cases, patterns");
         std::process::exit(1);
     }
 
-    let content = args.join(" ");
+    // Parse flags
+    let category = args.iter()
+        .position(|a| a == "--category")
+        .and_then(|i| args.get(i + 1))
+        .map(|s| match s.to_lowercase().as_str() {
+            "preferences" | "pref" => MemoryCategory::Preferences,
+            "entities" | "entity" => MemoryCategory::Entities,
+            "cases" | "case" => MemoryCategory::Cases,
+            "patterns" | "pattern" => MemoryCategory::Patterns,
+            _ => MemoryCategory::Events,
+        })
+        .unwrap_or(MemoryCategory::Events);
+
+    let topic = args.iter()
+        .position(|a| a == "--topic")
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+        .unwrap_or_else(|| "general".to_string());
+
+    // Collect content (everything that's not a flag or flag value)
+    let skip_indices: std::collections::HashSet<usize> = {
+        let mut s = std::collections::HashSet::new();
+        for (i, a) in args.iter().enumerate() {
+            if a == "--category" || a == "--topic" {
+                s.insert(i);
+                s.insert(i + 1);
+            }
+        }
+        s
+    };
+    let content: String = args.iter().enumerate()
+        .filter(|(i, _)| !skip_indices.contains(i))
+        .map(|(_, a)| a.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+
+    if content.is_empty() {
+        eprintln!("No content provided.");
+        std::process::exit(1);
+    }
+
     let path = brain_path();
     ensure_brain(&path)?;
 
-    // Create memory
+    // Validate through pipeline
     let title: String = content.chars().take(60).collect();
-    let mem = Memory::new(MemoryCategory::Events, "manual", &title, &content);
+    let mem = Memory::new(category, &topic, &title, &content);
 
-    // Store in memkoshi tables
+    use axel_memkoshi::pipeline::MemoryPipeline;
+    let pipeline = MemoryPipeline::new();
+    if let Err(errors) = pipeline.validate(&mem) {
+        eprintln!("Validation failed:");
+        for e in &errors {
+            eprintln!("  • {e}");
+        }
+        std::process::exit(1);
+    }
+
+    // Store
     let mut storage = MemoryStorage::open(&path)?;
     let staged = storage.stage_memory(&mem)?;
     storage.approve(&staged.memory.id)?;
 
-    // Also index for search
+    // Index for search
     let mut search = BrainSearch::open(&path)?;
     search.index_memory(&mem)?;
 
     println!("✓ Remembered: {} ({})", mem.title, mem.id);
+    println!("  category: {:?} | topic: {}", category, topic);
     Ok(())
 }
 
