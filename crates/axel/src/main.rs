@@ -38,6 +38,8 @@ fn main() {
         "search" => cmd_search(&args[2..]),
         "remember" => cmd_remember(&args[2..]),
         "recall" => cmd_recall(&args[2..]),
+        "handoff" => cmd_handoff(&args[2..]),
+        "forget" => cmd_forget(&args[2..]),
         "stats" => cmd_stats(),
         "memories" => cmd_memories(&args[2..]),
         "help" | "--help" | "-h" => { print_usage(); Ok(()) }
@@ -60,9 +62,11 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  axel init [--name NAME]           Create a new .r8 brain");
     eprintln!("  axel index <path>                 Index a file or directory");
-    eprintln!("  axel search <query> [--limit N]   Search the brain");
-    eprintln!("  axel remember <content>           Store a memory");
+    eprintln!("  axel search <query> [--limit N] [--json]  Search the brain");
+    eprintln!("  axel remember [--category C] [--topic T] <content>  Store a memory");
     eprintln!("  axel recall [query]               Get relevant context");
+    eprintln!("  axel handoff [set|get|clear] [content]  Manage session handoff");
+    eprintln!("  axel forget <memory_id>           Delete a memory");
     eprintln!("  axel stats                        Show brain stats");
     eprintln!("  axel memories [--limit N]         List stored memories");
     eprintln!();
@@ -376,6 +380,56 @@ fn cmd_memories(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             println!("  {}", mem.abstract_text);
         }
         println!();
+    }
+    Ok(())
+}
+
+fn cmd_handoff(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let path = brain_path();
+    ensure_brain(&path)?;
+    let storage = MemoryStorage::open(&path)?;
+
+    if args.is_empty() || args[0] == "get" {
+        // Get current handoff
+        match storage.get_context("handoff")? {
+            Some(handoff) => println!("{handoff}"),
+            None => println!("No handoff set."),
+        }
+    } else if args[0] == "set" {
+        let content = args[1..].join(" ");
+        if content.is_empty() {
+            eprintln!("Usage: axel handoff set <content>");
+            std::process::exit(1);
+        }
+        storage.set_context("handoff", &content, "boot")?;
+        println!("✓ Handoff set ({} chars)", content.len());
+    } else if args[0] == "clear" {
+        storage.set_context("handoff", "", "boot")?;
+        println!("✓ Handoff cleared");
+    } else {
+        // Treat everything as "set"
+        let content = args.join(" ");
+        storage.set_context("handoff", &content, "boot")?;
+        println!("✓ Handoff set ({} chars)", content.len());
+    }
+    Ok(())
+}
+
+fn cmd_forget(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    if args.is_empty() {
+        eprintln!("Usage: axel forget <memory_id>");
+        std::process::exit(1);
+    }
+
+    let id = &args[0];
+    let path = brain_path();
+    ensure_brain(&path)?;
+
+    let storage = MemoryStorage::open(&path)?;
+    if storage.delete_memory(id)? {
+        println!("✓ Forgotten: {id}");
+    } else {
+        println!("Memory not found: {id}");
     }
     Ok(())
 }
