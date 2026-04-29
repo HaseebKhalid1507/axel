@@ -1,0 +1,25 @@
+[package]
+name = "axel"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Portable agent intelligence — search, memory, session awareness in one .r8 file"
+
+[dependencies]
+velocirag = { path = "../velocirag" }
+axel-memkoshi = { path = "../memkoshi" }
+axel-stelline = { path = "../stelline" }
+rusqlite = { workspace = true }
+usearch = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+dirs = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

@@ -1,0 +1,35 @@
+[package]
+name = "velocirag"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Lightning-fast 4-layer RAG search engine for AI agents"
+
+[dependencies]
+rusqlite = { workspace = true }
+usearch = { workspace = true }
+ort = { workspace = true }
+tokenizers = { workspace = true }
+ndarray = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+ordered-float = { workspace = true }
+rayon = { workspace = true }
+regex = { workspace = true }
+walkdir = { workspace = true }
+pulldown-cmark = { workspace = true }
+dirs = { workspace = true }
+tracing = { workspace = true }
+hex = { workspace = true }
+md-5 = "0.10"
+ureq = "3"
+serde_yaml = "0.9"
+once_cell = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }
