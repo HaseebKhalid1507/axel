@@ -73,6 +73,10 @@ impl BrainSearch {
         let embeddings = self.db.load_all_embeddings()
             .map_err(|e| AxelError::Search(format!("Failed to load embeddings: {e}")))?;
 
+        if !embeddings.is_empty() {
+            eprintln!("Building search index ({} vectors)...", embeddings.len());
+        }
+
         for (key, embedding) in &embeddings {
             self.index.add(*key as u64, embedding)
                 .map_err(|e| AxelError::Search(format!("Failed to add to index: {e}")))?;
