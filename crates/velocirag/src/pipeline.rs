@@ -301,8 +301,7 @@ pub fn build_graph(
                 .file_stem()
                 .and_then(|s| s.to_str())
                 .unwrap_or("unknown")
-                .replace('-', " ")
-                .replace('_', " ");
+                .replace(['-', '_'], " ");
 
             let node_id = format!("note_{:x}", md5_short(&rel_path));
 
@@ -485,7 +484,6 @@ pub fn build_graph(
                 nodes_added: new_nodes.len(),
                 edges_added: new_edges.len(),
                 extra: [("embeddings".into(), node_embeddings.len().to_string())].into(),
-                ..Default::default()
             });
             info!("Stage 7: +{} semantic edges from {} embeddings ({:.1}s)",
                   new_edges.len(), node_embeddings.len(), t.elapsed().as_secs_f64());

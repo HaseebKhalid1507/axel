@@ -222,8 +222,7 @@ impl TemporalAnalyzer {
                 continue;
             }
 
-            for j in (i + 1)..dated.len() {
-                let (tgt, tgt_date) = &dated[j];
+            for (tgt, tgt_date) in &dated[(i + 1)..] {
                 let diff = (*tgt_date - *src_date).num_days().unsigned_abs() as i64;
 
                 if diff > self.window_days { break; }

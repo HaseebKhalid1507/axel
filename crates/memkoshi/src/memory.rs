@@ -36,7 +36,7 @@ impl MemoryCategory {
     }
 
     /// Parse a lowercase tag back into a category.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "preferences" => Some(Self::Preferences),
             "entities" => Some(Self::Entities),
@@ -71,7 +71,7 @@ impl Confidence {
     }
 
     /// Parse a lowercase tag back into a confidence level.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "high" => Some(Self::High),
             "medium" => Some(Self::Medium),
@@ -104,7 +104,7 @@ impl ReviewStatus {
     }
 
     /// Parse a lowercase tag back into a status.
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(Self::Pending),
             "approved" => Some(Self::Approved),

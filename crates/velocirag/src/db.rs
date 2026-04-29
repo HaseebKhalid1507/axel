@@ -487,6 +487,7 @@ impl Database {
     }
 
     /// Convenience: insert an edge from individual fields.
+    #[allow(clippy::too_many_arguments)]
     pub fn insert_edge(
         &self,
         id: &str,

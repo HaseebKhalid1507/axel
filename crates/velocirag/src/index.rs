@@ -21,6 +21,7 @@ const DEFAULT_EF_SEARCH: usize = 64;        // Query-time search depth
 pub struct VectorIndex {
     index: Index,
     count: usize,
+    #[allow(dead_code)]
     path: Option<PathBuf>,
 }
 

@@ -338,7 +338,7 @@ impl<'a> SearchEngine<'a> {
 
         // Traverse neighbors of matched nodes
         let mut results = Vec::new();
-        let query_lower = query.to_lowercase();
+        let _query_lower = query.to_lowercase();
 
         for (node_id, title, _content) in &matched_nodes {
             let neighbors = self.db.get_neighbors(node_id, GRAPH_DEPTH, GRAPH_MAX_RESULTS)?;

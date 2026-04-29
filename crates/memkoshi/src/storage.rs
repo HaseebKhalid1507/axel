@@ -217,7 +217,7 @@ impl MemoryStorage {
         let row = stmt
             .query_row(params![id], row_to_memory)
             .optional()?;
-        Ok(row.transpose()?)
+        row.transpose()
     }
 
     /// List the most recent `limit` memories by `created` descending.
@@ -516,7 +516,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
     Ok((|| -> std::result::Result<Memory, MemkoshiError> {
         Ok(Memory {
             id,
-            category: MemoryCategory::from_str(&category).ok_or_else(|| {
+            category: MemoryCategory::parse(&category).ok_or_else(|| {
                 MemkoshiError::InvalidEnum {
                     field: "category",
                     value: category.clone(),
@@ -526,7 +526,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
             title,
             abstract_text,
             content,
-            confidence: Confidence::from_str(&confidence).ok_or_else(|| {
+            confidence: Confidence::parse(&confidence).ok_or_else(|| {
                 MemkoshiError::InvalidEnum {
                     field: "confidence",
                     value: confidence.clone(),
@@ -559,7 +559,7 @@ fn row_to_staged(
         let memory = mem_result?;
         Ok(StagedMemory {
             memory,
-            review_status: ReviewStatus::from_str(&review_status).ok_or_else(|| {
+            review_status: ReviewStatus::parse(&review_status).ok_or_else(|| {
                 MemkoshiError::InvalidEnum {
                     field: "review_status",
                     value: review_status.clone(),

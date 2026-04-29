@@ -154,7 +154,7 @@ fn cmd_index(cli: &Cli, target: &Path) -> Result<ExitCode, Box<dyn std::error::E
         for entry in walkdir::WalkDir::new(target)
             .into_iter()
             .filter_map(|e| e.ok())
-            .filter(|e| e.path().extension().map_or(false, |ext| ext == "md" || ext == "txt"))
+            .filter(|e| e.path().extension().is_some_and(|ext| ext == "md" || ext == "txt"))
         {
             let content = std::fs::read_to_string(entry.path())?;
             if content.len() < 50 { continue; }
@@ -580,9 +580,9 @@ fn parse_category(s: &str) -> Result<MemoryCategory, Box<dyn std::error::Error>>
 /// Strip YAML frontmatter (--- ... ---) from markdown content.
 fn strip_frontmatter(content: &str) -> String {
     let trimmed = content.trim_start();
-    if trimmed.starts_with("---") {
-        if let Some(end) = trimmed[3..].find("---") {
-            return trimmed[end + 6..].trim_start().to_string();
+    if let Some(after) = trimmed.strip_prefix("---") {
+        if let Some(end) = after.find("---") {
+            return after[end + 3..].trim_start().to_string();
         }
     }
     content.to_string()
