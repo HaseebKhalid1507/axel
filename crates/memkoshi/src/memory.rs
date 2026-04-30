@@ -154,6 +154,8 @@ pub struct Memory {
     pub signature: Option<String>,
     /// Memory ID that superseded this one, if any.
     pub superseded_by: Option<String>,
+    /// Optional expiry timestamp (UTC). None means no expiry.
+    pub expires_at: Option<DateTime<Utc>>,
 }
 
 impl Memory {
@@ -181,6 +183,7 @@ impl Memory {
             trust_level: 1.0,
             signature: None,
             superseded_by: None,
+            expires_at: None,
         }
     }
 
@@ -205,6 +208,34 @@ impl Memory {
     /// Check if this memory has been superseded.
     pub fn is_superseded(&self) -> bool {
         self.superseded_by.is_some()
+    }
+
+    /// Set TTL for this memory.
+    pub fn set_ttl(&mut self, hours: u64) {
+        self.expires_at = Some(Utc::now() + chrono::Duration::hours(hours as i64));
+    }
+
+    /// Check if this memory has expired.
+    pub fn is_expired(&self) -> bool {
+        match self.expires_at {
+            Some(expires) => Utc::now() > expires,
+            None => false,
+        }
+    }
+
+    /// Get remaining TTL in hours, if any.
+    pub fn remaining_ttl_hours(&self) -> Option<i64> {
+        match self.expires_at {
+            Some(expires) => {
+                let remaining = expires - Utc::now();
+                if remaining.num_seconds() > 0 {
+                    Some(remaining.num_hours())
+                } else {
+                    Some(0) // Expired
+                }
+            },
+            None => None, // No expiry
+        }
     }
 }
 

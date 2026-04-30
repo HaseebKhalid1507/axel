@@ -427,4 +427,30 @@ mod tests {
         assert!(mem.updated.is_some());
         assert!(mem.tags.contains(&"superseded".to_string()));
     }
+
+    #[test]
+    fn test_memory_ttl() {
+        use chrono::{Duration, Utc};
+        
+        let mut mem = valid_memory();
+        
+        // Initially no expiry
+        assert_eq!(mem.expires_at, None);
+        assert!(!mem.is_expired());
+        assert_eq!(mem.remaining_ttl_hours(), None);
+        
+        // Set TTL to 24 hours
+        mem.set_ttl(24);
+        assert!(mem.expires_at.is_some());
+        assert!(!mem.is_expired());
+        
+        let remaining = mem.remaining_ttl_hours();
+        assert!(remaining.is_some());
+        assert!(remaining.unwrap() >= 23 && remaining.unwrap() <= 24); // Allow for clock skew
+        
+        // Simulate memory that expired 1 hour ago
+        mem.expires_at = Some(Utc::now() - Duration::hours(1));
+        assert!(mem.is_expired());
+        assert_eq!(mem.remaining_ttl_hours(), Some(0));
+    }
 }

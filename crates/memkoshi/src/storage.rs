@@ -246,6 +246,28 @@ impl MemoryStorage {
         Ok(n > 0)
     }
 
+    /// Remove all expired memories and return the count of deleted memories.
+    /// A memory is expired if it has an `expires_at` timestamp that is in the past.
+    /// Since the database schema doesn't yet support the `expires_at` field,
+    /// this implementation checks expiry using the in-memory representation.
+    pub fn prune_expired(&self) -> Result<u64> {
+        // TODO: This is inefficient as it loads all memories into memory.
+        // Once the database schema is updated to include expires_at, 
+        // this should be done with a SQL DELETE WHERE expires_at < NOW().
+        let all_memories = self.list_memories(10000)?; // Large limit to get all memories
+        let mut deleted_count = 0u64;
+        
+        for memory in all_memories {
+            if memory.is_expired() {
+                if self.delete_memory(&memory.id)? {
+                    deleted_count += 1;
+                }
+            }
+        }
+        
+        Ok(deleted_count)
+    }
+
     // ------------------------------------------------------------------ staging
 
     /// Stage `memory` as `Pending` and return the staging envelope.
@@ -544,6 +566,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
             trust_level,
             signature,
             superseded_by: None, // TODO: Handle this field properly in database schema
+            expires_at: None, // TODO: Handle this field properly in database schema
         })
     })())
 }

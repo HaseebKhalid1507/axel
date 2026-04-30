@@ -92,6 +92,10 @@ fn tool_definitions() -> Value {
                             "type": "number",
                             "description": "Importance 0.0–1.0 (default: 0.5)",
                             "default": 0.5
+                        },
+                        "ttl_hours": {
+                            "type": "integer",
+                            "description": "Time-to-live in hours. Memory will be auto-deleted after this time (optional)"
                         }
                     },
                     "required": ["content", "category"]
@@ -147,13 +151,20 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
             let content = args["content"].as_str().unwrap_or("");
             let category = args["category"].as_str().unwrap_or("events");
             let importance = args["importance"].as_f64().unwrap_or(0.5);
+            let ttl_hours = args["ttl_hours"].as_u64();
 
             if content.is_empty() {
                 return tool_error("Content cannot be empty");
             }
 
-            match brain.remember(content, category, importance) {
-                Ok(id) => tool_text(&format!("✅ Memory stored: {}", id)),
+            match brain.remember_with_ttl(content, category, importance, ttl_hours) {
+                Ok(id) => {
+                    let ttl_info = match ttl_hours {
+                        Some(hours) => format!(" (expires in {}h)", hours),
+                        None => "".to_string(),
+                    };
+                    tool_text(&format!("✅ Memory stored: {}{}", id, ttl_info))
+                },
                 Err(e) => tool_error(&format!("Failed to store memory: {}", e)),
             }
         }

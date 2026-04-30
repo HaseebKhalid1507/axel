@@ -172,6 +172,21 @@ impl AxelBrain {
         category: &str,
         importance: f64,
     ) -> Result<String> {
+        self.remember_with_ttl(content, category, importance, None)
+    }
+
+    /// Store a memory with optional TTL. Returns the memory ID.
+    ///
+    /// The memory is validated, signed (if signing key exists), and indexed
+    /// for search immediately. If `ttl_hours` is provided, the memory will
+    /// expire after that many hours.
+    pub fn remember_with_ttl(
+        &mut self,
+        content: &str,
+        category: &str,
+        importance: f64,
+        ttl_hours: Option<u64>,
+    ) -> Result<String> {
         let cat = match category.to_lowercase().as_str() {
             "events" | "event" => MemoryCategory::Events,
             "preferences" | "preference" | "pref" => MemoryCategory::Preferences,
@@ -191,6 +206,11 @@ impl AxelBrain {
             content.to_string(),
         );
         memory.importance = importance.clamp(0.0, 1.0);
+
+        // Set TTL if provided
+        if let Some(hours) = ttl_hours {
+            memory.set_ttl(hours);
+        }
 
         // Sign if brain has a signing key
         if let Some(ref signer) = self.brain.signer() {
@@ -221,6 +241,11 @@ impl AxelBrain {
     /// Delete a memory by ID.
     pub fn forget(&mut self, id: &str) -> Result<bool> {
         Ok(self.storage.delete_memory(id)?)
+    }
+
+    /// Remove all expired memories and return the count of deleted memories.
+    pub fn prune_expired(&mut self) -> Result<u64> {
+        Ok(self.storage.prune_expired()?)
     }
 
     // ── Handoff ─────────────────────────────────────────────────────────
