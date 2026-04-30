@@ -109,6 +109,20 @@ fn tool_definitions() -> Value {
                     "properties": {},
                     "required": []
                 }
+            },
+            {
+                "name": "axel_verify",
+                "description": "Verify a memory by ID — returns full record with provenance and signature status. Use this to inspect a specific memory's authenticity and metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Memory ID to verify (e.g. mem_12345678)"
+                        }
+                    },
+                    "required": ["memory_id"]
+                }
             }
         ]
     })
@@ -180,6 +194,76 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
                     }
                 }
                 Err(e) => tool_error(&format!("Recall failed: {}", e)),
+            }
+        }
+
+        "axel_verify" => {
+            let memory_id = args["memory_id"].as_str().unwrap_or("");
+
+            if memory_id.is_empty() {
+                return tool_error("Memory ID cannot be empty");
+            }
+
+            match brain.get_memory_with_verification(memory_id) {
+                Ok(Some((memory, verified))) => {
+                    let verification_status = if memory.signature.is_some() {
+                        if verified { "✅ VERIFIED" } else { "❌ FAILED" }
+                    } else {
+                        "⚠️ UNSIGNED"
+                    };
+
+                    let ttl_info = match memory.remaining_ttl_hours() {
+                        Some(hours) if hours > 0 => format!("⏰ Expires in {}h", hours),
+                        Some(_) => "🕐 EXPIRED".to_string(), // 0 or negative
+                        None => "∞ No expiry".to_string(),
+                    };
+
+                    let superseded_info = if memory.is_superseded() {
+                        format!("🔄 Superseded by: {}", memory.superseded_by.as_deref().unwrap_or("unknown"))
+                    } else {
+                        "✨ Active".to_string()
+                    };
+
+                    tool_text(&format!(
+                        "🔍 Memory Verification: {}\n\n\
+                        📝 **Content:** {}\n\n\
+                        📊 **Metadata:**\n\
+                        • ID: {}\n\
+                        • Category: {:?}\n\
+                        • Title: {}\n\
+                        • Topic: {}\n\
+                        • Importance: {:.2}\n\
+                        • Confidence: {:?}\n\
+                        • Trust Level: {:.2}\n\
+                        • Created: {}\n\
+                        • Updated: {}\n\
+                        • Sessions: {}\n\
+                        • Tags: {}\n\
+                        • Related Topics: {}\n\n\
+                        🔐 **Security:** {}\n\
+                        ⏱️ **TTL:** {}\n\
+                        🔄 **Status:** {}",
+                        memory_id,
+                        memory.content,
+                        memory.id,
+                        memory.category,
+                        memory.title,
+                        memory.topic,
+                        memory.importance,
+                        memory.confidence,
+                        memory.trust_level,
+                        memory.created.format("%Y-%m-%d %H:%M:%S UTC"),
+                        memory.updated.map(|u| u.format("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or("Never".to_string()),
+                        memory.source_sessions.join(", "),
+                        memory.tags.join(", "),
+                        memory.related_topics.join(", "),
+                        verification_status,
+                        ttl_info,
+                        superseded_info
+                    ))
+                },
+                Ok(None) => tool_error(&format!("Memory not found: {}", memory_id)),
+                Err(e) => tool_error(&format!("Failed to verify memory: {}", e)),
             }
         }
 

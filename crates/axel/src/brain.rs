@@ -243,9 +243,18 @@ impl AxelBrain {
         Ok(self.storage.delete_memory(id)?)
     }
 
-    /// Remove all expired memories and return the count of deleted memories.
-    pub fn prune_expired(&mut self) -> Result<u64> {
-        Ok(self.storage.prune_expired()?)
+    /// Get a memory by ID with verification status.
+    pub fn get_memory_with_verification(&self, id: &str) -> Result<Option<(Memory, bool)>> {
+        match self.storage.get_memory(id)? {
+            Some(memory) => {
+                let verified = match &self.brain.signer() {
+                    Some(signer) => signer.verify(&memory),
+                    None => false, // No signer available
+                };
+                Ok(Some((memory, verified)))
+            },
+            None => Ok(None),
+        }
     }
 
     // ── Handoff ─────────────────────────────────────────────────────────
