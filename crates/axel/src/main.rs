@@ -88,6 +88,8 @@ enum Commands {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Run as a SynapsCLI extension (JSON-RPC over stdio)
+    Extension,
 }
 
 fn brain_path(cli: &Cli) -> PathBuf {
@@ -107,6 +109,11 @@ fn main() -> ExitCode {
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
+        Commands::Extension => {
+            let path = brain_path(&cli);
+            axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
     };
 
     match result {
