@@ -148,6 +148,7 @@ impl<'a> GraphQuerier<'a> {
         let mut stmt = self.db.conn().prepare(
             "SELECT target_id, weight, confidence FROM edges
              WHERE source_id = ?1 AND type = 'similar_to'
+               AND (valid_to IS NULL OR valid_to > datetime('now'))
              ORDER BY weight DESC LIMIT ?2"
         )?;
 
@@ -358,8 +359,9 @@ impl<'a> GraphQuerier<'a> {
     /// Get all edges touching a node (both directions).
     fn get_edges_both(&self, node_id: &str) -> Result<Vec<Edge>> {
         let mut stmt = self.db.conn().prepare(
-            "SELECT id, source_id, target_id, type, weight, confidence, metadata, source_file
-             FROM edges WHERE source_id = ?1 OR target_id = ?1"
+            "SELECT id, source_id, target_id, type, weight, confidence, metadata, source_file, valid_from, valid_to
+             FROM edges WHERE (source_id = ?1 OR target_id = ?1)
+               AND (valid_to IS NULL OR valid_to > datetime('now'))"
         )?;
 
         let rows = stmt.query_map([node_id], |row| {
@@ -375,6 +377,8 @@ impl<'a> GraphQuerier<'a> {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 source_file: row.get(7)?,
+                valid_from: row.get::<_, Option<String>>(8)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
+                valid_to: row.get::<_, Option<String>>(9)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
             })
         })?;
 
@@ -409,8 +413,8 @@ mod tests {
         db.insert_node("c", "note", "Node C", None, &serde_json::json!({}), None).unwrap();
 
         // Insert edges: a → b → c
-        db.insert_edge("e1", "a", "b", "references", 1.0, 1.0, &serde_json::json!({}), None).unwrap();
-        db.insert_edge("e2", "b", "c", "references", 1.0, 1.0, &serde_json::json!({}), None).unwrap();
+        db.insert_edge("e1", "a", "b", "references", 1.0, 1.0, &serde_json::json!({}), None, None, None).unwrap();
+        db.insert_edge("e2", "b", "c", "references", 1.0, 1.0, &serde_json::json!({}), None, None, None).unwrap();
 
         let querier = GraphQuerier::new(&db);
         let result = querier.find_path("a", "c").unwrap();
@@ -428,8 +432,8 @@ mod tests {
         db.insert_node("a", "note", "A", None, &serde_json::json!({}), None).unwrap();
         db.insert_node("b", "note", "B", None, &serde_json::json!({}), None).unwrap();
 
-        db.insert_edge("e1", "hub", "a", "references", 1.0, 1.0, &serde_json::json!({}), None).unwrap();
-        db.insert_edge("e2", "hub", "b", "references", 1.0, 1.0, &serde_json::json!({}), None).unwrap();
+        db.insert_edge("e1", "hub", "a", "references", 1.0, 1.0, &serde_json::json!({}), None, None, None).unwrap();
+        db.insert_edge("e2", "hub", "b", "references", 1.0, 1.0, &serde_json::json!({}), None, None, None).unwrap();
 
         let querier = GraphQuerier::new(&db);
         let hubs = querier.get_hub_nodes(5).unwrap();
