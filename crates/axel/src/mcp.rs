@@ -123,6 +123,30 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["memory_id"]
                 }
+            },
+            {
+                "name": "axel_update",
+                "description": "Update a memory's content and/or importance — wiki-style editing with re-signing and re-indexing. Use this to correct or enhance existing memories.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Memory ID to update (e.g. mem_12345678)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New content for the memory (optional)"
+                        },
+                        "importance": {
+                            "type": "number",
+                            "description": "New importance level 0.0-1.0 (optional)",
+                            "minimum": 0.0,
+                            "maximum": 1.0
+                        }
+                    },
+                    "required": ["memory_id"]
+                }
             }
         ]
     })
@@ -264,6 +288,46 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
                 },
                 Ok(None) => tool_error(&format!("Memory not found: {}", memory_id)),
                 Err(e) => tool_error(&format!("Failed to verify memory: {}", e)),
+            }
+        }
+
+        "axel_update" => {
+            let memory_id = args["memory_id"].as_str().unwrap_or("");
+            let new_content = args["content"].as_str();
+            let new_importance = args["importance"].as_f64();
+
+            if memory_id.is_empty() {
+                return tool_error("Memory ID cannot be empty");
+            }
+
+            // Validate new content if provided
+            if let Some(content) = new_content {
+                if content.trim().is_empty() {
+                    return tool_error("Content cannot be empty");
+                }
+                if content.chars().count() < 50 {
+                    return tool_error("Content must be at least 50 characters");
+                }
+            }
+
+            // Validate importance if provided
+            if let Some(importance) = new_importance {
+                if !(0.0..=1.0).contains(&importance) {
+                    return tool_error("Importance must be between 0.0 and 1.0");
+                }
+            }
+
+            match brain.update_memory(memory_id, new_content, new_importance) {
+                Ok(true) => {
+                    let updates: Vec<String> = [
+                        new_content.map(|_| "content"),
+                        new_importance.map(|_| "importance"),
+                    ].into_iter().flatten().map(|s| s.to_string()).collect();
+                    
+                    tool_text(&format!("✅ Memory updated: {} ({})", memory_id, updates.join(", ")))
+                },
+                Ok(false) => tool_error(&format!("Memory not found: {}", memory_id)),
+                Err(e) => tool_error(&format!("Failed to update memory: {}", e)),
             }
         }
 

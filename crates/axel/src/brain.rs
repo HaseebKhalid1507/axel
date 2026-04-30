@@ -243,6 +243,41 @@ impl AxelBrain {
         Ok(self.storage.delete_memory(id)?)
     }
 
+    /// Remove all expired memories and return the count of deleted memories.
+    pub fn prune_expired(&mut self) -> Result<u64> {
+        Ok(self.storage.prune_expired()?)
+    }
+
+    /// Update a memory's content and/or importance.
+    /// Re-signs the memory if a signing key exists and re-indexes for search.
+    /// Returns true if the memory was found and updated.
+    pub fn update_memory(
+        &mut self,
+        id: &str,
+        new_content: Option<&str>,
+        new_importance: Option<f64>,
+    ) -> Result<bool> {
+        // Update in storage
+        if !self.storage.update_memory(id, new_content, new_importance)? {
+            return Ok(false); // Memory not found
+        }
+
+        // Get the updated memory for re-signing and re-indexing
+        if let Some(mut memory) = self.storage.get_memory(id)? {
+            // Re-sign if brain has a signing key
+            if let Some(ref signer) = self.brain.signer() {
+                memory.signature = Some(signer.sign(&memory));
+                // Update the signature in the database
+                self.storage.store_memory(&memory)?;
+            }
+
+            // Re-index for search
+            let _ = self.search.index_memory(&memory);
+        }
+
+        Ok(true)
+    }
+
     /// Get a memory by ID with verification status.
     pub fn get_memory_with_verification(&self, id: &str) -> Result<Option<(Memory, bool)>> {
         match self.storage.get_memory(id)? {

@@ -268,6 +268,33 @@ impl MemoryStorage {
         Ok(deleted_count)
     }
 
+    /// Update a memory's content and/or importance. Returns true if the memory was found and updated.
+    pub fn update_memory(
+        &self, 
+        id: &str, 
+        new_content: Option<&str>, 
+        new_importance: Option<f64>
+    ) -> Result<bool> {
+        // First check if memory exists
+        let memory = match self.get_memory(id)? {
+            Some(m) => m,
+            None => return Ok(false), // Memory not found
+        };
+
+        // Prepare update values
+        let content = new_content.unwrap_or(&memory.content);
+        let importance = new_importance.unwrap_or(memory.importance).clamp(0.0, 1.0);
+        let updated = chrono::Utc::now().to_rfc3339();
+
+        // Execute update
+        let rows_affected = self.conn.execute(
+            "UPDATE memories SET content = ?1, importance = ?2, updated = ?3 WHERE id = ?4",
+            params![content, importance, updated, id]
+        )?;
+
+        Ok(rows_affected > 0)
+    }
+
     // ------------------------------------------------------------------ staging
 
     /// Stage `memory` as `Pending` and return the staging envelope.
