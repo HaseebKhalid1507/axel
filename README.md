@@ -12,7 +12,6 @@ Axel is a CLI tool and library that gives any AI agent persistent memory. Three 
 
 - **VelociRAG** — 4-layer search (vector similarity + BM25 keywords + knowledge graph + metadata), fused with Reciprocal Rank Fusion
 - **Memkoshi** — Memory system with staging gates, HMAC signing, importance decay/boost, and injection detection
-- **Stelline** — Session intelligence: regex extraction, quality gate, dedup, context injection
 
 Everything lives in a single `.r8` file — a SQLite database that IS your agent's brain.
 
@@ -100,7 +99,6 @@ sqlite3 axel.r8 "SELECT COUNT(*) FROM documents"
 │                  axel (CLI + glue)               │
 │                                                  │
 │  ┌──────────────┐  ┌───────────┐  ┌───────────┐ │
-│  │  velocirag   │  │  memkoshi │  │  stelline  │ │
 │  │  (search)    │  │  (memory) │  │  (extract) │ │
 │  └──────┬───────┘  └─────┬─────┘  └─────┬─────┘ │
 │         └────────────────┼───────────────┘       │
@@ -117,7 +115,6 @@ sqlite3 axel.r8 "SELECT COUNT(*) FROM documents"
 |-------|------|-------|-------|
 | `velocirag` | 4-layer RAG search engine, ONNX embeddings (MiniLM-L6-v2), USearch HNSW, RRF fusion | 5,468 | 34 |
 | `axel-memkoshi` | Memory staging, HMAC signing, decay/boost, pattern detection | 2,134 | 35 |
-| `axel-stelline` | Session parser, regex extraction, quality gate, dedup, context updates | 1,491 | 57 |
 | `axel` | CLI, `.r8` format, context injection | 2,138 | 31 |
 
 **Total: ~11,200 lines · 157 tests · 4 crates**

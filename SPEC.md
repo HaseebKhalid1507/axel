@@ -12,7 +12,7 @@ Axel is a SynapsCLI plugin that gives any agent persistent memory, intelligent s
 
 One file = one agent brain. Drop it in, agent has context. Move it between machines. No setup, no configuration, no separate databases.
 
-**What it replaces:** Three separate Python projects (VelociRAG, Memkoshi, Stelline) consolidated into one Rust plugin with a unified storage format.
+**What it replaces:** Two separate Python projects (VelociRAG, Memkoshi) consolidated into one Rust plugin with a unified storage format.
 
 ### Success Criteria
 
@@ -39,7 +39,6 @@ One file = one agent brain. Drop it in, agent has context. Move it between machi
 │                    Axel Plugin                   │
 │                                                  │
 │  ┌──────────────┐  ┌───────────┐  ┌───────────┐│
-│  │  VelociRAG-RS │  │  Memkoshi │  │  Stelline ││
 │  │  (search)     │  │  (memory) │  │  (extract)││
 │  │              │  │           │  │           ││
 │  │ • 4-layer    │  │ • Stage   │  │ • Session ││
@@ -189,7 +188,6 @@ axel_status    — Stats: memory count, index size, last session, patterns
 - [ ] Pattern detection (frequency, gaps, temporal)
 - [ ] Decay & boost (importance over time)
 
-### Phase 4: Session Intelligence (Stelline port)
 - [ ] Session transcript parser (SynapsCLI JSONL format)
 - [ ] LLM-based memory extraction (via SynapsCLI's own model connection)
 - [ ] Quality gate (content length, importance threshold, field validation)
@@ -244,7 +242,6 @@ axel_status    — Stats: memory count, index size, last session, patterns
 │   │       ├── evolution.rs # Session scoring
 │   │       ├── security.rs  # HMAC signing + injection guard
 │   │       └── decay.rs     # Importance decay & boost
-│   ├── stelline/            # Session intelligence
 │   │   ├── Cargo.toml
 │   │   └── src/
 │   │       ├── lib.rs
@@ -279,7 +276,6 @@ cargo build --release                # Release build
 cargo test                           # All tests
 cargo test -p velocirag              # Just search engine
 cargo test -p memkoshi               # Just memory layer
-cargo test -p stelline               # Just extraction
 cargo test -p axel                   # Just plugin + .r8
 
 # Run (standalone, outside SynapsCLI)

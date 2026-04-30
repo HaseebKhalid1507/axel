@@ -13,7 +13,6 @@ path = "src/main.rs"
 [dependencies]
 velocirag = { path = "../velocirag" }
 axel-memkoshi = { path = "../memkoshi" }
-axel-stelline = { path = "../stelline" }
 rusqlite = { workspace = true }
 usearch = { workspace = true }
 serde = { workspace = true }

@@ -91,7 +91,6 @@ fn main() {
     let queries = [
         "VelociRAG search architecture",
         "Memkoshi memory system",
-        "Stelline session intelligence",
         "SynapsCLI agent runtime Rust",
         "D&D campaign Jawz character",
         "Haseeb internship job",

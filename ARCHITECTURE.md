@@ -139,7 +139,6 @@ Hash memory IDs against conversation history, skip duplicates.
 ## Decision 4: When to Extract Memories
 
 ### The Problem
-Stelline uses an LLM call to extract memories from session transcripts.
 That costs tokens. When do we do it?
 
 ### Options

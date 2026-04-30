@@ -10,7 +10,6 @@
 | Yoru | Performance | ✅ Rich findings — 2 high-impact issues |
 | Gojo | Test Coverage | ✅ Full coverage map — 5 untested modules found |
 | Star-Lord | UX/CLI | ✅ Full report — 11 issues, #1 is broken query parser |
-| Zero | Stelline/Extractor | ❌ Timed out (ran adversarial probes instead of writing) |
 
 ---
 

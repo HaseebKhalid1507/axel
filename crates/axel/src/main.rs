@@ -67,11 +67,6 @@ enum Commands {
         /// Optional search query (omit for boot context)
         query: Vec<String>,
     },
-    /// Extract memories from a transcript or text file
-    Extract {
-        /// Path to file, or inline text
-        input: Vec<String>,
-    },
     /// Manage session handoff
     Handoff {
         /// Subcommand: set, get, or clear
@@ -108,7 +103,6 @@ fn main() -> ExitCode {
         Commands::Search { query, limit, json } => cmd_search(&cli, query, *limit, *json),
         Commands::Remember { content, category, topic } => cmd_remember(&cli, content, category, topic),
         Commands::Recall { query } => cmd_recall(&cli, query),
-        Commands::Extract { input } => cmd_extract(&cli, input),
         Commands::Handoff { action, content } => cmd_handoff(&cli, action, content),
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
@@ -351,79 +345,6 @@ fn cmd_recall(cli: &Cli, query_parts: &[String]) -> Result<ExitCode, Box<dyn std
     }
 }
 
-fn cmd_extract(cli: &Cli, input_parts: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    if input_parts.is_empty() {
-        eprintln!("Please provide a file path or text to extract from.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    let path = brain_path(cli);
-    ensure_brain(&path)?;
-
-    // Read from file or treat as inline text
-    let text = if input_parts.len() == 1 && Path::new(&input_parts[0]).exists() {
-        std::fs::read_to_string(&input_parts[0])?
-    } else {
-        input_parts.join(" ")
-    };
-
-    // Extract via regex
-    let raw_memories = axel_stelline::extractor::extract_regex(&text);
-    if raw_memories.is_empty() {
-        eprintln!("No memories extracted from input.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    // Quality gate
-    let result = axel_stelline::quality::quality_gate(raw_memories);
-    println!("Extracted: {} accepted, {} rejected\n", result.accepted.len(), result.rejected.len());
-
-    for (mem, reason) in &result.rejected {
-        eprintln!("  ✗ Rejected: {} ({})", mem.title, reason);
-    }
-
-    if result.accepted.is_empty() {
-        eprintln!("No memories passed quality gate.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    // Store accepted memories
-    let brain = Brain::open(&path)?;
-    let signer = brain.signer();
-    drop(brain);
-
-    let mut storage = MemoryStorage::open_existing(&path)?;
-    let mut search = BrainSearch::open(&path)?;
-    let mut stored = 0;
-    let pipeline = MemoryPipeline::new();
-
-    for mem in &result.accepted {
-        if let Err(errors) = pipeline.validate(mem) {
-            eprintln!("  ✗ Validation failed for '{}': {}", mem.title, errors.join(", "));
-            continue;
-        }
-
-        // Sign if brain has a signing key
-        let mut signed_mem = mem.clone();
-        if let Some(ref s) = signer {
-            signed_mem.signature = Some(s.sign(&signed_mem));
-        }
-
-        match storage.stage_memory(&signed_mem) {
-            Ok(staged) => {
-                let _ = storage.approve(&staged.memory.id);
-                let _ = search.index_memory(&signed_mem);
-                stored += 1;
-                println!("  ✓ [{:?}] {}", mem.category, mem.title);
-            }
-            Err(e) => eprintln!("  ✗ Failed to store: {e}"),
-        }
-    }
-
-    println!("\n✓ Stored {stored} memories");
-    Ok(ExitCode::SUCCESS)
-}
-
 fn cmd_handoff(cli: &Cli, action: &str, content_parts: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = brain_path(cli);
     ensure_brain(&path)?;
@@ -530,7 +451,7 @@ fn cmd_memories(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error:
     let memories = storage.list_memories(limit)?;
 
     if memories.is_empty() {
-        eprintln!("No memories stored yet. Use `axel remember` or `axel extract` to add some.");
+        eprintln!("No memories stored yet. Use `axel remember` to add some.");
         return Ok(ExitCode::FAILURE);
     }
 
