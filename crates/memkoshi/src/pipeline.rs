@@ -1,6 +1,7 @@
 //! Validation and deduplication pipeline for incoming memories.
 
 use crate::memory::Memory;
+use std::collections::HashSet;
 
 const INJECTION_PATTERNS: &[&str] = &[
     // Original
@@ -103,6 +104,64 @@ impl MemoryPipeline {
         }
         false
     }
+
+    /// Detect contradictions between a new memory and existing memories.
+    /// Returns the memory IDs of any existing memories that contradict the new one.
+    /// 
+    /// Two memories are considered contradictory if:
+    /// 1. They have a high Jaccard token similarity (≥ 0.85) in their content
+    /// 2. They have different content (not exact duplicates)
+    pub fn detect_contradictions(&self, memory: &Memory, existing: &[Memory]) -> Vec<String> {
+        let mut contradictions = Vec::new();
+        let new_content_tokens = self.tokenize_content(&memory.content);
+        
+        for other in existing {
+            // Skip if it's the same memory
+            if memory.id == other.id {
+                continue;
+            }
+            
+            let other_content_tokens = self.tokenize_content(&other.content);
+            let jaccard_sim = self.jaccard_similarity(&new_content_tokens, &other_content_tokens);
+            
+            // If Jaccard similarity is high but content is different, it's a contradiction
+            if jaccard_sim >= 0.85 && memory.content.trim() != other.content.trim() {
+                contradictions.push(other.id.clone());
+            }
+        }
+        
+        contradictions
+    }
+
+    /// Tokenize content into a set of words (lowercase, alphanumeric only).
+    fn tokenize_content(&self, content: &str) -> HashSet<String> {
+        content
+            .to_lowercase()
+            .split_whitespace()
+            .map(|word| {
+                word.chars()
+                    .filter(|c| c.is_alphanumeric())
+                    .collect::<String>()
+            })
+            .filter(|word| !word.is_empty())
+            .collect()
+    }
+
+    /// Calculate Jaccard similarity between two sets of tokens.
+    fn jaccard_similarity(&self, set1: &HashSet<String>, set2: &HashSet<String>) -> f64 {
+        if set1.is_empty() && set2.is_empty() {
+            return 1.0;
+        }
+        
+        let intersection_size = set1.intersection(set2).count() as f64;
+        let union_size = set1.union(set2).count() as f64;
+        
+        if union_size == 0.0 {
+            0.0
+        } else {
+            intersection_size / union_size
+        }
+    }
 }
 
 /// Classic dynamic-programming Levenshtein edit distance.
@@ -137,6 +196,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory};
+    use std::collections::HashSet;
 
     fn valid_memory() -> Memory {
         Memory::new(
@@ -266,5 +326,105 @@ mod tests {
             let result = pipeline.validate(&mem);
             assert!(result.is_err(), "Pattern '{pat}' should have been blocked");
         }
+    }
+
+    #[test]
+    fn test_jaccard_similarity() {
+        let pipeline = MemoryPipeline::new();
+        
+        // Test identical content
+        let tokens1 = pipeline.tokenize_content("the quick brown fox jumps");
+        let tokens2 = pipeline.tokenize_content("the quick brown fox jumps");
+        assert_eq!(pipeline.jaccard_similarity(&tokens1, &tokens2), 1.0);
+        
+        // Test completely different content
+        let tokens3 = pipeline.tokenize_content("hello world");
+        let tokens4 = pipeline.tokenize_content("goodbye universe");
+        assert_eq!(pipeline.jaccard_similarity(&tokens3, &tokens4), 0.0);
+        
+        // Test partial overlap
+        let tokens5 = pipeline.tokenize_content("the quick brown fox");
+        let tokens6 = pipeline.tokenize_content("the slow brown dog");
+        let similarity = pipeline.jaccard_similarity(&tokens5, &tokens6);
+        // Intersection: {the, brown}, Union: {the, quick, brown, fox, slow, dog}
+        // Similarity = 2/6 = 0.333...
+        assert!((similarity - 0.3333333333333333).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_tokenize_content() {
+        let pipeline = MemoryPipeline::new();
+        
+        let tokens = pipeline.tokenize_content("The quick, brown fox jumps!");
+        let expected: std::collections::HashSet<String> = ["the", "quick", "brown", "fox", "jumps"]
+            .iter().map(|s| s.to_string()).collect();
+        assert_eq!(tokens, expected);
+    }
+
+    #[test]
+    fn test_detect_contradictions_high_similarity() {
+        let pipeline = MemoryPipeline::new();
+        
+        let mut mem1 = valid_memory();
+        mem1.id = "mem_12345678".to_string();
+        mem1.content = "John Smith is a software engineer who works at Google and lives in California".to_string();
+        
+        let mut mem2 = valid_memory();
+        mem2.id = "mem_87654321".to_string(); 
+        mem2.content = "John Smith is a software engineer who works at Microsoft and lives in California".to_string();
+        
+        let existing = vec![mem1];
+        let contradictions = pipeline.detect_contradictions(&mem2, &existing);
+        
+        assert!(!contradictions.is_empty(), "Should detect contradiction");
+        assert!(contradictions.contains(&"mem_12345678".to_string()));
+    }
+
+    #[test]
+    fn test_detect_contradictions_low_similarity() {
+        let pipeline = MemoryPipeline::new();
+        
+        let mut mem1 = valid_memory();
+        mem1.id = "mem_12345678".to_string();
+        mem1.content = "John Smith is a software engineer".to_string();
+        
+        let mut mem2 = valid_memory();
+        mem2.id = "mem_87654321".to_string(); 
+        mem2.content = "Alice Johnson is a data scientist who loves machine learning and artificial intelligence".to_string();
+        
+        let existing = vec![mem1];
+        let contradictions = pipeline.detect_contradictions(&mem2, &existing);
+        
+        assert!(contradictions.is_empty(), "Should not detect contradiction with low similarity");
+    }
+
+    #[test]
+    fn test_detect_contradictions_identical_content() {
+        let pipeline = MemoryPipeline::new();
+        
+        let mut mem1 = valid_memory();
+        mem1.id = "mem_12345678".to_string();
+        mem1.content = "John Smith is a software engineer who works at Google".to_string();
+        
+        let mut mem2 = valid_memory();
+        mem2.id = "mem_87654321".to_string(); 
+        mem2.content = "John Smith is a software engineer who works at Google".to_string();
+        
+        let existing = vec![mem1];
+        let contradictions = pipeline.detect_contradictions(&mem2, &existing);
+        
+        assert!(contradictions.is_empty(), "Should not detect contradiction for identical content");
+    }
+
+    #[test]
+    fn test_memory_supersede() {
+        let mut mem = valid_memory();
+        assert!(!mem.is_superseded());
+        
+        mem.supersede_with("mem_new12345".to_string());
+        assert!(mem.is_superseded());
+        assert_eq!(mem.superseded_by, Some("mem_new12345".to_string()));
+        assert!(mem.updated.is_some());
+        assert!(mem.tags.contains(&"superseded".to_string()));
     }
 }

@@ -543,6 +543,7 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
             },
             trust_level,
             signature,
+            superseded_by: None, // TODO: Handle this field properly in database schema
         })
     })())
 }

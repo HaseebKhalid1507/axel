@@ -152,6 +152,8 @@ pub struct Memory {
     pub trust_level: f64,
     /// HMAC-SHA256 signature (hex), if signed.
     pub signature: Option<String>,
+    /// Memory ID that superseded this one, if any.
+    pub superseded_by: Option<String>,
 }
 
 impl Memory {
@@ -178,6 +180,7 @@ impl Memory {
             updated: None,
             trust_level: 1.0,
             signature: None,
+            superseded_by: None,
         }
     }
 
@@ -186,6 +189,22 @@ impl Memory {
         let mut bytes = [0u8; 4];
         rand::rng().fill_bytes(&mut bytes);
         format!("mem_{}", hex::encode(bytes))
+    }
+
+    /// Mark this memory as superseded by another memory.
+    pub fn supersede_with(&mut self, superseding_memory_id: String) {
+        self.superseded_by = Some(superseding_memory_id);
+        self.updated = Some(Utc::now());
+        // Add superseded metadata to tags if not already present
+        let superseded_tag = "superseded".to_string();
+        if !self.tags.contains(&superseded_tag) {
+            self.tags.push(superseded_tag);
+        }
+    }
+
+    /// Check if this memory has been superseded.
+    pub fn is_superseded(&self) -> bool {
+        self.superseded_by.is_some()
     }
 }
 
