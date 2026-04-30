@@ -90,6 +90,8 @@ enum Commands {
     },
     /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     Extension,
+    /// Run as an MCP server (exposes search/remember/recall as tools)
+    Mcp,
 }
 
 fn brain_path(cli: &Cli) -> PathBuf {
@@ -112,6 +114,11 @@ fn main() -> ExitCode {
         Commands::Extension => {
             let path = brain_path(&cli);
             axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+        Commands::Mcp => {
+            let path = brain_path(&cli);
+            axel::mcp::run(&path).map(|_| ExitCode::SUCCESS)
                 .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
         }
     };
