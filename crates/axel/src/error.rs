@@ -19,6 +19,9 @@ pub enum AxelError {
     #[error("Memory error: {0}")]
     Memory(String),
 
+    #[error("Memkoshi error: {0}")]
+    Memkoshi(#[from] axel_memkoshi::error::MemkoshiError),
+
     #[error("Schema version mismatch: file has v{file}, runtime expects v{expected}")]
     SchemaMismatch { file: i32, expected: i32 },
 
