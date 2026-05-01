@@ -21,22 +21,24 @@ Current problem: two session journal entries about debugging have nearly identic
 
 Requires: one-time full re-embed (~6 minutes), modify `index_document()` to prepend context.
 
-### 3. Temporal Decay Curve for Excitability
+### 3. Temporal Decay Curve for Excitability ✅ SHIPPED
 **Impact: Medium | Effort: Low**
 
-Currently excitability only changes during consolidation runs (every 6 hours). Add a continuous decay component: when search reads excitability for the boost, apply a time-based decay factor based on `last_accessed`. Documents untouched for weeks should gradually lose their boost even between consolidation runs.
-
-Formula: `effective_excitability = stored_excitability * (1.0 - 0.01 * days_since_access).max(0.8)`
+~~Currently excitability only changes during consolidation runs (every 6 hours).~~ 
+DONE: Search now applies a continuous 1%/day temporal decay factor to excitability
+based on `last_accessed`. Documents untouched for weeks gradually lose their boost
+even between consolidation runs. Capped at 80% of stored value.
 
 ### 4. Co-Retrieval Graph Visualization
 **Impact: Medium | Effort: Medium**
 
 `axel graph` command that shows the most connected document clusters based on co-retrieval edges. Outputs a textual graph or exports to DOT format for Graphviz rendering. Would make the Hebbian wiring visible.
 
-### 5. Consolidation Health Alerts
+### 5. Consolidation Health Alerts ✅ SHIPPED
 **Impact: Medium | Effort: Low**
 
-When `axel stats` or `jawz-boot` runs, check the last consolidation time. If it's been >12 hours (2x the timer interval), warn: "⚠ Consolidation hasn't run in 14 hours — check timer." Also warn if excitability distribution is too flat (no differentiation) or too extreme (most docs at floor/ceiling).
+DONE: `axel stats` now checks last consolidation time and warns if >12 hours stale.
+Also warns if no runs recorded or if excitability distribution is flat.
 
 ### 6. Session-Aware Access Logging
 **Impact: Medium | Effort: Low**
