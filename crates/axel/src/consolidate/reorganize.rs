@@ -82,6 +82,28 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
 
     stats.co_retrieval_pairs = pairs.len();
 
+    // Pre-load all existing co_retrieved edges for batch lookup
+    let mut existing_edges: std::collections::HashMap<String, (String, f64)> = std::collections::HashMap::new();
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT id, source_id, target_id, weight FROM edges
+         WHERE type = 'co_retrieved'
+           AND (valid_to IS NULL OR valid_to > datetime('now'))"
+    ) {
+        if let Ok(rows) = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+            ))
+        }) {
+            for row in rows.flatten() {
+                let key = coret_edge_id(&row.1, &row.2);
+                existing_edges.insert(key, (row.0, row.3));
+            }
+        }
+    }
+
     // 3. Upsert co_retrieved edges for each surviving pair.
     // Wrap in a transaction to avoid partial writes on error.
     if !dry_run && !pairs.is_empty() {
@@ -91,19 +113,8 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
         let edge_id = coret_edge_id(a, b);
         let bump = (*count as f64) / 10.0;
 
-        // Existing live edge (either direction)?
-        let existing: Option<(String, f64)> = conn
-            .query_row(
-                "SELECT id, weight FROM edges
-                 WHERE type = 'co_retrieved'
-                   AND ((source_id = ?1 AND target_id = ?2)
-                        OR (source_id = ?2 AND target_id = ?1))
-                   AND (valid_to IS NULL OR valid_to > datetime('now'))
-                 LIMIT 1",
-                params![a, b],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?)),
-            )
-            .ok();
+        // Look up pre-loaded edges instead of per-pair query
+        let existing = existing_edges.get(&edge_id).cloned();
 
         if dry_run {
             if existing.is_some() {

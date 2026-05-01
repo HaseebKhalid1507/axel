@@ -237,8 +237,10 @@ impl AxelBrain {
         let staged = self.storage.stage_memory(&memory)?;
         self.storage.approve(&staged.memory.id)?;
 
-        // Index for search
-        let _ = self.search.index_memory(&memory);
+        // Index for search — log warning if indexing fails (memory is stored but won't be searchable)
+        if let Err(e) = self.search.index_memory(&memory) {
+            eprintln!("⚠ Memory {} stored but search indexing failed: {e}", memory.id);
+        }
 
         let id = memory.id.clone();
         Ok(id)
@@ -283,7 +285,9 @@ impl AxelBrain {
             }
 
             // Re-index for search
-            let _ = self.search.index_memory(&memory);
+            if let Err(e) = self.search.index_memory(&memory) {
+                eprintln!("⚠ Memory {} updated but search re-indexing failed: {e}", id);
+            }
         }
 
         Ok(true)
