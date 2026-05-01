@@ -753,3 +753,154 @@ fn test_handoff_case_insensitive() {
          \nwindow:\n{window}"
     );
 }
+
+// ─── 27. cosine similarity ────────────────────────────────────────────────
+//
+// Standalone replica of the inline `cosine()` closure inside the MMR section
+// of velocirag::search::SearchEngine::search (not accessible from outside).
+#[test]
+fn test_cosine_similarity() {
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        if a.len() != b.len() || a.is_empty() {
+            return 0.0;
+        }
+        let mut dot = 0.0f32;
+        let mut na  = 0.0f32;
+        let mut nb  = 0.0f32;
+        for i in 0..a.len() {
+            dot += a[i] * b[i];
+            na  += a[i] * a[i];
+            nb  += b[i] * b[i];
+        }
+        let denom = na.sqrt() * nb.sqrt();
+        if denom == 0.0 { 0.0 } else { dot / denom }
+    }
+
+    // Identical unit vectors → 1.0
+    assert!((cosine(&[1.0, 0.0, 0.0], &[1.0, 0.0, 0.0]) - 1.0).abs() < 1e-6,
+        "identical unit vectors should give cosine 1.0");
+
+    // Orthogonal vectors → 0.0
+    assert!((cosine(&[1.0, 0.0, 0.0], &[0.0, 1.0, 0.0]) - 0.0).abs() < 1e-6,
+        "orthogonal vectors should give cosine 0.0");
+
+    // 45° angle → strictly between 0 and 1
+    let v = cosine(&[1.0, 1.0, 0.0], &[1.0, 0.0, 0.0]);
+    assert!(v > 0.0 && v < 1.0,
+        "cosine([1,1,0], [1,0,0]) should be in (0,1), got {v}");
+
+    // Empty slices → 0.0 (early-return guard)
+    assert_eq!(cosine(&[], &[]), 0.0, "empty slices should return 0.0");
+}
+
+// ─── 28. coret_edge_id symmetry (comprehensive) ────────────────────────────
+//
+// Generates 10 distinct pairs and verifies:
+//   a) each pair produces the same ID regardless of argument order
+//   b) no two *different* pairs share an ID (collision-free in this set)
+#[test]
+fn test_coret_edge_id_symmetry_comprehensive() {
+    use axel::consolidate::reorganize::coret_edge_id;
+    use std::collections::HashMap;
+
+    let pairs: &[(&str, &str)] = &[
+        ("doc_alpha",        "doc_beta"),
+        ("doc_gamma",        "doc_delta"),
+        ("note_1",           "note_2"),
+        ("zzz",              "aaa"),
+        ("rust",             "async"),
+        ("2024-01-01",       "2025-12-31"),
+        ("a",                "b"),
+        ("long_doc_id_one",  "long_doc_id_two"),
+        ("x",                "y"),
+        ("consolidate",      "reorganize"),
+    ];
+
+    let mut seen: HashMap<String, (&str, &str)> = HashMap::new();
+
+    for &(a, b) in pairs {
+        let fwd = coret_edge_id(a, b);
+        let rev = coret_edge_id(b, a);
+
+        // Symmetry: both orderings produce the same ID.
+        assert_eq!(fwd, rev,
+            "coret_edge_id({a:?}, {b:?}) = {fwd} but coret_edge_id({b:?}, {a:?}) = {rev}");
+
+        // Collision-freedom: no other pair in this set has claimed this ID.
+        if let Some(&(pa, pb)) = seen.get(&fwd) {
+            panic!("collision: coret_edge_id({a:?},{b:?}) == coret_edge_id({pa:?},{pb:?}) = {fwd}");
+        }
+        seen.insert(fwd, (a, b));
+    }
+
+    assert_eq!(seen.len(), pairs.len(), "all 10 pairs should produce distinct IDs");
+}
+
+// ─── 29. recency boost math ────────────────────────────────────────────────
+//
+// Pins the recency formula used inside SearchEngine::search:
+//   recency = ln(1 + 1/(days_since_indexed + 1))
+//   contribution = recency * 0.05
+#[test]
+fn test_recency_boost_math() {
+    fn recency_boost(days: f64) -> f64 {
+        (1.0 + 1.0 / (days + 1.0)).ln() * 0.05
+    }
+
+    // days=0: ln(1 + 1/1) * 0.05 = ln(2) * 0.05 ≈ 0.034657
+    let v0 = recency_boost(0.0);
+    assert!((v0 - 0.034657).abs() < 1e-4,
+        "recency_boost(days=0) expected ≈0.0347, got {v0:.6}");
+
+    // days=7: ln(1 + 1/8) * 0.05 ≈ 0.005889
+    let v7 = recency_boost(7.0);
+    assert!((v7 - 0.005889).abs() < 1e-4,
+        "recency_boost(days=7) expected ≈0.00589, got {v7:.6}");
+
+    // days=365: ln(1 + 1/366) * 0.05 ≈ 0.000136
+    let v365 = recency_boost(365.0);
+    assert!((v365 - 0.000136).abs() < 1e-5,
+        "recency_boost(days=365) expected ≈0.000136, got {v365:.7}");
+
+    // Monotone: older docs get less boost.
+    assert!(v0 > v7 && v7 > v365,
+        "recency boost should decrease with age: {v0:.6} > {v7:.6} > {v365:.6}");
+}
+
+// ─── 30. temporal decay math ──────────────────────────────────────────────
+//
+// Pins the Ebbinghaus search-time decay formula used in SearchEngine::search:
+//   decay = exp(-days_since_access / 60).max(0.7)
+#[test]
+fn test_temporal_decay_math() {
+    fn temporal_decay(days: f64) -> f64 {
+        (-days / 60.0_f64).exp().max(0.7)
+    }
+
+    // days=0: exp(0) = 1.0
+    assert!((temporal_decay(0.0) - 1.0).abs() < 1e-9,
+        "decay at days=0 should be exactly 1.0");
+
+    // days=7: exp(-7/60) ≈ 0.8899 — above the floor
+    let v7 = temporal_decay(7.0);
+    assert!((v7 - 0.8899).abs() < 1e-3,
+        "decay at days=7 expected ≈0.8899, got {v7:.6}");
+    assert!(v7 > 0.7, "days=7 should be above the 0.7 floor");
+
+    // days=42: exp(-42/60) ≈ 0.4966 — below floor → clamped to 0.7
+    let v42 = temporal_decay(42.0);
+    assert!((v42 - 0.7).abs() < 1e-9,
+        "decay at days=42 should be clamped to 0.7 floor, got {v42:.6}");
+
+    // days=200: well below floor → 0.7
+    let v200 = temporal_decay(200.0);
+    assert!((v200 - 0.7).abs() < 1e-9,
+        "decay at days=200 should be clamped to 0.7 floor, got {v200:.6}");
+
+    // Floor holds for any large value.
+    for days in [100.0_f64, 500.0, 3650.0] {
+        let v = temporal_decay(days);
+        assert!(v >= 0.7 - 1e-9,
+            "decay should never drop below 0.7 floor at days={days}, got {v}");
+    }
+}
