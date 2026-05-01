@@ -13,6 +13,7 @@ use serde_json::json;
 
 use crate::error::Result;
 use crate::search::BrainSearch;
+use velocirag::db::Node;
 
 /// Stats reported by a Phase 3 pass.
 ///
@@ -54,9 +55,16 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
     let conn = db.conn();
 
     // 1. Window start = last consolidation finished_at, else epoch.
-    let since: String = db
+    let since_raw: String = db
         .last_consolidation_time()?
         .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+    // Normalize: strip timezone suffix and replace 'T' with ' '
+    // to match SQLite datetime() format used by co_retrieval timestamps.
+    let since = since_raw
+        .replace('T', " ")
+        .split('+').next().unwrap_or(&since_raw)
+        .split('Z').next().unwrap_or(&since_raw)
+        .to_string();
 
     // 2. Aggregate co_retrieval pairs since `since`.
     //    `co_retrieval` may not exist on older brains — degrade gracefully.
@@ -105,10 +113,6 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
     }
 
     // 3. Upsert co_retrieved edges for each surviving pair.
-    // Wrap in a transaction to avoid partial writes on error.
-    if !dry_run && !pairs.is_empty() {
-        let _ = conn.execute_batch("BEGIN");
-    }
     for (a, b, count) in &pairs {
         let edge_id = coret_edge_id(a, b);
         let bump = (*count as f64) / 10.0;
@@ -136,6 +140,23 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
             }
             None => {
                 let weight = bump.min(1.0);
+                // Ensure nodes exist (FK constraint requires them)
+                db.upsert_node(&Node {
+                    id: a.clone(),
+                    node_type: "document".to_string(),
+                    title: a.clone(),
+                    content: None,
+                    metadata: json!({}),
+                    source_file: None,
+                })?;
+                db.upsert_node(&Node {
+                    id: b.clone(),
+                    node_type: "document".to_string(),
+                    title: b.clone(),
+                    content: None,
+                    metadata: json!({}),
+                    source_file: None,
+                })?;
                 db.insert_edge(
                     &edge_id,
                     a,
@@ -151,9 +172,6 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
                 stats.edges_added += 1;
             }
         }
-    }
-    if !dry_run && !pairs.is_empty() {
-        let _ = conn.execute_batch("COMMIT");
     }
 
     // 4. Decay stale co_retrieved edges — those with no recent reinforcement.
