@@ -112,7 +112,6 @@ enum Commands {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
-    /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     /// Run a consolidation pass on the brain
     ///
     /// Reindexes changed files, strengthens accessed documents,
@@ -137,6 +136,7 @@ enum Commands {
         #[arg(long)]
         report: Option<PathBuf>,
     },
+    /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     Extension,
     /// Run as an MCP server (exposes search/remember/recall as tools)
     Mcp,
