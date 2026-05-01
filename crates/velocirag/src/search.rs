@@ -266,8 +266,25 @@ impl<'a> SearchEngine<'a> {
         }
 
         // ═══ FUSE via RRF ═══
-        let fused = rrf::reciprocal_rank_fusion(&results_lists, opts.rrf_k);
+        let mut fused = rrf::reciprocal_rank_fusion(&results_lists, opts.rrf_k);
         stats.fused_count = fused.len();
+
+        // ═══ EXCITABILITY BOOST ═══
+        // Documents with higher excitability get a mild ranking boost.
+        // This closes the consolidation feedback loop: accessed docs rise,
+        // neglected docs sink — matching biological reconsolidation.
+        for result in &mut fused {
+            let excitability: f64 = self.db.conn().query_row(
+                "SELECT COALESCE(excitability, 0.5) FROM documents WHERE doc_id = ?1",
+                [&result.doc_id],
+                |row| row.get(0),
+            ).unwrap_or(0.5);
+            // Boost range: 0.9x (excitability=0.0) to 1.1x (excitability=1.0)
+            let boost = 0.9 + (excitability * 0.2);
+            result.rrf_score *= boost;
+        }
+        // Re-sort after boosting
+        fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // ═══ RERANK (optional) ═══
         let final_results = if opts.use_reranker && self.reranker.is_some() {
