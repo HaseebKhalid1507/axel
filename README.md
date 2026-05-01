@@ -201,22 +201,69 @@ sqlite3 axel.r8 "SELECT COUNT(*) FROM document_access"
 
 ---
 
-## Integration
+## Integration with SynapsCLI
 
-### MCP Server
+Axel is designed to be the memory layer for [SynapsCLI](https://github.com/HaseebKhalid1507/synaps-cli) — a terminal-native AI agent runtime. Three integration points:
+
+### 1. MCP Server
+
+Axel runs as an MCP (Model Context Protocol) server, exposing 6 tools that any SynapsCLI agent can call:
 
 ```bash
-axel mcp   # Exposes 6 tools over JSON-RPC stdio
+axel mcp   # Start the MCP server (configured in ~/.synaps-cli/mcp.json)
 ```
 
-Tools: `axel_search`, `axel_remember`, `axel_recall`, `axel_verify`, `axel_update`, `axel_consolidate`
+| Tool | What It Does |
+|------|-------------|
+| `axel_search` | Search the brain — returns ranked results with scores |
+| `axel_remember` | Store a new memory with category, importance, TTL |
+| `axel_recall` | Get boot context — handoff + recent memories + hot docs |
+| `axel_verify` | Check a memory's HMAC signature and provenance |
+| `axel_update` | Edit a memory's content or importance (re-signs) |
+| `axel_consolidate` | Trigger a consolidation pass (any phase, dry-run supported) |
 
-### SynapsCLI Plugin
+```json
+// ~/.synaps-cli/mcp.json
+{
+  "mcpServers": {
+    "axel": {
+      "command": "/path/to/axel",
+      "args": ["mcp"]
+    }
+  }
+}
+```
 
-The `axel-brain` plugin at `~/.synaps-cli/plugins/axel-brain/` provides:
-- **Proactive context injection** — searches the brain on the first message and injects relevant docs
-- **Session-aware reindexing** — runs Phase 1 on session start
-- **Automatic search feedback** — every search logs access events for consolidation
+### 2. Native Plugin
+
+The `axel-brain` plugin hooks directly into SynapsCLI's extension system for zero-friction integration:
+
+```
+~/.synaps-cli/plugins/axel-brain/
+├── .synaps-plugin/
+│   └── plugin.json          # Extension manifest
+└── main.py                  # Hook handlers
+```
+
+**What it does:**
+
+| Hook | When | Action |
+|------|------|--------|
+| `on_session_start` | Agent boots | Runs Phase 1 (reindex) to catch file changes |
+| `before_message` | First user message | Searches brain, injects relevant context into system prompt |
+| `on_session_end` | Session closes | Logs session boundary |
+
+The plugin only injects on the **first message** of a session — after that, the agent calls `axel_search` explicitly when it needs context. This keeps token costs minimal.
+
+Results below a confidence threshold (0.025) are filtered out — only genuinely relevant documents get injected.
+
+### 3. Multi-Agent Shared Memory
+
+Every SynapsCLI agent — main session and subagents — can read from the same `.r8` brain. When one agent searches for "CS646" and another later searches for "network security," the access patterns compound:
+
+- Agent A searches → document_access logged → consolidation boosts excitability
+- Agent B searches → boosted doc ranks higher → access logged again → stronger boost
+- The whole crew builds shared knowledge through a single brain
 
 ### Configuration
 
@@ -224,9 +271,13 @@ The `axel-brain` plugin at `~/.synaps-cli/plugins/axel-brain/` provides:
 AXEL_BRAIN=/path/to/custom.r8   # Override default brain path
 ```
 
-Default brain: `~/.config/axel/axel.r8`
-Model cache: `~/.cache/axel/models/`
-Sources: `~/.config/axel/sources.toml`
+| Path | Purpose |
+|------|---------|
+| `~/.config/axel/axel.r8` | Default brain location |
+| `~/.config/axel/sources.toml` | Consolidation source directories |
+| `~/.cache/axel/models/` | ONNX embedding model cache |
+| `~/.synaps-cli/mcp.json` | MCP server configuration |
+| `~/.synaps-cli/plugins/axel-brain/` | Native plugin |
 
 ---
 
