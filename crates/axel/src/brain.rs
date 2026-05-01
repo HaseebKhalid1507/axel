@@ -98,7 +98,7 @@ impl AxelBrain {
         let handoff = self.get_handoff()?;
         let memories = self.storage.list_memories(20)?;
 
-        let entries: Vec<InjectionEntry> = memories.iter().map(|m| {
+        let mut entries: Vec<InjectionEntry> = memories.iter().map(|m| {
             InjectionEntry {
                 memory_id: m.id.clone(),
                 title: m.title.clone(),
@@ -108,6 +108,37 @@ impl AxelBrain {
                 relevance_score: m.importance, // boot context uses importance as proxy
             }
         }).collect();
+
+        // Proactive injection: include top 3 most excitable documents
+        // (high-excitability = frequently accessed = currently relevant)
+        if let Ok(mut stmt) = self.search.db().conn().prepare(
+            "SELECT doc_id, SUBSTR(content, 1, 200), excitability
+             FROM documents
+             WHERE excitability > 0.6
+             ORDER BY excitability DESC
+             LIMIT 3"
+        ) {
+            if let Ok(rows) = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            }) {
+                for row in rows.flatten() {
+                    if !self.seen_memory_ids.contains(&row.0) {
+                        entries.push(InjectionEntry {
+                            memory_id: row.0.clone(),
+                            title: format!("🔥 {}", row.0),
+                            abstract_text: row.1,
+                            category: "hot_document".to_string(),
+                            importance: row.2,
+                            relevance_score: row.2,
+                        });
+                    }
+                }
+            }
+        }
 
         let ctx = inject::build_injection(
             handoff.as_deref(),
