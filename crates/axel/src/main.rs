@@ -143,6 +143,9 @@ enum Commands {
         /// Write prune candidates report to file
         #[arg(long)]
         report: Option<PathBuf>,
+        /// Output as JSON (for scripting)
+        #[arg(long)]
+        json: bool,
     },
     /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     Extension,
@@ -176,11 +179,11 @@ fn main() -> ExitCode {
         Commands::Excitability { limit } => cmd_excitability(&cli, *limit),
         Commands::Suggest { query, limit } => cmd_suggest(&cli, query, *limit),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
-        Commands::Consolidate { phase, dry_run, verbose, sources, history, report } =>
+        Commands::Consolidate { phase, dry_run, verbose, sources, history, report, json } =>
             if *history {
                 cmd_consolidate_history(&cli)
             } else {
-                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref(), report.as_deref())
+                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref(), report.as_deref(), *json)
             },
         Commands::Extension => {
             let path = brain_path(&cli);
@@ -393,6 +396,7 @@ fn cmd_consolidate(
     verbose: bool,
     sources_path: Option<&Path>,
     report_path: Option<&Path>,
+    json_mode: bool,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     use axel::consolidate::{self, Phase, ConsolidateOptions};
 
@@ -424,6 +428,38 @@ fn cmd_consolidate(
     }
 
     let stats = consolidate::consolidate(&mut search, &opts)?;
+
+    if json_mode {
+        let json = serde_json::json!({
+            "dry_run": dry_run,
+            "duration_secs": stats.duration_secs,
+            "reindex": {
+                "checked": stats.reindex.checked,
+                "reindexed": stats.reindex.reindexed,
+                "new_files": stats.reindex.new_files,
+                "pruned": stats.reindex.pruned,
+                "skipped": stats.reindex.skipped,
+            },
+            "strengthen": {
+                "boosted": stats.strengthen.boosted,
+                "decayed": stats.strengthen.decayed,
+                "extinction": stats.strengthen.extinction_signals,
+            },
+            "reorganize": {
+                "pairs": stats.reorganize.co_retrieval_pairs,
+                "edges_added": stats.reorganize.edges_added,
+                "edges_updated": stats.reorganize.edges_updated,
+                "edges_removed": stats.reorganize.edges_removed,
+            },
+            "prune": {
+                "removed": stats.prune.removed,
+                "flagged": stats.prune.flagged,
+                "misaligned": stats.prune.misaligned,
+            },
+        });
+        println!("{}", serde_json::to_string_pretty(&json)?);
+        return Ok(ExitCode::SUCCESS);
+    }
 
     println!("\n═══ Consolidation {} ═══", if dry_run { "(dry run)" } else { "complete" });
     let skip_info = if stats.reindex.skipped > 0 {
