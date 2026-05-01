@@ -20,7 +20,9 @@ pub struct StrengthenStats {
 
 const BOOST_SCALE: f64 = 0.05;
 const BOOST_CAP: f64 = 0.2;
+#[allow(dead_code)]
 const DECAY_RATE_PER_WEEK: f64 = 0.02;
+#[allow(dead_code)]
 const DECAY_CAP: f64 = 0.3;
 const GRACE_DAYS: f64 = 14.0;
 const SCORE_EXTINCTION_THRESHOLD: f64 = 0.02;
@@ -128,7 +130,7 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool, verbose: bool) -> Result<
 
     // Decay untouched docs older than the grace period.
     let mut stmt = conn.prepare(
-        "SELECT doc_id, excitability,
+        "SELECT doc_id, excitability, COALESCE(access_count, 0),
                 COALESCE(
                     (julianday('now') - julianday(last_accessed)),
                     (julianday('now') - julianday(indexed_at)),
@@ -145,20 +147,24 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool, verbose: bool) -> Result<
         Ok((
             row.get::<_, String>(0)?,
             row.get::<_, f64>(1)?,
-            row.get::<_, f64>(2)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, f64>(3)?,
         ))
     }).map_err(|e| AxelError::Search(format!("query decay: {e}")))?;
 
     let mut updates: Vec<(String, f64)> = Vec::new();
     for r in rows {
-        let (doc_id, excitability, days_inactive) = r
+        let (doc_id, excitability, access_count, days_inactive) = r
             .map_err(|e| AxelError::Search(format!("decay row: {e}")))?;
         if grouped.contains_key(&doc_id) { continue; }
         if days_inactive < GRACE_DAYS { continue; }
 
-        let weeks_inactive = days_inactive / 7.0;
-        let penalty = (DECAY_RATE_PER_WEEK * weeks_inactive).min(DECAY_CAP);
-        let new_excitability = (excitability - penalty).max(EXCITABILITY_FLOOR);
+        // Ebbinghaus exponential forgetting curve (Murre & Dros, 2015)
+        // S = stability, increases with access count
+        const S_BASE: f64 = 30.0; // base stability in days
+        let stability = S_BASE * (1.0 + (1.0 + access_count as f64).ln());
+        let retention = (-days_inactive / stability).exp();
+        let new_excitability = (excitability * retention).max(EXCITABILITY_FLOOR);
         if (new_excitability - excitability).abs() < f64::EPSILON { continue; }
         updates.push((doc_id, new_excitability));
     }

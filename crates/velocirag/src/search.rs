@@ -176,11 +176,29 @@ impl<'a> SearchEngine<'a> {
             results_lists.push(ranked);
         }
 
+        // ═══ QUERY EXPANSION (Pseudo-Relevance Feedback) ═══
+        // Use top vector hit to expand BM25 query with related terms
+        let expanded_query = if !results_lists.is_empty() && !results_lists[0].is_empty() {
+            let top_content = &results_lists[0][0].content;
+            let query_lower = query.to_lowercase();
+            let expansion_terms: Vec<String> = extract_top_terms(top_content, 3)
+                .into_iter()
+                .filter(|t| !query_lower.contains(t.as_str()))
+                .collect();
+            if expansion_terms.is_empty() {
+                query.to_string()
+            } else {
+                format!("{} {}", query, expansion_terms.join(" "))
+            }
+        } else {
+            query.to_string()
+        };
+
         // ═══ LAYER 2: KEYWORD SEARCH (BM25 via FTS5) ═══
         if opts.layers.keyword {
             let t = Instant::now();
             let k = opts.limit * KEYWORD_CANDIDATES_MULTIPLIER;
-            let fts_results = self.db.keyword_search(query, k)?;
+            let fts_results = self.db.keyword_search(&expanded_query, k)?;
 
             let ranked: Vec<RankedResult> = fts_results
                 .into_iter()
@@ -297,9 +315,10 @@ impl<'a> SearchEngine<'a> {
                 }) {
                     for row in rows.flatten() {
                         let (doc_id, stored_excitability, days_since_access) = row;
-                        // Temporal decay: excitability fades 1% per day since last access
-                        // but never below 80% of stored value
-                        let decay_factor = (1.0 - 0.01 * days_since_access).max(0.8);
+                        // Ebbinghaus exponential decay (Murre & Dros, 2015).
+                        // Shorter stability for real-time decay between consolidation runs.
+                        // 50% retention at ~42 days, floored at 0.7 of stored value.
+                        let decay_factor = (-days_since_access / 60.0).exp().max(0.7);
                         let effective = stored_excitability * decay_factor;
                         excitability_map.insert(doc_id, effective);
                     }
@@ -700,4 +719,41 @@ impl<'a> SearchEngine<'a> {
             metadata: r.metadata,
         }).collect())
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Pseudo-Relevance Feedback helper
+// Extracts top-N most frequent meaningful terms from a passage of text.
+// Used to expand BM25 queries with terms drawn from the top vector hit.
+// ─────────────────────────────────────────────────────────────────────────────
+fn extract_top_terms(text: &str, n: usize) -> Vec<String> {
+    use std::collections::HashMap;
+
+    const STOPWORDS: &[&str] = &[
+        "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+        "have", "has", "had", "do", "does", "did", "will", "would", "could",
+        "should", "may", "might", "shall", "can", "need", "must",
+        "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
+        "into", "through", "during", "before", "after", "above", "below",
+        "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
+        "this", "that", "these", "those", "it", "its", "they", "them",
+        "he", "she", "we", "you", "i", "me", "my", "our", "your", "his", "her",
+        "which", "who", "whom", "what", "where", "when", "how", "why",
+        "all", "each", "every", "any", "some", "no", "more", "most", "other",
+    ];
+
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for word in text.split_whitespace() {
+        let clean = word
+            .to_lowercase()
+            .trim_matches(|c: char| !c.is_alphanumeric())
+            .to_string();
+        if clean.len() > 3 && !STOPWORDS.contains(&clean.as_str()) {
+            *counts.entry(clean).or_insert(0) += 1;
+        }
+    }
+
+    let mut sorted: Vec<_> = counts.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.into_iter().take(n).map(|(w, _)| w).collect()
 }
