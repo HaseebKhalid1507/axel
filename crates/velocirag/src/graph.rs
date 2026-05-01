@@ -377,8 +377,8 @@ impl<'a> GraphQuerier<'a> {
                     .and_then(|s| serde_json::from_str(&s).ok())
                     .unwrap_or_default(),
                 source_file: row.get(7)?,
-                valid_from: row.get::<_, Option<String>>(8)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
-                valid_to: row.get::<_, Option<String>>(9)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
+                valid_from: row.get::<_, Option<String>>(8)?.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(Into::into)),
+                valid_to: row.get::<_, Option<String>>(9)?.and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok().map(Into::into)),
             })
         })?;
 

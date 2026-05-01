@@ -138,55 +138,9 @@ fn brain_path(cli: &Cli) -> PathBuf {
 }
 
 fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::SourceDir>, Box<dyn std::error::Error>> {
-    use axel::consolidate::{SourceDir, Priority};
-
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
-
-    // Try: explicit override → AXEL_SOURCES env → ~/.config/axel/sources.toml → hardcoded defaults
-    let config_path = override_path
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/axel/sources.toml")));
-
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        let parsed: toml::Value = content.parse()?;
-
-        if let Some(sources) = parsed.get("source").and_then(|v| v.as_array()) {
-            let mut result = Vec::new();
-            for src in sources {
-                let name = src.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
-                let path_str = src.get("path").and_then(|v| v.as_str()).unwrap_or("");
-                let priority_str = src.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
-
-                let expanded = path_str.replace("~", &home);
-                let priority = match priority_str {
-                    "high" => Priority::High,
-                    "low" => Priority::Low,
-                    _ => Priority::Medium,
-                };
-
-                result.push(SourceDir {
-                    path: PathBuf::from(expanded),
-                    name: name.to_string(),
-                    priority,
-                });
-            }
-            if !result.is_empty() {
-                return Ok(result);
-            }
-        }
-    }
-
-    // Fallback defaults
-    Ok(vec![
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
-    ])
+    // Single source of truth lives in `axel::consolidate` so the MCP handler
+    // and CLI agree. Errors degrade to defaults rather than aborting.
+    Ok(axel::consolidate::load_sources(override_path))
 }
 
 fn main() -> ExitCode {
@@ -420,7 +374,7 @@ fn cmd_consolidate(
     verbose: bool,
     sources_path: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    use axel::consolidate::{self, Phase, ConsolidateOptions, SourceDir, Priority};
+    use axel::consolidate::{self, Phase, ConsolidateOptions};
 
     let path = brain_path(cli);
     ensure_brain(&path)?;
@@ -462,6 +416,17 @@ fn cmd_consolidate(
     println!("  Phase 4 — Prune:      {} removed, {} flagged, {} misaligned",
         stats.prune.removed, stats.prune.flagged, stats.prune.misaligned);
     println!("  Duration: {:.1}s", stats.duration_secs);
+
+    // Surface flagged candidates so the "human review" mechanism is actionable.
+    // Always print when there are any; verbose adds the misaligned breakdown.
+    if !stats.prune_candidates.is_empty() {
+        println!("\n── Prune candidates (review) ──");
+        for c in &stats.prune_candidates {
+            if !verbose && c.reason == "misaligned_embedding" { continue; }
+            println!("  [{}] {}  exc={:.3} access={} age={}d",
+                c.reason, c.doc_id, c.excitability, c.access_count, c.age_days);
+        }
+    }
 
     Ok(ExitCode::SUCCESS)
 }

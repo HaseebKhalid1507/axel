@@ -228,6 +228,7 @@ impl Database {
             CREATE INDEX IF NOT EXISTS idx_edges_type ON edges(type);
             CREATE INDEX IF NOT EXISTS idx_edges_weight ON edges(weight DESC);
             CREATE INDEX IF NOT EXISTS idx_edges_source_file ON edges(source_file);
+            CREATE INDEX IF NOT EXISTS idx_edges_type_src_tgt ON edges(type, source_id, target_id);
 
             -- ═══ METADATA ═══
             CREATE TABLE IF NOT EXISTS tags (
@@ -303,6 +304,7 @@ impl Database {
                 timestamp   TEXT NOT NULL DEFAULT (datetime('now'))
             );
             CREATE INDEX IF NOT EXISTS idx_coret_pair ON co_retrieval(doc_id_a, doc_id_b);
+            CREATE INDEX IF NOT EXISTS idx_coret_timestamp ON co_retrieval(timestamp);
 
             -- ═══ CONSOLIDATION RUN LOG ═══
             CREATE TABLE IF NOT EXISTS consolidation_log (
@@ -378,6 +380,13 @@ impl Database {
                 [],
             )?;
         }
+
+        // Indexes on migrated columns (must come after ALTER TABLE).
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_doc_excitability ON documents(excitability);
+             CREATE INDEX IF NOT EXISTS idx_doc_access_count ON documents(access_count);
+             CREATE INDEX IF NOT EXISTS idx_doc_last_accessed ON documents(last_accessed);"
+        )?;
 
         // ── Migration: add valid_from/valid_to to edges if missing ──
         let edge_cols: Vec<String> = self.conn
@@ -1019,7 +1028,48 @@ impl Database {
         Ok(())
     }
 
-    // ── Transactions ────────────────────────────────────────────────────
+    /// Insert a consolidation log entry at start (finished_at NULL), return rowid.
+    pub fn start_consolidation_log(&self, started_at: &str) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO consolidation_log (started_at, finished_at,
+                phase1_reindexed, phase1_pruned,
+                phase2_boosted, phase2_decayed,
+                phase3_edges_added, phase3_edges_updated,
+                phase4_flagged, phase4_removed,
+                duration_secs
+             ) VALUES (?1, NULL, 0, 0, 0, 0, 0, 0, 0, 0, NULL)",
+            params![started_at],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Update an in-progress consolidation log row with final stats.
+    pub fn update_consolidation_log(&self, id: i64, log: &ConsolidationLogEntry) -> Result<()> {
+        self.conn.execute(
+            "UPDATE consolidation_log SET
+                finished_at = ?2,
+                phase1_reindexed = ?3, phase1_pruned = ?4,
+                phase2_boosted = ?5, phase2_decayed = ?6,
+                phase3_edges_added = ?7, phase3_edges_updated = ?8,
+                phase4_flagged = ?9, phase4_removed = ?10,
+                duration_secs = ?11
+             WHERE id = ?1",
+            params![
+                id,
+                log.finished_at,
+                log.phase1_reindexed,
+                log.phase1_pruned,
+                log.phase2_boosted,
+                log.phase2_decayed,
+                log.phase3_edges_added,
+                log.phase3_edges_updated,
+                log.phase4_flagged,
+                log.phase4_removed,
+                log.duration_secs,
+            ],
+        )?;
+        Ok(())
+    }
 
     /// Execute a closure inside a transaction.
     pub fn transaction<F, T>(&mut self, f: F) -> Result<T>

@@ -176,7 +176,7 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
     match name {
         "axel_search" => {
             let query = args["query"].as_str().unwrap_or("");
-            let limit = args["limit"].as_u64().unwrap_or(5) as usize;
+            let limit = args["limit"].as_u64().unwrap_or(5).min(50) as usize;
 
             if query.is_empty() {
                 return tool_error("Query cannot be empty");
@@ -373,22 +373,14 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
         }
 
         "axel_consolidate" => {
-            use crate::consolidate::{self, Phase, ConsolidateOptions, SourceDir, Priority};
+            use crate::consolidate::{self, Phase, ConsolidateOptions};
             use std::collections::HashSet;
-            use std::path::PathBuf;
 
             let dry_run = args["dry_run"].as_bool().unwrap_or(false);
             let phase_str = args["phase"].as_str().unwrap_or("all");
 
-            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".into());
-            let sources = vec![
-                SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
-                SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
-                SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
-                SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
-                SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
-                SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
-            ];
+            // Honour ~/.config/axel/sources.toml so MCP and CLI runs agree.
+            let sources = consolidate::load_sources(None);
 
             let phases: HashSet<Phase> = match phase_str {
                 "reindex" => [Phase::Reindex].into(),

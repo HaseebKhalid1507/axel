@@ -99,7 +99,10 @@ pub fn reindex_source(
         let doc_id = format!("{}::{}", source.name, relative_id);
 
         if !dry_run {
-            search.index_document(&doc_id, &content, None, Some(&abs_str))?;
+            if let Err(e) = search.index_document(&doc_id, &content, None, Some(&abs_str)) {
+                eprintln!("⚠ index_document failed for {abs_str}: {e}");
+                continue;
+            }
             if is_new { newly_indexed.push(doc_id.clone()); }
         }
         stats.reindexed += 1;

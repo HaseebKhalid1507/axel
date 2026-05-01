@@ -54,15 +54,38 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool) -> Result<StrengthenStats
 
     let conn = db.conn();
 
-    // Boost / extinction for accessed docs.
+    // Pre-load excitabilities for all accessed docs in one query — eliminates
+    // the N+1 SELECT (one round-trip per doc) that dominated this phase.
+    let doc_ids: Vec<String> = grouped.keys().cloned().collect();
+    let mut current_excit: HashMap<String, f64> = HashMap::with_capacity(doc_ids.len());
+    if !doc_ids.is_empty() {
+        // Chunk to stay under SQLite's parameter limit (default 32766).
+        for chunk in doc_ids.chunks(500) {
+            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let sql = format!(
+                "SELECT doc_id, excitability FROM documents WHERE doc_id IN ({placeholders})"
+            );
+            let mut stmt = conn.prepare(&sql)
+                .map_err(|e| AxelError::Search(format!("prepare excitability bulk: {e}")))?;
+            let params_vec: Vec<&dyn rusqlite::ToSql> =
+                chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+            let rows = stmt.query_map(params_vec.as_slice(), |r| {
+                Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?))
+            }).map_err(|e| AxelError::Search(format!("query excitability bulk: {e}")))?;
+            for r in rows {
+                let (id, v) = r.map_err(|e| AxelError::Search(format!("excit row: {e}")))?;
+                current_excit.insert(id, v);
+            }
+        }
+    }
+
+    // Compute new values in memory, then flush in one transaction.
+    let mut boost_updates: Vec<(String, f64)> = Vec::with_capacity(grouped.len());
+
     for (doc_id, (count, score_sum, score_n)) in &grouped {
-        let current: f64 = match conn.query_row(
-            "SELECT excitability FROM documents WHERE doc_id = ?1",
-            params![doc_id],
-            |r| r.get::<_, f64>(0),
-        ) {
-            Ok(v) => v,
-            Err(_) => continue,
+        let current = match current_excit.get(doc_id) {
+            Some(v) => *v,
+            None => continue, // doc was deleted between access-log write and now
         };
 
         let avg_score = if *score_n > 0 { score_sum / (*score_n as f64) } else { 1.0 };
@@ -72,16 +95,27 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool) -> Result<StrengthenStats
             (current - EXTINCTION_PENALTY).max(EXCITABILITY_FLOOR)
         } else {
             stats.boosted += 1;
-            let boost = (BOOST_SCALE * ((*count as f64) + 1.0).ln()).min(BOOST_CAP);
+            // log2 to match memkoshi/decay.rs and the spec; ln grew ~1.44× slower.
+            let boost = (BOOST_SCALE * ((*count as f64) + 1.0).log2()).min(BOOST_CAP);
             (current + boost).min(EXCITABILITY_CEILING)
         };
 
-        if !dry_run {
-            conn.execute(
-                "UPDATE documents SET excitability = ?1 WHERE doc_id = ?2",
-                params![new_excitability, doc_id],
-            ).map_err(|e| AxelError::Search(format!("update excitability: {e}")))?;
+        boost_updates.push((doc_id.clone(), new_excitability));
+    }
+
+    if !dry_run && !boost_updates.is_empty() {
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| AxelError::Search(format!("begin tx: {e}")))?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE documents SET excitability = ?1 WHERE doc_id = ?2"
+            ).map_err(|e| AxelError::Search(format!("prepare boost update: {e}")))?;
+            for (doc_id, new_excit) in &boost_updates {
+                stmt.execute(params![new_excit, doc_id])
+                    .map_err(|e| AxelError::Search(format!("update excitability: {e}")))?;
+            }
         }
+        tx.commit().map_err(|e| AxelError::Search(format!("commit boost tx: {e}")))?;
     }
 
     // Decay untouched docs older than the grace period.
@@ -122,14 +156,23 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool) -> Result<StrengthenStats
     }
     drop(stmt);
 
-    for (doc_id, new_excitability) in updates {
-        stats.decayed += 1;
-        if !dry_run {
-            conn.execute(
-                "UPDATE documents SET excitability = ?1 WHERE doc_id = ?2",
-                params![new_excitability, doc_id],
-            ).map_err(|e| AxelError::Search(format!("decay update: {e}")))?;
+    if !dry_run && !updates.is_empty() {
+        let tx = conn.unchecked_transaction()
+            .map_err(|e| AxelError::Search(format!("begin decay tx: {e}")))?;
+        {
+            let mut stmt = tx.prepare(
+                "UPDATE documents SET excitability = ?1 WHERE doc_id = ?2"
+            ).map_err(|e| AxelError::Search(format!("prepare decay update: {e}")))?;
+            for (doc_id, new_excitability) in &updates {
+                stats.decayed += 1;
+                stmt.execute(params![new_excitability, doc_id])
+                    .map_err(|e| AxelError::Search(format!("decay update: {e}")))?;
+            }
         }
+        tx.commit().map_err(|e| AxelError::Search(format!("commit decay tx: {e}")))?;
+    } else {
+        // dry_run: still count what would have changed
+        stats.decayed += updates.len();
     }
 
     Ok(stats)
