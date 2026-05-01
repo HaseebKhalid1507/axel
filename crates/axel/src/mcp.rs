@@ -147,6 +147,24 @@ fn tool_definitions() -> Value {
                     },
                     "required": ["memory_id"]
                 }
+            },
+            {
+                "name": "axel_consolidate",
+                "description": "Run a consolidation pass on the brain. Reindexes changed files, strengthens accessed documents, reorganizes graph edges, and prunes stale content. Use sparingly — typically runs on a timer.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "phase": {
+                            "type": "string",
+                            "enum": ["all", "reindex", "strengthen", "reorganize", "prune"],
+                            "description": "Which phase to run. Default: all."
+                        },
+                        "dry_run": {
+                            "type": "boolean",
+                            "description": "Preview changes without applying them."
+                        }
+                    }
+                }
             }
         ]
     })
@@ -351,6 +369,55 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
                 },
                 Ok(false) => tool_error(&format!("Memory not found: {}", memory_id)),
                 Err(e) => tool_error(&format!("Failed to update memory: {}", e)),
+            }
+        }
+
+        "axel_consolidate" => {
+            use crate::consolidate::{self, Phase, ConsolidateOptions, SourceDir, Priority};
+            use std::collections::HashSet;
+            use std::path::PathBuf;
+
+            let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+            let phase_str = args["phase"].as_str().unwrap_or("all");
+
+            let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".into());
+            let sources = vec![
+                SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
+                SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
+                SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
+                SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
+                SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
+                SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
+            ];
+
+            let phases: HashSet<Phase> = match phase_str {
+                "reindex" => [Phase::Reindex].into(),
+                "strengthen" => [Phase::Strengthen].into(),
+                "reorganize" => [Phase::Reorganize].into(),
+                "prune" => [Phase::Prune].into(),
+                _ => HashSet::new(),
+            };
+
+            let opts = ConsolidateOptions { sources, phases, dry_run, verbose: false };
+
+            match consolidate::consolidate(brain.search_mut(), &opts) {
+                Ok(stats) => {
+                    let mode = if dry_run { "dry run" } else { "complete" };
+                    tool_text(&format!(
+                        "🧠 Consolidation {mode}\n\
+                         Phase 1 — Reindex:    {} checked, {} reindexed, {} pruned\n\
+                         Phase 2 — Strengthen: {} boosted, {} decayed, {} extinction\n\
+                         Phase 3 — Reorganize: +{} edges, ~{} updated, -{} removed\n\
+                         Phase 4 — Prune:      {} removed, {} flagged, {} misaligned\n\
+                         Duration: {:.1}s",
+                        stats.reindex.checked, stats.reindex.reindexed, stats.reindex.pruned,
+                        stats.strengthen.boosted, stats.strengthen.decayed, stats.strengthen.extinction_signals,
+                        stats.reorganize.edges_added, stats.reorganize.edges_updated, stats.reorganize.edges_removed,
+                        stats.prune.removed, stats.prune.flagged, stats.prune.misaligned,
+                        stats.duration_secs,
+                    ))
+                }
+                Err(e) => tool_error(&format!("Consolidation failed: {e}")),
             }
         }
 

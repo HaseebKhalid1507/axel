@@ -124,6 +124,9 @@ enum Commands {
         /// Path to sources config TOML
         #[arg(long)]
         sources: Option<PathBuf>,
+        /// Show consolidation history
+        #[arg(long)]
+        history: bool,
     },
     Extension,
     /// Run as an MCP server (exposes search/remember/recall as tools)
@@ -132,6 +135,58 @@ enum Commands {
 
 fn brain_path(cli: &Cli) -> PathBuf {
     cli.brain.clone().unwrap_or_else(|| AxelConfig::default().brain_path)
+}
+
+fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::SourceDir>, Box<dyn std::error::Error>> {
+    use axel::consolidate::{SourceDir, Priority};
+
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
+
+    // Try: explicit override → AXEL_SOURCES env → ~/.config/axel/sources.toml → hardcoded defaults
+    let config_path = override_path
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/axel/sources.toml")));
+
+    if config_path.exists() {
+        let content = std::fs::read_to_string(&config_path)?;
+        let parsed: toml::Value = content.parse()?;
+
+        if let Some(sources) = parsed.get("source").and_then(|v| v.as_array()) {
+            let mut result = Vec::new();
+            for src in sources {
+                let name = src.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
+                let path_str = src.get("path").and_then(|v| v.as_str()).unwrap_or("");
+                let priority_str = src.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
+
+                let expanded = path_str.replace("~", &home);
+                let priority = match priority_str {
+                    "high" => Priority::High,
+                    "low" => Priority::Low,
+                    _ => Priority::Medium,
+                };
+
+                result.push(SourceDir {
+                    path: PathBuf::from(expanded),
+                    name: name.to_string(),
+                    priority,
+                });
+            }
+            if !result.is_empty() {
+                return Ok(result);
+            }
+        }
+    }
+
+    // Fallback defaults
+    Ok(vec![
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
+        SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
+    ])
 }
 
 fn main() -> ExitCode {
@@ -148,8 +203,12 @@ fn main() -> ExitCode {
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
-        Commands::Consolidate { phase, dry_run, verbose, sources } =>
-            cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref()),
+        Commands::Consolidate { phase, dry_run, verbose, sources, history } =>
+            if *history {
+                cmd_consolidate_history(&cli)
+            } else {
+                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref())
+            },
         Commands::Extension => {
             let path = brain_path(&cli);
             axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
@@ -359,7 +418,7 @@ fn cmd_consolidate(
     phase: Option<&str>,
     dry_run: bool,
     verbose: bool,
-    _sources_path: Option<&Path>,
+    sources_path: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     use axel::consolidate::{self, Phase, ConsolidateOptions, SourceDir, Priority};
 
@@ -368,16 +427,8 @@ fn cmd_consolidate(
 
     let mut search = BrainSearch::open(&path)?;
 
-    // Default sources — hardcoded for now, TODO: parse from TOML
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
-    let sources = vec![
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
-    ];
+    // Load sources from TOML config or use defaults
+    let sources = load_sources(sources_path)?;
 
     let phases = match phase {
         Some("reindex") => [Phase::Reindex].into_iter().collect(),
@@ -415,6 +466,49 @@ fn cmd_consolidate(
     Ok(ExitCode::SUCCESS)
 }
 
+fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let path = brain_path(cli);
+    ensure_brain(&path)?;
+
+    let search = BrainSearch::open(&path)?;
+    let db = search.db();
+
+    let mut stmt = db.conn().prepare(
+        "SELECT id, started_at, finished_at, phase1_reindexed, phase1_pruned,
+                phase2_boosted, phase2_decayed, phase3_edges_added, phase3_edges_updated,
+                phase4_flagged, phase4_removed, duration_secs
+         FROM consolidation_log ORDER BY id DESC LIMIT 20"
+    )?;
+
+    let rows: Vec<(i64, String, Option<String>, i64, i64, i64, i64, i64, i64, i64, i64, f64)> = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?, row.get(1)?, row.get(2)?,
+                row.get(3)?, row.get(4)?, row.get(5)?,
+                row.get(6)?, row.get(7)?, row.get(8)?,
+                row.get(9)?, row.get(10)?, row.get(11)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    if rows.is_empty() {
+        println!("No consolidation runs recorded.");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("═══ Consolidation History (last {}) ═══\n", rows.len());
+    for (id, started, _finished, reindexed, pruned, boosted, decayed, edges_add, edges_upd, flagged, removed, dur) in &rows {
+        let ts = started.split('T').next().unwrap_or(started);
+        let time = started.split('T').nth(1).and_then(|t| t.split('.').next()).unwrap_or("");
+        println!("  #{id}  {ts} {time}  ({dur:.1}s)");
+        println!("    reindex: {reindexed} indexed, {pruned} pruned | strengthen: {boosted} ↑ {decayed} ↓");
+        println!("    graph: +{edges_add} ~{edges_upd} | prune: {removed} removed, {flagged} flagged\n");
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
 fn cmd_search(
     cli: &Cli,
     query_parts: &[String],
@@ -434,6 +528,19 @@ fn cmd_search(
     let start = Instant::now();
     let response = search.search(&query, limit)?;
     let ms = start.elapsed().as_millis();
+
+    // Log search hits as document access events (same as MCP path)
+    let db = search.db();
+    for r in &response.results {
+        let _ = db.log_document_access(&r.doc_id, "search_hit", Some(&query), Some(r.score), None);
+        let _ = db.increment_document_access(&r.doc_id);
+    }
+    let top_ids: Vec<&str> = response.results.iter().take(5).map(|r| r.doc_id.as_str()).collect();
+    for i in 0..top_ids.len() {
+        for j in (i+1)..top_ids.len() {
+            let _ = db.log_co_retrieval(top_ids[i], top_ids[j], &query);
+        }
+    }
 
     if json_mode {
         let results: Vec<serde_json::Value> = response.results.iter().map(|r| {

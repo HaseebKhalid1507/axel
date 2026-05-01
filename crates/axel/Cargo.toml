@@ -25,6 +25,7 @@ hex = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }
+toml = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }

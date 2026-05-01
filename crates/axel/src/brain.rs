@@ -166,6 +166,11 @@ impl AxelBrain {
         self.search.db()
     }
 
+    /// Mutable access to the search engine (needed by consolidation).
+    pub fn search_mut(&mut self) -> &mut BrainSearch {
+        &mut self.search
+    }
+
     // ── Memory ──────────────────────────────────────────────────────────
 
     /// Store a memory. Returns the memory ID.
