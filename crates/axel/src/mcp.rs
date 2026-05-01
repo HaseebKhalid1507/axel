@@ -92,6 +92,10 @@ fn tool_definitions() -> Value {
                             "type": "number",
                             "description": "Importance 0.0–1.0 (default: 0.5)",
                             "default": 0.5
+                        },
+                        "ttl_hours": {
+                            "type": "integer",
+                            "description": "Time-to-live in hours. Memory will be auto-deleted after this time (optional)"
                         }
                     },
                     "required": ["content", "category"]
@@ -104,6 +108,44 @@ fn tool_definitions() -> Value {
                     "type": "object",
                     "properties": {},
                     "required": []
+                }
+            },
+            {
+                "name": "axel_verify",
+                "description": "Verify a memory by ID — returns full record with provenance and signature status. Use this to inspect a specific memory's authenticity and metadata.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Memory ID to verify (e.g. mem_12345678)"
+                        }
+                    },
+                    "required": ["memory_id"]
+                }
+            },
+            {
+                "name": "axel_update",
+                "description": "Update a memory's content and/or importance — wiki-style editing with re-signing and re-indexing. Use this to correct or enhance existing memories.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "memory_id": {
+                            "type": "string",
+                            "description": "Memory ID to update (e.g. mem_12345678)"
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "New content for the memory (optional)"
+                        },
+                        "importance": {
+                            "type": "number",
+                            "description": "New importance level 0.0-1.0 (optional)",
+                            "minimum": 0.0,
+                            "maximum": 1.0
+                        }
+                    },
+                    "required": ["memory_id"]
                 }
             }
         ]
@@ -147,13 +189,20 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
             let content = args["content"].as_str().unwrap_or("");
             let category = args["category"].as_str().unwrap_or("events");
             let importance = args["importance"].as_f64().unwrap_or(0.5);
+            let ttl_hours = args["ttl_hours"].as_u64();
 
             if content.is_empty() {
                 return tool_error("Content cannot be empty");
             }
 
-            match brain.remember(content, category, importance) {
-                Ok(id) => tool_text(&format!("✅ Memory stored: {}", id)),
+            match brain.remember_with_ttl(content, category, importance, ttl_hours) {
+                Ok(id) => {
+                    let ttl_info = match ttl_hours {
+                        Some(hours) => format!(" (expires in {}h)", hours),
+                        None => "".to_string(),
+                    };
+                    tool_text(&format!("✅ Memory stored: {}{}", id, ttl_info))
+                },
                 Err(e) => tool_error(&format!("Failed to store memory: {}", e)),
             }
         }
@@ -169,6 +218,116 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
                     }
                 }
                 Err(e) => tool_error(&format!("Recall failed: {}", e)),
+            }
+        }
+
+        "axel_verify" => {
+            let memory_id = args["memory_id"].as_str().unwrap_or("");
+
+            if memory_id.is_empty() {
+                return tool_error("Memory ID cannot be empty");
+            }
+
+            match brain.get_memory_with_verification(memory_id) {
+                Ok(Some((memory, verified))) => {
+                    let verification_status = if memory.signature.is_some() {
+                        if verified { "✅ VERIFIED" } else { "❌ FAILED" }
+                    } else {
+                        "⚠️ UNSIGNED"
+                    };
+
+                    let ttl_info = match memory.remaining_ttl_hours() {
+                        Some(hours) if hours > 0 => format!("⏰ Expires in {}h", hours),
+                        Some(_) => "🕐 EXPIRED".to_string(), // 0 or negative
+                        None => "∞ No expiry".to_string(),
+                    };
+
+                    let superseded_info = if memory.is_superseded() {
+                        format!("🔄 Superseded by: {}", memory.superseded_by.as_deref().unwrap_or("unknown"))
+                    } else {
+                        "✨ Active".to_string()
+                    };
+
+                    tool_text(&format!(
+                        "🔍 Memory Verification: {}\n\n\
+                        📝 **Content:** {}\n\n\
+                        📊 **Metadata:**\n\
+                        • ID: {}\n\
+                        • Category: {:?}\n\
+                        • Title: {}\n\
+                        • Topic: {}\n\
+                        • Importance: {:.2}\n\
+                        • Confidence: {:?}\n\
+                        • Trust Level: {:.2}\n\
+                        • Created: {}\n\
+                        • Updated: {}\n\
+                        • Sessions: {}\n\
+                        • Tags: {}\n\
+                        • Related Topics: {}\n\n\
+                        🔐 **Security:** {}\n\
+                        ⏱️ **TTL:** {}\n\
+                        🔄 **Status:** {}",
+                        memory_id,
+                        memory.content,
+                        memory.id,
+                        memory.category,
+                        memory.title,
+                        memory.topic,
+                        memory.importance,
+                        memory.confidence,
+                        memory.trust_level,
+                        memory.created.format("%Y-%m-%d %H:%M:%S UTC"),
+                        memory.updated.map(|u| u.format("%Y-%m-%d %H:%M:%S UTC").to_string()).unwrap_or("Never".to_string()),
+                        memory.source_sessions.join(", "),
+                        memory.tags.join(", "),
+                        memory.related_topics.join(", "),
+                        verification_status,
+                        ttl_info,
+                        superseded_info
+                    ))
+                },
+                Ok(None) => tool_error(&format!("Memory not found: {}", memory_id)),
+                Err(e) => tool_error(&format!("Failed to verify memory: {}", e)),
+            }
+        }
+
+        "axel_update" => {
+            let memory_id = args["memory_id"].as_str().unwrap_or("");
+            let new_content = args["content"].as_str();
+            let new_importance = args["importance"].as_f64();
+
+            if memory_id.is_empty() {
+                return tool_error("Memory ID cannot be empty");
+            }
+
+            // Validate new content if provided
+            if let Some(content) = new_content {
+                if content.trim().is_empty() {
+                    return tool_error("Content cannot be empty");
+                }
+                if content.chars().count() < 50 {
+                    return tool_error("Content must be at least 50 characters");
+                }
+            }
+
+            // Validate importance if provided
+            if let Some(importance) = new_importance {
+                if !(0.0..=1.0).contains(&importance) {
+                    return tool_error("Importance must be between 0.0 and 1.0");
+                }
+            }
+
+            match brain.update_memory(memory_id, new_content, new_importance) {
+                Ok(true) => {
+                    let updates: Vec<String> = [
+                        new_content.map(|_| "content"),
+                        new_importance.map(|_| "importance"),
+                    ].into_iter().flatten().map(|s| s.to_string()).collect();
+                    
+                    tool_text(&format!("✅ Memory updated: {} ({})", memory_id, updates.join(", ")))
+                },
+                Ok(false) => tool_error(&format!("Memory not found: {}", memory_id)),
+                Err(e) => tool_error(&format!("Failed to update memory: {}", e)),
             }
         }
 

@@ -19,7 +19,7 @@ use crate::error::{Result, VelociError};
 
 // ── Schema version ──────────────────────────────────────────────────────────
 
-const SCHEMA_VERSION: i32 = 1;
+const SCHEMA_VERSION: i32 = 2;
 const EMBEDDING_DIM: usize = 384; // all-MiniLM-L6-v2
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -57,6 +57,8 @@ pub struct Edge {
     pub confidence: f64,
     pub metadata: serde_json::Value,
     pub source_file: Option<String>,
+    pub valid_from: Option<chrono::DateTime<chrono::Utc>>,
+    pub valid_to: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result from a BM25 keyword search.
@@ -187,6 +189,8 @@ impl Database {
                 source_file TEXT,
                 source_name TEXT,
                 created_at  TEXT NOT NULL,
+                valid_from  TEXT,
+                valid_to    TEXT,
                 FOREIGN KEY (source_id) REFERENCES nodes(id) ON DELETE CASCADE,
                 FOREIGN KEY (target_id) REFERENCES nodes(id) ON DELETE CASCADE
             );
@@ -448,9 +452,12 @@ impl Database {
     pub fn upsert_edge(&self, edge: &Edge) -> Result<()> {
         let metadata_json = serde_json::to_string(&edge.metadata)?;
         let now = Utc::now().to_rfc3339();
+        let valid_from = edge.valid_from.map(|dt| dt.to_rfc3339());
+        let valid_to = edge.valid_to.map(|dt| dt.to_rfc3339());
+        
         self.conn.execute(
-            "INSERT OR REPLACE INTO edges (id, source_id, target_id, type, weight, confidence, metadata, source_file, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT OR REPLACE INTO edges (id, source_id, target_id, type, weight, confidence, metadata, source_file, created_at, valid_from, valid_to)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 edge.id,
                 edge.source_id,
@@ -461,9 +468,21 @@ impl Database {
                 metadata_json,
                 edge.source_file,
                 now,
+                valid_from,
+                valid_to,
             ],
         )?;
         Ok(())
+    }
+
+    /// Invalidate an edge by setting its valid_to timestamp to now.
+    pub fn invalidate_edge(&self, edge_id: &str) -> Result<bool> {
+        let now = Utc::now().to_rfc3339();
+        let rows_affected = self.conn.execute(
+            "UPDATE edges SET valid_to = ?1 WHERE id = ?2",
+            params![now, edge_id],
+        )?;
+        Ok(rows_affected > 0)
     }
 
     /// Convenience: insert a node from individual fields.
@@ -498,6 +517,8 @@ impl Database {
         confidence: f64,
         metadata: &serde_json::Value,
         source_file: Option<&str>,
+        valid_from: Option<chrono::DateTime<chrono::Utc>>,
+        valid_to: Option<chrono::DateTime<chrono::Utc>>,
     ) -> Result<()> {
         self.upsert_edge(&Edge {
             id: id.to_string(),
@@ -508,6 +529,8 @@ impl Database {
             confidence,
             metadata: metadata.clone(),
             source_file: source_file.map(|s| s.to_string()),
+            valid_from,
+            valid_to,
         })
     }
 
@@ -556,13 +579,15 @@ impl Database {
                  FROM edges e
                  JOIN reachable ON (e.source_id = reachable.node_id OR e.target_id = reachable.node_id)
                  WHERE reachable.depth < ?2
+                   AND (e.valid_to IS NULL OR e.valid_to > datetime('now'))
              )
              SELECT DISTINCT n.id, n.type, n.title, n.content, n.metadata, n.source_file,
-                             e.id, e.source_id, e.target_id, e.type, e.weight, e.confidence, e.metadata, e.source_file
+                             e.id, e.source_id, e.target_id, e.type, e.weight, e.confidence, e.metadata, e.source_file, e.valid_from, e.valid_to
              FROM reachable r
              JOIN nodes n ON n.id = r.node_id
              JOIN edges e ON (e.source_id = r.node_id OR e.target_id = r.node_id)
              WHERE r.node_id != ?1
+               AND (e.valid_to IS NULL OR e.valid_to > datetime('now'))
              ORDER BY e.weight DESC
              LIMIT ?3",
         )?;
@@ -585,6 +610,8 @@ impl Database {
                 confidence: row.get(11)?,
                 metadata: serde_json::from_str(&row.get::<_, String>(12)?).unwrap_or_default(),
                 source_file: row.get(13)?,
+                valid_from: row.get::<_, Option<String>>(14)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
+                valid_to: row.get::<_, Option<String>>(15)?.map(|s| chrono::DateTime::parse_from_rfc3339(&s).unwrap().into()),
             };
             Ok((node, edge))
         })?;
@@ -870,6 +897,8 @@ mod tests {
             confidence: 0.85,
             metadata: serde_json::json!({}),
             source_file: None,
+            valid_from: None,
+            valid_to: None,
         };
         db.upsert_edge(&edge).unwrap();
 

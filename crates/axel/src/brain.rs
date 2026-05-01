@@ -172,6 +172,21 @@ impl AxelBrain {
         category: &str,
         importance: f64,
     ) -> Result<String> {
+        self.remember_with_ttl(content, category, importance, None)
+    }
+
+    /// Store a memory with optional TTL. Returns the memory ID.
+    ///
+    /// The memory is validated, signed (if signing key exists), and indexed
+    /// for search immediately. If `ttl_hours` is provided, the memory will
+    /// expire after that many hours.
+    pub fn remember_with_ttl(
+        &mut self,
+        content: &str,
+        category: &str,
+        importance: f64,
+        ttl_hours: Option<u64>,
+    ) -> Result<String> {
         let cat = match category.to_lowercase().as_str() {
             "events" | "event" => MemoryCategory::Events,
             "preferences" | "preference" | "pref" => MemoryCategory::Preferences,
@@ -191,6 +206,11 @@ impl AxelBrain {
             content.to_string(),
         );
         memory.importance = importance.clamp(0.0, 1.0);
+
+        // Set TTL if provided
+        if let Some(hours) = ttl_hours {
+            memory.set_ttl(hours);
+        }
 
         // Sign if brain has a signing key
         if let Some(ref signer) = self.brain.signer() {
@@ -221,6 +241,55 @@ impl AxelBrain {
     /// Delete a memory by ID.
     pub fn forget(&mut self, id: &str) -> Result<bool> {
         Ok(self.storage.delete_memory(id)?)
+    }
+
+    /// Remove all expired memories and return the count of deleted memories.
+    pub fn prune_expired(&mut self) -> Result<u64> {
+        Ok(self.storage.prune_expired()?)
+    }
+
+    /// Update a memory's content and/or importance.
+    /// Re-signs the memory if a signing key exists and re-indexes for search.
+    /// Returns true if the memory was found and updated.
+    pub fn update_memory(
+        &mut self,
+        id: &str,
+        new_content: Option<&str>,
+        new_importance: Option<f64>,
+    ) -> Result<bool> {
+        // Update in storage
+        if !self.storage.update_memory(id, new_content, new_importance)? {
+            return Ok(false); // Memory not found
+        }
+
+        // Get the updated memory for re-signing and re-indexing
+        if let Some(mut memory) = self.storage.get_memory(id)? {
+            // Re-sign if brain has a signing key
+            if let Some(ref signer) = self.brain.signer() {
+                memory.signature = Some(signer.sign(&memory));
+                // Update the signature in the database
+                self.storage.store_memory(&memory)?;
+            }
+
+            // Re-index for search
+            let _ = self.search.index_memory(&memory);
+        }
+
+        Ok(true)
+    }
+
+    /// Get a memory by ID with verification status.
+    pub fn get_memory_with_verification(&self, id: &str) -> Result<Option<(Memory, bool)>> {
+        match self.storage.get_memory(id)? {
+            Some(memory) => {
+                let verified = match &self.brain.signer() {
+                    Some(signer) => signer.verify(&memory),
+                    None => false, // No signer available
+                };
+                Ok(Some((memory, verified)))
+            },
+            None => Ok(None),
+        }
     }
 
     // ── Handoff ─────────────────────────────────────────────────────────

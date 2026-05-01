@@ -246,6 +246,55 @@ impl MemoryStorage {
         Ok(n > 0)
     }
 
+    /// Remove all expired memories and return the count of deleted memories.
+    /// A memory is expired if it has an `expires_at` timestamp that is in the past.
+    /// Since the database schema doesn't yet support the `expires_at` field,
+    /// this implementation checks expiry using the in-memory representation.
+    pub fn prune_expired(&self) -> Result<u64> {
+        // TODO: This is inefficient as it loads all memories into memory.
+        // Once the database schema is updated to include expires_at, 
+        // this should be done with a SQL DELETE WHERE expires_at < NOW().
+        let all_memories = self.list_memories(10000)?; // Large limit to get all memories
+        let mut deleted_count = 0u64;
+        
+        for memory in all_memories {
+            if memory.is_expired() {
+                if self.delete_memory(&memory.id)? {
+                    deleted_count += 1;
+                }
+            }
+        }
+        
+        Ok(deleted_count)
+    }
+
+    /// Update a memory's content and/or importance. Returns true if the memory was found and updated.
+    pub fn update_memory(
+        &self, 
+        id: &str, 
+        new_content: Option<&str>, 
+        new_importance: Option<f64>
+    ) -> Result<bool> {
+        // First check if memory exists
+        let memory = match self.get_memory(id)? {
+            Some(m) => m,
+            None => return Ok(false), // Memory not found
+        };
+
+        // Prepare update values
+        let content = new_content.unwrap_or(&memory.content);
+        let importance = new_importance.unwrap_or(memory.importance).clamp(0.0, 1.0);
+        let updated = chrono::Utc::now().to_rfc3339();
+
+        // Execute update
+        let rows_affected = self.conn.execute(
+            "UPDATE memories SET content = ?1, importance = ?2, updated = ?3 WHERE id = ?4",
+            params![content, importance, updated, id]
+        )?;
+
+        Ok(rows_affected > 0)
+    }
+
     // ------------------------------------------------------------------ staging
 
     /// Stage `memory` as `Pending` and return the staging envelope.
@@ -543,6 +592,8 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
             },
             trust_level,
             signature,
+            superseded_by: None, // TODO: Handle this field properly in database schema
+            expires_at: None, // TODO: Handle this field properly in database schema
         })
     })())
 }

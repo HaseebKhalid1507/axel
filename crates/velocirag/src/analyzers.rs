@@ -89,6 +89,8 @@ impl ExplicitAnalyzer {
                         confidence: 0.9,
                         metadata: serde_json::json!({"link_text": link}),
                         source_file: None,
+                        valid_from: None,
+                        valid_to: None,
                     });
                 }
             }
@@ -106,6 +108,8 @@ impl ExplicitAnalyzer {
                         confidence: 1.0,
                         metadata: serde_json::json!({"tag_name": tag}),
                         source_file: None,
+                        valid_from: None,
+                        valid_to: None,
                     });
                 }
             }
@@ -241,6 +245,8 @@ impl TemporalAnalyzer {
                     confidence: 0.7,
                     metadata: serde_json::json!({"temporal_type": "concurrent", "days_apart": diff}),
                     source_file: None,
+                    valid_from: None,
+                    valid_to: None,
                 });
 
                 *edge_counts.entry(src.id.as_str()).or_insert(0) += 1;
@@ -361,6 +367,8 @@ impl EntityAnalyzer {
                             confidence: 0.8,
                             metadata: serde_json::json!({"entity_name": entity}),
                             source_file: None,
+                            valid_from: None,
+                            valid_to: None,
                         });
                     }
                 }
@@ -462,6 +470,8 @@ impl TopicAnalyzer {
                         confidence: 0.6,
                         metadata: serde_json::json!({"topic_name": topic_name}),
                         source_file: None,
+                        valid_from: None,
+                        valid_to: None,
                     });
                 }
             }
@@ -561,6 +571,8 @@ impl SemanticAnalyzer {
                     confidence: clamped,
                     metadata: serde_json::json!({"similarity_score": sim, "analysis_method": "cosine"}),
                     source_file: None,
+                    valid_from: None,
+                    valid_to: None,
                 });
 
                 *edge_counts.entry(src_id.as_str()).or_insert(0) += 1;
@@ -728,9 +740,9 @@ mod tests {
         ];
         let edges = vec![
             Edge { id: "e1".into(), source_id: "a".into(), target_id: "b".into(),
-                   edge_type: "test".into(), weight: 1.0, confidence: 1.0, metadata: Value::Null, source_file: None },
+                   edge_type: "test".into(), weight: 1.0, confidence: 1.0, metadata: Value::Null, source_file: None, valid_from: None, valid_to: None },
             Edge { id: "e2".into(), source_id: "b".into(), target_id: "c".into(),
-                   edge_type: "test".into(), weight: 1.0, confidence: 1.0, metadata: Value::Null, source_file: None },
+                   edge_type: "test".into(), weight: 1.0, confidence: 1.0, metadata: Value::Null, source_file: None, valid_from: None, valid_to: None },
         ];
         let scores = CentralityAnalyzer.analyze(&nodes, &edges);
         // Node B should have highest centrality (bridge between A and C)
