@@ -299,7 +299,8 @@ impl<'a> SearchEngine<'a> {
             let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
                 "SELECT doc_id, COALESCE(excitability, 0.5),
-                        COALESCE((julianday('now') - julianday(last_accessed)), 0)
+                        COALESCE((julianday('now') - julianday(last_accessed)), 0),
+                        COALESCE((julianday('now') - julianday(indexed_at)), 30)
                  FROM documents WHERE doc_id IN ({})",
                 placeholders.join(",")
             );
@@ -312,16 +313,19 @@ impl<'a> SearchEngine<'a> {
                         row.get::<_, String>(0)?,
                         row.get::<_, f64>(1)?,
                         row.get::<_, f64>(2)?,
+                        row.get::<_, f64>(3)?,
                     ))
                 }) {
                     for row in rows.flatten() {
-                        let (doc_id, stored_excitability, days_since_access) = row;
+                        let (doc_id, stored_excitability, days_since_access, days_since_indexed) = row;
                         // Ebbinghaus exponential decay (Murre & Dros, 2015).
-                        // Shorter stability for real-time decay between consolidation runs.
-                        // 50% retention at ~42 days, floored at 0.7 of stored value.
                         let decay_factor = (-days_since_access / 60.0).exp().max(0.7);
-                        let effective = stored_excitability * decay_factor;
-                        excitability_map.insert(doc_id, effective);
+                        // Recency boost (YouTube DNN paper, Covington et al. 2016):
+                        // Recently modified docs get a mild boost.
+                        // log(1 + 1/days) gives ~0.7 for today, ~0.3 for 7 days, ~0.1 for 30 days
+                        let recency = (1.0 + 1.0 / (days_since_indexed + 1.0)).ln().min(0.7);
+                        let effective = stored_excitability * decay_factor + recency * 0.05;
+                        excitability_map.insert(doc_id, effective.min(1.0));
                     }
                 }
             }
