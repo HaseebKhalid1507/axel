@@ -836,6 +836,31 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("  Co-retrievals:  {co_ret_count}");
     println!("  Excitability:   μ={avg_excitability:.3}  min={min_excitability:.3}  max={max_excitability:.3}");
 
+    // Health alerts
+    let last_run: Option<String> = conn.query_row(
+        "SELECT finished_at FROM consolidation_log WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1",
+        [], |r| r.get(0)
+    ).ok();
+    if let Some(ref ts) = last_run {
+        // Parse and check if it's been too long
+        let normalized = ts.replace('T', " ").split('+').next().unwrap_or(ts).to_string();
+        if let Ok(hours) = conn.query_row(
+            "SELECT (julianday('now') - julianday(?1)) * 24",
+            [&normalized], |r| r.get::<_, f64>(0)
+        ) {
+            if hours > 12.0 {
+                println!("\n  ⚠ Consolidation hasn't run in {:.0} hours (expected every 6)", hours);
+            }
+        }
+    } else if consolidation_runs == 0 {
+        println!("\n  ⚠ No consolidation runs recorded — run `axel consolidate` to start");
+    }
+
+    // Excitability distribution warning
+    if max_excitability - min_excitability < 0.01 && doc_count > 100 {
+        println!("  ⚠ Excitability is flat — consolidation may not be processing access events");
+    }
+
     Ok(ExitCode::SUCCESS)
 }
 
