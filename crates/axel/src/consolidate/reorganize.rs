@@ -139,6 +139,26 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
     }
 
     // 4. Decay stale co_retrieved edges — those with no recent reinforcement.
+    // Pre-load all recently reinforced pairs to avoid N+1 queries.
+    let recent_pairs: std::collections::HashSet<(String, String)> = {
+        let mut set = std::collections::HashSet::new();
+        if let Ok(mut stmt) = conn.prepare(
+            "SELECT DISTINCT doc_id_a, doc_id_b FROM co_retrieval
+             WHERE timestamp > datetime('now', ?1)",
+        ) {
+            if let Ok(rows) = stmt.query_map(params![format!("-{} days", STALE_DAYS)], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            }) {
+                for row in rows.flatten() {
+                    // Store both orderings for fast lookup
+                    set.insert((row.0.clone(), row.1.clone()));
+                    set.insert((row.1, row.0));
+                }
+            }
+        }
+        set
+    };
+
     let live_edges: Vec<(String, String, String, f64)> = {
         let mut stmt = conn.prepare(
             "SELECT id, source_id, target_id, weight FROM edges
@@ -157,19 +177,8 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
     };
 
     for (id, src, tgt, weight) in live_edges {
-        // Co-retrieval table may be absent — treat as "no recent activity".
-        let recent: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM co_retrieval
-                 WHERE timestamp > datetime('now', ?1)
-                   AND ((doc_id_a = ?2 AND doc_id_b = ?3)
-                        OR (doc_id_a = ?3 AND doc_id_b = ?2))",
-                params![format!("-{} days", STALE_DAYS), src, tgt],
-                |row| row.get(0),
-            )
-            .unwrap_or(0);
-
-        if recent > 0 {
+        // Check pre-loaded set instead of per-edge query
+        if recent_pairs.contains(&(src.clone(), tgt.clone())) {
             continue; // freshly reinforced — leave alone
         }
 
