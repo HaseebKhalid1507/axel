@@ -166,6 +166,29 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
 
             match brain.search(query, limit) {
                 Ok(results) => {
+                    // Log search hits as document access events (best-effort, silent on failure)
+                    let db = brain.search_db();
+                    for r in &results.results {
+                        let _ = db.log_document_access(
+                            &r.doc_id,
+                            "search_hit",
+                            Some(query),
+                            Some(r.score),
+                            None,
+                        );
+                        let _ = db.increment_document_access(&r.doc_id);
+                    }
+                    // Log co-retrieval pairs for top-5 results
+                    let top_ids: Vec<&str> = results.results.iter()
+                        .take(5)
+                        .map(|r| r.doc_id.as_str())
+                        .collect();
+                    for i in 0..top_ids.len() {
+                        for j in (i + 1)..top_ids.len() {
+                            let _ = db.log_co_retrieval(top_ids[i], top_ids[j], query);
+                        }
+                    }
+
                     let mut output = format!("🔍 {} results for \"{}\" ({:.0}ms)\n\n",
                         results.results.len(), query, results.stats.total_ms);
 

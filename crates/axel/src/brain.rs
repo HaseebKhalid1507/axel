@@ -160,6 +160,12 @@ impl AxelBrain {
         self.search.search(query, limit)
     }
 
+    /// Access the underlying VelociRAG database (for access logging,
+    /// consolidation, etc.).
+    pub fn search_db(&self) -> &velocirag::db::Database {
+        self.search.db()
+    }
+
     // ── Memory ──────────────────────────────────────────────────────────
 
     /// Store a memory. Returns the memory ID.

@@ -79,6 +79,32 @@ pub struct FileEntry {
     pub source_name: String,
 }
 
+/// A document access event (search hit, open, reference, etc.).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DocumentAccess {
+    pub doc_id: String,
+    pub access_type: String,
+    pub query: Option<String>,
+    pub score: Option<f64>,
+    pub timestamp: String,
+}
+
+/// Stats from a single consolidation run.
+#[derive(Debug, Clone, Default)]
+pub struct ConsolidationLogEntry {
+    pub started_at: String,
+    pub finished_at: Option<String>,
+    pub phase1_reindexed: i64,
+    pub phase1_pruned: i64,
+    pub phase2_boosted: i64,
+    pub phase2_decayed: i64,
+    pub phase3_edges_added: i64,
+    pub phase3_edges_updated: i64,
+    pub phase4_flagged: i64,
+    pub phase4_removed: i64,
+    pub duration_secs: Option<f64>,
+}
+
 // ── Database ────────────────────────────────────────────────────────────────
 
 pub struct Database {
@@ -254,6 +280,45 @@ impl Database {
                 key     TEXT PRIMARY KEY,
                 value   TEXT NOT NULL
             );
+
+            -- ═══ DOCUMENT ACCESS LOG (consolidation Phase 2 input) ═══
+            CREATE TABLE IF NOT EXISTS document_access (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id      TEXT NOT NULL,
+                access_type TEXT NOT NULL,
+                query       TEXT,
+                score       REAL,
+                timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
+                session_id  TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_docaccess_doc_id ON document_access(doc_id);
+            CREATE INDEX IF NOT EXISTS idx_docaccess_timestamp ON document_access(timestamp);
+
+            -- ═══ CO-RETRIEVAL PAIRS (consolidation Phase 3 input) ═══
+            CREATE TABLE IF NOT EXISTS co_retrieval (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                doc_id_a    TEXT NOT NULL,
+                doc_id_b    TEXT NOT NULL,
+                query       TEXT,
+                timestamp   TEXT NOT NULL DEFAULT (datetime('now'))
+            );
+            CREATE INDEX IF NOT EXISTS idx_coret_pair ON co_retrieval(doc_id_a, doc_id_b);
+
+            -- ═══ CONSOLIDATION RUN LOG ═══
+            CREATE TABLE IF NOT EXISTS consolidation_log (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT,
+                phase1_reindexed  INTEGER DEFAULT 0,
+                phase1_pruned     INTEGER DEFAULT 0,
+                phase2_boosted    INTEGER DEFAULT 0,
+                phase2_decayed    INTEGER DEFAULT 0,
+                phase3_edges_added    INTEGER DEFAULT 0,
+                phase3_edges_updated  INTEGER DEFAULT 0,
+                phase4_flagged    INTEGER DEFAULT 0,
+                phase4_removed    INTEGER DEFAULT 0,
+                duration_secs     REAL
+            );
             ",
         )?;
 
@@ -282,6 +347,34 @@ impl Database {
             )?;
             self.conn.execute(
                 "UPDATE documents SET indexed_at = COALESCE(created, CURRENT_TIMESTAMP) WHERE indexed_at IS NULL",
+                [],
+            )?;
+        }
+
+        // ── Migration: add consolidation columns to documents ──
+        let doc_cols: Vec<String> = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(documents)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols
+        };
+        if !doc_cols.iter().any(|c| c == "access_count") {
+            self.conn.execute(
+                "ALTER TABLE documents ADD COLUMN access_count INTEGER DEFAULT 0",
+                [],
+            )?;
+        }
+        if !doc_cols.iter().any(|c| c == "last_accessed") {
+            self.conn.execute(
+                "ALTER TABLE documents ADD COLUMN last_accessed TIMESTAMP",
+                [],
+            )?;
+        }
+        if !doc_cols.iter().any(|c| c == "excitability") {
+            self.conn.execute(
+                "ALTER TABLE documents ADD COLUMN excitability REAL DEFAULT 0.5",
                 [],
             )?;
         }
@@ -776,6 +869,126 @@ impl Database {
         self.conn.execute(
             "INSERT OR REPLACE INTO file_cache (cache_key, last_modified, source_name) VALUES (?1, ?2, ?3)",
             params![cache_key, mtime, source_name],
+        )?;
+        Ok(())
+    }
+
+    // ── Consolidation: access logging ───────────────────────────────────
+
+    /// Log a document access event.
+    pub fn log_document_access(
+        &self,
+        doc_id: &str,
+        access_type: &str,
+        query: Option<&str>,
+        score: Option<f64>,
+        session_id: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO document_access (doc_id, access_type, query, score, session_id)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![doc_id, access_type, query, score, session_id],
+        )?;
+        Ok(())
+    }
+
+    /// Increment access_count and update last_accessed on the documents table.
+    pub fn increment_document_access(&self, doc_id: &str) -> Result<()> {
+        self.conn.execute(
+            "UPDATE documents
+             SET access_count = COALESCE(access_count, 0) + 1,
+                 last_accessed = CURRENT_TIMESTAMP
+             WHERE doc_id = ?1",
+            params![doc_id],
+        )?;
+        Ok(())
+    }
+
+    /// Log a co-retrieval pair (orders the pair canonically so a < b).
+    pub fn log_co_retrieval(
+        &self,
+        doc_id_a: &str,
+        doc_id_b: &str,
+        query: &str,
+    ) -> Result<()> {
+        if doc_id_a == doc_id_b {
+            return Ok(());
+        }
+        let (a, b) = if doc_id_a < doc_id_b {
+            (doc_id_a, doc_id_b)
+        } else {
+            (doc_id_b, doc_id_a)
+        };
+        self.conn.execute(
+            "INSERT INTO co_retrieval (doc_id_a, doc_id_b, query) VALUES (?1, ?2, ?3)",
+            params![a, b, query],
+        )?;
+        Ok(())
+    }
+
+    /// Get document access events since a given RFC3339 timestamp.
+    pub fn get_document_accesses_since(&self, since: &str) -> Result<Vec<DocumentAccess>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT doc_id, access_type, query, score, timestamp
+             FROM document_access
+             WHERE timestamp >= ?1
+             ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(params![since], |row| {
+            Ok(DocumentAccess {
+                doc_id: row.get(0)?,
+                access_type: row.get(1)?,
+                query: row.get(2)?,
+                score: row.get(3)?,
+                timestamp: row.get(4)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Get the most recent consolidation run's finished_at timestamp.
+    pub fn last_consolidation_time(&self) -> Result<Option<String>> {
+        let result = self
+            .conn
+            .query_row(
+                "SELECT finished_at FROM consolidation_log
+                 WHERE finished_at IS NOT NULL
+                 ORDER BY finished_at DESC LIMIT 1",
+                [],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()?;
+        Ok(result.flatten())
+    }
+
+    /// Insert a consolidation log entry.
+    pub fn insert_consolidation_log(&self, log: &ConsolidationLogEntry) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO consolidation_log (
+                started_at, finished_at,
+                phase1_reindexed, phase1_pruned,
+                phase2_boosted, phase2_decayed,
+                phase3_edges_added, phase3_edges_updated,
+                phase4_flagged, phase4_removed,
+                duration_secs
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                log.started_at,
+                log.finished_at,
+                log.phase1_reindexed,
+                log.phase1_pruned,
+                log.phase2_boosted,
+                log.phase2_decayed,
+                log.phase3_edges_added,
+                log.phase3_edges_updated,
+                log.phase4_flagged,
+                log.phase4_removed,
+                log.duration_secs,
+            ],
         )?;
         Ok(())
     }
