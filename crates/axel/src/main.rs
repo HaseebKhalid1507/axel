@@ -845,6 +845,23 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("  Co-retrievals:  {co_ret_count}");
     println!("  Excitability:   μ={avg_excitability:.3}  min={min_excitability:.3}  max={max_excitability:.3}");
 
+    // Top queries — what's the brain thinking about?
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT query, COUNT(*) FROM document_access
+         WHERE query IS NOT NULL AND query != ''
+         GROUP BY query ORDER BY COUNT(*) DESC LIMIT 5"
+    ) {
+        let queries: Vec<(String, i64)> = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?))
+        }).ok().map(|rows| rows.flatten().collect()).unwrap_or_default();
+        if !queries.is_empty() {
+            println!("  Top queries:    {}", queries.iter()
+                .map(|(q, c)| format!("{q} ({c})"))
+                .collect::<Vec<_>>()
+                .join(", "));
+        }
+    }
+
     // Health alerts
     let last_run: Option<String> = conn.query_row(
         "SELECT finished_at FROM consolidation_log WHERE finished_at IS NOT NULL ORDER BY id DESC LIMIT 1",
