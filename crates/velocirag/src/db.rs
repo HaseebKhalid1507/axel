@@ -263,6 +263,29 @@ impl Database {
             params![SCHEMA_VERSION.to_string()],
         )?;
 
+        // ── Migration: add `indexed_at` to documents if missing ──
+        // Used by the incremental indexer to compare file mtime vs. last-indexed time.
+        let has_indexed_at: bool = {
+            let mut stmt = self.conn.prepare("PRAGMA table_info(documents)")?;
+            let cols: Vec<String> = stmt
+                .query_map([], |row| row.get::<_, String>(1))?
+                .filter_map(|r| r.ok())
+                .collect();
+            cols.iter().any(|c| c == "indexed_at")
+        };
+        if !has_indexed_at {
+            // CURRENT_TIMESTAMP isn't allowed as a default for ALTER TABLE ADD COLUMN,
+            // so use NULL default and backfill from `created`.
+            self.conn.execute(
+                "ALTER TABLE documents ADD COLUMN indexed_at TIMESTAMP",
+                [],
+            )?;
+            self.conn.execute(
+                "UPDATE documents SET indexed_at = COALESCE(created, CURRENT_TIMESTAMP) WHERE indexed_at IS NULL",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
@@ -288,8 +311,8 @@ impl Database {
         let embedding_blob = embedding_to_blob(embedding);
 
         let _id = self.conn.execute(
-            "INSERT OR REPLACE INTO documents (doc_id, content, metadata, embedding, file_path)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT OR REPLACE INTO documents (doc_id, content, metadata, embedding, file_path, indexed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
             params![doc_id, content, metadata_json, embedding_blob, file_path],
         )?;
         let rowid = self.conn.last_insert_rowid();
@@ -385,6 +408,28 @@ impl Database {
             params![file_path],
         )?;
         Ok(deleted)
+    }
+
+    /// Return (file_path, indexed_at_unix_seconds) for every indexed file
+    /// whose `file_path` starts with `prefix`. Used by the incremental indexer
+    /// to decide which files need re-indexing and which to prune.
+    pub fn indexed_files_under(&self, prefix: &str) -> Result<Vec<(String, f64)>> {
+        let pattern = format!("{}%", escape_like(prefix));
+        let mut stmt = self.conn.prepare(
+            "SELECT file_path,
+                    COALESCE(CAST(strftime('%s', indexed_at) AS REAL),
+                             CAST(strftime('%s', created) AS REAL),
+                             0)
+             FROM documents
+             WHERE file_path IS NOT NULL
+               AND file_path LIKE ?1 ESCAPE '\\'",
+        )?;
+        let rows = stmt.query_map(params![pattern], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut out = Vec::new();
+        for r in rows { out.push(r?); }
+        Ok(out)
     }
 
     // ── BM25 / FTS5 ────────────────────────────────────────────────────

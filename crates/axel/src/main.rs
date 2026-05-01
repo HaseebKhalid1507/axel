@@ -39,6 +39,24 @@ enum Commands {
     Index {
         /// Path to file or directory to index
         path: PathBuf,
+        /// Optional source name to prefix doc_ids (e.g. "mikoshi")
+        #[arg(long)]
+        source: Option<String>,
+    },
+    /// Incrementally sync a directory into the brain
+    ///
+    /// Walks `path`, re-indexing only files whose mtime is newer than
+    /// the stored `indexed_at`, and prunes DB entries whose `file_path`
+    /// no longer exists on disk (scoped to `path`).
+    IndexSync {
+        /// Path to directory to sync
+        path: PathBuf,
+        /// Optional source name to prefix doc_ids (e.g. "mikoshi")
+        #[arg(long)]
+        source: Option<String>,
+        /// Skip pruning of deleted files
+        #[arg(long)]
+        no_prune: bool,
     },
     /// Search the brain
     Search {
@@ -103,7 +121,8 @@ fn main() -> ExitCode {
 
     let result = match &cli.command {
         Commands::Init { name } => cmd_init(&cli, name.as_deref()),
-        Commands::Index { path } => cmd_index(&cli, path),
+        Commands::Index { path, source } => cmd_index(&cli, path, source.as_deref()),
+        Commands::IndexSync { path, source, no_prune } => cmd_index_sync(&cli, path, source.as_deref(), *no_prune),
         Commands::Search { query, limit, json } => cmd_search(&cli, query, *limit, *json),
         Commands::Remember { content, category, topic } => cmd_remember(&cli, content, category, topic),
         Commands::Recall { query } => cmd_recall(&cli, query),
@@ -150,7 +169,7 @@ fn cmd_init(cli: &Cli, name: Option<&str>) -> Result<ExitCode, Box<dyn std::erro
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_index(cli: &Cli, target: &Path) -> Result<ExitCode, Box<dyn std::error::Error>> {
+fn cmd_index(cli: &Cli, target: &Path, source: Option<&str>) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = brain_path(cli);
     ensure_brain(&path)?;
 
@@ -167,26 +186,151 @@ fn cmd_index(cli: &Cli, target: &Path) -> Result<ExitCode, Box<dyn std::error::E
             let content = std::fs::read_to_string(entry.path())?;
             if content.len() < 50 { continue; }
 
-            let doc_id = entry.path()
+            let relative_id = entry.path()
                 .strip_prefix(target).unwrap_or(entry.path())
                 .to_string_lossy()
                 .replace('/', "::")
                 .replace(".md", "")
                 .replace(".txt", "");
 
+            let doc_id = if let Some(src) = source {
+                format!("{src}::{relative_id}")
+            } else {
+                relative_id
+            };
+
             search.index_document(&doc_id, &content, None, Some(&entry.path().to_string_lossy()))?;
             count += 1;
         }
     } else {
         let content = std::fs::read_to_string(target)?;
-        let doc_id = target.file_stem()
+        let stem = target.file_stem()
             .map(|s| s.to_string_lossy().to_string())
             .unwrap_or_else(|| "doc".to_string());
+        let doc_id = if let Some(src) = source {
+            format!("{src}::{stem}")
+        } else {
+            stem
+        };
         search.index_document(&doc_id, &content, None, Some(&target.to_string_lossy()))?;
         count = 1;
     }
 
     println!("✓ Indexed {count} documents ({:.1}s)", start.elapsed().as_secs_f64());
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_index_sync(
+    cli: &Cli,
+    target: &Path,
+    source: Option<&str>,
+    no_prune: bool,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let path = brain_path(cli);
+    ensure_brain(&path)?;
+
+    if !target.is_dir() {
+        eprintln!("index-sync requires a directory, got: {}", target.display());
+        return Ok(ExitCode::FAILURE);
+    }
+
+    // Canonicalize so the LIKE-prefix match in the DB lines up with what
+    // `index_document(file_path=…)` originally stored (absolute paths).
+    let target_abs = std::fs::canonicalize(target).unwrap_or_else(|_| target.to_path_buf());
+    let prefix = {
+        let mut s = target_abs.to_string_lossy().to_string();
+        if !s.ends_with('/') { s.push('/'); }
+        s
+    };
+
+    let start = Instant::now();
+    let mut search = BrainSearch::open(&path)?;
+
+    // Map of absolute file_path → indexed_at unix seconds for everything
+    // currently in the brain under this source dir.
+    let indexed: std::collections::HashMap<String, f64> = search
+        .db()
+        .indexed_files_under(&prefix)
+        .map_err(|e| format!("DB read failed: {e}"))?
+        .into_iter()
+        .collect();
+
+    let mut checked = 0usize;
+    let mut reindexed = 0usize;
+    let mut new_files = 0usize;
+    let mut seen_on_disk: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for entry in walkdir::WalkDir::new(&target_abs)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md" || ext == "txt"))
+    {
+        checked += 1;
+        let file_path = entry.path();
+        let abs = match std::fs::canonicalize(file_path) {
+            Ok(p) => p,
+            Err(_) => file_path.to_path_buf(),
+        };
+        let abs_str = abs.to_string_lossy().to_string();
+        seen_on_disk.insert(abs_str.clone());
+
+        // mtime as unix seconds
+        let mtime = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+
+        let is_new = !indexed.contains_key(&abs_str);
+        let needs = match indexed.get(&abs_str) {
+            None => true,
+            Some(&indexed_at) => mtime > indexed_at + 0.5, // 0.5s slack for second-precision TIMESTAMP
+        };
+
+        if !needs { continue; }
+
+        let content = match std::fs::read_to_string(file_path) {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if content.len() < 50 { continue; }
+
+        let relative_id = file_path
+            .strip_prefix(&target_abs).unwrap_or(file_path)
+            .to_string_lossy()
+            .replace('/', "::")
+            .replace(".md", "")
+            .replace(".txt", "");
+        let doc_id = if let Some(src) = source {
+            format!("{src}::{relative_id}")
+        } else {
+            relative_id
+        };
+
+        search.index_document(&doc_id, &content, None, Some(&abs_str))?;
+        reindexed += 1;
+        if is_new { new_files += 1; }
+    }
+
+    // Prune: anything in DB under this prefix that wasn't seen on disk.
+    let mut pruned = 0usize;
+    if !no_prune {
+        for (file_path, _) in &indexed {
+            if !seen_on_disk.contains(file_path) && !std::path::Path::new(file_path).exists() {
+                let n = search.db().delete_documents_by_file(file_path)
+                    .map_err(|e| format!("Delete failed: {e}"))?;
+                if n > 0 { pruned += 1; }
+            }
+        }
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    println!(
+        "✓ sync [{}] checked={checked} reindexed={reindexed} (new={new_files}) pruned={pruned} ({elapsed:.1}s)",
+        source.unwrap_or("(no-source)")
+    );
     Ok(ExitCode::SUCCESS)
 }
 
