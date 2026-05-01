@@ -107,6 +107,24 @@ enum Commands {
         limit: usize,
     },
     /// Run as a SynapsCLI extension (JSON-RPC over stdio)
+    /// Run a consolidation pass on the brain
+    ///
+    /// Reindexes changed files, strengthens accessed documents,
+    /// reorganizes graph edges, and prunes stale content.
+    Consolidate {
+        /// Run specific phase only
+        #[arg(long, value_parser = ["reindex", "strengthen", "reorganize", "prune"])]
+        phase: Option<String>,
+        /// Preview changes without applying them
+        #[arg(long)]
+        dry_run: bool,
+        /// Verbose output (per-document details)
+        #[arg(short, long)]
+        verbose: bool,
+        /// Path to sources config TOML
+        #[arg(long)]
+        sources: Option<PathBuf>,
+    },
     Extension,
     /// Run as an MCP server (exposes search/remember/recall as tools)
     Mcp,
@@ -130,6 +148,8 @@ fn main() -> ExitCode {
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
+        Commands::Consolidate { phase, dry_run, verbose, sources } =>
+            cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref()),
         Commands::Extension => {
             let path = brain_path(&cli);
             axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
@@ -331,6 +351,67 @@ fn cmd_index_sync(
         "✓ sync [{}] checked={checked} reindexed={reindexed} (new={new_files}) pruned={pruned} ({elapsed:.1}s)",
         source.unwrap_or("(no-source)")
     );
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_consolidate(
+    cli: &Cli,
+    phase: Option<&str>,
+    dry_run: bool,
+    verbose: bool,
+    _sources_path: Option<&Path>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use axel::consolidate::{self, Phase, ConsolidateOptions, SourceDir, Priority};
+
+    let path = brain_path(cli);
+    ensure_brain(&path)?;
+
+    let mut search = BrainSearch::open(&path)?;
+
+    // Default sources — hardcoded for now, TODO: parse from TOML
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
+    let sources = vec![
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
+        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
+        SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
+    ];
+
+    let phases = match phase {
+        Some("reindex") => [Phase::Reindex].into_iter().collect(),
+        Some("strengthen") => [Phase::Strengthen].into_iter().collect(),
+        Some("reorganize") => [Phase::Reorganize].into_iter().collect(),
+        Some("prune") => [Phase::Prune].into_iter().collect(),
+        _ => std::collections::HashSet::new(), // empty = all
+    };
+
+    let opts = ConsolidateOptions {
+        sources,
+        phases,
+        dry_run,
+        verbose,
+    };
+
+    if dry_run {
+        println!("🔍 Dry run — no changes will be written\n");
+    }
+
+    let stats = consolidate::consolidate(&mut search, &opts)?;
+
+    println!("\n═══ Consolidation {} ═══", if dry_run { "(dry run)" } else { "complete" });
+    println!("  Phase 1 — Reindex:    {} checked, {} reindexed ({} new), {} pruned",
+        stats.reindex.checked, stats.reindex.reindexed, stats.reindex.new_files, stats.reindex.pruned);
+    println!("  Phase 2 — Strengthen: {} boosted, {} decayed, {} extinction",
+        stats.strengthen.boosted, stats.strengthen.decayed, stats.strengthen.extinction_signals);
+    println!("  Phase 3 — Reorganize: {} pairs, +{} edges, ~{} updated, -{} removed",
+        stats.reorganize.co_retrieval_pairs, stats.reorganize.edges_added,
+        stats.reorganize.edges_updated, stats.reorganize.edges_removed);
+    println!("  Phase 4 — Prune:      {} removed, {} flagged, {} misaligned",
+        stats.prune.removed, stats.prune.flagged, stats.prune.misaligned);
+    println!("  Duration: {:.1}s", stats.duration_secs);
+
     Ok(ExitCode::SUCCESS)
 }
 

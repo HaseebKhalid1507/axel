@@ -379,6 +379,25 @@ impl Database {
             )?;
         }
 
+        // ── Migration: add valid_from/valid_to to edges if missing ──
+        let edge_cols: Vec<String> = self.conn
+            .prepare("PRAGMA table_info(edges)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .filter_map(|r| r.ok())
+            .collect();
+        if !edge_cols.is_empty() && !edge_cols.iter().any(|c| c == "valid_from") {
+            self.conn.execute(
+                "ALTER TABLE edges ADD COLUMN valid_from TEXT",
+                [],
+            )?;
+        }
+        if !edge_cols.is_empty() && !edge_cols.iter().any(|c| c == "valid_to") {
+            self.conn.execute(
+                "ALTER TABLE edges ADD COLUMN valid_to TEXT",
+                [],
+            )?;
+        }
+
         Ok(())
     }
 
