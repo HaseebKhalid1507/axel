@@ -601,18 +601,8 @@ fn cmd_search(
     let response = search.search(&query, limit)?;
     let ms = start.elapsed().as_millis();
 
-    // Log search hits as document access events (same as MCP path)
-    let db = search.db();
-    for r in &response.results {
-        let _ = db.log_document_access(&r.doc_id, "search_hit", Some(&query), Some(r.score), None);
-        let _ = db.increment_document_access(&r.doc_id);
-    }
-    let top_ids: Vec<&str> = response.results.iter().take(5).map(|r| r.doc_id.as_str()).collect();
-    for i in 0..top_ids.len() {
-        for j in (i+1)..top_ids.len() {
-            let _ = db.log_co_retrieval(top_ids[i], top_ids[j], &query);
-        }
-    }
+    // Record search feedback for consolidation
+    search.record_search_feedback(&query, &response.results);
 
     if json_mode {
         let results: Vec<serde_json::Value> = response.results.iter().map(|r| {

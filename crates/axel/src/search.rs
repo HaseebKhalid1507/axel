@@ -233,6 +233,23 @@ impl BrainSearch {
     pub fn db(&self) -> &Database {
         &self.db
     }
+
+    /// Record search feedback: access events + co-retrieval pairs.
+    /// Called after every search (CLI and MCP) to feed consolidation data.
+    /// All logging is best-effort — failures are silently ignored.
+    pub fn record_search_feedback(&self, query: &str, results: &[velocirag::search::SearchResult]) {
+        let db = &self.db;
+        for r in results {
+            let _ = db.log_document_access(&r.doc_id, "search_hit", Some(query), Some(r.score), None);
+            let _ = db.increment_document_access(&r.doc_id);
+        }
+        let top_ids: Vec<&str> = results.iter().take(5).map(|r| r.doc_id.as_str()).collect();
+        for i in 0..top_ids.len() {
+            for j in (i+1)..top_ids.len() {
+                let _ = db.log_co_retrieval(top_ids[i], top_ids[j], query);
+            }
+        }
+    }
 }
 
 impl Drop for BrainSearch {
