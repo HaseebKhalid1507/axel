@@ -406,8 +406,13 @@ fn cmd_consolidate(
     let stats = consolidate::consolidate(&mut search, &opts)?;
 
     println!("\n═══ Consolidation {} ═══", if dry_run { "(dry run)" } else { "complete" });
-    println!("  Phase 1 — Reindex:    {} checked, {} reindexed ({} new), {} pruned",
-        stats.reindex.checked, stats.reindex.reindexed, stats.reindex.new_files, stats.reindex.pruned);
+    let skip_info = if stats.reindex.skipped > 0 {
+        format!(", {} skipped", stats.reindex.skipped)
+    } else {
+        String::new()
+    };
+    println!("  Phase 1 — Reindex:    {} checked, {} reindexed ({} new), {} pruned{}",
+        stats.reindex.checked, stats.reindex.reindexed, stats.reindex.new_files, stats.reindex.pruned, skip_info);
     println!("  Phase 2 — Strengthen: {} boosted, {} decayed, {} extinction",
         stats.strengthen.boosted, stats.strengthen.decayed, stats.strengthen.extinction_signals);
     println!("  Phase 3 — Reorganize: {} pairs, +{} edges, ~{} updated, -{} removed",

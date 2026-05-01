@@ -162,6 +162,7 @@ pub fn consolidate(search: &mut BrainSearch, opts: &ConsolidateOptions) -> Resul
                     stats.reindex.reindexed += s.reindexed;
                     stats.reindex.new_files += s.new_files;
                     stats.reindex.pruned += s.pruned;
+                    stats.reindex.skipped += s.skipped;
                 }
                 Err(e) => {
                     partial_failure = true;

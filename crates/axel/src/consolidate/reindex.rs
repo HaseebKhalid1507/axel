@@ -20,6 +20,7 @@ pub struct ReindexStats {
     pub reindexed: usize,
     pub new_files: usize,
     pub pruned: usize,
+    pub skipped: usize,
 }
 
 const ALLOCATION_K: usize = 5;
@@ -86,7 +87,13 @@ pub fn reindex_source(
 
         let content = match std::fs::read_to_string(file_path) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(e) => {
+                stats.skipped += 1;
+                if std::env::var("AXEL_VERBOSE").is_ok() {
+                    eprintln!("⚠ skip unreadable file {}: {e}", file_path.display());
+                }
+                continue;
+            }
         };
         if content.len() < 50 { continue; }
 
