@@ -315,6 +315,205 @@ impl<'a> SearchEngine<'a> {
             fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
         }
 
+        // ═══ GRAPH BOOST (spreading activation) ═══
+        // Huang/Chen/Zeng 2004: propagate relevance along co_retrieved edges.
+        // A doc connected to a strong hit gets a fractional boost — even if it
+        // didn't match the query directly. Closes the loop with consolidation:
+        // edges built from co-retrieval feed back into ranking.
+        const GRAPH_BOOST_FACTOR: f64 = 0.3;
+        const GRAPH_SOURCES_TOPK: usize = 5;
+
+        if !fused.is_empty() {
+            // Cheap gate: skip entirely if the graph has no live co_retrieved edges.
+            let has_coret: bool = self.db.conn()
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM edges WHERE type = 'co_retrieved'
+                                   AND (valid_to IS NULL OR valid_to > datetime('now')) LIMIT 1)",
+                    [],
+                    |row| row.get::<_, i64>(0).map(|n| n != 0),
+                )
+                .unwrap_or(false);
+
+            if has_coret {
+                // Snapshot top-K parents (doc_id, rrf_score) — `fused` will mutate below.
+                let parents: Vec<(String, f64)> = fused.iter()
+                    .take(GRAPH_SOURCES_TOPK)
+                    .map(|f| (f.doc_id.clone(), f.rrf_score))
+                    .collect();
+
+                // doc_id -> position in `fused`, for O(1) bumps.
+                let mut index_map: std::collections::HashMap<String, usize> =
+                    fused.iter().enumerate().map(|(i, f)| (f.doc_id.clone(), i)).collect();
+
+                // Aggregate boosts before mutating, so multiple parents stack.
+                let mut boost_accum: std::collections::HashMap<String, f64> =
+                    std::collections::HashMap::new();
+
+                let conn = self.db.conn();
+                {
+                    let mut fwd = conn.prepare_cached(
+                        "SELECT target_id, weight FROM edges
+                         WHERE source_id = ?1 AND type = 'co_retrieved'
+                           AND (valid_to IS NULL OR valid_to > datetime('now'))",
+                    ).ok();
+                    let mut rev = conn.prepare_cached(
+                        "SELECT source_id, weight FROM edges
+                         WHERE target_id = ?1 AND type = 'co_retrieved'
+                           AND (valid_to IS NULL OR valid_to > datetime('now'))",
+                    ).ok();
+
+                    for (parent_id, parent_score) in &parents {
+                        let mut neighbors: Vec<(String, f64)> = Vec::new();
+                        if let Some(ref mut s) = fwd {
+                            if let Ok(rows) = s.query_map([parent_id], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                            }) {
+                                neighbors.extend(rows.flatten());
+                            }
+                        }
+                        if let Some(ref mut s) = rev {
+                            if let Ok(rows) = s.query_map([parent_id], |row| {
+                                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                            }) {
+                                neighbors.extend(rows.flatten());
+                            }
+                        }
+                        for (neighbor_id, weight) in neighbors {
+                            if neighbor_id == *parent_id { continue; } // self-loop guard
+                            let graph_score = parent_score * weight * GRAPH_BOOST_FACTOR;
+                            *boost_accum.entry(neighbor_id).or_insert(0.0) += graph_score;
+                        }
+                    }
+                } // drop cached stmts so we can re-borrow conn
+
+                // Apply boosts: bump existing or add new candidates (capped).
+                let max_total = opts.limit * 2;
+                for (neighbor_id, graph_score) in boost_accum {
+                    if let Some(&idx) = index_map.get(&neighbor_id) {
+                        fused[idx].rrf_score += graph_score;
+                    } else if fused.len() < max_total {
+                        let row = conn.query_row(
+                            "SELECT content, metadata FROM documents WHERE doc_id = ?1",
+                            [&neighbor_id],
+                            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                        ).ok();
+                        if let Some((content, metadata_str)) = row {
+                            let doc_metadata: serde_json::Value =
+                                serde_json::from_str(&metadata_str).unwrap_or_else(|_| serde_json::json!({}));
+                            index_map.insert(neighbor_id.clone(), fused.len());
+                            fused.push(FusedResult {
+                                doc_id: neighbor_id,
+                                content,
+                                rrf_score: graph_score,
+                                original_score: 0.0,
+                                metadata: serde_json::json!({
+                                    "source": "graph_boost",
+                                    "graph_score": graph_score,
+                                    "doc_metadata": doc_metadata,
+                                }),
+                            });
+                        }
+                    }
+                }
+
+                // Re-sort after spreading activation.
+                fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
+            }
+        }
+
+        // ═══ MMR DIVERSITY (Goldstein & Carbonell, 1998) ═══
+        // Penalize near-duplicates (e.g. same doc indexed via two source paths).
+        // MMR = λ · rel(d) − (1 − λ) · max_sim(d, selected)
+        if fused.len() > opts.limit {
+            const LAMBDA: f32 = 0.7;
+
+            // Batch-load embeddings for candidates by doc_id.
+            let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT doc_id, embedding FROM documents WHERE doc_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut emb_map: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
+            if let Ok(mut stmt) = self.db.conn().prepare_cached(&sql) {
+                let params: Vec<&dyn rusqlite::ToSql> = fused.iter().map(|r| &r.doc_id as &dyn rusqlite::ToSql).collect();
+                if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
+                    let doc_id: String = row.get(0)?;
+                    let blob: Vec<u8> = row.get(1)?;
+                    let v: Vec<f32> = blob
+                        .chunks_exact(4)
+                        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                        .collect();
+                    Ok((doc_id, v))
+                }) {
+                    for r in rows.flatten() {
+                        emb_map.insert(r.0, r.1);
+                    }
+                }
+            }
+
+            fn cosine(a: &[f32], b: &[f32]) -> f32 {
+                if a.len() != b.len() || a.is_empty() {
+                    return 0.0;
+                }
+                let mut dot = 0.0f32;
+                let mut na = 0.0f32;
+                let mut nb = 0.0f32;
+                for i in 0..a.len() {
+                    dot += a[i] * b[i];
+                    na += a[i] * a[i];
+                    nb += b[i] * b[i];
+                }
+                let denom = na.sqrt() * nb.sqrt();
+                if denom == 0.0 { 0.0 } else { dot / denom }
+            }
+
+            // Normalize relevance to [0,1] for stable MMR scaling.
+            let max_rel = fused.iter().map(|r| r.rrf_score).fold(f64::MIN, f64::max);
+            let min_rel = fused.iter().map(|r| r.rrf_score).fold(f64::MAX, f64::min);
+            let span = (max_rel - min_rel).max(1e-9);
+
+            let mut remaining: Vec<FusedResult> = std::mem::take(&mut fused);
+            let mut selected: Vec<FusedResult> = Vec::with_capacity(opts.limit);
+            let mut selected_embs: Vec<Vec<f32>> = Vec::with_capacity(opts.limit);
+
+            // Seed with highest-scoring doc.
+            let first = remaining.remove(0);
+            if let Some(e) = emb_map.get(&first.doc_id).cloned() {
+                selected_embs.push(e);
+            } else {
+                selected_embs.push(Vec::new());
+            }
+            selected.push(first);
+
+            while selected.len() < opts.limit && !remaining.is_empty() {
+                let mut best_idx = 0usize;
+                let mut best_score = f32::MIN;
+                for (i, cand) in remaining.iter().enumerate() {
+                    let rel = ((cand.rrf_score - min_rel) / span) as f32;
+                    let max_sim = if let Some(ce) = emb_map.get(&cand.doc_id) {
+                        selected_embs
+                            .iter()
+                            .map(|se| if se.is_empty() { 0.0 } else { cosine(ce, se) })
+                            .fold(f32::MIN, f32::max)
+                    } else {
+                        0.0
+                    };
+                    let max_sim = if max_sim == f32::MIN { 0.0 } else { max_sim };
+                    let mmr = LAMBDA * rel - (1.0 - LAMBDA) * max_sim;
+                    if mmr > best_score {
+                        best_score = mmr;
+                        best_idx = i;
+                    }
+                }
+                let chosen = remaining.remove(best_idx);
+                let emb = emb_map.get(&chosen.doc_id).cloned().unwrap_or_default();
+                selected_embs.push(emb);
+                selected.push(chosen);
+            }
+
+            fused = selected;
+        }
+
         // ═══ RERANK (optional) ═══
         let final_results = if opts.use_reranker && self.reranker.is_some() {
             let t = Instant::now();
