@@ -175,7 +175,7 @@ pub fn consolidate(search: &mut BrainSearch, opts: &ConsolidateOptions) -> Resul
     // Phase 2: Strengthen — reconsolidation from access log.
     if wants(&opts.phases, Phase::Strengthen) {
         if opts.verbose { eprintln!("⟳ strengthen"); }
-        match strengthen::strengthen(search, opts.dry_run) {
+        match strengthen::strengthen(search, opts.dry_run, opts.verbose) {
             Ok(s) => stats.strengthen = s,
             Err(e) => {
                 partial_failure = true;

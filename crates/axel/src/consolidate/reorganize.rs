@@ -39,7 +39,7 @@ const STALE_DAYS: i64 = 30;
 
 /// Deterministic id for the co_retrieved edge between two doc_ids. Order-
 /// independent so swapping a/b yields the same id.
-fn coret_edge_id(a: &str, b: &str) -> String {
+pub(crate) fn coret_edge_id(a: &str, b: &str) -> String {
     let (lo, hi) = if a <= b { (a, b) } else { (b, a) };
     let mut h = DefaultHasher::new();
     lo.hash(&mut h);

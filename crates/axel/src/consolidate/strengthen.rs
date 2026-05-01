@@ -28,7 +28,7 @@ const EXTINCTION_PENALTY: f64 = 0.05;
 const EXCITABILITY_FLOOR: f64 = 0.1;
 const EXCITABILITY_CEILING: f64 = 1.0;
 
-pub fn strengthen(search: &BrainSearch, dry_run: bool) -> Result<StrengthenStats> {
+pub fn strengthen(search: &BrainSearch, dry_run: bool, verbose: bool) -> Result<StrengthenStats> {
     let mut stats = StrengthenStats::default();
     let db = search.db();
 
@@ -92,12 +92,20 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool) -> Result<StrengthenStats
 
         let new_excitability = if avg_score < SCORE_EXTINCTION_THRESHOLD {
             stats.extinction_signals += 1;
-            (current - EXTINCTION_PENALTY).max(EXCITABILITY_FLOOR)
+            let new = (current - EXTINCTION_PENALTY).max(EXCITABILITY_FLOOR);
+            if verbose {
+                eprintln!("  ↘ {doc_id}  {current:.3} → {new:.3}  (extinction, avg_score={avg_score:.4}, {count} hits)");
+            }
+            new
         } else {
             stats.boosted += 1;
             // log2 to match memkoshi/decay.rs and the spec; ln grew ~1.44× slower.
             let boost = (BOOST_SCALE * ((*count as f64) + 1.0).log2()).min(BOOST_CAP);
-            (current + boost).min(EXCITABILITY_CEILING)
+            let new = (current + boost).min(EXCITABILITY_CEILING);
+            if verbose {
+                eprintln!("  ↗ {doc_id}  {current:.3} → {new:.3}  (boost +{boost:.4}, {count} hits)");
+            }
+            new
         };
 
         boost_updates.push((doc_id.clone(), new_excitability));

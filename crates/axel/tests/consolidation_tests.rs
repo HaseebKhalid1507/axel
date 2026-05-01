@@ -257,3 +257,133 @@ fn cleanup_deletes_rows_older_than_90_days() {
     assert_eq!(da_count, 1, "old document_access row should be deleted");
     assert_eq!(cr_count, 1, "old co_retrieval row should be deleted");
 }
+
+// ─── 11. excitability floor clamp ──────────────────────────────────────────
+#[test]
+fn excitability_clamp_floor() {
+    let (mut brain, _tmp) = setup_brain();
+    let search = brain.search_mut();
+    let db = search.db();
+
+    db.insert_document("doc_floor", "content for floor clamp test long enough to satisfy", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    db.conn().execute(
+        "UPDATE documents SET excitability = 0.12,
+                              indexed_at   = datetime('now', '-365 days'),
+                              created      = datetime('now', '-365 days')
+         WHERE doc_id = ?1",
+        params!["doc_floor"],
+    ).unwrap();
+
+    // Hammer decay enough times to drive past the floor if it weren't clamped.
+    for _ in 0..50 {
+        let _ = strengthen(search, false).unwrap();
+    }
+
+    let v = excitability_of(search.db(), "doc_floor");
+    assert!(v >= 0.1 - 1e-9, "excitability dipped below floor: {v}");
+}
+
+// ─── 12. excitability ceiling clamp ────────────────────────────────────────
+#[test]
+fn excitability_clamp_ceiling() {
+    let (mut brain, _tmp) = setup_brain();
+    let search = brain.search_mut();
+    let db = search.db();
+
+    db.insert_document("doc_ceil", "content for ceiling clamp test long enough to satisfy", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    db.conn().execute(
+        "UPDATE documents SET excitability = 0.99 WHERE doc_id = ?1",
+        params!["doc_ceil"],
+    ).unwrap();
+
+    // Pile on high-score hits so every strengthen() pass tries to boost.
+    for _ in 0..20 {
+        db.log_document_access("doc_ceil", "search_hit", Some("q"), Some(0.95), None).unwrap();
+    }
+
+    for _ in 0..50 {
+        let _ = strengthen(search, false).unwrap();
+    }
+
+    let v = excitability_of(search.db(), "doc_ceil");
+    assert!(v <= 1.0 + 1e-9, "excitability exceeded ceiling: {v}");
+}
+
+// ─── 13. coret_edge_id is order-independent ────────────────────────────────
+#[test]
+fn coret_edge_id_is_order_independent() {
+    use axel::consolidate::reorganize::coret_edge_id;
+    assert_eq!(coret_edge_id("a", "b"), coret_edge_id("b", "a"));
+    assert_eq!(coret_edge_id("zzz", "aaa"), coret_edge_id("aaa", "zzz"));
+    // Different inputs ⇒ different edges.
+    assert_ne!(coret_edge_id("a", "b"), coret_edge_id("a", "c"));
+}
+
+// ─── 14. document access_count increments to 3 ─────────────────────────────
+#[test]
+fn document_access_count_increments() {
+    let db = Database::open_memory().unwrap();
+    db.insert_document("doc_n", "content for access count increment test long enough", &serde_json::json!({}), &fake_emb(), None).unwrap();
+
+    db.increment_document_access("doc_n").unwrap();
+    db.increment_document_access("doc_n").unwrap();
+    db.increment_document_access("doc_n").unwrap();
+
+    let count: i64 = db.conn()
+        .query_row("SELECT access_count FROM documents WHERE doc_id = ?1", params!["doc_n"], |r| r.get(0))
+        .unwrap();
+    assert_eq!(count, 3);
+}
+
+// ─── 15. last_consolidation_time skips in-progress runs ────────────────────
+#[test]
+fn consolidation_log_in_progress_marker() {
+    let db = Database::open_memory().unwrap();
+
+    // Previous, fully-finished run.
+    db.insert_consolidation_log(&ConsolidationLogEntry {
+        started_at:           "2026-01-01T00:00:00Z".into(),
+        finished_at:          Some("2026-01-01T00:01:00Z".into()),
+        phase1_reindexed: 0, phase1_pruned: 0,
+        phase2_boosted:   0, phase2_decayed: 0,
+        phase3_edges_added: 0, phase3_edges_updated: 0,
+        phase4_flagged:   0, phase4_removed: 0,
+        duration_secs: Some(60.0),
+    }).unwrap();
+
+    // Current, in-progress run (finished_at = NULL).
+    db.conn().execute(
+        "INSERT INTO consolidation_log (started_at, finished_at) VALUES (?1, NULL)",
+        params!["2026-02-01T00:00:00Z"],
+    ).unwrap();
+
+    let last = db.last_consolidation_time().unwrap();
+    assert_eq!(last.as_deref(), Some("2026-01-01T00:01:00Z"),
+        "in-progress run should be ignored; previous finished run wins");
+}
+
+// ─── 16. CLI search --limit cap ────────────────────────────────────────────
+//
+// MCP caps `limit` at 50. The CLI currently does NOT cap — `cmd_search`
+// forwards the user-supplied value straight to `BrainSearch::search`. This
+// test pins that behavior so any future cap (or its absence) is intentional.
+#[test]
+fn search_limit_cap_cli() {
+    let src = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")
+    ).expect("read main.rs");
+
+    // Find cmd_search and inspect ~40 lines for any explicit cap.
+    let idx = src.find("fn cmd_search").expect("cmd_search defined");
+    let window: String = src[idx..].lines().take(40).collect::<Vec<_>>().join("\n");
+
+    let has_cap = window.contains(".min(50")
+        || window.contains(".min(100")
+        || window.contains("limit.min(")
+        || window.contains("if limit >");
+
+    // NOTE: as of this commit the CLI does not cap --limit. If you add one,
+    // flip this assertion. The MCP path enforces 50 independently.
+    assert!(!has_cap,
+        "CLI now caps --limit; update this test (and confirm parity with MCP's 50 cap)");
+}
