@@ -100,6 +100,12 @@ enum Commands {
     },
     /// Show brain statistics
     Stats,
+    /// Show excitability distribution — top and bottom documents
+    Excitability {
+        /// Number of documents to show per group
+        #[arg(long, default_value = "10")]
+        limit: usize,
+    },
     /// List stored memories
     Memories {
         /// Maximum memories to list
@@ -159,6 +165,7 @@ fn main() -> ExitCode {
         Commands::Handoff { action, content } => cmd_handoff(&cli, action, content),
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
+        Commands::Excitability { limit } => cmd_excitability(&cli, *limit),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
         Commands::Consolidate { phase, dry_run, verbose, sources, history, report } =>
             if *history {
@@ -815,6 +822,87 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("  Access events:  {access_count} ({accessed_docs} unique docs)");
     println!("  Co-retrievals:  {co_ret_count}");
     println!("  Excitability:   μ={avg_excitability:.3}  min={min_excitability:.3}  max={max_excitability:.3}");
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_excitability(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let path = brain_path(cli);
+    ensure_brain(&path)?;
+    let brain = Brain::open(&path)?;
+    let conn = brain.conn();
+
+    println!("═══ Excitability Distribution ═══\n");
+
+    // Top N most excitable
+    println!("🔥 Most excitable (top {limit}):\n");
+    let mut stmt = conn.prepare(
+        "SELECT doc_id, excitability, access_count,
+                COALESCE(CAST(julianday('now') - julianday(created) AS INTEGER), 0) as age_days
+         FROM documents
+         ORDER BY excitability DESC
+         LIMIT ?1"
+    )?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows.flatten() {
+        let bar = "█".repeat(((row.1 * 20.0) as usize).min(20));
+        println!("  {:.3} {} [{:>3} hits, {:>3}d] {}",
+            row.1, bar, row.2, row.3, row.0);
+    }
+
+    // Bottom N least excitable
+    println!("\n❄ Least excitable (bottom {limit}):\n");
+    let mut stmt = conn.prepare(
+        "SELECT doc_id, excitability, access_count,
+                COALESCE(CAST(julianday('now') - julianday(created) AS INTEGER), 0) as age_days
+         FROM documents
+         ORDER BY excitability ASC
+         LIMIT ?1"
+    )?;
+    let rows = stmt.query_map([limit], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, f64>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, i64>(3)?,
+        ))
+    })?;
+    for row in rows.flatten() {
+        let bar = "█".repeat(((row.1 * 20.0) as usize).min(20));
+        println!("  {:.3} {} [{:>3} hits, {:>3}d] {}",
+            row.1, bar, row.2, row.3, row.0);
+    }
+
+    // Distribution histogram
+    println!("\n📊 Distribution:\n");
+    let buckets: Vec<(String, i64)> = conn.prepare(
+        "SELECT
+            CASE
+                WHEN excitability < 0.2 THEN '0.0-0.2'
+                WHEN excitability < 0.4 THEN '0.2-0.4'
+                WHEN excitability < 0.6 THEN '0.4-0.6'
+                WHEN excitability < 0.8 THEN '0.6-0.8'
+                ELSE '0.8-1.0'
+            END as bucket,
+            COUNT(*) as cnt
+         FROM documents
+         GROUP BY bucket
+         ORDER BY bucket"
+    )?.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?.flatten().collect();
+
+    let max_count = buckets.iter().map(|(_, c)| *c).max().unwrap_or(1);
+    for (bucket, count) in &buckets {
+        let bar_len = ((*count as f64 / max_count as f64) * 40.0) as usize;
+        let bar = "█".repeat(bar_len);
+        println!("  {bucket}  {bar} {count}");
+    }
 
     Ok(ExitCode::SUCCESS)
 }

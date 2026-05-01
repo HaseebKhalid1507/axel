@@ -83,6 +83,10 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
     stats.co_retrieval_pairs = pairs.len();
 
     // 3. Upsert co_retrieved edges for each surviving pair.
+    // Wrap in a transaction to avoid partial writes on error.
+    if !dry_run && !pairs.is_empty() {
+        let _ = conn.execute_batch("BEGIN");
+    }
     for (a, b, count) in &pairs {
         let edge_id = coret_edge_id(a, b);
         let bump = (*count as f64) / 10.0;
@@ -136,6 +140,9 @@ pub fn reorganize(search: &BrainSearch, dry_run: bool) -> Result<ReorganizeStats
                 stats.edges_added += 1;
             }
         }
+    }
+    if !dry_run && !pairs.is_empty() {
+        let _ = conn.execute_batch("COMMIT");
     }
 
     // 4. Decay stale co_retrieved edges — those with no recent reinforcement.
