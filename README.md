@@ -1,17 +1,18 @@
 # Axel
 
-**Portable agent intelligence — search, memory, and session awareness in one `.r8` file.**
+**Portable agent intelligence — search, memory, and self-organizing knowledge in one `.r8` file.**
 
-One file is your agent's entire brain. Copy it. Move it. It just works.
+One file is your agent's entire brain. It searches, remembers, and gets smarter the more you use it.
 
 ---
 
-## What It Is
+## What It Does
 
-Axel is a CLI tool and library that gives any AI agent persistent memory. Three engines, one file:
+Axel gives AI agents persistent, self-organizing memory. Three systems, one file:
 
-- **VelociRAG** — 4-layer search (vector similarity + BM25 keywords + knowledge graph + metadata), fused with Reciprocal Rank Fusion
-- **Memkoshi** — Memory system with staging gates, HMAC signing, importance decay/boost, and injection detection
+- **VelociRAG** — 4-layer search (vector + BM25 + knowledge graph + metadata), fused with Reciprocal Rank Fusion, enhanced with MMR diversity, graph-boosted retrieval, query expansion, and excitability-aware ranking
+- **Memkoshi** — Structured memory with staging, HMAC signing, importance decay/boost, and injection detection
+- **Consolidation** — Biologically-inspired memory lifecycle that strengthens accessed documents, decays forgotten ones, wires related docs together, and prunes stale content
 
 Everything lives in a single `.r8` file — a SQLite database that IS your agent's brain.
 
@@ -27,7 +28,7 @@ cargo build --release
 axel init --name myagent
 
 # Index your notes
-axel index ./notes
+axel index ./notes --source mynotes
 
 # Search
 axel search "rust async patterns"
@@ -35,8 +36,11 @@ axel search "rust async patterns"
 # Remember something
 axel remember --category preferences --topic stack "Chose axum over actix for async websocket support"
 
-# Boot context (handoff + recent memories)
+# Boot context (handoff + recent memories + hot docs)
 axel recall
+
+# Run consolidation (or let the timer do it)
+axel consolidate
 ```
 
 ---
@@ -45,49 +49,125 @@ axel recall
 
 | Command | Description |
 |---------|-------------|
-| `axel init [--name N]` | Create a new `.r8` brain file |
-| `axel index <path>` | Index a file or directory (`.md` + `.txt`) |
-| `axel search <query> [--limit N] [--json]` | 4-layer search across documents and memories |
-| `axel remember <content> [--category C] [--topic T]` | Store a signed memory |
-| `axel recall [query]` | Boot context (handoff + recent memories), or query-based recall |
-| `axel extract <file\|text>` | Extract memories from a transcript via regex + quality gate |
-| `axel handoff <set\|get\|clear> [content]` | Manage session handoff note (max 4096 chars) |
-| `axel forget <id>` | Delete a memory by ID (`mem_xxxxxxxx`) |
-| `axel stats` | Brain statistics: documents, memories, graph nodes, file size |
-| `axel memories [--limit N]` | List stored memories with signature status |
+| `axel init [--name N]` | Create a new `.r8` brain |
+| `axel index <path> [--source S]` | Index a file or directory |
+| `axel index-sync <path> [--source S]` | Incremental sync — only re-index changed files |
+| `axel search <query> [--limit N] [--json]` | Search with excitability boost, MMR diversity, graph expansion |
+| `axel remember <content>` | Store a signed memory |
+| `axel recall [query]` | Boot context or query-based recall |
+| `axel handoff <set\|get\|clear>` | Session handoff management |
+| `axel forget <id>` | Delete a memory |
+| `axel stats` | Brain health dashboard — docs, access events, excitability, top queries |
+| `axel memories [--limit N]` | List stored memories |
+| `axel consolidate` | Run the 4-phase memory lifecycle |
+| `axel excitability [--limit N]` | Visualize document importance distribution |
+| `axel suggest <query>` | Graph-based document recommendations |
+| `axel extension` | Run as SynapsCLI extension (JSON-RPC) |
+| `axel mcp` | Run as MCP server (6 tools) |
 
-**Memory categories:** `events` (default) · `preferences` · `entities` · `cases` · `patterns`
-
-**`--json` flag:** `axel search --json "query"` returns structured JSON for scripting/agents.
+### Consolidation Flags
 
 ```bash
-# JSON output example
-axel search --json "deployment strategy" | jq '.results[0].content'
+axel consolidate                    # Full 4-phase run
+axel consolidate --phase reindex    # Single phase only
+axel consolidate --dry-run          # Preview without changes
+axel consolidate -v                 # Per-document detail
+axel consolidate --history          # Past runs + timer status
+axel consolidate --report out.md    # Export prune candidates
+axel consolidate --json             # Machine-readable output
+axel consolidate --sources cfg.toml # Custom source config
+```
+
+---
+
+## Consolidation
+
+The brain self-organizes through a 4-phase cycle that runs automatically every 6 hours:
+
+**Phase 1 — Reindex.** Walk source directories, detect changed files via mtime comparison, re-embed modified content, prune deleted files. New documents get linked to high-excitability neighbors (competitive allocation).
+
+**Phase 2 — Strengthen.** Read the access log since last run. Documents that were searched for get an excitability boost. Documents with consistently low search scores get an extinction signal. Documents untouched for weeks decay following an exponential forgetting curve. More accesses = slower decay.
+
+**Phase 3 — Reorganize.** Documents that keep appearing in the same search results get graph edges between them. Unreinforced edges decay. The knowledge graph wires itself through usage.
+
+**Phase 4 — Prune.** Flag stale documents (low excitability, zero access, old). Auto-remove from low-priority sources. Flag for human review from high-priority sources. Detect misaligned embeddings.
+
+### The Feedback Loop
+
+```
+search → access logged → consolidation boosts excitability →
+search ranking improves → more access → more boost → repeat
+```
+
+Documents you use get stronger. Documents you don't fade away. The brain self-organizes.
+
+### Setup
+
+```bash
+# Enable the systemd timer (every 6 hours)
+systemctl --user enable --now axel-consolidate.timer
+
+# Configure sources
+cat ~/.config/axel/sources.toml
+```
+
+```toml
+[[source]]
+name = "notes"
+path = "~/notes/"
+priority = "high"
+
+[[source]]
+name = "archive"
+path = "~/archive/"
+priority = "low"
+```
+
+---
+
+## Search
+
+Search combines 4 retrieval layers via Reciprocal Rank Fusion, then applies post-processing:
+
+1. **Vector similarity** — ONNX MiniLM-L6-v2 embeddings, USearch HNSW index
+2. **BM25 keywords** — FTS5 full-text search with pseudo-relevance query expansion
+3. **Knowledge graph** — traverse entity and relationship edges
+4. **Metadata** — tags and cross-references
+5. **RRF fusion** — merge all layers into a single ranked list
+6. **Excitability boost** — recently accessed docs rank higher, with exponential temporal decay
+7. **Graph boost** — documents connected via co-retrieval edges get a spreading activation bump
+8. **MMR diversity** — penalize near-duplicate results via cosine similarity
+
+```bash
+axel search "deployment strategy" --limit 5
+axel search "deployment strategy" --json | jq '.results[0].content'
 ```
 
 ---
 
 ## The `.r8` Format
 
-A `.r8` file is a **single SQLite database** (WAL mode). One file = one brain. No directories, no sidecars.
+A `.r8` file is a **single SQLite database** (WAL mode). One file = one brain.
 
 ```
-axel.r8  →  Single SQLite file
-  ├── documents + documents_fts   — indexed corpus (FTS5 full-text search)
-  ├── nodes + edges               — knowledge graph (lightweight: title/type only, no content)
-  ├── memories + staged_memories  — HMAC-signed memories with review pipeline
-  ├── events + memory_access      — behavioral event log
-  ├── patterns                    — detected behavioral patterns
-  ├── context_data                — session handoff + boot context (key/value)
-  └── schema_info                 — schema version, agent name, created timestamp
+axel.r8  →  SQLite
+  ├── documents              — indexed corpus with excitability scores
+  ├── documents_fts          — FTS5 full-text search index
+  ├── document_access        — search hit log (feeds consolidation)
+  ├── co_retrieval           — co-appearance tracking (feeds graph wiring)
+  ├── consolidation_log      — audit trail for consolidation runs
+  ├── nodes + edges          — knowledge graph (co-retrieval + entity edges)
+  ├── memories               — HMAC-signed structured memories
+  ├── staged_memories        — memories pending review
+  ├── memory_access          — memory retrieval log
+  ├── context_data           — session handoff (key/value)
+  └── brain_meta             — schema version, agent name, model info
 ```
-
-The USearch HNSW index is rebuilt in memory from stored embeddings on open (~70ms for 7K docs), then cached to `~/.cache/axel/<sha256>.usearch` for hot starts. Embeddings are the source of truth; the index is the accelerator.
 
 ```bash
-# It's just SQLite — inspect it directly
-sqlite3 axel.r8 "SELECT title, category FROM memories LIMIT 10"
-sqlite3 axel.r8 "SELECT COUNT(*) FROM documents"
+# It's just SQLite
+sqlite3 axel.r8 "SELECT doc_id, excitability FROM documents ORDER BY excitability DESC LIMIT 5"
+sqlite3 axel.r8 "SELECT COUNT(*) FROM document_access"
 ```
 
 ---
@@ -95,82 +175,58 @@ sqlite3 axel.r8 "SELECT COUNT(*) FROM documents"
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────┐
-│                  axel (CLI + glue)               │
-│                                                  │
-│  ┌──────────────┐  ┌───────────┐  ┌───────────┐ │
-│  │  (search)    │  │  (memory) │  │  (extract) │ │
-│  └──────┬───────┘  └─────┬─────┘  └─────┬─────┘ │
-│         └────────────────┼───────────────┘       │
-│                  ┌───────▼───────┐               │
-│                  │   axel.r8     │               │
-│                  │  (SQLite)     │               │
-│                  └───────────────┘               │
-└─────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────┐
+│                      axel (crate)                     │
+│  CLI · MCP server · SynapsCLI extension · library     │
+│                                                       │
+│  ┌──────────┐  ┌──────────┐  ┌───────────────────┐   │
+│  │ search   │  │ memory   │  │  consolidation    │   │
+│  │ (query)  │  │ (store)  │  │  (4-phase cycle)  │   │
+│  └────┬─────┘  └────┬─────┘  └────────┬──────────┘   │
+│       └──────────────┼────────────────-┘              │
+│              ┌───────▼───────┐                        │
+│              │   brain.r8    │                        │
+│              │   (SQLite)    │                        │
+│              └───────────────┘                        │
+└──────────────────────────────────────────────────────┘
 ```
 
 ### Crates
 
-| Crate | Role | Lines | Tests |
-|-------|------|-------|-------|
-| `velocirag` | 4-layer RAG search engine, ONNX embeddings (MiniLM-L6-v2), USearch HNSW, RRF fusion | 5,468 | 34 |
-| `axel-memkoshi` | Memory staging, HMAC signing, decay/boost, pattern detection | 2,134 | 35 |
-| `axel` | CLI, `.r8` format, context injection | 2,138 | 31 |
-
-**Total: ~11,200 lines · 157 tests · 4 crates**
+| Crate | Role |
+|-------|------|
+| `velocirag` | 4-layer RAG engine, ONNX embeddings, HNSW index, RRF fusion, MMR, graph boost |
+| `axel-memkoshi` | Memory storage, HMAC signing, decay/boost, pattern detection |
+| `axel` | CLI, `.r8` format, consolidation engine, MCP server, context injection |
 
 ---
 
-## Features
+## Integration
 
-**Search**
-- 4-layer retrieval: vector similarity · BM25 keyword · knowledge graph · metadata tags
-- Reciprocal Rank Fusion across all layers
-- Optional TinyBERT cross-encoder reranker (off by default, enable in config)
-- `--json` flag for scripting and agent tool calls
-
-**Memory**
-- HMAC-SHA256 signing on every memory — `axel memories` shows `✓` valid / `⚠ TAMPERED` / `⚠ UNSIGNED`
-- Prompt injection detection before storage
-- Importance decay over time, boost on access
-- Stage → validate → approve pipeline
-- Pattern detection across memory access history
-
-**Extraction**
-- `axel extract` runs regex patterns against transcripts — zero LLM cost
-- Quality gate: length check, importance threshold, field validation
-- Deduplication against existing memories (Levenshtein on titles + semantic similarity)
-
-**Context Injection**
-- Tiered injection budget: 200 tokens handoff + 500 tokens relevant memories per turn
-- Agent pulls more depth via `axel search --json` on demand
-
----
-
-## SynapsCLI Integration
-
-Skill file at `~/.synaps-cli/skills/axel/axel.md` — loaded via `load_skill` to give the agent full command awareness.
-
-The `jawz-axel` tool injects boot context automatically at session start (handoff + recent memories). Agents use `axel search --json` for in-session retrieval and `axel remember` to commit decisions as they happen.
+### MCP Server
 
 ```bash
-# Skill gives the agent these patterns:
-axel search --json "topic"                        # Before answering anything
-axel remember --category entities --topic people "Dr. Smith, security lab, Thursdays 3pm"
-axel handoff set "Working on X, blocked on Y, resume with Z"
-axel extract session-brief.md                     # End of session
+axel mcp   # Exposes 6 tools over JSON-RPC stdio
 ```
 
----
+Tools: `axel_search`, `axel_remember`, `axel_recall`, `axel_verify`, `axel_update`, `axel_consolidate`
 
-## Environment
+### SynapsCLI Plugin
+
+The `axel-brain` plugin at `~/.synaps-cli/plugins/axel-brain/` provides:
+- **Proactive context injection** — searches the brain on the first message and injects relevant docs
+- **Session-aware reindexing** — runs Phase 1 on session start
+- **Automatic search feedback** — every search logs access events for consolidation
+
+### Configuration
 
 ```bash
 AXEL_BRAIN=/path/to/custom.r8   # Override default brain path
 ```
 
-Default brain: `~/.config/axel/axel.r8`  
-Model cache: `~/.cache/axel/models/` (ONNX models, auto-downloaded on first use)
+Default brain: `~/.config/axel/axel.r8`
+Model cache: `~/.cache/axel/models/`
+Sources: `~/.config/axel/sources.toml`
 
 ---
 
