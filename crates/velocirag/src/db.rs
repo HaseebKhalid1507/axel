@@ -947,13 +947,20 @@ impl Database {
 
     /// Get document access events since a given RFC3339 timestamp.
     pub fn get_document_accesses_since(&self, since: &str) -> Result<Vec<DocumentAccess>> {
+        // Normalize: strip any timezone suffix and replace 'T' with ' '
+        // so we compare apples-to-apples with SQLite's datetime() format.
+        let normalized = since
+            .replace('T', " ")
+            .split('+').next().unwrap_or(since)
+            .split('Z').next().unwrap_or(since)
+            .to_string();
         let mut stmt = self.conn.prepare(
             "SELECT doc_id, access_type, query, score, timestamp
              FROM document_access
              WHERE timestamp >= ?1
              ORDER BY timestamp ASC",
         )?;
-        let rows = stmt.query_map(params![since], |row| {
+        let rows = stmt.query_map(params![normalized], |row| {
             Ok(DocumentAccess {
                 doc_id: row.get(0)?,
                 access_type: row.get(1)?,
