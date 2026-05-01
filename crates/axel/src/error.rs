@@ -22,6 +22,9 @@ pub enum AxelError {
     #[error("Memkoshi error: {0}")]
     Memkoshi(#[from] axel_memkoshi::error::MemkoshiError),
 
+    #[error("Velocirag error: {0}")]
+    Velocirag(#[from] velocirag::error::VelociError),
+
     #[error("Schema version mismatch: file has v{file}, runtime expects v{expected}")]
     SchemaMismatch { file: i32, expected: i32 },
 
