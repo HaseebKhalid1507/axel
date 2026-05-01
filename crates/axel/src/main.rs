@@ -106,6 +106,14 @@ enum Commands {
         #[arg(long, default_value = "10")]
         limit: usize,
     },
+    /// Suggest related documents based on co-retrieval graph
+    Suggest {
+        /// Document ID or search query to find related documents
+        query: Vec<String>,
+        /// Maximum suggestions
+        #[arg(long, default_value = "5")]
+        limit: usize,
+    },
     /// List stored memories
     Memories {
         /// Maximum memories to list
@@ -166,6 +174,7 @@ fn main() -> ExitCode {
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
         Commands::Excitability { limit } => cmd_excitability(&cli, *limit),
+        Commands::Suggest { query, limit } => cmd_suggest(&cli, query, *limit),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
         Commands::Consolidate { phase, dry_run, verbose, sources, history, report } =>
             if *history {
@@ -859,6 +868,83 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Excitability distribution warning
     if max_excitability - min_excitability < 0.01 && doc_count > 100 {
         println!("  ⚠ Excitability is flat — consolidation may not be processing access events");
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_suggest(cli: &Cli, query_parts: &[String], limit: usize) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let path = brain_path(cli);
+    ensure_brain(&path)?;
+
+    let query = query_parts.join(" ");
+    if query.is_empty() {
+        eprintln!("Please provide a query or document ID.");
+        return Ok(ExitCode::FAILURE);
+    }
+
+    let mut search = BrainSearch::open(&path)?;
+
+    // First, find the document — either by exact doc_id or search
+    let doc_id = {
+        let db = search.db();
+        let exact: Option<String> = db.conn().query_row(
+            "SELECT doc_id FROM documents WHERE doc_id = ?1",
+            [&query],
+            |r| r.get(0),
+        ).ok();
+
+        if let Some(id) = exact {
+            id
+        } else {
+            // Search and use top result
+            let results = search.search(&query, 1)?;
+            if let Some(top) = results.results.first() {
+                println!("📍 Best match: {}\n", top.doc_id);
+                top.doc_id.clone()
+            } else {
+                eprintln!("No documents found for: {query}");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    };
+
+    let db = search.db();
+    let conn = db.conn();
+
+    // Find co-retrieved neighbors
+    let mut stmt = conn.prepare(
+        "SELECT e.target_id, e.weight, COALESCE(d.excitability, 0.5), d.access_count
+         FROM edges e
+         LEFT JOIN documents d ON d.doc_id = e.target_id
+         WHERE e.source_id = ?1 AND e.type = 'co_retrieved'
+           AND (e.valid_to IS NULL OR e.valid_to > datetime('now'))
+         UNION
+         SELECT e.source_id, e.weight, COALESCE(d.excitability, 0.5), d.access_count
+         FROM edges e
+         LEFT JOIN documents d ON d.doc_id = e.source_id
+         WHERE e.target_id = ?1 AND e.type = 'co_retrieved'
+           AND (e.valid_to IS NULL OR e.valid_to > datetime('now'))
+         ORDER BY 2 DESC
+         LIMIT ?2"
+    )?;
+
+    let suggestions: Vec<(String, f64, f64, i64)> = stmt.query_map(
+        rusqlite::params![doc_id, limit],
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+    )?.flatten().collect();
+
+    if suggestions.is_empty() {
+        println!("No co-retrieval connections found for: {doc_id}");
+        println!("(Run more searches to build the co-retrieval graph)");
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("═══ Related to: {} ═══\n", doc_id);
+    for (i, (neighbor, weight, exc, access)) in suggestions.iter().enumerate() {
+        let bar = "█".repeat((*weight * 10.0) as usize);
+        println!("  {}. {} {}", i + 1, bar, neighbor);
+        println!("     weight={:.2}  excitability={:.3}  accesses={}", weight, exc, access);
     }
 
     Ok(ExitCode::SUCCESS)
