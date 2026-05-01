@@ -122,7 +122,7 @@ fn strengthen_boosts_accessed_documents() {
     }
 
     let before = excitability_of(db, "doc_a");
-    let stats = strengthen(search, false).unwrap();
+    let stats = strengthen(search, false, false).unwrap();
     let after = excitability_of(search.db(), "doc_a");
 
     assert!(after > before, "excitability should increase: {before} -> {after}");
@@ -147,7 +147,7 @@ fn strengthen_decays_old_untouched_documents() {
     ).unwrap();
 
     let before = excitability_of(db, "doc_old");
-    let stats = strengthen(search, false).unwrap();
+    let stats = strengthen(search, false, false).unwrap();
     let after = excitability_of(search.db(), "doc_old");
 
     assert!(after < before, "excitability should decay: {before} -> {after}");
@@ -173,7 +173,7 @@ fn strengthen_extinction_on_low_scores() {
     }
 
     let before = excitability_of(db, "doc_x");
-    let stats = strengthen(search, false).unwrap();
+    let stats = strengthen(search, false, false).unwrap();
     let after = excitability_of(search.db(), "doc_x");
 
     assert!(after < before, "extinction should drop excitability: {before} -> {after}");
@@ -276,7 +276,7 @@ fn excitability_clamp_floor() {
 
     // Hammer decay enough times to drive past the floor if it weren't clamped.
     for _ in 0..50 {
-        let _ = strengthen(search, false).unwrap();
+        let _ = strengthen(search, false, false).unwrap();
     }
 
     let v = excitability_of(search.db(), "doc_floor");
@@ -302,7 +302,7 @@ fn excitability_clamp_ceiling() {
     }
 
     for _ in 0..50 {
-        let _ = strengthen(search, false).unwrap();
+        let _ = strengthen(search, false, false).unwrap();
     }
 
     let v = excitability_of(search.db(), "doc_ceil");
