@@ -127,6 +127,9 @@ enum Commands {
         /// Show consolidation history
         #[arg(long)]
         history: bool,
+        /// Write prune candidates report to file
+        #[arg(long)]
+        report: Option<PathBuf>,
     },
     Extension,
     /// Run as an MCP server (exposes search/remember/recall as tools)
@@ -157,11 +160,11 @@ fn main() -> ExitCode {
         Commands::Forget { id } => cmd_forget(&cli, id),
         Commands::Stats => cmd_stats(&cli),
         Commands::Memories { limit } => cmd_memories(&cli, *limit),
-        Commands::Consolidate { phase, dry_run, verbose, sources, history } =>
+        Commands::Consolidate { phase, dry_run, verbose, sources, history, report } =>
             if *history {
                 cmd_consolidate_history(&cli)
             } else {
-                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref())
+                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref(), report.as_deref())
             },
         Commands::Extension => {
             let path = brain_path(&cli);
@@ -373,6 +376,7 @@ fn cmd_consolidate(
     dry_run: bool,
     verbose: bool,
     sources_path: Option<&Path>,
+    report_path: Option<&Path>,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     use axel::consolidate::{self, Phase, ConsolidateOptions};
 
@@ -431,6 +435,38 @@ fn cmd_consolidate(
             println!("  [{}] {}  exc={:.3} access={} age={}d",
                 c.reason, c.doc_id, c.excitability, c.access_count, c.age_days);
         }
+    }
+
+    // Write report to file if --report was specified
+    if let Some(report) = report_path {
+        let mut lines = Vec::new();
+        lines.push(format!("# Consolidation Report — {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")));
+        lines.push(String::new());
+        lines.push(format!("## Summary"));
+        lines.push(format!("- Reindex: {} checked, {} reindexed, {} new, {} pruned",
+            stats.reindex.checked, stats.reindex.reindexed, stats.reindex.new_files, stats.reindex.pruned));
+        lines.push(format!("- Strengthen: {} boosted, {} decayed, {} extinction",
+            stats.strengthen.boosted, stats.strengthen.decayed, stats.strengthen.extinction_signals));
+        lines.push(format!("- Reorganize: +{} edges, ~{} updated, -{} removed",
+            stats.reorganize.edges_added, stats.reorganize.edges_updated, stats.reorganize.edges_removed));
+        lines.push(format!("- Prune: {} removed, {} flagged, {} misaligned",
+            stats.prune.removed, stats.prune.flagged, stats.prune.misaligned));
+        lines.push(format!("- Duration: {:.1}s", stats.duration_secs));
+
+        if !stats.prune_candidates.is_empty() {
+            lines.push(String::new());
+            lines.push(format!("## Prune Candidates ({} total)", stats.prune_candidates.len()));
+            lines.push(String::new());
+            lines.push("| Reason | Doc ID | Excitability | Access Count | Age (days) |".to_string());
+            lines.push("|--------|--------|-------------|-------------|-----------|".to_string());
+            for c in &stats.prune_candidates {
+                lines.push(format!("| {} | {} | {:.3} | {} | {} |",
+                    c.reason, c.doc_id, c.excitability, c.access_count, c.age_days));
+            }
+        }
+
+        std::fs::write(report, lines.join("\n"))?;
+        println!("\n📄 Report written to {}", report.display());
     }
 
     Ok(ExitCode::SUCCESS)
