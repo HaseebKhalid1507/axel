@@ -273,11 +273,15 @@ impl<'a> SearchEngine<'a> {
         // Documents with higher excitability get a mild ranking boost.
         // This closes the consolidation feedback loop: accessed docs rise,
         // neglected docs sink — matching biological reconsolidation.
+        // Temporal decay: excitability fades between consolidation runs based on
+        // time since last access (Ebbinghaus-inspired).
         // Batch-load excitabilities to avoid N+1 queries.
         if !fused.is_empty() {
             let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
-                "SELECT doc_id, COALESCE(excitability, 0.5) FROM documents WHERE doc_id IN ({})",
+                "SELECT doc_id, COALESCE(excitability, 0.5),
+                        COALESCE((julianday('now') - julianday(last_accessed)), 0)
+                 FROM documents WHERE doc_id IN ({})",
                 placeholders.join(",")
             );
             let mut stmt = self.db.conn().prepare_cached(&sql).ok();
@@ -285,10 +289,19 @@ impl<'a> SearchEngine<'a> {
             if let Some(ref mut s) = stmt {
                 let params: Vec<&dyn rusqlite::ToSql> = fused.iter().map(|r| &r.doc_id as &dyn rusqlite::ToSql).collect();
                 if let Ok(rows) = s.query_map(params.as_slice(), |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, f64>(1)?,
+                        row.get::<_, f64>(2)?,
+                    ))
                 }) {
                     for row in rows.flatten() {
-                        excitability_map.insert(row.0, row.1);
+                        let (doc_id, stored_excitability, days_since_access) = row;
+                        // Temporal decay: excitability fades 1% per day since last access
+                        // but never below 80% of stored value
+                        let decay_factor = (1.0 - 0.01 * days_since_access).max(0.8);
+                        let effective = stored_excitability * decay_factor;
+                        excitability_map.insert(doc_id, effective);
                     }
                 }
             }
