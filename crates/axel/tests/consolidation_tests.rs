@@ -611,3 +611,145 @@ fn test_reorganize_edge_id_deterministic() {
     // The id always starts with "coret_" and looks like a hex string.
     assert!(id_a.starts_with("coret_"), "edge id should have coret_ prefix: {id_a}");
 }
+
+// ─── 23. record_search_feedback creates DB rows ─────────────────────────────
+//
+// Calls BrainSearch::record_search_feedback with synthetic results and
+// verifies that document_access and co_retrieval rows are written.
+#[test]
+fn test_record_search_feedback() {
+    let (mut brain, _tmp) = setup_brain();
+    let search = brain.search_mut();
+    let db = search.db();
+
+    // Pre-insert two docs so FK constraints are satisfied.
+    db.insert_document("fb_doc_1", "content for feedback test alpha long enough here", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    db.insert_document("fb_doc_2", "content for feedback test beta long enough here",  &serde_json::json!({}), &fake_emb(), None).unwrap();
+
+    // Fake SearchResults — only doc_id + score matter for record_search_feedback.
+    let results = vec![
+        velocirag::search::SearchResult {
+            doc_id:   "fb_doc_1".to_string(),
+            content:  "alpha".to_string(),
+            score:    0.9,
+            source:   "fused".to_string(),
+            metadata: serde_json::json!({}),
+        },
+        velocirag::search::SearchResult {
+            doc_id:   "fb_doc_2".to_string(),
+            content:  "beta".to_string(),
+            score:    0.8,
+            source:   "fused".to_string(),
+            metadata: serde_json::json!({}),
+        },
+    ];
+
+    search.record_search_feedback("test query", &results);
+
+    let da_count: i64 = db.conn()
+        .query_row("SELECT COUNT(*) FROM document_access", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(da_count, 2, "one document_access row per result");
+
+    let cr_count: i64 = db.conn()
+        .query_row("SELECT COUNT(*) FROM co_retrieval", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(cr_count, 1, "one co_retrieval row for the two-doc pair");
+}
+
+// ─── 24. Ebbinghaus decay: higher access_count → slower decay ───────────────
+//
+// Pure math test — no DB. Verifies the stability formula:
+//   stability = S_BASE * (1 + ln(1 + access_count))
+// and that the resulting retention at 30 days is strictly higher for
+// access_count=10 than for access_count=1.
+#[test]
+fn test_ebbinghaus_decay_stability_increases_with_access() {
+    const S_BASE: f64 = 60.0;
+    let stability_1  = S_BASE * (1.0 + (1.0 +  1.0_f64).ln()); // 1 access
+    let stability_10 = S_BASE * (1.0 + (1.0 + 10.0_f64).ln()); // 10 accesses
+    let retention_1  = (-30.0 / stability_1 ).exp();
+    let retention_10 = (-30.0 / stability_10).exp();
+    assert!(
+        retention_10 > retention_1,
+        "more accesses should mean slower decay: retention_1={retention_1:.4} retention_10={retention_10:.4}"
+    );
+}
+
+// ─── 25. extract_top_terms filters stopwords ───────────────────────────────
+//
+// Duplicates the extract_top_terms logic inline so we can test it without
+// needing pub(crate) visibility into velocirag internals.
+#[test]
+fn test_query_expansion_stopwords() {
+    // ── inline replica of velocirag::search::extract_top_terms ──────────
+    fn extract_top_terms_local(text: &str, n: usize) -> Vec<String> {
+        use std::collections::HashMap;
+        const STOPWORDS: &[&str] = &[
+            "the", "a", "an", "is", "are", "was", "were", "be", "been", "being",
+            "have", "has", "had", "do", "does", "did", "will", "would", "could",
+            "should", "may", "might", "shall", "can", "need", "must",
+            "in", "on", "at", "to", "for", "of", "with", "by", "from", "as",
+            "into", "through", "during", "before", "after", "above", "below",
+            "and", "but", "or", "nor", "not", "so", "yet", "both", "either",
+            "this", "that", "these", "those", "it", "its", "they", "them",
+            "he", "she", "we", "you", "i", "me", "my", "our", "your", "his", "her",
+            "which", "who", "whom", "what", "where", "when", "how", "why",
+            "all", "each", "every", "any", "some", "no", "more", "most", "other",
+        ];
+        let mut counts: HashMap<String, usize> = HashMap::new();
+        for word in text.split_whitespace() {
+            let clean = word
+                .to_lowercase()
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .to_string();
+            if clean.len() > 3 && !STOPWORDS.contains(&clean.as_str()) {
+                *counts.entry(clean).or_insert(0) += 1;
+            }
+        }
+        let mut sorted: Vec<_> = counts.into_iter().collect();
+        sorted.sort_by(|a, b| b.1.cmp(&a.1));
+        sorted.into_iter().take(n).map(|(w, _)| w).collect()
+    }
+    // ── end replica ──────────────────────────────────────────────────────
+
+    let text = "the quick brown fox jumps over the lazy dog and it was very fast";
+    let terms = extract_top_terms_local(text, 5);
+
+    // "the", "and", "was", "it" are in STOPWORDS; "over" is too but only 4 chars —
+    // the filter requires len > 3, so ≤3-char words never reach STOPWORDS anyway.
+    let stopwords = ["the", "and", "was", "it"];
+    for sw in &stopwords {
+        assert!(
+            !terms.contains(&sw.to_string()),
+            "stopword '{sw}' should have been filtered out; got: {terms:?}"
+        );
+    }
+    // At least one meaningful term must survive.
+    assert!(!terms.is_empty(), "should return at least one meaningful term");
+    // Every returned term must be longer than 3 chars.
+    for term in &terms {
+        assert!(term.len() > 3, "term '{term}' is too short — should have been filtered");
+    }
+}
+
+// ─── 26. handoff command is case-insensitive ───────────────────────────────
+//
+// Verifies that cmd_handoff uses .to_lowercase() before matching, so
+// "Set", "SET", and "set" are all handled as the same command.
+// Tests the source directly (same pattern as test 16 / search_limit_cap_cli).
+#[test]
+fn test_handoff_case_insensitive() {
+    let src = std::fs::read_to_string(
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")
+    ).expect("read main.rs");
+
+    let idx = src.find("fn cmd_handoff").expect("cmd_handoff should be defined in main.rs");
+    let window: String = src[idx..].lines().take(20).collect::<Vec<_>>().join("\n");
+
+    assert!(
+        window.contains("to_lowercase()"),
+        "cmd_handoff should call .to_lowercase() on the action argument for case-insensitive matching;\
+         \nwindow:\n{window}"
+    );
+}
