@@ -753,13 +753,18 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     println!("  Events:     {}", stats.event_count);
     println!("  File size:  {:.1} MB", file_size as f64 / 1024.0 / 1024.0);
 
-    // Consolidation metrics
+    // Consolidation metrics — batched queries
     let conn = brain.conn();
+    let (accessed_docs, avg_excitability, min_excitability, max_excitability): (i64, f64, f64, f64) = conn.query_row(
+        "SELECT COUNT(CASE WHEN access_count > 0 THEN 1 END),
+                COALESCE(AVG(excitability), 0.5),
+                COALESCE(MIN(excitability), 0.5),
+                COALESCE(MAX(excitability), 0.5)
+         FROM documents",
+        [], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    ).unwrap_or((0, 0.5, 0.5, 0.5));
     let access_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM document_access", [], |r| r.get(0)
-    ).unwrap_or(0);
-    let accessed_docs: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM documents WHERE access_count > 0", [], |r| r.get(0)
     ).unwrap_or(0);
     let co_ret_count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM co_retrieval", [], |r| r.get(0)
@@ -767,15 +772,6 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let consolidation_runs: i64 = conn.query_row(
         "SELECT COUNT(*) FROM consolidation_log", [], |r| r.get(0)
     ).unwrap_or(0);
-    let avg_excitability: f64 = conn.query_row(
-        "SELECT COALESCE(AVG(excitability), 0.5) FROM documents", [], |r| r.get(0)
-    ).unwrap_or(0.5);
-    let min_excitability: f64 = conn.query_row(
-        "SELECT COALESCE(MIN(excitability), 0.5) FROM documents", [], |r| r.get(0)
-    ).unwrap_or(0.5);
-    let max_excitability: f64 = conn.query_row(
-        "SELECT COALESCE(MAX(excitability), 0.5) FROM documents", [], |r| r.get(0)
-    ).unwrap_or(0.5);
 
     println!("\n  ── Consolidation ──");
     println!("  Runs:           {consolidation_runs}");
