@@ -6,7 +6,7 @@
 //! No Python, no subprocess shelling. Brain opens once, stays warm,
 //! all search happens in-process.
 
-use std::io::{self, BufRead, Read, Write};
+use std::io::{self, BufRead, Write};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
