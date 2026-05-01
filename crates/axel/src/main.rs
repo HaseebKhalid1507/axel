@@ -1059,6 +1059,28 @@ fn cmd_excitability(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::er
 
     // Distribution histogram
     println!("\n📊 Distribution:\n");
+
+    // At-risk documents: were accessed but excitability is falling
+    let mut at_risk_stmt = conn.prepare(
+        "SELECT doc_id, excitability, access_count,
+                COALESCE(CAST(julianday('now') - julianday(last_accessed) AS INTEGER), 999) as days_stale
+         FROM documents
+         WHERE access_count > 0 AND excitability < 0.45
+         ORDER BY excitability ASC
+         LIMIT ?1"
+    )?;
+    let at_risk: Vec<(String, f64, i64, i64)> = at_risk_stmt.query_map([limit], |r| {
+        Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+    })?.flatten().collect();
+    if !at_risk.is_empty() {
+        println!("⚠ At risk (accessed but fading):\n");
+        for (doc_id, exc, access, days) in &at_risk {
+            println!("  {:.3} [{:>3} hits, {:>3}d stale] {}",
+                exc, access, days, doc_id);
+        }
+        println!();
+    }
+
     let buckets: Vec<(String, i64)> = conn.prepare(
         "SELECT
             CASE
