@@ -124,8 +124,6 @@ impl<'a> SearchEngine<'a> {
     /// Run a four-layer fusion search.
     pub fn search(&mut self, query: &str, opts: &SearchOptions) -> Result<SearchResponse> {
         let start = Instant::now();
-        let mut results_lists: Vec<Vec<RankedResult>> = Vec::new();
-
         let mut stats = SearchStats {
             total_ms: 0.0,
             vector_ms: None,
@@ -140,47 +138,86 @@ impl<'a> SearchEngine<'a> {
             fused_count: 0,
             final_count: 0,
         };
+        let mut results_lists: Vec<Vec<RankedResult>> = Vec::new();
 
-        // ═══ LAYER 1: VECTOR SIMILARITY ═══
         if opts.layers.vector {
-            let t = Instant::now();
-            let query_embedding = self.embedder.embed_one(query)?;
-            let k = opts.limit * VECTOR_CANDIDATES_MULTIPLIER;
-            let vector_results = self.index.search(&query_embedding, k)?;
-
-            let ranked: Vec<RankedResult> = vector_results
-                .into_iter()
-                .filter_map(|vr| {
-                    let doc = self.db.conn().query_row(
-                        "SELECT doc_id, content, metadata FROM documents WHERE id = ?1",
-                        [vr.id as i64],
-                        |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                            ))
-                        },
-                    ).ok()?;
-                    Some(RankedResult {
-                        doc_id: doc.0,
-                        content: doc.1,
-                        score: vr.score as f64,
-                        metadata: serde_json::from_str(&doc.2).unwrap_or_default(),
-                    })
-                })
-                .collect();
-
-            stats.vector_candidates = ranked.len();
-            stats.vector_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
-            results_lists.push(ranked);
+            self.retrieve_vector(query, opts, &mut results_lists, &mut stats)?;
         }
 
-        // ═══ QUERY EXPANSION (Pseudo-Relevance Feedback) ═══
-        // Use top vector hit to expand BM25 query with related terms.
-        // Only expand if vector search ran AND top result is confident (score > 0.02).
-        let expanded_query = if opts.layers.vector && !results_lists.is_empty() && !results_lists[0].is_empty()
-            && results_lists[0][0].score > 0.02  // confidence gate — don't expand on weak hits
+        let expanded_query = self.expand_query(query, &results_lists, opts);
+
+        if opts.layers.keyword {
+            self.retrieve_keyword(&expanded_query, opts, &mut results_lists, &mut stats)?;
+        }
+
+        if opts.layers.graph {
+            self.retrieve_graph(query, &mut results_lists, &mut stats)?;
+        }
+
+        self.retrieve_metadata(query, opts, &mut results_lists, &mut stats)?;
+
+        let mut fused = rrf::reciprocal_rank_fusion(&results_lists, opts.rrf_k);
+        stats.fused_count = fused.len();
+
+        self.apply_excitability_boost(&mut fused);
+        self.apply_graph_boost(&mut fused, opts);
+        self.apply_mmr_diversity(&mut fused, opts);
+
+        let final_results = self.finalize(query, fused, opts, &mut stats)?;
+
+        stats.final_count = final_results.len();
+        stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+        Ok(SearchResponse {
+            results: final_results,
+            stats,
+        })
+    }
+
+    fn retrieve_vector(
+        &mut self,
+        query: &str,
+        opts: &SearchOptions,
+        results_lists: &mut Vec<Vec<RankedResult>>,
+        stats: &mut SearchStats,
+    ) -> Result<()> {
+        let t = Instant::now();
+        let query_embedding = self.embedder.embed_one(query)?;
+        let k = opts.limit * VECTOR_CANDIDATES_MULTIPLIER;
+        let vector_results = self.index.search(&query_embedding, k)?;
+
+        let ranked: Vec<RankedResult> = vector_results
+            .into_iter()
+            .filter_map(|vr| {
+                let doc = self.db.conn().query_row(
+                    "SELECT doc_id, content, metadata FROM documents WHERE id = ?1",
+                    [vr.id as i64],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    },
+                ).ok()?;
+                Some(RankedResult {
+                    doc_id: doc.0,
+                    content: doc.1,
+                    score: vr.score as f64,
+                    metadata: serde_json::from_str(&doc.2).unwrap_or_default(),
+                })
+            })
+            .collect();
+
+        stats.vector_candidates = ranked.len();
+        stats.vector_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+        results_lists.push(ranked);
+        Ok(())
+    }
+
+    fn expand_query(&self, query: &str, results_lists: &[Vec<RankedResult>], opts: &SearchOptions) -> String {
+        if opts.layers.vector && !results_lists.is_empty() && !results_lists[0].is_empty()
+            && results_lists[0][0].score > 0.02
         {
             let top_content = &results_lists[0][0].content;
             let query_lower = query.to_lowercase();
@@ -195,108 +232,112 @@ impl<'a> SearchEngine<'a> {
             }
         } else {
             query.to_string()
-        };
-
-        // ═══ LAYER 2: KEYWORD SEARCH (BM25 via FTS5) ═══
-        if opts.layers.keyword {
-            let t = Instant::now();
-            let k = opts.limit * KEYWORD_CANDIDATES_MULTIPLIER;
-            let fts_results = self.db.keyword_search(&expanded_query, k)?;
-
-            let ranked: Vec<RankedResult> = fts_results
-                .into_iter()
-                .map(|fts| {
-                    // Normalize BM25 rank to 0-1 score
-                    let score = if fts.bm25_rank == 0.0 {
-                        DEFAULT_BM25_SCORE
-                    } else {
-                        (1.0 + (fts.bm25_rank / 50.0)).clamp(0.0, 1.0)
-                    };
-                    RankedResult {
-                        doc_id: fts.doc_id,
-                        content: fts.content,
-                        score,
-                        metadata: serde_json::json!({
-                            "bm25_rank": fts.bm25_rank,
-                            "snippet": fts.snippet,
-                        }),
-                    }
-                })
-                .collect();
-
-            stats.keyword_candidates = ranked.len();
-            stats.keyword_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
-            results_lists.push(ranked);
         }
+    }
 
-        // ═══ LAYER 3: KNOWLEDGE GRAPH ═══
-        if opts.layers.graph {
-            let t = Instant::now();
-            // Find graph nodes matching the query, then traverse
-            let graph_results = self.graph_search(query)?;
-            stats.graph_candidates = graph_results.len();
-            stats.graph_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
-            if !graph_results.is_empty() {
-                results_lists.push(graph_results);
-            }
-        }
+    fn retrieve_keyword(
+        &self,
+        expanded_query: &str,
+        opts: &SearchOptions,
+        results_lists: &mut Vec<Vec<RankedResult>>,
+        stats: &mut SearchStats,
+    ) -> Result<()> {
+        let t = Instant::now();
+        let k = opts.limit * KEYWORD_CANDIDATES_MULTIPLIER;
+        let fts_results = self.db.keyword_search(expanded_query, k)?;
 
-        // ═══ LAYER 4: METADATA (tags + cross-refs) ═══
-        {
-            let t = Instant::now();
-            let mut metadata_results = Vec::new();
-
-            // Search by tags matching query words
-            let words: Vec<&str> = query.split_whitespace()
-                .filter(|w| w.len() >= 3)
-                .collect();
-
-            for word in &words {
-                if let Ok(tag_docs) = self.db.search_by_tag(word, 10) {
-                    for (doc_id, content) in tag_docs {
-                        metadata_results.push(RankedResult {
-                            doc_id,
-                            content,
-                            score: 0.7,
-                            metadata: serde_json::json!({"source": "tag_match", "tag": word}),
-                        });
-                    }
+        let ranked: Vec<RankedResult> = fts_results
+            .into_iter()
+            .map(|fts| {
+                let score = if fts.bm25_rank == 0.0 {
+                    DEFAULT_BM25_SCORE
+                } else {
+                    (1.0 + (fts.bm25_rank / 50.0)).clamp(0.0, 1.0)
+                };
+                RankedResult {
+                    doc_id: fts.doc_id,
+                    content: fts.content,
+                    score,
+                    metadata: serde_json::json!({
+                        "bm25_rank": fts.bm25_rank,
+                        "snippet": fts.snippet,
+                    }),
                 }
-                if let Ok(ref_docs) = self.db.search_by_cross_ref(word, 10) {
-                    for (doc_id, content) in ref_docs {
-                        metadata_results.push(RankedResult {
-                            doc_id,
-                            content,
-                            score: 0.6,
-                            metadata: serde_json::json!({"source": "cross_ref", "ref": word}),
-                        });
-                    }
+            })
+            .collect();
+
+        stats.keyword_candidates = ranked.len();
+        stats.keyword_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+        results_lists.push(ranked);
+        Ok(())
+    }
+
+    fn retrieve_graph(
+        &self,
+        query: &str,
+        results_lists: &mut Vec<Vec<RankedResult>>,
+        stats: &mut SearchStats,
+    ) -> Result<()> {
+        let t = Instant::now();
+        let graph_results = self.graph_search(query)?;
+        stats.graph_candidates = graph_results.len();
+        stats.graph_ms = Some(t.elapsed().as_secs_f64() * 1000.0);
+        if !graph_results.is_empty() {
+            results_lists.push(graph_results);
+        }
+        Ok(())
+    }
+
+    fn retrieve_metadata(
+        &self,
+        query: &str,
+        _opts: &SearchOptions,
+        results_lists: &mut Vec<Vec<RankedResult>>,
+        stats: &mut SearchStats,
+    ) -> Result<()> {
+        let t = Instant::now();
+        let mut metadata_results = Vec::new();
+
+        let words: Vec<&str> = query.split_whitespace()
+            .filter(|w| w.len() >= 3)
+            .collect();
+
+        for word in &words {
+            if let Ok(tag_docs) = self.db.search_by_tag(word, 10) {
+                for (doc_id, content) in tag_docs {
+                    metadata_results.push(RankedResult {
+                        doc_id,
+                        content,
+                        score: 0.7,
+                        metadata: serde_json::json!({"source": "tag_match", "tag": word}),
+                    });
                 }
             }
-
-            // Dedup
-            let mut seen = std::collections::HashSet::new();
-            metadata_results.retain(|r| seen.insert(r.doc_id.clone()));
-
-            let metadata_ms = t.elapsed().as_secs_f64() * 1000.0;
-            if !metadata_results.is_empty() {
-                stats.metadata_candidates = metadata_results.len();
-                stats.metadata_ms = Some(metadata_ms);
-                results_lists.push(metadata_results);
+            if let Ok(ref_docs) = self.db.search_by_cross_ref(word, 10) {
+                for (doc_id, content) in ref_docs {
+                    metadata_results.push(RankedResult {
+                        doc_id,
+                        content,
+                        score: 0.6,
+                        metadata: serde_json::json!({"source": "cross_ref", "ref": word}),
+                    });
+                }
             }
         }
 
-        // ═══ FUSE via RRF ═══
-        let mut fused = rrf::reciprocal_rank_fusion(&results_lists, opts.rrf_k);
-        stats.fused_count = fused.len();
+        let mut seen = std::collections::HashSet::new();
+        metadata_results.retain(|r| seen.insert(r.doc_id.clone()));
 
-        // ═══ EXCITABILITY BOOST ═══
-        // Documents with higher excitability get a mild ranking boost.
-        // This closes the consolidation feedback loop: accessed docs rise,
-        // neglected docs sink — matching biological reconsolidation.
-        // Temporal decay: excitability fades between consolidation runs based on
-        // time since last access (Ebbinghaus-inspired).
-        // Batch-load excitabilities to avoid N+1 queries.
+        let metadata_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if !metadata_results.is_empty() {
+            stats.metadata_candidates = metadata_results.len();
+            stats.metadata_ms = Some(metadata_ms);
+            results_lists.push(metadata_results);
+        }
+        Ok(())
+    }
+
+    fn apply_excitability_boost(&self, fused: &mut Vec<FusedResult>) {
         if !fused.is_empty() {
             let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
@@ -331,7 +372,7 @@ impl<'a> SearchEngine<'a> {
                     }
                 }
             }
-            for result in &mut fused {
+            for result in fused.iter_mut() {
                 let excitability = excitability_map.get(&result.doc_id).copied().unwrap_or(0.5);
                 // Boost range: 0.9x (excitability=0.0) to 1.1x (excitability=1.0)
                 let boost = 0.9 + (excitability * 0.2);
@@ -340,12 +381,9 @@ impl<'a> SearchEngine<'a> {
             // Re-sort after boosting
             fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
         }
+    }
 
-        // ═══ GRAPH BOOST (spreading activation) ═══
-        // Huang/Chen/Zeng 2004: propagate relevance along co_retrieved edges.
-        // A doc connected to a strong hit gets a fractional boost — even if it
-        // didn't match the query directly. Closes the loop with consolidation:
-        // edges built from co-retrieval feed back into ranking.
+    fn apply_graph_boost(&self, fused: &mut Vec<FusedResult>, opts: &SearchOptions) {
         const GRAPH_BOOST_FACTOR: f64 = 0.3;
         const GRAPH_SOURCES_TOPK: usize = 5;
 
@@ -446,10 +484,9 @@ impl<'a> SearchEngine<'a> {
                 fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
             }
         }
+    }
 
-        // ═══ MMR DIVERSITY (Goldstein & Carbonell, 1998) ═══
-        // Penalize near-duplicates (e.g. same doc indexed via two source paths).
-        // MMR = λ · rel(d) − (1 − λ) · max_sim(d, selected)
+    fn apply_mmr_diversity(&self, fused: &mut Vec<FusedResult>, opts: &SearchOptions) {
         if fused.len() > opts.limit {
             const LAMBDA: f32 = 0.7;
 
@@ -498,7 +535,7 @@ impl<'a> SearchEngine<'a> {
             let min_rel = fused.iter().map(|r| r.rrf_score).fold(f64::MAX, f64::min);
             let span = (max_rel - min_rel).max(1e-9);
 
-            let mut remaining: Vec<FusedResult> = std::mem::take(&mut fused);
+            let mut remaining: Vec<FusedResult> = std::mem::take(fused);
             let mut selected: Vec<FusedResult> = Vec::with_capacity(opts.limit);
             let mut selected_embs: Vec<Vec<f32>> = Vec::with_capacity(opts.limit);
 
@@ -537,10 +574,17 @@ impl<'a> SearchEngine<'a> {
                 selected.push(chosen);
             }
 
-            fused = selected;
+            *fused = selected;
         }
+    }
 
-        // ═══ RERANK (optional) ═══
+    fn finalize(
+        &mut self,
+        query: &str,
+        fused: Vec<FusedResult>,
+        opts: &SearchOptions,
+        stats: &mut SearchStats,
+    ) -> Result<Vec<SearchResult>> {
         let final_results = if opts.use_reranker && self.reranker.is_some() {
             let t = Instant::now();
             let reranked = self.rerank(query, &fused, opts.limit)?;
@@ -559,14 +603,7 @@ impl<'a> SearchEngine<'a> {
                 })
                 .collect()
         };
-
-        stats.final_count = final_results.len();
-        stats.total_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        Ok(SearchResponse {
-            results: final_results,
-            stats,
-        })
+        Ok(final_results)
     }
 
     // ── Internal ────────────────────────────────────────────────────────
