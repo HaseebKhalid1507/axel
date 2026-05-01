@@ -386,3 +386,228 @@ fn search_limit_cap_cli() {
     assert!(has_cap,
         "CLI should cap --limit to prevent OOM. Expected .min(100) in cmd_search");
 }
+
+// ─── 18. co_retrieval rows are stored and aggregate correctly ───────────────
+//
+// Tests the DB-level primitives reorganize() builds on — without needing
+// an ONNX model. Inserts 4 co-retrieval events for one pair (> threshold of 3)
+// and 1 for another (below threshold), then verifies the COUNT/GROUP BY query
+// that reorganize() uses returns exactly the pair that crossed the threshold.
+#[test]
+fn test_reorganize_creates_edge() {
+    let db = Database::open_memory().unwrap();
+
+    // Two docs — content must be non-trivial; insert_document validates length.
+    db.insert_document("doc_alpha", "alpha content long enough to pass sanity check", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    db.insert_document("doc_beta",  "beta content long enough to pass sanity check",  &serde_json::json!({}), &fake_emb(), None).unwrap();
+
+    // 4 co-retrieval events → crosses threshold of 3.
+    for _ in 0..4 {
+        db.log_co_retrieval("doc_alpha", "doc_beta", "some query").unwrap();
+    }
+    // 2 events for a second pair → below threshold.
+    db.insert_document("doc_gamma", "gamma content long enough to pass sanity check", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    for _ in 0..2 {
+        db.log_co_retrieval("doc_alpha", "doc_gamma", "other query").unwrap();
+    }
+
+    // Total raw rows stored.
+    let total: i64 = db.conn()
+        .query_row("SELECT COUNT(*) FROM co_retrieval", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(total, 6, "all co_retrieval events should be stored");
+
+    // Verify the aggregate query reorganize() uses. Threshold = 3.
+    let threshold: i64 = 3;
+    let mut stmt = db.conn().prepare(
+        "SELECT doc_id_a, doc_id_b, COUNT(*) as co_count
+         FROM co_retrieval
+         WHERE timestamp > '1970-01-01'
+         GROUP BY doc_id_a, doc_id_b
+         HAVING COUNT(*) >= ?1",
+    ).unwrap();
+    let pairs: Vec<(String, String, i64)> = stmt
+        .query_map(params![threshold], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+
+    assert_eq!(pairs.len(), 1, "only the pair with ≥3 events should cross threshold");
+    let (a, b, count) = &pairs[0];
+    // log_co_retrieval canonicalises ordering (a < b).
+    assert_eq!(a, "doc_alpha");
+    assert_eq!(b, "doc_beta");
+    assert_eq!(*count, 4);
+}
+
+// ─── 19. prune query flags old zero-access doc with low excitability ────────
+//
+// Directly mirrors the WHERE clause inside prune_with_priorities():
+//   excitability < 0.15  AND  access_count = 0  AND  age > 60 days.
+// We fake the age with a direct SQL UPDATE on `created`.
+#[test]
+fn test_prune_flags_old_zero_access() {
+    let db = Database::open_memory().unwrap();
+
+    db.insert_document(
+        "stale_doc",
+        "stale content long enough to pass insert_document sanity check here",
+        &serde_json::json!({}),
+        &fake_emb(),
+        None,
+    ).unwrap();
+
+    // Force the document into prune-candidate territory.
+    db.conn().execute(
+        "UPDATE documents
+         SET excitability  = 0.12,
+             access_count  = 0,
+             created       = datetime('now', '-90 days'),
+             indexed_at    = datetime('now', '-90 days')
+         WHERE doc_id = ?1",
+        params!["stale_doc"],
+    ).unwrap();
+
+    // Run the exact query prune_with_priorities() uses.
+    let candidates: Vec<(String, f64, i64, i64)> = db.conn()
+        .prepare(
+            "SELECT doc_id, excitability, access_count,
+                    CAST(julianday('now') - julianday(created) AS INTEGER) as age_days
+             FROM documents
+             WHERE excitability < 0.15
+               AND access_count = 0
+               AND CAST(julianday('now') - julianday(created) AS INTEGER) > 60",
+        )
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+
+    assert_eq!(candidates.len(), 1, "stale doc should be flagged by prune query");
+    let (doc_id, excitability, access_count, age_days) = &candidates[0];
+    assert_eq!(doc_id, "stale_doc");
+    assert!(*excitability < 0.15, "excitability should be below threshold: {excitability}");
+    assert_eq!(*access_count, 0);
+    assert!(*age_days > 60, "doc should appear > 60 days old: {age_days}");
+}
+
+// ─── 20. co_retrieval cleanup removes old rows ──────────────────────────────
+//
+// Tests the exact DELETE statement used in consolidate::consolidate() for the
+// bounded-retention cleanup of the co_retrieval table (90-day window).
+#[test]
+fn test_co_retrieval_cleanup() {
+    let db = Database::open_memory().unwrap();
+    let conn = db.conn();
+
+    // Manually insert rows with backdated timestamps — bypassing log_co_retrieval
+    // so we control the timestamp directly.
+    conn.execute(
+        "INSERT INTO co_retrieval (doc_id_a, doc_id_b, query, timestamp)
+         VALUES
+           ('a', 'b', 'q', datetime('now', '-100 days')),
+           ('a', 'c', 'q', datetime('now', '-100 days')),
+           ('a', 'b', 'q', datetime('now', '-100 days'))",
+        [],
+    ).unwrap();
+
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM co_retrieval", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, 3, "rows should be present before cleanup");
+
+    // Same DELETE used in consolidate().
+    conn.execute(
+        "DELETE FROM co_retrieval WHERE timestamp < datetime('now', '-90 days')",
+        [],
+    ).unwrap();
+
+    let after: i64 = conn
+        .query_row("SELECT COUNT(*) FROM co_retrieval", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(after, 0, "all rows older than 90 days should be removed");
+}
+
+// ─── 21. document_access cleanup removes old, preserves recent ─────────────
+//
+// Same logic as test_co_retrieval_cleanup but for the document_access table.
+// Verifies the DELETE preserves rows inside the 90-day window.
+#[test]
+fn test_document_access_cleanup() {
+    let db = Database::open_memory().unwrap();
+    db.insert_document("doc_1", "some content long enough for the sanity checks here", &serde_json::json!({}), &fake_emb(), None).unwrap();
+    let conn = db.conn();
+
+    conn.execute(
+        "INSERT INTO document_access (doc_id, access_type, timestamp)
+         VALUES
+           ('doc_1', 'search_hit', datetime('now', '-120 days')),
+           ('doc_1', 'search_hit', datetime('now', '-95 days')),
+           ('doc_1', 'search_hit', datetime('now', '-1 days')),
+           ('doc_1', 'search_hit', datetime('now'))",
+        [],
+    ).unwrap();
+
+    // Same DELETE used in consolidate().
+    conn.execute(
+        "DELETE FROM document_access WHERE timestamp < datetime('now', '-90 days')",
+        [],
+    ).unwrap();
+
+    let remaining: i64 = conn
+        .query_row("SELECT COUNT(*) FROM document_access", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(remaining, 2, "only rows within 90 days should survive: got {remaining}");
+
+    // Also verify each surviving row is actually recent.
+    let old_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM document_access
+             WHERE timestamp < datetime('now', '-90 days')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(old_count, 0, "no old rows should remain after cleanup");
+}
+
+// ─── 22. coret_edge_id is deterministic across multiple calls ───────────────
+//
+// coret_edge_id uses DefaultHasher which is seeded at program start. Calling
+// it multiple times within the same process must return the same value every
+// time (deterministic within a run). Order-independence is already tested in
+// test 13; here we verify stability over repeated invocations.
+#[test]
+fn test_reorganize_edge_id_deterministic() {
+    use axel::consolidate::reorganize::coret_edge_id;
+
+    let id_a = coret_edge_id("doc_alpha", "doc_beta");
+
+    // Same call ten times — must always equal the first result.
+    for i in 0..10 {
+        let id = coret_edge_id("doc_alpha", "doc_beta");
+        assert_eq!(id, id_a, "call #{i} returned a different id: {id} vs {id_a}");
+    }
+
+    // Both orderings yield the same id, consistently.
+    for i in 0..10 {
+        let id_fwd = coret_edge_id("doc_alpha", "doc_beta");
+        let id_rev = coret_edge_id("doc_beta", "doc_alpha");
+        assert_eq!(id_fwd, id_rev,
+            "call #{i}: forward {id_fwd} != reverse {id_rev}");
+    }
+
+    // Different inputs → different ids, consistently.
+    let id_other = coret_edge_id("doc_alpha", "doc_gamma");
+    assert_ne!(id_a, id_other, "different pairs should produce different edge ids");
+    for i in 0..10 {
+        assert_eq!(coret_edge_id("doc_alpha", "doc_gamma"), id_other,
+            "call #{i} for second pair was unstable");
+    }
+
+    // The id always starts with "coret_" and looks like a hex string.
+    assert!(id_a.starts_with("coret_"), "edge id should have coret_ prefix: {id_a}");
+}

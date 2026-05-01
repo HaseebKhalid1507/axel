@@ -486,6 +486,19 @@ fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Er
     let search = BrainSearch::open(&path)?;
     let db = search.db();
 
+    // Show systemd timer status if available
+    if let Ok(output) = std::process::Command::new("systemctl")
+        .args(["--user", "list-timers", "axel-consolidate.timer", "--no-pager"])
+        .output()
+    {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        if stdout.contains("axel-consolidate") {
+            for line in stdout.lines().skip(1).take(1) {
+                println!("⏱ Timer: {}\n", line.trim());
+            }
+        }
+    }
+
     let mut stmt = db.conn().prepare(
         "SELECT id, started_at, finished_at, phase1_reindexed, phase1_pruned,
                 phase2_boosted, phase2_decayed, phase3_edges_added, phase3_edges_updated,
