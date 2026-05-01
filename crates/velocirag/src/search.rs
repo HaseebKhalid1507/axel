@@ -178,8 +178,10 @@ impl<'a> SearchEngine<'a> {
 
         // ═══ QUERY EXPANSION (Pseudo-Relevance Feedback) ═══
         // Use top vector hit to expand BM25 query with related terms.
-        // Only expand if vector search ran (results_lists[0] is vector results).
-        let expanded_query = if opts.layers.vector && !results_lists.is_empty() && !results_lists[0].is_empty() {
+        // Only expand if vector search ran AND top result is confident (score > 0.02).
+        let expanded_query = if opts.layers.vector && !results_lists.is_empty() && !results_lists[0].is_empty()
+            && results_lists[0][0].score > 0.02  // confidence gate — don't expand on weak hits
+        {
             let top_content = &results_lists[0][0].content;
             let query_lower = query.to_lowercase();
             let expansion_terms: Vec<String> = extract_top_terms(top_content, 3)

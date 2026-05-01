@@ -161,7 +161,7 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool, verbose: bool) -> Result<
 
         // Ebbinghaus exponential forgetting curve (Murre & Dros, 2015)
         // S = stability, increases with access count
-        const S_BASE: f64 = 30.0; // base stability in days
+        const S_BASE: f64 = 60.0; // base stability in days (raised from 30 per review — 30 was too aggressive for knowledge notes)
         let stability = S_BASE * (1.0 + (1.0 + access_count as f64).ln());
         let retention = (-days_inactive / stability).exp();
         let new_excitability = (excitability * retention).max(EXCITABILITY_FLOOR);

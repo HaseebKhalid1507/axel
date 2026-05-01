@@ -770,7 +770,7 @@ fn cmd_handoff(cli: &Cli, action: &str, content_parts: &[String]) -> Result<Exit
 
     const MAX_HANDOFF_CHARS: usize = 4096;
 
-    match action {
+    match action.to_lowercase().as_str() {
         "get" => {
             match storage.get_context("handoff")? {
                 Some(handoff) if !handoff.is_empty() => println!("{handoff}"),
