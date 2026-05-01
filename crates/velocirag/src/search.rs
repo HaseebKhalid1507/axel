@@ -177,8 +177,9 @@ impl<'a> SearchEngine<'a> {
         }
 
         // ═══ QUERY EXPANSION (Pseudo-Relevance Feedback) ═══
-        // Use top vector hit to expand BM25 query with related terms
-        let expanded_query = if !results_lists.is_empty() && !results_lists[0].is_empty() {
+        // Use top vector hit to expand BM25 query with related terms.
+        // Only expand if vector search ran (results_lists[0] is vector results).
+        let expanded_query = if opts.layers.vector && !results_lists.is_empty() && !results_lists[0].is_empty() {
             let top_content = &results_lists[0][0].content;
             let query_lower = query.to_lowercase();
             let expansion_terms: Vec<String> = extract_top_terms(top_content, 3)
@@ -302,7 +303,7 @@ impl<'a> SearchEngine<'a> {
                  FROM documents WHERE doc_id IN ({})",
                 placeholders.join(",")
             );
-            let mut stmt = self.db.conn().prepare_cached(&sql).ok();
+            let mut stmt = self.db.conn().prepare(&sql).ok();
             let mut excitability_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
             if let Some(ref mut s) = stmt {
                 let params: Vec<&dyn rusqlite::ToSql> = fused.iter().map(|r| &r.doc_id as &dyn rusqlite::ToSql).collect();
@@ -399,7 +400,7 @@ impl<'a> SearchEngine<'a> {
                         }
                         for (neighbor_id, weight) in neighbors {
                             if neighbor_id == *parent_id { continue; } // self-loop guard
-                            let graph_score = parent_score * weight * GRAPH_BOOST_FACTOR;
+                            let graph_score = parent_score * weight.clamp(0.0, 1.0) * GRAPH_BOOST_FACTOR;
                             *boost_accum.entry(neighbor_id).or_insert(0.0) += graph_score;
                         }
                     }
@@ -453,7 +454,7 @@ impl<'a> SearchEngine<'a> {
                 placeholders.join(",")
             );
             let mut emb_map: std::collections::HashMap<String, Vec<f32>> = std::collections::HashMap::new();
-            if let Ok(mut stmt) = self.db.conn().prepare_cached(&sql) {
+            if let Ok(mut stmt) = self.db.conn().prepare(&sql) {
                 let params: Vec<&dyn rusqlite::ToSql> = fused.iter().map(|r| &r.doc_id as &dyn rusqlite::ToSql).collect();
                 if let Ok(rows) = stmt.query_map(params.as_slice(), |row| {
                     let doc_id: String = row.get(0)?;
@@ -496,7 +497,7 @@ impl<'a> SearchEngine<'a> {
             let mut selected_embs: Vec<Vec<f32>> = Vec::with_capacity(opts.limit);
 
             // Seed with highest-scoring doc.
-            let first = remaining.remove(0);
+            let first = remaining.swap_remove(0);
             if let Some(e) = emb_map.get(&first.doc_id).cloned() {
                 selected_embs.push(e);
             } else {
@@ -524,7 +525,7 @@ impl<'a> SearchEngine<'a> {
                         best_idx = i;
                     }
                 }
-                let chosen = remaining.remove(best_idx);
+                let chosen = remaining.swap_remove(best_idx);
                 let emb = emb_map.get(&chosen.doc_id).cloned().unwrap_or_default();
                 selected_embs.push(emb);
                 selected.push(chosen);
