@@ -273,18 +273,34 @@ impl<'a> SearchEngine<'a> {
         // Documents with higher excitability get a mild ranking boost.
         // This closes the consolidation feedback loop: accessed docs rise,
         // neglected docs sink — matching biological reconsolidation.
-        for result in &mut fused {
-            let excitability: f64 = self.db.conn().query_row(
-                "SELECT COALESCE(excitability, 0.5) FROM documents WHERE doc_id = ?1",
-                [&result.doc_id],
-                |row| row.get(0),
-            ).unwrap_or(0.5);
-            // Boost range: 0.9x (excitability=0.0) to 1.1x (excitability=1.0)
-            let boost = 0.9 + (excitability * 0.2);
-            result.rrf_score *= boost;
+        // Batch-load excitabilities to avoid N+1 queries.
+        if !fused.is_empty() {
+            let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
+            let sql = format!(
+                "SELECT doc_id, COALESCE(excitability, 0.5) FROM documents WHERE doc_id IN ({})",
+                placeholders.join(",")
+            );
+            let mut stmt = self.db.conn().prepare_cached(&sql).ok();
+            let mut excitability_map: std::collections::HashMap<String, f64> = std::collections::HashMap::new();
+            if let Some(ref mut s) = stmt {
+                let params: Vec<&dyn rusqlite::ToSql> = fused.iter().map(|r| &r.doc_id as &dyn rusqlite::ToSql).collect();
+                if let Ok(rows) = s.query_map(params.as_slice(), |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+                }) {
+                    for row in rows.flatten() {
+                        excitability_map.insert(row.0, row.1);
+                    }
+                }
+            }
+            for result in &mut fused {
+                let excitability = excitability_map.get(&result.doc_id).copied().unwrap_or(0.5);
+                // Boost range: 0.9x (excitability=0.0) to 1.1x (excitability=1.0)
+                let boost = 0.9 + (excitability * 0.2);
+                result.rrf_score *= boost;
+            }
+            // Re-sort after boosting
+            fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
         }
-        // Re-sort after boosting
-        fused.sort_by(|a, b| b.rrf_score.partial_cmp(&a.rrf_score).unwrap_or(std::cmp::Ordering::Equal));
 
         // ═══ RERANK (optional) ═══
         let final_results = if opts.use_reranker && self.reranker.is_some() {
