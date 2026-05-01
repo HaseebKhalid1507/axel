@@ -18,7 +18,7 @@ use crate::error::{Result, VelociError};
 
 const MODEL_NAME: &str = "all-MiniLM-L6-v2";
 const _MODEL_REPO: &str = "sentence-transformers/all-MiniLM-L6-v2";
-const EMBEDDING_DIM: usize = 384;
+use crate::EMBEDDING_DIM;
 const DEFAULT_CACHE_SIZE: usize = 10_000;
 const MAX_BATCH_SIZE: usize = 256;
 const MAX_SEQ_LENGTH: usize = 256;

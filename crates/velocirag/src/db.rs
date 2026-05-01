@@ -20,7 +20,7 @@ use crate::error::{Result, VelociError};
 // ── Schema version ──────────────────────────────────────────────────────────
 
 const SCHEMA_VERSION: i32 = 2;
-const EMBEDDING_DIM: usize = 384; // all-MiniLM-L6-v2
+use crate::EMBEDDING_DIM;
 
 // ── Types ───────────────────────────────────────────────────────────────────
 
