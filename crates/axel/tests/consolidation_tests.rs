@@ -382,8 +382,7 @@ fn search_limit_cap_cli() {
         || window.contains("limit.min(")
         || window.contains("if limit >");
 
-    // NOTE: as of this commit the CLI does not cap --limit. If you add one,
-    // flip this assertion. The MCP path enforces 50 independently.
-    assert!(!has_cap,
-        "CLI now caps --limit; update this test (and confirm parity with MCP's 50 cap)");
+    // CLI now caps --limit at 100 (MCP caps at 50).
+    assert!(has_cap,
+        "CLI should cap --limit to prevent OOM. Expected .min(100) in cmd_search");
 }

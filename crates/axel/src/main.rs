@@ -496,6 +496,7 @@ fn cmd_search(
 
     let mut search = BrainSearch::open(&path)?;
     let start = Instant::now();
+    let limit = limit.min(100); // cap to prevent OOM on large brains
     let response = search.search(&query, limit)?;
     let ms = start.elapsed().as_millis();
 
