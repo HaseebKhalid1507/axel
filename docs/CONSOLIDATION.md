@@ -1,5 +1,27 @@
 # Consolidation — Biologically-Inspired Memory Lifecycle for Axel
 
+## Status (as of S183)
+
+**All implementation steps complete.** System is live and running on a 6-hour timer.
+
+| Component | Status |
+|-----------|--------|
+| Schema (document_access, co_retrieval, consolidation_log, excitability) | ✅ Shipped |
+| Search hit logging (MCP + CLI) | ✅ Shipped |
+| Phase 1 — Reindex (mtime sync + competitive allocation) | ✅ Shipped |
+| Phase 2 — Strengthen (retrieval-based reconsolidation) | ✅ Shipped |
+| Phase 3 — Reorganize (co-retrieval Hebbian wiring) | ✅ Shipped |
+| Phase 4 — Prune (decay + cleanup + misalignment detection) | ✅ Shipped |
+| CLI (`axel consolidate` + `--phase`, `--dry-run`, `-v`, `--history`, `--report`) | ✅ Shipped |
+| `axel excitability` command (distribution visualization) | ✅ Shipped |
+| `axel_consolidate` MCP tool | ✅ Shipped |
+| Excitability-aware search ranking (feedback loop) | ✅ Shipped |
+| Systemd timer (every 6 hours) | ✅ Enabled |
+| Boot hook (Phase 1 on jawz-boot) | ✅ Wired |
+| sources.toml config | ✅ Shipped |
+| Integration tests (22 tests) | ✅ Passing |
+| 8-agent code review | ✅ Done, fixes applied |
+
 ## Overview
 
 Consolidation is the process by which Axel's brain evolves over time — not just
