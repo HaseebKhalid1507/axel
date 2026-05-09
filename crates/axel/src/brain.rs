@@ -421,6 +421,99 @@ impl AxelBrain {
         Ok(true)
     }
 
+    /// Patch an existing memory with rich metadata via [`MemoryPatch`].
+    ///
+    /// Unlike [`Self::update_memory`] (which only handles `content` and
+    /// `importance`), this method can patch every mutable field of the
+    /// stored [`Memory`]. Each `Some(value)` field overwrites; each `None`
+    /// leaves the existing value untouched. The double-`Option` on
+    /// `MemoryPatch::expires_at` lets callers clear an expiry by passing
+    /// `Some(None)`.
+    ///
+    /// Behaviour:
+    /// - Returns `Ok(false)` if the memory id does not exist.
+    /// - Applies the patch in-memory; clamps `importance` / `trust_level`
+    ///   into `[0.0, 1.0]` if supplied.
+    /// - Sets `updated = Some(Utc::now())`.
+    /// - Re-validates via the same [`MemoryPipeline`] used by
+    ///   [`Self::remember`]; returns `Err` on validation failure (the
+    ///   stored record is left unchanged).
+    /// - Re-signs the patched memory if the brain has a signing key,
+    ///   replacing the previous signature.
+    /// - Persists via a full upsert (`storage.store_memory`), so all
+    ///   patched columns hit disk.
+    /// - Re-indexes for search; logs a warning on indexing failure but
+    ///   does NOT return Err (mirrors [`Self::update_memory`]).
+    ///
+    /// Returns `Ok(true)` on success, `Ok(false)` if the id was unknown.
+    pub fn update_memory_full(&mut self, id: &str, patch: MemoryPatch) -> Result<bool> {
+        let mut memory = match self.storage.get_memory(id)? {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+
+        if let Some(v) = patch.category {
+            memory.category = v;
+        }
+        if let Some(v) = patch.topic {
+            memory.topic = v;
+        }
+        if let Some(v) = patch.title {
+            memory.title = v;
+        }
+        if let Some(v) = patch.abstract_text {
+            memory.abstract_text = v;
+        }
+        if let Some(v) = patch.content {
+            memory.content = v;
+        }
+        if let Some(v) = patch.confidence {
+            memory.confidence = v;
+        }
+        if let Some(v) = patch.importance {
+            memory.importance = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = patch.tags {
+            memory.tags = v;
+        }
+        if let Some(v) = patch.related_topics {
+            memory.related_topics = v;
+        }
+        if let Some(v) = patch.source_sessions {
+            memory.source_sessions = v;
+        }
+        if let Some(v) = patch.trust_level {
+            memory.trust_level = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = patch.expires_at {
+            memory.expires_at = v;
+        }
+
+        memory.updated = Some(Utc::now());
+
+        if let Err(errors) = self.pipeline.validate(&memory) {
+            return Err(AxelError::Other(format!(
+                "Validation failed: {}",
+                errors.join(", ")
+            )));
+        }
+
+        if let Some(ref signer) = self.brain.signer() {
+            memory.signature = Some(signer.sign(&memory));
+        }
+
+        self.storage.store_memory(&memory)?;
+
+        if let Err(e) = self.search.index_memory(&memory) {
+            eprintln!(
+                "⚠ Memory {} updated but search re-indexing failed: {e}",
+                id
+            );
+        }
+
+        Ok(true)
+    }
+
     /// Get a memory by ID with verification status.
     pub fn get_memory_with_verification(&self, id: &str) -> Result<Option<(Memory, bool)>> {
         match self.storage.get_memory(id)? {
