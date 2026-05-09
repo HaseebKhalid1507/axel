@@ -24,10 +24,50 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use axel_memkoshi::memory::{Memory, MemoryCategory};
+use axel_memkoshi::memory::{Confidence, Memory, MemoryCategory};
 use axel_memkoshi::pipeline::MemoryPipeline;
 use axel_memkoshi::storage::MemoryStorage;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use velocirag::search::SearchResponse;
+
+/// Patch for [`AxelBrain::update_memory_full`]. Every field is optional:
+/// `None` means "leave unchanged"; `Some(value)` overwrites.
+///
+/// `id`, `created`, `signature`, and `superseded_by` are deliberately NOT
+/// in the patch — they are either immutable identity (`id`, `created`) or
+/// managed by the brain (`signature` is re-computed automatically) or have
+/// their own dedicated API (supersedence). The double-`Option` on
+/// `expires_at` lets a caller distinguish "leave unchanged" (`None`) from
+/// "clear an existing expiry" (`Some(None)`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryPatch {
+    /// Replace the memory category.
+    pub category: Option<MemoryCategory>,
+    /// Replace the topic label.
+    pub topic: Option<String>,
+    /// Replace the title.
+    pub title: Option<String>,
+    /// Replace the abstract text.
+    pub abstract_text: Option<String>,
+    /// Replace the full content body.
+    pub content: Option<String>,
+    /// Replace the confidence level.
+    pub confidence: Option<Confidence>,
+    /// Replace importance (will be clamped to `[0.0, 1.0]`).
+    pub importance: Option<f64>,
+    /// Replace the tags vector.
+    pub tags: Option<Vec<String>>,
+    /// Replace the related-topics vector.
+    pub related_topics: Option<Vec<String>>,
+    /// Replace the source-sessions vector.
+    pub source_sessions: Option<Vec<String>>,
+    /// Replace trust level (will be clamped to `[0.0, 1.0]`).
+    pub trust_level: Option<f64>,
+    /// Replace the expiry. `Some(None)` clears an existing expiry;
+    /// `Some(Some(ts))` sets a new expiry; the outer `None` leaves it alone.
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+}
 
 use crate::error::{AxelError, Result};
 use crate::inject::{self, InjectionContext, InjectionEntry};
@@ -432,5 +472,43 @@ impl Drop for AxelBrain {
     fn drop(&mut self) {
         // Best-effort flush on drop
         let _ = self.search.flush();
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn memory_patch_default_is_all_none() {
+        let p = MemoryPatch::default();
+        assert!(p.category.is_none());
+        assert!(p.topic.is_none());
+        assert!(p.title.is_none());
+        assert!(p.abstract_text.is_none());
+        assert!(p.content.is_none());
+        assert!(p.confidence.is_none());
+        assert!(p.importance.is_none());
+        assert!(p.tags.is_none());
+        assert!(p.related_topics.is_none());
+        assert!(p.source_sessions.is_none());
+        assert!(p.trust_level.is_none());
+        assert!(p.expires_at.is_none());
+    }
+
+    #[test]
+    fn memory_patch_roundtrips_through_json() {
+        let p = MemoryPatch {
+            topic: Some("t".into()),
+            importance: Some(0.5),
+            expires_at: Some(None),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: MemoryPatch = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.topic.as_deref(), Some("t"));
+        assert_eq!(back.importance, Some(0.5));
+        // expires_at: outer Some, inner None — caller wants to clear expiry
+        assert!(matches!(back.expires_at, Some(None)));
     }
 }
