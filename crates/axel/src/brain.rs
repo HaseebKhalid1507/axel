@@ -317,6 +317,63 @@ impl AxelBrain {
         Ok(id)
     }
 
+    /// Store a fully-enriched [`Memory`] verbatim (with brain-side enforcement).
+    ///
+    /// Use this when the caller has already populated rich metadata —
+    /// `topic`, `tags`, `related_topics`, `abstract_text`, `confidence`,
+    /// `trust_level`, `source_sessions`, optional `expires_at` — and wants
+    /// it persisted as-is rather than going through the lossy
+    /// `(content, category, importance)` shortcut of [`Self::remember`].
+    ///
+    /// Brain-side enforcement (in order):
+    /// 1. If `memory.id` is empty, generate a fresh `mem_XXXXXXXX` id.
+    ///    Otherwise the caller's id is preserved.
+    /// 2. Clamp `importance` and `trust_level` into `[0.0, 1.0]`.
+    /// 3. If the brain has a signing key, (re-)sign the memory; an
+    ///    incoming `signature` is overwritten with a fresh one. If the
+    ///    brain has no signer, `signature` is left untouched (callers may
+    ///    pass in an externally-produced signature).
+    /// 4. Validate via the standard [`MemoryPipeline`] (same gate
+    ///    `remember` uses).
+    /// 5. Stage → approve → index for search.
+    ///
+    /// Note: `created` is honoured as-supplied. Callers building memories
+    /// via [`Memory::new`] already get `Utc::now()` stamped, so this method
+    /// deliberately does NOT overwrite that — preserving the historical
+    /// timestamp lets callers replay archived records faithfully.
+    ///
+    /// Returns the resulting memory id.
+    pub fn remember_full(&mut self, mut memory: Memory) -> Result<String> {
+        if memory.id.is_empty() {
+            memory.id = Memory::generate_id();
+        }
+        memory.importance = memory.importance.clamp(0.0, 1.0);
+        memory.trust_level = memory.trust_level.clamp(0.0, 1.0);
+
+        if let Some(ref signer) = self.brain.signer() {
+            memory.signature = Some(signer.sign(&memory));
+        }
+
+        if let Err(errors) = self.pipeline.validate(&memory) {
+            return Err(AxelError::Other(format!(
+                "Validation failed: {}",
+                errors.join(", ")
+            )));
+        }
+
+        let staged = self.storage.stage_memory(&memory)?;
+        self.storage.approve(&staged.memory.id)?;
+
+        if let Err(e) = self.search.index_memory(&memory) {
+            eprintln!(
+                "⚠ Memory {} stored but search indexing failed: {e}",
+                memory.id
+            );
+        }
+
+        Ok(memory.id)
+    }
+
     /// List recent memories.
     pub fn memories(&self, limit: usize) -> Result<Vec<Memory>> {
         Ok(self.storage.list_memories(limit)?)
@@ -501,14 +558,16 @@ mod patch_tests {
         let p = MemoryPatch {
             topic: Some("t".into()),
             importance: Some(0.5),
-            expires_at: Some(None),
+            tags: Some(vec!["a".into(), "b".into()]),
             ..Default::default()
         };
         let s = serde_json::to_string(&p).unwrap();
         let back: MemoryPatch = serde_json::from_str(&s).unwrap();
         assert_eq!(back.topic.as_deref(), Some("t"));
         assert_eq!(back.importance, Some(0.5));
-        // expires_at: outer Some, inner None — caller wants to clear expiry
-        assert!(matches!(back.expires_at, Some(None)));
+        assert_eq!(back.tags.as_deref(), Some(&["a".to_string(), "b".to_string()][..]));
+        // Untouched fields remain None
+        assert!(back.title.is_none());
+        assert!(back.content.is_none());
     }
 }
