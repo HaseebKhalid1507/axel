@@ -9,4 +9,4 @@ pub mod mcp;
 pub mod consolidate;
 
 // Convenience re-export — the main entry point for library consumers
-pub use brain::AxelBrain;
+pub use brain::{AxelBrain, MemoryPatch};

@@ -24,10 +24,50 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-use axel_memkoshi::memory::{Memory, MemoryCategory};
+use axel_memkoshi::memory::{Confidence, Memory, MemoryCategory};
 use axel_memkoshi::pipeline::MemoryPipeline;
 use axel_memkoshi::storage::MemoryStorage;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use velocirag::search::SearchResponse;
+
+/// Patch for [`AxelBrain::update_memory_full`]. Every field is optional:
+/// `None` means "leave unchanged"; `Some(value)` overwrites.
+///
+/// `id`, `created`, `signature`, and `superseded_by` are deliberately NOT
+/// in the patch — they are either immutable identity (`id`, `created`) or
+/// managed by the brain (`signature` is re-computed automatically) or have
+/// their own dedicated API (supersedence). The double-`Option` on
+/// `expires_at` lets a caller distinguish "leave unchanged" (`None`) from
+/// "clear an existing expiry" (`Some(None)`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct MemoryPatch {
+    /// Replace the memory category.
+    pub category: Option<MemoryCategory>,
+    /// Replace the topic label.
+    pub topic: Option<String>,
+    /// Replace the title.
+    pub title: Option<String>,
+    /// Replace the abstract text.
+    pub abstract_text: Option<String>,
+    /// Replace the full content body.
+    pub content: Option<String>,
+    /// Replace the confidence level.
+    pub confidence: Option<Confidence>,
+    /// Replace importance (will be clamped to `[0.0, 1.0]`).
+    pub importance: Option<f64>,
+    /// Replace the tags vector.
+    pub tags: Option<Vec<String>>,
+    /// Replace the related-topics vector.
+    pub related_topics: Option<Vec<String>>,
+    /// Replace the source-sessions vector.
+    pub source_sessions: Option<Vec<String>>,
+    /// Replace trust level (will be clamped to `[0.0, 1.0]`).
+    pub trust_level: Option<f64>,
+    /// Replace the expiry. `Some(None)` clears an existing expiry;
+    /// `Some(Some(ts))` sets a new expiry; the outer `None` leaves it alone.
+    pub expires_at: Option<Option<DateTime<Utc>>>,
+}
 
 use crate::error::{AxelError, Result};
 use crate::inject::{self, InjectionContext, InjectionEntry};
@@ -277,6 +317,63 @@ impl AxelBrain {
         Ok(id)
     }
 
+    /// Store a fully-enriched [`Memory`] verbatim (with brain-side enforcement).
+    ///
+    /// Use this when the caller has already populated rich metadata —
+    /// `topic`, `tags`, `related_topics`, `abstract_text`, `confidence`,
+    /// `trust_level`, `source_sessions`, optional `expires_at` — and wants
+    /// it persisted as-is rather than going through the lossy
+    /// `(content, category, importance)` shortcut of [`Self::remember`].
+    ///
+    /// Brain-side enforcement (in order):
+    /// 1. If `memory.id` is empty, generate a fresh `mem_XXXXXXXX` id.
+    ///    Otherwise the caller's id is preserved.
+    /// 2. Clamp `importance` and `trust_level` into `[0.0, 1.0]`.
+    /// 3. If the brain has a signing key, (re-)sign the memory; an
+    ///    incoming `signature` is overwritten with a fresh one. If the
+    ///    brain has no signer, `signature` is left untouched (callers may
+    ///    pass in an externally-produced signature).
+    /// 4. Validate via the standard [`MemoryPipeline`] (same gate
+    ///    `remember` uses).
+    /// 5. Stage → approve → index for search.
+    ///
+    /// Note: `created` is honoured as-supplied. Callers building memories
+    /// via [`Memory::new`] already get `Utc::now()` stamped, so this method
+    /// deliberately does NOT overwrite that — preserving the historical
+    /// timestamp lets callers replay archived records faithfully.
+    ///
+    /// Returns the resulting memory id.
+    pub fn remember_full(&mut self, mut memory: Memory) -> Result<String> {
+        if memory.id.is_empty() {
+            memory.id = Memory::generate_id();
+        }
+        memory.importance = memory.importance.clamp(0.0, 1.0);
+        memory.trust_level = memory.trust_level.clamp(0.0, 1.0);
+
+        if let Some(ref signer) = self.brain.signer() {
+            memory.signature = Some(signer.sign(&memory));
+        }
+
+        if let Err(errors) = self.pipeline.validate(&memory) {
+            return Err(AxelError::Other(format!(
+                "Validation failed: {}",
+                errors.join(", ")
+            )));
+        }
+
+        let staged = self.storage.stage_memory(&memory)?;
+        self.storage.approve(&staged.memory.id)?;
+
+        if let Err(e) = self.search.index_memory(&memory) {
+            eprintln!(
+                "⚠ Memory {} stored but search indexing failed: {e}",
+                memory.id
+            );
+        }
+
+        Ok(memory.id)
+    }
+
     /// List recent memories.
     pub fn memories(&self, limit: usize) -> Result<Vec<Memory>> {
         Ok(self.storage.list_memories(limit)?)
@@ -319,6 +416,99 @@ impl AxelBrain {
             if let Err(e) = self.search.index_memory(&memory) {
                 eprintln!("⚠ Memory {} updated but search re-indexing failed: {e}", id);
             }
+        }
+
+        Ok(true)
+    }
+
+    /// Patch an existing memory with rich metadata via [`MemoryPatch`].
+    ///
+    /// Unlike [`Self::update_memory`] (which only handles `content` and
+    /// `importance`), this method can patch every mutable field of the
+    /// stored [`Memory`]. Each `Some(value)` field overwrites; each `None`
+    /// leaves the existing value untouched. The double-`Option` on
+    /// `MemoryPatch::expires_at` lets callers clear an expiry by passing
+    /// `Some(None)`.
+    ///
+    /// Behaviour:
+    /// - Returns `Ok(false)` if the memory id does not exist.
+    /// - Applies the patch in-memory; clamps `importance` / `trust_level`
+    ///   into `[0.0, 1.0]` if supplied.
+    /// - Sets `updated = Some(Utc::now())`.
+    /// - Re-validates via the same [`MemoryPipeline`] used by
+    ///   [`Self::remember`]; returns `Err` on validation failure (the
+    ///   stored record is left unchanged).
+    /// - Re-signs the patched memory if the brain has a signing key,
+    ///   replacing the previous signature.
+    /// - Persists via a full upsert (`storage.store_memory`), so all
+    ///   patched columns hit disk.
+    /// - Re-indexes for search; logs a warning on indexing failure but
+    ///   does NOT return Err (mirrors [`Self::update_memory`]).
+    ///
+    /// Returns `Ok(true)` on success, `Ok(false)` if the id was unknown.
+    pub fn update_memory_full(&mut self, id: &str, patch: MemoryPatch) -> Result<bool> {
+        let mut memory = match self.storage.get_memory(id)? {
+            Some(m) => m,
+            None => return Ok(false),
+        };
+
+        if let Some(v) = patch.category {
+            memory.category = v;
+        }
+        if let Some(v) = patch.topic {
+            memory.topic = v;
+        }
+        if let Some(v) = patch.title {
+            memory.title = v;
+        }
+        if let Some(v) = patch.abstract_text {
+            memory.abstract_text = v;
+        }
+        if let Some(v) = patch.content {
+            memory.content = v;
+        }
+        if let Some(v) = patch.confidence {
+            memory.confidence = v;
+        }
+        if let Some(v) = patch.importance {
+            memory.importance = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = patch.tags {
+            memory.tags = v;
+        }
+        if let Some(v) = patch.related_topics {
+            memory.related_topics = v;
+        }
+        if let Some(v) = patch.source_sessions {
+            memory.source_sessions = v;
+        }
+        if let Some(v) = patch.trust_level {
+            memory.trust_level = v.clamp(0.0, 1.0);
+        }
+        if let Some(v) = patch.expires_at {
+            memory.expires_at = v;
+        }
+
+        memory.updated = Some(Utc::now());
+
+        if let Err(errors) = self.pipeline.validate(&memory) {
+            return Err(AxelError::Other(format!(
+                "Validation failed: {}",
+                errors.join(", ")
+            )));
+        }
+
+        if let Some(ref signer) = self.brain.signer() {
+            memory.signature = Some(signer.sign(&memory));
+        }
+
+        self.storage.store_memory(&memory)?;
+
+        if let Err(e) = self.search.index_memory(&memory) {
+            eprintln!(
+                "⚠ Memory {} updated but search re-indexing failed: {e}",
+                id
+            );
         }
 
         Ok(true)
@@ -432,5 +622,45 @@ impl Drop for AxelBrain {
     fn drop(&mut self) {
         // Best-effort flush on drop
         let _ = self.search.flush();
+    }
+}
+
+#[cfg(test)]
+mod patch_tests {
+    use super::*;
+
+    #[test]
+    fn memory_patch_default_is_all_none() {
+        let p = MemoryPatch::default();
+        assert!(p.category.is_none());
+        assert!(p.topic.is_none());
+        assert!(p.title.is_none());
+        assert!(p.abstract_text.is_none());
+        assert!(p.content.is_none());
+        assert!(p.confidence.is_none());
+        assert!(p.importance.is_none());
+        assert!(p.tags.is_none());
+        assert!(p.related_topics.is_none());
+        assert!(p.source_sessions.is_none());
+        assert!(p.trust_level.is_none());
+        assert!(p.expires_at.is_none());
+    }
+
+    #[test]
+    fn memory_patch_roundtrips_through_json() {
+        let p = MemoryPatch {
+            topic: Some("t".into()),
+            importance: Some(0.5),
+            tags: Some(vec!["a".into(), "b".into()]),
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&p).unwrap();
+        let back: MemoryPatch = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.topic.as_deref(), Some("t"));
+        assert_eq!(back.importance, Some(0.5));
+        assert_eq!(back.tags.as_deref(), Some(&["a".to_string(), "b".to_string()][..]));
+        // Untouched fields remain None
+        assert!(back.title.is_none());
+        assert!(back.content.is_none());
     }
 }
