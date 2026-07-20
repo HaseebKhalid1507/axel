@@ -8,6 +8,8 @@ pub mod extension;
 pub mod mcp;
 pub mod consolidate;
 pub mod project_memory;
+pub mod chat_history;
+pub mod retrieval;
 
 // Convenience re-export — the main entry point for library consumers
 pub use brain::{AxelBrain, MemoryPatch};
