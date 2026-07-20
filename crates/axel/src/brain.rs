@@ -93,6 +93,8 @@ impl AxelBrain {
     pub fn open_or_create(path: impl AsRef<Path>, agent_name: Option<&str>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let brain = Brain::open_or_create(&path, agent_name)?;
+        // Additive, transactional project-memory migration (T32–T36).
+        crate::project_memory::migrate(brain.conn())?;
         let search = BrainSearch::open(&path)?;
         let storage = MemoryStorage::open_existing(&path)?;
         let pipeline = MemoryPipeline::new();
@@ -111,6 +113,8 @@ impl AxelBrain {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let brain = Brain::open(&path)?;
+        // Additive, transactional project-memory migration (T32–T36).
+        crate::project_memory::migrate(brain.conn())?;
         let search = BrainSearch::open(&path)?;
         let storage = MemoryStorage::open_existing(&path)?;
         let pipeline = MemoryPipeline::new();
@@ -526,6 +530,104 @@ impl AxelBrain {
             },
             None => Ok(None),
         }
+    }
+
+    // ── Project-scoped memory (T32–T36) ─────────────────────────────────
+
+    /// Store a memory under a trusted project scope (signed + validated).
+    ///
+    /// Enforcement:
+    /// * `scope.project_key` must be non-empty (fail closed);
+    /// * `Retention::NeverPersist` is rejected — never enters the `.r8`;
+    /// * a tombstoned id can never be re-inserted;
+    /// * the write (row + lexical FTS entry) is one transaction (crash-safe);
+    /// * no embedding/model/network work — fully offline.
+    pub fn store_scoped(
+        &mut self,
+        mut memory: Memory,
+        scope: &crate::project_memory::MemoryScope,
+    ) -> Result<String> {
+        if memory.id.is_empty() {
+            memory.id = Memory::generate_id();
+        }
+        memory.importance = memory.importance.clamp(0.0, 1.0);
+        memory.trust_level = memory.trust_level.clamp(0.0, 1.0);
+        if let Some(ref signer) = self.brain.signer() {
+            memory.signature = Some(signer.sign(&memory));
+        }
+        if let Err(errors) = self.pipeline.validate(&memory) {
+            return Err(AxelError::Other(format!(
+                "Validation failed: {}",
+                errors.join(", ")
+            )));
+        }
+        crate::project_memory::store_scoped(self.brain.conn(), &memory, scope)?;
+        Ok(memory.id)
+    }
+
+    /// Store many scoped memories in a single transaction (all-or-nothing).
+    pub fn store_scoped_batch(
+        &mut self,
+        items: Vec<(Memory, crate::project_memory::MemoryScope)>,
+    ) -> Result<Vec<String>> {
+        let mut prepared = Vec::with_capacity(items.len());
+        for (mut memory, scope) in items {
+            if memory.id.is_empty() {
+                memory.id = Memory::generate_id();
+            }
+            memory.importance = memory.importance.clamp(0.0, 1.0);
+            memory.trust_level = memory.trust_level.clamp(0.0, 1.0);
+            if let Some(ref signer) = self.brain.signer() {
+                memory.signature = Some(signer.sign(&memory));
+            }
+            if let Err(errors) = self.pipeline.validate(&memory) {
+                return Err(AxelError::Other(format!(
+                    "Validation failed: {}",
+                    errors.join(", ")
+                )));
+            }
+            prepared.push((memory, scope));
+        }
+        crate::project_memory::store_scoped_batch(self.brain.conn(), &prepared)?;
+        Ok(prepared.into_iter().map(|(m, _)| m.id).collect())
+    }
+
+    /// Project-scoped, bounded, offline lexical search (see
+    /// [`crate::project_memory::search_scoped`]).
+    pub fn search_scoped(
+        &self,
+        query: &crate::project_memory::ScopedQuery,
+    ) -> Result<Vec<crate::project_memory::ScopedDescriptor>> {
+        crate::project_memory::search_scoped(self.brain.conn(), query)
+    }
+
+    /// Exact-ID project-checked fetch with signature verification.
+    pub fn fetch_scoped(
+        &self,
+        id: &str,
+        project_key: &str,
+    ) -> Result<Option<crate::project_memory::ScopedMemoryView>> {
+        let mut view =
+            match crate::project_memory::fetch_scoped(self.brain.conn(), id, project_key)? {
+                Some(v) => v,
+                None => return Ok(None),
+            };
+        if let Some(ref signer) = self.brain.signer() {
+            if let Some(memory) = self.storage.get_memory(id)? {
+                view.verified = Some(signer.verify(&memory));
+            }
+        }
+        Ok(Some(view))
+    }
+
+    /// Exact, project-scoped tombstone + delete.
+    pub fn forget_scoped(&mut self, id: &str, project_key: &str) -> Result<bool> {
+        crate::project_memory::forget_scoped(self.brain.conn(), id, project_key)
+    }
+
+    /// Per-retention-class counts for a project scope (retention inspect).
+    pub fn retention_stats_scoped(&self, project_key: &str) -> Result<Vec<(String, u64)>> {
+        crate::project_memory::retention_stats(self.brain.conn(), project_key)
     }
 
     // ── Handoff ─────────────────────────────────────────────────────────
