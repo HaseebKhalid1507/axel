@@ -16,6 +16,7 @@
 
 use std::cmp::Ordering;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use serde::Serialize;
 
@@ -33,9 +34,15 @@ pub const MAX_SELECTED_CAP: usize = 8;
 // recency/class differences so same-session records outrank foreign-session
 // records at equal lexical relevance.
 const W_LEXICAL: f64 = 2.0;
+const W_SEMANTIC: f64 = 2.5;
 const W_SESSION: f64 = 1.0;
 const W_CLASS: f64 = 0.75;
 const W_RECENCY: f64 = 0.5;
+
+/// Optional-local-embedding p95 target (spec §16.2). Implementations receive
+/// this strict budget and must return [`EmbeddingRankError::TimedOut`] when it
+/// is exhausted.
+pub const LOCAL_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// Machine-readable reason a record was selected (spec §10.4). Every
 /// selected record carries at least one. Never free text.
@@ -44,6 +51,8 @@ const W_RECENCY: f64 = 0.5;
 pub enum RankReason {
     /// Matched the lexical FTS query.
     LexicalMatch,
+    /// Optional local embeddings contributed to hybrid ranking.
+    SemanticMatch,
     /// Matched an explicitly requested tag/entity (reserved for the exact
     /// tag generator; not emitted by the B2 generators).
     ExactTagMatch,
@@ -132,6 +141,136 @@ impl SelectionMetrics {
 pub struct RankedSelection {
     pub records: Vec<(ScopedDescriptor, Vec<RankReason>)>,
     pub metrics: SelectionMetrics,
+}
+
+/// Metadata-only reason that explicitly enabled embeddings fell back to the
+/// lexical ranker. No query, candidate, path, or model content is retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EmbeddingFallbackNote {
+    ModelUnavailable,
+    TimedOut,
+    Failed,
+    InvalidScores,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingRankError {
+    TimedOut,
+    Failed,
+}
+
+/// Adapter boundary for an already-enabled, already-provisioned local model.
+/// It deliberately has no download or network operation.
+pub trait LocalEmbeddingRanker {
+    fn is_available(&self) -> bool;
+
+    fn semantic_scores(
+        &mut self,
+        query: &str,
+        candidates: &[RecallCandidate],
+        timeout: Duration,
+    ) -> Result<Vec<f64>, EmbeddingRankError>;
+}
+
+/// Closed opt-in state: default/off contains no ranker and cannot infer or
+/// provision embeddings. A caller must explicitly construct `Enabled`.
+#[derive(Default)]
+pub enum EmbeddingRanking<'a> {
+    #[default]
+    Off,
+    Enabled(&'a mut dyn LocalEmbeddingRanker),
+}
+
+impl<'a> EmbeddingRanking<'a> {
+    pub fn enabled(ranker: &'a mut dyn LocalEmbeddingRanker) -> Self {
+        Self::Enabled(ranker)
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct EmbeddingRankingMetadata {
+    pub embeddings_enabled: bool,
+    pub embeddings_used: bool,
+    pub fallback_note: Option<EmbeddingFallbackNote>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HybridRankedSelection {
+    pub records: Vec<(ScopedDescriptor, Vec<RankReason>)>,
+    pub metadata: EmbeddingRankingMetadata,
+}
+
+/// Rank lexically by default; only an explicit `Enabled` ranker can add the
+/// bounded local semantic signal. Any unavailable, failed, malformed, or timed
+/// out embedding result automatically returns the unchanged lexical ranking.
+pub fn rank_and_select_hybrid(
+    candidates: Vec<RecallCandidate>,
+    session_id: Option<&str>,
+    max_selected: usize,
+    query: &str,
+    embeddings: EmbeddingRanking<'_>,
+) -> HybridRankedSelection {
+    let lexical = || rank_and_select(candidates.clone(), session_id, max_selected);
+    let EmbeddingRanking::Enabled(ranker) = embeddings else {
+        return HybridRankedSelection {
+            records: lexical(),
+            metadata: EmbeddingRankingMetadata::default(),
+        };
+    };
+
+    let mut metadata = EmbeddingRankingMetadata {
+        embeddings_enabled: true,
+        ..EmbeddingRankingMetadata::default()
+    };
+    if !ranker.is_available() {
+        metadata.fallback_note = Some(EmbeddingFallbackNote::ModelUnavailable);
+        return HybridRankedSelection {
+            records: lexical(),
+            metadata,
+        };
+    }
+
+    let semantic_scores = match ranker.semantic_scores(query, &candidates, LOCAL_EMBEDDING_TIMEOUT)
+    {
+        Ok(scores)
+            if scores.len() == candidates.len() && scores.iter().all(|score| score.is_finite()) =>
+        {
+            scores
+        }
+        Ok(_) => {
+            metadata.fallback_note = Some(EmbeddingFallbackNote::InvalidScores);
+            return HybridRankedSelection {
+                records: lexical(),
+                metadata,
+            };
+        }
+        Err(EmbeddingRankError::TimedOut) => {
+            metadata.fallback_note = Some(EmbeddingFallbackNote::TimedOut);
+            return HybridRankedSelection {
+                records: lexical(),
+                metadata,
+            };
+        }
+        Err(EmbeddingRankError::Failed) => {
+            metadata.fallback_note = Some(EmbeddingFallbackNote::Failed);
+            return HybridRankedSelection {
+                records: lexical(),
+                metadata,
+            };
+        }
+    };
+
+    metadata.embeddings_used = true;
+    HybridRankedSelection {
+        records: rank_current_with_semantic(
+            candidates,
+            session_id,
+            max_selected,
+            Some(&semantic_scores),
+        ),
+        metadata,
+    }
 }
 
 /// Rank with measurable stale-selection counters. Known superseded or
@@ -291,6 +430,15 @@ fn rank_current(
     session_id: Option<&str>,
     max_selected: usize,
 ) -> Vec<(ScopedDescriptor, Vec<RankReason>)> {
+    rank_current_with_semantic(candidates, session_id, max_selected, None)
+}
+
+fn rank_current_with_semantic(
+    candidates: Vec<RecallCandidate>,
+    session_id: Option<&str>,
+    max_selected: usize,
+    semantic_scores: Option<&[f64]>,
+) -> Vec<(ScopedDescriptor, Vec<RankReason>)> {
     let cap = max_selected.min(MAX_SELECTED_CAP);
     if cap == 0 {
         return Vec::new();
@@ -299,17 +447,23 @@ fn rank_current(
 
     // Disclosure gate FIRST (defence in depth): a withheld record is never
     // scored, never sorted, never inspected by the ranker.
-    let mut scored: Vec<(RecallCandidate, bool, f64)> = candidates
+    let mut scored: Vec<(RecallCandidate, bool, f64, bool)> = candidates
         .into_iter()
-        .filter(|c| model_visible(&c.descriptor))
-        .filter(|c| !known_stale(c))
-        .map(|c| {
+        .enumerate()
+        .filter(|(_, c)| model_visible(&c.descriptor))
+        .filter(|(_, c)| !known_stale(c))
+        .map(|(index, c)| {
             let affinity = c.session_affinity
                 || session_tag
                     .as_deref()
                     .is_some_and(|t| c.descriptor.tags.iter().any(|tag| tag == t));
-            let s = score(&c, affinity);
-            (c, affinity, s)
+            let semantic = semantic_scores
+                .and_then(|scores| scores.get(index))
+                .copied()
+                .unwrap_or(0.0)
+                .clamp(0.0, 1.0);
+            let s = score(&c, affinity) + W_SEMANTIC * semantic;
+            (c, affinity, s, semantic > 0.0)
         })
         .collect();
 
@@ -326,7 +480,7 @@ fn rank_current(
     // mixing while keeping the diversity pass strictly bounded (≤32 rows).
     let diversity_window = cap.saturating_mul(4).min(MAX_SELECTED_CAP * 4);
     let mut ranked = Vec::with_capacity(diversity_window);
-    for (candidate, affinity, candidate_score) in scored {
+    for (candidate, affinity, candidate_score, semantic_match) in scored {
         if ranked.len() >= diversity_window {
             break;
         }
@@ -337,12 +491,12 @@ fn rank_current(
         if !norm_title.is_empty() && !seen_titles.insert(norm_title) {
             continue; // exact (normalised) duplicate title
         }
-        ranked.push((candidate, affinity, candidate_score));
+        ranked.push((candidate, affinity, candidate_score, semantic_match));
     }
 
     let diversity_keys: Vec<_> = ranked
         .iter()
-        .map(|(candidate, _, score)| {
+        .map(|(candidate, _, score, _)| {
             DiversityKey::new(
                 DiversityClass::of(&candidate.descriptor.category),
                 *score,
@@ -353,8 +507,11 @@ fn rank_current(
     diverse_selection_indices(&diversity_keys, cap)
         .into_iter()
         .map(|index| {
-            let (candidate, affinity, _) = &ranked[index];
-            let reasons = reasons_for(candidate, *affinity);
+            let (candidate, affinity, _, semantic_match) = &ranked[index];
+            let mut reasons = reasons_for(candidate, *affinity);
+            if *semantic_match {
+                reasons.push(RankReason::SemanticMatch);
+            }
             debug_assert!(!reasons.is_empty(), "spec §10.4: ≥1 rank reason required");
             (candidate.descriptor.clone(), reasons)
         })
@@ -422,5 +579,170 @@ mod diversity_tests {
             .collect();
 
         assert_eq!(classes.len(), 5);
+    }
+}
+
+#[cfg(test)]
+mod local_embedding_tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::project_memory::{RecordLinks, Retention};
+
+    fn candidate(id: &str, title: &str) -> RecallCandidate {
+        RecallCandidate {
+            descriptor: ScopedDescriptor {
+                id: id.into(),
+                project_key: "project".into(),
+                title: title.into(),
+                snippet: Some(format!("{title} details")),
+                category: CLASS_ENTITY_FACT.into(),
+                tags: Vec::new(),
+                created: "2026-01-01T00:00:00Z".into(),
+                sensitivity: Sensitivity::Normal,
+                retention: Retention::Standard,
+                provenance: "test".into(),
+                links: RecordLinks::default(),
+            },
+            recency: 0.5,
+            session_affinity: false,
+            class_weight: 0.5,
+            lexical_match: true,
+            recency_fallback: false,
+        }
+    }
+
+    struct FakeRanker {
+        available: bool,
+        result: Result<Vec<f64>, EmbeddingRankError>,
+        calls: usize,
+        observed_timeout: Option<Duration>,
+    }
+
+    impl LocalEmbeddingRanker for FakeRanker {
+        fn is_available(&self) -> bool {
+            self.available
+        }
+
+        fn semantic_scores(
+            &mut self,
+            _query: &str,
+            _candidates: &[RecallCandidate],
+            timeout: Duration,
+        ) -> Result<Vec<f64>, EmbeddingRankError> {
+            self.calls += 1;
+            self.observed_timeout = Some(timeout);
+            self.result.clone()
+        }
+    }
+
+    #[test]
+    fn embeddings_are_off_by_default_and_never_inferred_by_recall() {
+        let candidates = vec![candidate("lexical", "lexical winner")];
+        let selected = rank_and_select_hybrid(
+            candidates.clone(),
+            None,
+            8,
+            "query",
+            EmbeddingRanking::default(),
+        );
+        let capture_selected = rank_and_select_hybrid(
+            candidates.clone(),
+            None,
+            8,
+            "captured turn",
+            EmbeddingRanking::default(),
+        );
+        let search_selected = rank_and_select_hybrid(
+            candidates,
+            None,
+            8,
+            "search terms",
+            EmbeddingRanking::default(),
+        );
+
+        for result in [&selected, &capture_selected, &search_selected] {
+            assert!(!result.metadata.embeddings_enabled);
+            assert!(!result.metadata.embeddings_used);
+            assert_eq!(result.metadata.fallback_note, None);
+            assert_eq!(result.records[0].0.id, "lexical");
+        }
+    }
+
+    #[test]
+    fn enabled_but_missing_model_falls_back_with_metadata_only_note() {
+        let mut ranker = FakeRanker {
+            available: false,
+            result: Ok(vec![1.0]),
+            calls: 0,
+            observed_timeout: None,
+        };
+        let candidates = vec![candidate("lexical", "unaltered title")];
+        let selected = rank_and_select_hybrid(
+            candidates,
+            None,
+            8,
+            "query",
+            EmbeddingRanking::enabled(&mut ranker),
+        );
+
+        assert_eq!(ranker.calls, 0, "missing model must not attempt inference");
+        assert!(selected.metadata.embeddings_enabled);
+        assert!(!selected.metadata.embeddings_used);
+        assert_eq!(
+            selected.metadata.fallback_note,
+            Some(EmbeddingFallbackNote::ModelUnavailable)
+        );
+        assert_eq!(selected.records[0].0.title, "unaltered title");
+    }
+
+    #[test]
+    fn timeout_falls_back_to_lexical_and_records_target_in_metadata() {
+        let mut ranker = FakeRanker {
+            available: true,
+            result: Err(EmbeddingRankError::TimedOut),
+            calls: 0,
+            observed_timeout: None,
+        };
+        let selected = rank_and_select_hybrid(
+            vec![candidate("lexical", "lexical fallback")],
+            None,
+            8,
+            "query",
+            EmbeddingRanking::enabled(&mut ranker),
+        );
+
+        assert_eq!(ranker.calls, 1);
+        assert_eq!(ranker.observed_timeout, Some(LOCAL_EMBEDDING_TIMEOUT));
+        assert_eq!(
+            selected.metadata.fallback_note,
+            Some(EmbeddingFallbackNote::TimedOut)
+        );
+        assert_eq!(selected.records[0].0.id, "lexical");
+    }
+
+    #[test]
+    fn available_embeddings_add_a_hybrid_ranking_signal() {
+        let mut ranker = FakeRanker {
+            available: true,
+            result: Ok(vec![0.0, 1.0]),
+            calls: 0,
+            observed_timeout: None,
+        };
+        let selected = rank_and_select_hybrid(
+            vec![
+                candidate("lexical-first", "first lexical candidate"),
+                candidate("semantic-best", "second semantic candidate"),
+            ],
+            None,
+            2,
+            "query",
+            EmbeddingRanking::enabled(&mut ranker),
+        );
+
+        assert!(selected.metadata.embeddings_used);
+        assert_eq!(selected.metadata.fallback_note, None);
+        assert_eq!(selected.records[0].0.id, "semantic-best");
+        assert!(selected.records[0].1.contains(&RankReason::SemanticMatch));
     }
 }
