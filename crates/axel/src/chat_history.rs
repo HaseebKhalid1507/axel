@@ -44,8 +44,8 @@ use axel_memkoshi::memory::{Confidence, Memory, MemoryCategory};
 
 use crate::error::{AxelError, Result};
 use crate::project_memory::{
-    search_scoped, store_scoped_typed, MemoryScope, Retention, ScopedDescriptor, ScopedQuery,
-    Sensitivity,
+    search_scoped, store_scoped_typed_with_links, MemoryScope, RecordLinks, Retention,
+    ScopedDescriptor, ScopedQuery, Sensitivity,
 };
 
 // ── Record-class category constants (spec §8.1) ─────────────────────────
@@ -374,10 +374,18 @@ pub fn store_capture_with_id(
         .unwrap_or_default();
     memory.tags = tags.into_iter().collect();
     memory.related_topics = entities.into_iter().collect();
-    // A correction carries the older stable id inside its typed JSON body.
-    // The legacy `superseded_by` column points in the opposite direction
-    // (older row → newer row), so it is deliberately not misused here.
-    store_scoped_typed(conn, &memory, &scope, request.record.class())?;
+    let links = match &request.record {
+        EpisodicRecord::Correction(correction) => RecordLinks {
+            supersedes: correction
+                .supersedes_id
+                .map(storage_id)
+                .into_iter()
+                .collect(),
+            ..RecordLinks::default()
+        },
+        _ => RecordLinks::default(),
+    };
+    store_scoped_typed_with_links(conn, &memory, &scope, request.record.class(), &links)?;
     Ok(CaptureAck {
         id,
         class: request.record.class().to_string(),

@@ -105,6 +105,63 @@ fn reasons_for(c: &RecallCandidate, affinity: bool) -> Vec<RankReason> {
     reasons
 }
 
+fn known_stale(c: &RecallCandidate) -> bool {
+    c.descriptor.links.superseded_by.is_some() || c.descriptor.links.invalidated_at.is_some()
+}
+
+/// Measurable stale/superseded selection counters for quality evaluation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct SelectionMetrics {
+    pub candidates: usize,
+    pub stale_candidates: usize,
+    pub selected: usize,
+    pub stale_selected: usize,
+}
+
+impl SelectionMetrics {
+    /// Fraction of selected records known stale. Empty selections report 0.
+    pub fn stale_selected_rate(&self) -> f64 {
+        if self.selected == 0 {
+            0.0
+        } else {
+            self.stale_selected as f64 / self.selected as f64
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RankedSelection {
+    pub records: Vec<(ScopedDescriptor, Vec<RankReason>)>,
+    pub metrics: SelectionMetrics,
+}
+
+/// Rank with measurable stale-selection counters. Known superseded or
+/// invalidated records receive the strongest possible penalty: exclusion, so
+/// they can never be presented as current without an explicit conflict label.
+pub fn rank_and_select_with_metrics(
+    candidates: Vec<RecallCandidate>,
+    session_id: Option<&str>,
+    max_selected: usize,
+) -> RankedSelection {
+    let mut metrics = SelectionMetrics {
+        candidates: candidates.len(),
+        stale_candidates: candidates
+            .iter()
+            .filter(|candidate| known_stale(candidate))
+            .count(),
+        ..SelectionMetrics::default()
+    };
+    let records = rank_current(candidates, session_id, max_selected);
+    metrics.selected = records.len();
+    metrics.stale_selected = records
+        .iter()
+        .filter(|(descriptor, _)| {
+            descriptor.links.superseded_by.is_some() || descriptor.links.invalidated_at.is_some()
+        })
+        .count();
+    RankedSelection { records, metrics }
+}
+
 /// Rank the candidate set and select at most
 /// `min(max_selected, MAX_SELECTED_CAP)` records (spec §9.2, §16.2).
 ///
@@ -113,6 +170,14 @@ fn reasons_for(c: &RecallCandidate, affinity: bool) -> Vec<RankReason> {
 /// Exact duplicate ids and exact normalised-title duplicates are dropped.
 /// Every returned record carries ≥1 [`RankReason`].
 pub fn rank_and_select(
+    candidates: Vec<RecallCandidate>,
+    session_id: Option<&str>,
+    max_selected: usize,
+) -> Vec<(ScopedDescriptor, Vec<RankReason>)> {
+    rank_and_select_with_metrics(candidates, session_id, max_selected).records
+}
+
+fn rank_current(
     candidates: Vec<RecallCandidate>,
     session_id: Option<&str>,
     max_selected: usize,
@@ -128,6 +193,7 @@ pub fn rank_and_select(
     let mut scored: Vec<(RecallCandidate, bool, f64)> = candidates
         .into_iter()
         .filter(|c| model_visible(&c.descriptor))
+        .filter(|c| !known_stale(c))
         .map(|c| {
             let affinity = c.session_affinity
                 || session_tag

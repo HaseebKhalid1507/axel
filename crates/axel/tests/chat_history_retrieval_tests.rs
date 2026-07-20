@@ -6,15 +6,18 @@
 //! `project_memory::migrate` that `AxelBrain::open*` runs).
 
 use axel::chat_history::{
-    generate_candidates, session_tag, RecallCandidate, CANDIDATES_RETAINED_CAP, CLASS_DECISION,
+    generate_candidates, session_tag, store_capture_with_id, CaptureRequest, Correction,
+    EpisodicRecord, EpisodicTurn, RecallCandidate, CANDIDATES_RETAINED_CAP, CLASS_DECISION,
     CLASS_EPISODIC_TURN, CLASS_PREFERENCE, CLASS_UNRESOLVED_TASK, RECENCY_FALLBACK_LIMIT,
     RECENCY_FALLBACK_WINDOW_HOURS,
 };
 use axel::project_memory::{
-    self, MemoryScope, Retention, ScopedDescriptor, Sensitivity,
+    self, MemoryScope, RecordLinks, Retention, ScopedDescriptor, Sensitivity,
 };
-use axel::retrieval::{rank_and_select, RankReason, MAX_SELECTED_CAP};
 use axel::r8::Brain;
+use axel::retrieval::{
+    rank_and_select, rank_and_select_with_metrics, RankReason, MAX_SELECTED_CAP,
+};
 use axel_memkoshi::memory::{Memory, MemoryCategory};
 use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
@@ -97,8 +100,7 @@ fn hundred_records_stay_within_candidate_and_selection_caps() {
     }
 
     // Even an absurd requested limit is capped by construction.
-    let candidates =
-        generate_candidates(conn, PROJECT, None, Some("needle"), 10_000).unwrap();
+    let candidates = generate_candidates(conn, PROJECT, None, Some("needle"), 10_000).unwrap();
     assert!(!candidates.is_empty());
     assert!(
         candidates.len() <= CANDIDATES_RETAINED_CAP,
@@ -166,8 +168,7 @@ fn secret_record_is_never_a_candidate_or_selected_even_on_lexical_match() {
         "needle body that is perfectly fine to disclose to the model",
     );
 
-    let candidates =
-        generate_candidates(conn, PROJECT, None, Some("needle"), 50).unwrap();
+    let candidates = generate_candidates(conn, PROJECT, None, Some("needle"), 50).unwrap();
     assert!(candidates.iter().any(|c| c.descriptor.id == normal_id));
     assert!(
         candidates.iter().all(|c| c.descriptor.id != secret_id),
@@ -179,7 +180,9 @@ fn secret_record_is_never_a_candidate_or_selected_even_on_lexical_match() {
     );
 
     let selected = rank_and_select(candidates, None, 8);
-    assert!(selected.iter().all(|(d, _)| d.id != secret_id && d.id != local_only_id));
+    assert!(selected
+        .iter()
+        .all(|(d, _)| d.id != secret_id && d.id != local_only_id));
 
     // Defence in depth: even a hand-constructed secret candidate is
     // excluded BEFORE ranking.
@@ -195,6 +198,7 @@ fn secret_record_is_never_a_candidate_or_selected_even_on_lexical_match() {
             sensitivity: Sensitivity::Secret,
             retention: Retention::Standard,
             provenance: "test".to_string(),
+            links: RecordLinks::default(),
         },
         recency: 1.0,
         session_affinity: true,
@@ -203,7 +207,10 @@ fn secret_record_is_never_a_candidate_or_selected_even_on_lexical_match() {
         recency_fallback: false,
     };
     let selected = rank_and_select(vec![smuggled], None, 8);
-    assert!(selected.is_empty(), "hand-built secret candidate was ranked");
+    assert!(
+        selected.is_empty(),
+        "hand-built secret candidate was ranked"
+    );
 }
 
 // ── Fallback: only on zero lexical rows, small and bounded (spec §9.5) ──
@@ -233,8 +240,7 @@ fn recency_fallback_triggers_only_on_empty_lexical_and_stays_bounded() {
     );
 
     // Lexical hit ⇒ no fallback candidates at all.
-    let candidates =
-        generate_candidates(conn, PROJECT, None, Some("conversational"), 128).unwrap();
+    let candidates = generate_candidates(conn, PROJECT, None, Some("conversational"), 128).unwrap();
     assert!(!candidates.is_empty());
     assert!(
         candidates.iter().all(|c| !c.recency_fallback),
@@ -251,7 +257,9 @@ fn recency_fallback_triggers_only_on_empty_lexical_and_stays_bounded() {
         "fallback returned {} > bound {RECENCY_FALLBACK_LIMIT}",
         candidates.len()
     );
-    assert!(candidates.iter().all(|c| c.recency_fallback && !c.lexical_match));
+    assert!(candidates
+        .iter()
+        .all(|c| c.recency_fallback && !c.lexical_match));
     assert!(
         candidates.iter().all(|c| c.descriptor.id != stale_id),
         "record outside the recency window entered the fallback"
@@ -354,6 +362,118 @@ fn session_tagged_records_outrank_untagged_at_equal_lexical_relevance() {
     }
 }
 
+#[test]
+fn correction_supersedes_target_and_stale_rate_is_computable() {
+    let (_dir, brain) = setup();
+    let conn = brain.conn();
+    let old_id = 0xe100_0000_0000_0001;
+    let correction_id = 0xe100_0000_0000_0002;
+    let request = |record| CaptureRequest {
+        project_key: PROJECT.into(),
+        sensitivity: Sensitivity::Normal,
+        retention: Retention::Standard,
+        provenance: "test-suite".into(),
+        record,
+        title: Some("needle database location".into()),
+        tags: vec![],
+        entities: vec![],
+    };
+    store_capture_with_id(
+        conn,
+        old_id,
+        &request(EpisodicRecord::Turn(EpisodicTurn {
+            content: "needle database is in east".into(),
+            source_session_id: None,
+            source_turn_id: None,
+        })),
+    )
+    .unwrap();
+    store_capture_with_id(
+        conn,
+        correction_id,
+        &request(EpisodicRecord::Correction(Correction {
+            correction: "needle database is in west".into(),
+            supersedes_id: Some(old_id),
+            source_session_id: None,
+            source_turn_id: None,
+        })),
+    )
+    .unwrap();
+
+    let persisted: (String, String) = conn
+        .query_row(
+            "SELECT supersedes, confirmed_by FROM memories WHERE id = ?1",
+            [format!("mem_{correction_id:016x}")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(persisted.0, format!("[\"mem_{old_id:016x}\"]"));
+    assert_eq!(persisted.1, "[]");
+
+    let candidates = generate_candidates(conn, PROJECT, None, Some("needle database"), 16).unwrap();
+    let selected = rank_and_select_with_metrics(candidates, None, 8);
+    assert!(selected
+        .records
+        .iter()
+        .any(|(d, _)| d.id == format!("mem_{correction_id:016x}")));
+    assert!(selected
+        .records
+        .iter()
+        .all(|(d, _)| d.id != format!("mem_{old_id:016x}")));
+    assert_eq!(selected.metrics.stale_candidates, 1);
+    assert_eq!(selected.metrics.stale_selected, 0);
+    assert_eq!(selected.metrics.stale_selected_rate(), 0.0);
+}
+
+#[test]
+fn tombstoned_id_does_not_resurface_through_links_after_index_rebuild() {
+    let (_dir, brain) = setup();
+    let conn = brain.conn();
+    let old_id = 0xe100_0000_0000_0011;
+    let correction_id = 0xe100_0000_0000_0012;
+    let request = |record| CaptureRequest {
+        project_key: PROJECT.into(),
+        sensitivity: Sensitivity::Normal,
+        retention: Retention::Standard,
+        provenance: "test-suite".into(),
+        record,
+        title: Some("needle cache policy".into()),
+        tags: vec![],
+        entities: vec![],
+    };
+    store_capture_with_id(
+        conn,
+        old_id,
+        &request(EpisodicRecord::Turn(EpisodicTurn {
+            content: "needle cache is unbounded".into(),
+            source_session_id: None,
+            source_turn_id: None,
+        })),
+    )
+    .unwrap();
+    store_capture_with_id(
+        conn,
+        correction_id,
+        &request(EpisodicRecord::Correction(Correction {
+            correction: "needle cache is bounded".into(),
+            supersedes_id: Some(old_id),
+            source_session_id: None,
+            source_turn_id: None,
+        })),
+    )
+    .unwrap();
+    let old_storage_id = format!("mem_{old_id:016x}");
+    project_memory::forget_scoped(conn, &old_storage_id, PROJECT).unwrap();
+    project_memory::rebuild_search_index(conn).unwrap();
+
+    let candidates = generate_candidates(conn, PROJECT, None, Some("needle cache"), 16).unwrap();
+    assert!(candidates.iter().all(|c| c.descriptor.id != old_storage_id));
+    assert!(candidates
+        .iter()
+        .flat_map(|c| c.descriptor.links.all_ids())
+        .all(|id| id != old_storage_id));
+}
+
 // ── Dedup: exact duplicate ids collapse before the cap applies ──────────
 
 #[test]
@@ -366,8 +486,7 @@ fn exact_duplicate_candidate_ids_are_deduped_in_selection() {
         "needle duplicated decision",
         "needle body for the duplicate id dedup contract check",
     );
-    let mut candidates =
-        generate_candidates(conn, PROJECT, None, Some("needle"), 16).unwrap();
+    let mut candidates = generate_candidates(conn, PROJECT, None, Some("needle"), 16).unwrap();
     assert_eq!(candidates.len(), 1);
     let dup = candidates[0].clone();
     candidates.push(dup.clone());
