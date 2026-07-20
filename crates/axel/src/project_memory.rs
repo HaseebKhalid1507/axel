@@ -201,7 +201,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     let mut alters: Vec<String> = Vec::new();
     for (col, ddl) in [
-        ("project_key", "ALTER TABLE memories ADD COLUMN project_key TEXT"),
+        (
+            "project_key",
+            "ALTER TABLE memories ADD COLUMN project_key TEXT",
+        ),
         (
             "sensitivity",
             "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
@@ -214,8 +217,14 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "provenance",
             "ALTER TABLE memories ADD COLUMN provenance TEXT NOT NULL DEFAULT ''",
         ),
-        ("expires_at", "ALTER TABLE memories ADD COLUMN expires_at TEXT"),
-        ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+        (
+            "expires_at",
+            "ALTER TABLE memories ADD COLUMN expires_at TEXT",
+        ),
+        (
+            "superseded_by",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT",
+        ),
     ] {
         if !column_exists(conn, "memories", col)? {
             alters.push(ddl.to_string());
@@ -271,7 +280,12 @@ fn validate_scope(scope: &MemoryScope) -> Result<()> {
     Ok(())
 }
 
-fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) -> Result<()> {
+fn insert_scoped_row(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    category_override: Option<&str>,
+) -> Result<()> {
     // Tombstone check — a forgotten id must stay forgotten.
     let tombstoned: Option<String> = conn
         .query_row(
@@ -296,7 +310,7 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
         params![
             memory.id,
-            memory.category.as_str(),
+            category_override.unwrap_or_else(|| memory.category.as_str()),
             memory.topic,
             memory.title,
             memory.abstract_text,
@@ -326,7 +340,12 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
             conn.execute(
                 "INSERT INTO memories_fts (mem_id, title, abstract, content)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![memory.id, memory.title, memory.abstract_text, memory.content],
+                params![
+                    memory.id,
+                    memory.title,
+                    memory.abstract_text,
+                    memory.content
+                ],
             )?;
         }
         Sensitivity::Secret => {
@@ -347,7 +366,40 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
 pub fn store_scoped(conn: &Connection, memory: &Memory, scope: &MemoryScope) -> Result<()> {
     validate_scope(scope)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    match insert_scoped_row(conn, memory, scope) {
+    match insert_scoped_row(conn, memory, scope, None) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Store one memory using a typed episodic class in the existing category
+/// column. `synchronous=FULL` makes the commit durable before `Ok` is
+/// returned, including for connections opened from legacy `.r8` files.
+pub fn store_scoped_typed(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    record_class: &str,
+) -> Result<()> {
+    validate_scope(scope)?;
+    if record_class.trim().is_empty() {
+        return Err(AxelError::Memory(
+            "store_scoped_typed: empty record class".into(),
+        ));
+    }
+    // Enable the strongest SQLite durability before migration too: legacy
+    // files may require schema writes, and those are part of the acknowledged
+    // capture operation.
+    conn.execute_batch("PRAGMA synchronous=FULL")?;
+    migrate(conn)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    match insert_scoped_row(conn, memory, scope, Some(record_class)) {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
             Ok(())
@@ -366,7 +418,7 @@ pub fn store_scoped_batch(conn: &Connection, items: &[(Memory, MemoryScope)]) ->
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     for (memory, scope) in items {
-        if let Err(e) = insert_scoped_row(conn, memory, scope) {
+        if let Err(e) = insert_scoped_row(conn, memory, scope, None) {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
