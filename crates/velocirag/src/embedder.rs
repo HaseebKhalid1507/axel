@@ -191,10 +191,17 @@ impl Embedder {
     }
 
     /// Save the embedding cache to disk.
+    ///
+    /// No-op when the cache is empty — a lexical-only session must leave
+    /// zero filesystem footprint under the cache dir (T35: no implicit
+    /// model/cache activity by default).
     pub fn save_cache(&self) {
         if let Some(ref dir) = self.cache_dir {
-            std::fs::create_dir_all(dir).ok();
             let mut cache = self.cache.lock().unwrap();
+            if cache.entries.is_empty() {
+                return;
+            }
+            std::fs::create_dir_all(dir).ok();
             if let Err(e) = cache.save_to_disk(dir) {
                 tracing::warn!("Failed to save embedding cache: {}", e);
             }

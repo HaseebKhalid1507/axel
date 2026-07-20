@@ -29,3 +29,6 @@ toml = "0.8"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# project_memory_tests open the .r8 SQLite file directly.
+rusqlite = { workspace = true }
+chrono = { workspace = true }

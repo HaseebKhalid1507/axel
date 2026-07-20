@@ -29,7 +29,7 @@ fn memory_creation_generates_unique_ids() {
     for _ in 0..100 {
         let id = Memory::generate_id();
         assert!(id.starts_with("mem_"), "bad prefix: {id}");
-        assert_eq!(id.len(), 4 + 8, "expected mem_ + 8 hex, got {id}");
+        assert_eq!(id.len(), 4 + 16, "expected mem_ + 16 hex, got {id}");
         let hex_part = &id[4..];
         assert!(
             hex_part.chars().all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()),

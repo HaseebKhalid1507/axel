@@ -121,7 +121,8 @@ impl ReviewStatus {
 /// keyword in Rust).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Memory {
-    /// Identifier of the form `mem_XXXXXXXX` (8 lowercase hex chars).
+    /// Identifier of the form `mem_<hex>` (16 lowercase hex chars for new ids;
+    /// legacy 8-hex ids remain valid).
     pub id: String,
     /// Coarse taxonomy.
     pub category: MemoryCategory,
@@ -187,9 +188,13 @@ impl Memory {
         }
     }
 
-    /// Generate a fresh `mem_XXXXXXXX` identifier with 8 hex characters.
+    /// Generate a fresh `mem_XXXXXXXXXXXXXXXX` identifier with 16 hex chars
+    /// (8 random bytes). Widened from 4 bytes (T35): at 100K+ memories the
+    /// 32-bit space hits birthday collisions with near certainty; 64 bits
+    /// keeps collision probability negligible at 1M+. Old 8-hex ids remain
+    /// valid — the id is an opaque TEXT key.
     pub fn generate_id() -> String {
-        let mut bytes = [0u8; 4];
+        let mut bytes = [0u8; 8];
         rand::rng().fill_bytes(&mut bytes);
         format!("mem_{}", hex::encode(bytes))
     }
