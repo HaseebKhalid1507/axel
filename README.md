@@ -284,3 +284,30 @@ AXEL_BRAIN=/path/to/custom.r8   # Override default brain path
 ## License
 
 MIT
+
+## Project-scoped memory (T32–T36)
+
+`axel::project_memory` adds an additive, backward-compatible layer on the
+`.r8` memories table: `project_key`, `sensitivity` (`normal`/`secret`),
+`retention` disclosure classes (`standard`, `local_only`,
+`visible_after_consent`, `persist_never_transmit`, `never_persist` — the
+last is rejected and never enters the file), `provenance`, persisted
+`expires_at`, a `memory_tombstones` table for exact project-scoped forget,
+and a `memories_fts` FTS5 lexical index that works fully offline (no
+embedding model, no network). Legacy rows are `NULL`-scoped and excluded
+from every project-scoped query by default (fail closed).
+
+### Scoped-search scale benchmark
+
+`cargo test -p axel --release --test scoped_search_bench -- --ignored --nocapture`
+on the reference dev machine (limit=10, text query matching ~all rows):
+
+| corpus  | batch insert | search (limit=10) |
+|--------:|-------------:|------------------:|
+| 1K      | 0.01 s       | 0.44 ms           |
+| 10K     | 0.10 s       | 3.61 ms           |
+| 100K    | 1.20 s       | 53.7 ms           |
+
+Result-set memory is proportional to the requested limit (hard cap 50),
+never to the total match count. 1M extrapolates to sub-second search
+(FTS5 rank + `LIMIT`); run with `AXEL_BENCH_1M=1` to measure it directly.
