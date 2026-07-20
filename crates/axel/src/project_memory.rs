@@ -129,6 +129,35 @@ pub struct MemoryScope {
     pub provenance: String,
 }
 
+/// Typed links between durable memory records (continuous-memory spec §9.4).
+/// IDs use the same stable storage representation as [`ScopedDescriptor::id`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordLinks {
+    #[serde(default)]
+    pub supersedes: Vec<String>,
+    #[serde(default)]
+    pub contradicts: Vec<String>,
+    #[serde(default)]
+    pub confirmed_by: Vec<String>,
+    #[serde(default)]
+    pub invalidated_at: Option<DateTime<Utc>>,
+    /// Reverse edge maintained when a newer record supersedes this one.
+    #[serde(default)]
+    pub superseded_by: Option<String>,
+}
+
+impl RecordLinks {
+    /// Every referenced record id, irrespective of relation type.
+    pub fn all_ids(&self) -> impl Iterator<Item = &str> {
+        self.supersedes
+            .iter()
+            .chain(&self.contradicts)
+            .chain(&self.confirmed_by)
+            .map(String::as_str)
+            .chain(self.superseded_by.iter().map(String::as_str))
+    }
+}
+
 /// Filters for a scoped search. All filters are ANDed.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ScopedQuery {
@@ -168,6 +197,8 @@ pub struct ScopedDescriptor {
     pub sensitivity: Sensitivity,
     pub retention: Retention,
     pub provenance: String,
+    /// Persisted supersession/contradiction graph links, scrubbed of tombstones.
+    pub links: RecordLinks,
 }
 
 /// Full fetch view. Body may be withheld by sensitivity/retention policy.
@@ -201,7 +232,10 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
 pub fn migrate(conn: &Connection) -> Result<()> {
     let mut alters: Vec<String> = Vec::new();
     for (col, ddl) in [
-        ("project_key", "ALTER TABLE memories ADD COLUMN project_key TEXT"),
+        (
+            "project_key",
+            "ALTER TABLE memories ADD COLUMN project_key TEXT",
+        ),
         (
             "sensitivity",
             "ALTER TABLE memories ADD COLUMN sensitivity TEXT NOT NULL DEFAULT 'normal'",
@@ -214,8 +248,30 @@ pub fn migrate(conn: &Connection) -> Result<()> {
             "provenance",
             "ALTER TABLE memories ADD COLUMN provenance TEXT NOT NULL DEFAULT ''",
         ),
-        ("expires_at", "ALTER TABLE memories ADD COLUMN expires_at TEXT"),
-        ("superseded_by", "ALTER TABLE memories ADD COLUMN superseded_by TEXT"),
+        (
+            "expires_at",
+            "ALTER TABLE memories ADD COLUMN expires_at TEXT",
+        ),
+        (
+            "superseded_by",
+            "ALTER TABLE memories ADD COLUMN superseded_by TEXT",
+        ),
+        (
+            "supersedes",
+            "ALTER TABLE memories ADD COLUMN supersedes TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            "contradicts",
+            "ALTER TABLE memories ADD COLUMN contradicts TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            "confirmed_by",
+            "ALTER TABLE memories ADD COLUMN confirmed_by TEXT NOT NULL DEFAULT '[]'",
+        ),
+        (
+            "invalidated_at",
+            "ALTER TABLE memories ADD COLUMN invalidated_at TEXT",
+        ),
     ] {
         if !column_exists(conn, "memories", col)? {
             alters.push(ddl.to_string());
@@ -257,6 +313,24 @@ pub fn migrate(conn: &Connection) -> Result<()> {
 
 // ── Store ───────────────────────────────────────────────────────────────
 
+fn live_link_ids(conn: &Connection, ids: &[String]) -> Result<Vec<String>> {
+    let mut live = Vec::with_capacity(ids.len());
+    for id in ids {
+        let tombstoned = conn
+            .query_row(
+                "SELECT 1 FROM memory_tombstones WHERE id = ?1",
+                [id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if !tombstoned {
+            live.push(id.clone());
+        }
+    }
+    Ok(live)
+}
+
 fn validate_scope(scope: &MemoryScope) -> Result<()> {
     if scope.project_key.trim().is_empty() {
         return Err(AxelError::Memory(
@@ -271,7 +345,20 @@ fn validate_scope(scope: &MemoryScope) -> Result<()> {
     Ok(())
 }
 
-fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) -> Result<()> {
+fn insert_scoped_row(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    category_override: Option<&str>,
+    links: &RecordLinks,
+) -> Result<()> {
+    let live_links = RecordLinks {
+        supersedes: live_link_ids(conn, &links.supersedes)?,
+        contradicts: live_link_ids(conn, &links.contradicts)?,
+        confirmed_by: live_link_ids(conn, &links.confirmed_by)?,
+        invalidated_at: links.invalidated_at,
+        superseded_by: links.superseded_by.clone(),
+    };
     // Tombstone check — a forgotten id must stay forgotten.
     let tombstoned: Option<String> = conn
         .query_row(
@@ -292,11 +379,12 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
             (id, category, topic, title, abstract_text, content, confidence,
              importance, source_sessions, tags, related_topics, created, updated,
              trust_level, signature, project_key, sensitivity, retention,
-             provenance, expires_at, superseded_by)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21)",
+             provenance, expires_at, superseded_by, supersedes, contradicts,
+             confirmed_by, invalidated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25)",
         params![
             memory.id,
-            memory.category.as_str(),
+            category_override.unwrap_or_else(|| memory.category.as_str()),
             memory.topic,
             memory.title,
             memory.abstract_text,
@@ -316,6 +404,10 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
             scope.provenance,
             memory.expires_at.map(|t| t.to_rfc3339()),
             memory.superseded_by,
+            serde_json::to_string(&live_links.supersedes)?,
+            serde_json::to_string(&live_links.contradicts)?,
+            serde_json::to_string(&live_links.confirmed_by)?,
+            live_links.invalidated_at.map(|t| t.to_rfc3339()),
         ],
     )?;
 
@@ -326,7 +418,12 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
             conn.execute(
                 "INSERT INTO memories_fts (mem_id, title, abstract, content)
                  VALUES (?1, ?2, ?3, ?4)",
-                params![memory.id, memory.title, memory.abstract_text, memory.content],
+                params![
+                    memory.id,
+                    memory.title,
+                    memory.abstract_text,
+                    memory.content
+                ],
             )?;
         }
         Sensitivity::Secret => {
@@ -347,7 +444,68 @@ fn insert_scoped_row(conn: &Connection, memory: &Memory, scope: &MemoryScope) ->
 pub fn store_scoped(conn: &Connection, memory: &Memory, scope: &MemoryScope) -> Result<()> {
     validate_scope(scope)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
-    match insert_scoped_row(conn, memory, scope) {
+    match insert_scoped_row(conn, memory, scope, None, &RecordLinks::default()) {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+    }
+}
+
+/// Store one memory using a typed episodic class in the existing category
+/// column. `synchronous=FULL` makes the commit durable before `Ok` is
+/// returned, including for connections opened from legacy `.r8` files.
+pub fn store_scoped_typed(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    record_class: &str,
+) -> Result<()> {
+    store_scoped_typed_with_links(conn, memory, scope, record_class, &RecordLinks::default())
+}
+
+/// Store one typed memory together with its contradiction-graph links.
+pub fn store_scoped_typed_with_links(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    record_class: &str,
+    links: &RecordLinks,
+) -> Result<()> {
+    validate_scope(scope)?;
+    if record_class.trim().is_empty() {
+        return Err(AxelError::Memory(
+            "store_scoped_typed: empty record class".into(),
+        ));
+    }
+    // Enable the strongest SQLite durability before migration too: legacy
+    // files may require schema writes, and those are part of the acknowledged
+    // capture operation.
+    conn.execute_batch("PRAGMA synchronous=FULL")?;
+    migrate(conn)?;
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        insert_scoped_row(conn, memory, scope, Some(record_class), links)?;
+        for target in &links.supersedes {
+            conn.execute(
+                "UPDATE memories SET superseded_by = ?1, invalidated_at = ?2
+                  WHERE id = ?3 AND project_key = ?4
+                    AND id NOT IN (SELECT id FROM memory_tombstones)",
+                params![
+                    memory.id,
+                    Utc::now().to_rfc3339(),
+                    target,
+                    scope.project_key
+                ],
+            )?;
+        }
+        Ok(())
+    })();
+    match result {
         Ok(()) => {
             conn.execute_batch("COMMIT")?;
             Ok(())
@@ -366,7 +524,7 @@ pub fn store_scoped_batch(conn: &Connection, items: &[(Memory, MemoryScope)]) ->
     }
     conn.execute_batch("BEGIN IMMEDIATE")?;
     for (memory, scope) in items {
-        if let Err(e) = insert_scoped_row(conn, memory, scope) {
+        if let Err(e) = insert_scoped_row(conn, memory, scope, None, &RecordLinks::default()) {
             let _ = conn.execute_batch("ROLLBACK");
             return Err(e);
         }
@@ -420,9 +578,29 @@ struct RawRow {
     sensitivity: String,
     retention: String,
     provenance: String,
+    supersedes: String,
+    contradicts: String,
+    confirmed_by: String,
+    invalidated_at: Option<String>,
+    superseded_by: Option<String>,
+}
+
+fn parse_links(r: &RawRow) -> RecordLinks {
+    RecordLinks {
+        supersedes: serde_json::from_str(&r.supersedes).unwrap_or_default(),
+        contradicts: serde_json::from_str(&r.contradicts).unwrap_or_default(),
+        confirmed_by: serde_json::from_str(&r.confirmed_by).unwrap_or_default(),
+        invalidated_at: r
+            .invalidated_at
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value).ok())
+            .map(|value| value.with_timezone(&Utc)),
+        superseded_by: r.superseded_by.clone(),
+    }
 }
 
 fn row_to_descriptor(r: RawRow) -> ScopedDescriptor {
+    let links = parse_links(&r);
     let sensitivity = Sensitivity::parse(&r.sensitivity).unwrap_or(Sensitivity::Secret);
     let retention = Retention::parse(&r.retention).unwrap_or(Retention::LocalOnly);
     // Secret => no body-derived snippet, ever.
@@ -441,6 +619,7 @@ fn row_to_descriptor(r: RawRow) -> ScopedDescriptor {
         sensitivity,
         retention,
         provenance: r.provenance,
+        links,
     }
 }
 
@@ -456,7 +635,9 @@ pub fn search_scoped(conn: &Connection, query: &ScopedQuery) -> Result<Vec<Scope
 
     let mut sql = String::from(
         "SELECT m.id, m.project_key, m.title, m.content, m.category, m.tags,
-                m.created, m.sensitivity, m.retention, m.provenance
+                m.created, m.sensitivity, m.retention, m.provenance,
+                m.supersedes, m.contradicts, m.confirmed_by, m.invalidated_at,
+                m.superseded_by
            FROM memories m ",
     );
     let mut binds: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
@@ -510,6 +691,11 @@ pub fn search_scoped(conn: &Connection, query: &ScopedQuery) -> Result<Vec<Scope
             sensitivity: row.get(7)?,
             retention: row.get(8)?,
             provenance: row.get(9)?,
+            supersedes: row.get(10)?,
+            contradicts: row.get(11)?,
+            confirmed_by: row.get(12)?,
+            invalidated_at: row.get(13)?,
+            superseded_by: row.get(14)?,
         }));
         if out.len() >= limit {
             break;
@@ -535,7 +721,9 @@ pub fn fetch_scoped(
     let now = Utc::now().to_rfc3339();
     let mut stmt = conn.prepare(
         "SELECT m.id, m.project_key, m.title, m.content, m.category, m.tags,
-                m.created, m.sensitivity, m.retention, m.provenance
+                m.created, m.sensitivity, m.retention, m.provenance,
+                m.supersedes, m.contradicts, m.confirmed_by, m.invalidated_at,
+                m.superseded_by
            FROM memories m
           WHERE m.id = ?1 AND m.project_key = ?2
             AND m.id NOT IN (SELECT id FROM memory_tombstones)
@@ -554,6 +742,11 @@ pub fn fetch_scoped(
                 sensitivity: row.get(7)?,
                 retention: row.get(8)?,
                 provenance: row.get(9)?,
+                supersedes: row.get(10)?,
+                contradicts: row.get(11)?,
+                confirmed_by: row.get(12)?,
+                invalidated_at: row.get(13)?,
+                superseded_by: row.get(14)?,
             })
         })
         .optional()?;
@@ -625,6 +818,47 @@ pub fn forget_scoped(conn: &Connection, id: &str, project_key: &str) -> Result<b
             "DELETE FROM memories WHERE id = ?1 AND project_key = ?2",
             params![id, project_key],
         )?;
+        // Scrub graph edges to the forgotten id; rebuilding the search index
+        // must never make a tombstoned record reachable through a survivor.
+        let mut stmt = conn.prepare(
+            "SELECT id, supersedes, contradicts, confirmed_by
+               FROM memories WHERE project_key = ?1",
+        )?;
+        let rows = stmt.query_map([project_key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut updates = Vec::new();
+        for row in rows {
+            let (survivor, supersedes, contradicts, confirmed_by) = row?;
+            let scrub = |json: &str| -> Vec<String> {
+                serde_json::from_str::<Vec<String>>(json)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|linked| linked != id)
+                    .collect()
+            };
+            updates.push((
+                survivor,
+                serde_json::to_string(&scrub(&supersedes))?,
+                serde_json::to_string(&scrub(&contradicts))?,
+                serde_json::to_string(&scrub(&confirmed_by))?,
+            ));
+        }
+        drop(stmt);
+        for (survivor, supersedes, contradicts, confirmed_by) in updates {
+            conn.execute(
+                "UPDATE memories
+                    SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3,
+                        superseded_by = CASE WHEN superseded_by = ?4 THEN NULL ELSE superseded_by END
+                  WHERE id = ?5",
+                params![supersedes, contradicts, confirmed_by, id, survivor],
+            )?;
+        }
         conn.execute("DELETE FROM memories_fts WHERE mem_id = ?1", params![id])?;
         Ok(true)
     })();
@@ -636,6 +870,35 @@ pub fn forget_scoped(conn: &Connection, id: &str, project_key: &str) -> Result<b
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
+        }
+    }
+}
+
+/// Rebuild the lexical index from live rows only. Graph links remain attached
+/// to records and tombstones are excluded defensively.
+pub fn rebuild_search_index(conn: &Connection) -> Result<()> {
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+    let result = (|| -> Result<()> {
+        conn.execute("DELETE FROM memories_fts", [])?;
+        conn.execute(
+            "INSERT INTO memories_fts (mem_id, title, abstract, content)
+             SELECT m.id, m.title,
+                    CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.abstract_text END,
+                    CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.content END
+               FROM memories m
+              WHERE m.id NOT IN (SELECT id FROM memory_tombstones)",
+            [],
+        )?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(error)
         }
     }
 }

@@ -1,4 +1,9 @@
 //! Auto-download models from HuggingFace on first use.
+//!
+//! The legacy `ensure_model` entry point remains for non-continuous-memory
+//! callers. [`LocalEmbeddingModel`] is the guarded E3 path: it is off by
+//! default, enablement is separate from the explicit download stub, and none
+//! of its operations can construct a network request.
 
 use std::fs;
 use std::io::Read;
@@ -32,6 +37,52 @@ pub const RERANKER_MODEL: ModelSpec = ModelSpec {
         ("tokenizer.json", "tokenizer.json"),
     ],
 };
+
+/// Explicit, local-only embedding model state for continuous-memory ranking.
+/// Default is disabled. Enabling merely permits already-provisioned files.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEmbeddingModel {
+    enabled: bool,
+    model_dir: PathBuf,
+}
+
+impl LocalEmbeddingModel {
+    pub fn disabled(model_dir: PathBuf) -> Self {
+        Self { enabled: false, model_dir }
+    }
+
+    pub fn enabled(model_dir: PathBuf) -> Self {
+        Self { enabled: true, model_dir }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.enabled
+            && EMBEDDER_MODEL.files.iter()
+                .all(|(_, local)| self.model_dir.join(local).is_file())
+    }
+
+    pub fn model_dir(&self) -> &Path {
+        &self.model_dir
+    }
+}
+
+impl Default for LocalEmbeddingModel {
+    fn default() -> Self {
+        Self::disabled(models_cache_dir().join(EMBEDDER_MODEL.local_dir))
+    }
+}
+
+/// Separate explicit download step for the E3 local-only path. This is a
+/// guarded stub by design: it performs no I/O and constructs no request.
+pub fn download_local_embedding_model(_model_dir: &Path) -> Result<()> {
+    Err(VelociError::Embedding(
+        "automatic model download is disabled; provision the model explicitly".into(),
+    ))
+}
 
 /// Resolve the cache directory for velocirag models.
 pub fn models_cache_dir() -> PathBuf {
