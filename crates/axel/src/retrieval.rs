@@ -7,11 +7,10 @@
 //!   never inspects a record it must not disclose. (Candidate generation
 //!   already enforces the same gate; this is defence in depth for
 //!   hand-constructed candidates.)
-//! * **Bounded selection**: output is capped at [`MAX_SELECTED_CAP`]
-//!   (spec §16.2: ≤8 selected records), exact duplicate ids are deduped,
-//!   and exact (case/whitespace-normalised) duplicate titles are dropped
-//!   as a cheap near-identical guard. The full MMR diversity pass is
-//!   deliberately out of scope here (Task E2).
+//! * **Bounded diverse selection**: after ranking, a bounded MMR-style
+//!   pass mixes useful record classes and penalises near-identical titles.
+//!   Output remains capped at [`MAX_SELECTED_CAP`] (spec §16.2: ≤8 selected
+//!   records), so downstream byte-bound packing cannot be expanded.
 //! * **Explainability (spec §10.4)**: every selected record carries at
 //!   least one machine-readable [`RankReason`] — never free text.
 
@@ -177,6 +176,116 @@ pub fn rank_and_select(
     rank_and_select_with_metrics(candidates, session_id, max_selected).records
 }
 
+/// The five useful classes called out by spec §9.3. Related episodic and fact
+/// categories share a class so the pass does not spend its small budget on
+/// cosmetic category differences.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DiversityClass {
+    Decision,
+    Preference,
+    Episode,
+    UnresolvedTask,
+    Fact,
+}
+
+impl DiversityClass {
+    fn of(category: &str) -> Option<Self> {
+        match category {
+            CLASS_DECISION => Some(Self::Decision),
+            CLASS_PREFERENCE => Some(Self::Preference),
+            CLASS_EPISODIC_TURN | CLASS_CONVERSATION_SUMMARY | CLASS_TOOL_OUTCOME => {
+                Some(Self::Episode)
+            }
+            CLASS_UNRESOLVED_TASK => Some(Self::UnresolvedTask),
+            CLASS_ENTITY_FACT | CLASS_CORRECTION => Some(Self::Fact),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct DiversityKey {
+    class: Option<DiversityClass>,
+    score: f64,
+    title_tokens: HashSet<String>,
+}
+
+impl DiversityKey {
+    fn new(class: Option<DiversityClass>, score: f64, title: &str) -> Self {
+        const STOP_WORDS: &[&str] = &["a", "an", "and", "are", "for", "is", "of", "the", "to"];
+        let title_tokens = title
+            .split(|character: char| !character.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_lowercase)
+            .filter(|token| !STOP_WORDS.contains(&token.as_str()))
+            .collect();
+        Self {
+            class,
+            score,
+            title_tokens,
+        }
+    }
+}
+
+fn title_similarity(left: &DiversityKey, right: &DiversityKey) -> f64 {
+    if left.title_tokens.is_empty() || right.title_tokens.is_empty() {
+        return 0.0;
+    }
+    let intersection = left.title_tokens.intersection(&right.title_tokens).count();
+    let union = left.title_tokens.union(&right.title_tokens).count();
+    intersection as f64 / union as f64
+}
+
+/// Select indices from an already-ranked, bounded window. Rank relevance
+/// decays gently while a one-time class novelty bonus promotes the spread in
+/// spec §9.3. Near-identical titles are excluded rather than merely reordered.
+fn diverse_selection_indices(ranked: &[DiversityKey], cap: usize) -> Vec<usize> {
+    const CLASS_NOVELTY_BONUS: f64 = 0.4;
+    const DUPLICATE_PENALTY: f64 = 0.75;
+    const NEAR_DUPLICATE_THRESHOLD: f64 = 0.72;
+
+    let cap = cap.min(MAX_SELECTED_CAP).min(ranked.len());
+    let mut selected = Vec::with_capacity(cap);
+    let mut selected_classes = HashSet::with_capacity(cap);
+
+    while selected.len() < cap {
+        let mut best: Option<(usize, f64)> = None;
+        for (index, key) in ranked.iter().enumerate() {
+            if selected.contains(&index) {
+                continue;
+            }
+            let similarity = selected
+                .iter()
+                .map(|&selected_index| title_similarity(key, &ranked[selected_index]))
+                .fold(0.0, f64::max);
+            if similarity >= NEAR_DUPLICATE_THRESHOLD {
+                continue;
+            }
+
+            let rank_relevance = key.score;
+            let class_novelty = key
+                .class
+                .filter(|class| !selected_classes.contains(class))
+                .map_or(0.0, |_| CLASS_NOVELTY_BONUS);
+            let mmr_score = rank_relevance + class_novelty - DUPLICATE_PENALTY * similarity;
+            if best.is_none_or(|(best_index, best_score)| {
+                mmr_score > best_score || (mmr_score == best_score && index < best_index)
+            }) {
+                best = Some((index, mmr_score));
+            }
+        }
+
+        let Some((index, _)) = best else {
+            break;
+        };
+        if let Some(class) = ranked[index].class {
+            selected_classes.insert(class);
+        }
+        selected.push(index);
+    }
+    selected
+}
+
 fn rank_current(
     candidates: Vec<RecallCandidate>,
     session_id: Option<&str>,
@@ -213,9 +322,12 @@ fn rank_current(
 
     let mut seen_ids: HashSet<String> = HashSet::with_capacity(cap);
     let mut seen_titles: HashSet<String> = HashSet::with_capacity(cap);
-    let mut selected: Vec<(ScopedDescriptor, Vec<RankReason>)> = Vec::with_capacity(cap);
-    for (candidate, affinity, _) in scored {
-        if selected.len() >= cap {
+    // Four alternatives per output slot is enough room for useful class
+    // mixing while keeping the diversity pass strictly bounded (≤32 rows).
+    let diversity_window = cap.saturating_mul(4).min(MAX_SELECTED_CAP * 4);
+    let mut ranked = Vec::with_capacity(diversity_window);
+    for (candidate, affinity, candidate_score) in scored {
+        if ranked.len() >= diversity_window {
             break;
         }
         if !seen_ids.insert(candidate.descriptor.id.clone()) {
@@ -225,9 +337,90 @@ fn rank_current(
         if !norm_title.is_empty() && !seen_titles.insert(norm_title) {
             continue; // exact (normalised) duplicate title
         }
-        let reasons = reasons_for(&candidate, affinity);
-        debug_assert!(!reasons.is_empty(), "spec §10.4: ≥1 rank reason required");
-        selected.push((candidate.descriptor, reasons));
+        ranked.push((candidate, affinity, candidate_score));
     }
-    selected
+
+    let diversity_keys: Vec<_> = ranked
+        .iter()
+        .map(|(candidate, _, score)| {
+            DiversityKey::new(
+                DiversityClass::of(&candidate.descriptor.category),
+                *score,
+                &candidate.descriptor.title,
+            )
+        })
+        .collect();
+    diverse_selection_indices(&diversity_keys, cap)
+        .into_iter()
+        .map(|index| {
+            let (candidate, affinity, _) = &ranked[index];
+            let reasons = reasons_for(candidate, *affinity);
+            debug_assert!(!reasons.is_empty(), "spec §10.4: ≥1 rank reason required");
+            (candidate.descriptor.clone(), reasons)
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod diversity_tests {
+    use super::*;
+
+    fn key(class: DiversityClass, title: &str) -> DiversityKey {
+        DiversityKey::new(Some(class), 1.0, title)
+    }
+
+    #[test]
+    fn near_duplicate_fixture_keeps_at_most_one_representative() {
+        let ranked = vec![
+            key(DiversityClass::Decision, "Deploy Rust service"),
+            key(DiversityClass::Decision, "Deploy the Rust service"),
+            key(DiversityClass::Fact, "Production region is eu-west-1"),
+        ];
+
+        let selected = diverse_selection_indices(&ranked, MAX_SELECTED_CAP);
+        let duplicate_representatives = selected.iter().filter(|&&index| index < 2).count();
+
+        assert!(duplicate_representatives <= 1);
+        assert_eq!(selected.len(), 2);
+    }
+
+    #[test]
+    fn diversity_stays_within_selection_and_prebounded_input() {
+        let ranked: Vec<_> = (0..12)
+            .map(|index| key(DiversityClass::Fact, &format!("unique fact number {index}")))
+            .collect();
+
+        let selected = diverse_selection_indices(&ranked, MAX_SELECTED_CAP);
+
+        assert!(selected.len() <= MAX_SELECTED_CAP);
+        assert!(selected.iter().all(|&index| index < ranked.len()));
+
+        // A byte-bounded upstream slice cannot be expanded by the pass.
+        let byte_bounded = &ranked[..3];
+        let selected = diverse_selection_indices(byte_bounded, MAX_SELECTED_CAP);
+        assert!(selected.len() <= byte_bounded.len());
+    }
+
+    #[test]
+    fn class_mixing_prefers_spread_over_many_same_class_records() {
+        let ranked = vec![
+            key(DiversityClass::Fact, "database uses postgres"),
+            key(DiversityClass::Fact, "api transport uses tonic"),
+            key(DiversityClass::Fact, "cache uses redis"),
+            key(DiversityClass::Fact, "frontend uses react"),
+            key(DiversityClass::Fact, "queue uses nats"),
+            key(DiversityClass::Decision, "ship on Tuesdays"),
+            key(DiversityClass::Preference, "prefer concise output"),
+            key(DiversityClass::Episode, "recent deploy failed"),
+            key(DiversityClass::UnresolvedTask, "repair deploy credentials"),
+        ];
+
+        let selected = diverse_selection_indices(&ranked, 5);
+        let classes: HashSet<_> = selected
+            .iter()
+            .filter_map(|&index| ranked[index].class)
+            .collect();
+
+        assert_eq!(classes.len(), 5);
+    }
 }
