@@ -180,6 +180,11 @@ impl VectorIndex {
             .collect())
     }
 
+    /// Whether the index holds a vector under `key`.
+    pub fn contains(&self, key: u64) -> bool {
+        self.index.contains(key)
+    }
+
     /// Number of vectors in the index.
     pub fn len(&self) -> usize {
         self.count

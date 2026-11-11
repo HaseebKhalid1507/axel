@@ -182,8 +182,14 @@ impl BrainSearch {
                 .document_count()
                 .unwrap_or(0);
 
+            // RULING: v2 c18b review round 5, item 1: the count, then every row's id. Another
+            // writer may have deleted one row and added another; the file then lacks the new
+            // row's vector, and is not loaded.
+            let holds_every_row = |loaded: &VectorIndex| {
+                document_ids(db.conn()).is_ok_and(|ids| ids.iter().all(|id| loaded.contains(*id as u64)))
+            };
             match VectorIndex::load(&cache_path) {
-                Ok(loaded) if loaded.len() == db_count && db_count > 0 => {
+                Ok(loaded) if loaded.len() == db_count && db_count > 0 && holds_every_row(&loaded) => {
                     eprintln!("Loading cached index ({} vectors)...", loaded.len());
                     (loaded, true)
                 }
@@ -749,6 +755,35 @@ mod tests {
         let search = open_hashing(&path).unwrap();
         assert!(search.index_built, "the next search would rebuild the index");
         assert_eq!(search.index.len(), 2);
+    }
+
+    /// v2 c18b review round 5, item 1: between two opens another writer deletes one row
+    /// and adds one (the count is the same); the second open rebuilds, and the new row is
+    /// found by its vector.
+    #[test]
+    fn a_warm_file_that_lacks_a_row_is_not_loaded_and_the_row_is_found() {
+        let (_dir, path) = tmp_brain_with_search();
+        {
+            let mut search = open_hashing(&path).unwrap();
+            search.index_document("a", "alpha document about lighthouses", None, None).unwrap();
+            search.index_document("b", "beta document about orchards", None, None).unwrap();
+        }
+        let cache = path.with_extension("r8.hnsw");
+        assert!(cache.exists());
+        {
+            // As the extension writes: its own connection, its own vector.
+            let mut other = open_hashing(&path).unwrap();
+            let embedding = other.embedder.embed_one("zeta document about glaciers").unwrap();
+            other.db.insert_document("z", "zeta document about glaciers", &serde_json::json!({}), &embedding, None).unwrap();
+            other.db.conn().execute("DELETE FROM documents WHERE doc_id = 'a'", []).unwrap();
+            // Nothing of its own index changed: its drop leaves the file as it is.
+        }
+        assert!(cache.exists(), "the file is gone: the test proves nothing");
+        let mut search = open_hashing(&path).unwrap();
+        assert!(!search.index_built, "the stale file was loaded");
+        let hits = search.search("glaciers", 5).unwrap();
+        assert!(hits.results.iter().any(|r| r.doc_id == "z"));
+        assert!(search.index.contains(search.db.get_document("z").unwrap().unwrap().id as u64));
     }
 
     /// The handle's own commits do not stop its save (`index`, `index-sync`).
