@@ -254,6 +254,10 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
         return;
     }
     log_line(&format!("front carry skipped={} forgot={}", carry.skipped.len(), carry.forgot.len()));
+    // A chat in which core's `memory_forget` was called: the turn is not to be learned.
+    // RULING: v2 c18a review round 2, item 5. Before the skipped chats are let go: a chat in
+    // both lists is marked while its buffer still holds the turn's first message and key.
+    mark_carried(st, &carry.forgot);
     // A chat that lost a hook is not captured live; the turn arrives with its archive.
     for session_id in &carry.skipped {
         st.capture.drop_session(session_id);
@@ -261,8 +265,6 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
     // The turns let go here are counted now, not at the next capture hook of any chat.
     // RULING: v2 final capture round, item 2: and a marked or withheld one is sent.
     capture::after_let_go(st);
-    // A chat in which core's `memory_forget` was called: the turn is not to be learned.
-    mark_carried(st, &carry.forgot);
 }
 
 /// `mark_forgotten` for each chat of `Carry.forgot`.

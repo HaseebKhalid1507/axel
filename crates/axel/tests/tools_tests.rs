@@ -2108,3 +2108,42 @@ fn rr4_the_wait_is_put_back_when_the_work_under_the_guard_panics() {
     assert!(panicked.is_err());
     assert_eq!(wait_of(&lab.st), own, "a panic left the wait at zero");
 }
+
+// RULING: v2 c18a review round 2, item 5: a chat in both lists of a `Carry` is marked before
+// it is let go, so the mark has its buffer's first message and keys.
+#[test]
+fn rr5_a_chat_both_skipped_and_forgotten_is_marked_from_its_buffer() {
+    let mut lab = Lab::new();
+    let t = lab.chat(&lab.a.clone(), "T");
+    let (first, second) = ("what was the reading of the weir gauge", "and the gauge at the upper lock");
+    let at = now_ms() - 5_000;
+    let log = |conn: &Connection, ts: i64, said: &str| {
+        conn.execute(
+            "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome, total_ms, detail)
+             VALUES (?1, 'S', ?2, '', 'the gauge', ?3, 'nothing_relevant', 1.0, '{}')",
+            params![ts, project::logical("S"), recall::query_hash(said)],
+        )
+        .unwrap();
+    };
+    log(lab.conn(), at, first);
+    lab.hook("before_message", "S", first, json!({}), at);
+    log(lab.conn(), at + 1_000, second);
+    lab.hook("before_message", "S", second, json!({}), at + 1_000);
+
+    let carry = Carry { skipped: vec!["S".to_string()], forgot: vec!["S".to_string()] };
+    let answer = forward(&mut lab, carry, "recall", json!({}), &t);
+    assert!(matches!(answer, FrontAnswer::Tool(Ok(_))));
+    let rows = call_row(lab.conn(), "S");
+    assert!(!rows.is_empty());
+    assert!(rows.iter().all(|(from_ms, _, _)| *from_ms == at), "{rows:?}");
+    let mut keys: Vec<String> = rows.iter().map(|(_, _, key)| key.clone()).collect();
+    keys.sort();
+    let mut want = vec![recall::query_hash(first), recall::query_hash(second)];
+    want.sort();
+    assert_eq!(keys, want);
+    assert_eq!(
+        count_id(lab.conn(), "SELECT COUNT(*) FROM recall_log WHERE session_id = ?1", "S"),
+        0,
+        "the turn's first message's log row is still there"
+    );
+}
