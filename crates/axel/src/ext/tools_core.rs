@@ -55,6 +55,10 @@ const NOTICE_MS: i64 = 30 * DAY_MS;
 // SPEC: 4102-4105 bound a handler at about 300 ms and give search no number of its own. The
 // search works to this deadline; recall's own floor-free run stops at it with `timeout`.
 const SEARCH_BUDGET: Duration = Duration::from_millis(250);
+/// What one `forget` call may wait for the write lock in all: the rpc thread waits
+/// `TOOL_WAIT_MS` (2 s, `ext/server.rs`) for the answer, and this leaves room to send it.
+// RULING: v2 c18a review, item 4.
+const FORGET_BUDGET: Duration = Duration::from_millis(1_800);
 const HANDOFF_CHARS: usize = 800;
 const LABEL_CHARS: usize = 300;
 const FIELD_CHARS: usize = 120;
@@ -218,6 +222,24 @@ fn write<T>(st: &FrontState, work: impl FnOnce(&Connection) -> Result<T>) -> Res
     conn.execute_batch("COMMIT").map_err(sql(st, true))?;
     drop(guard);
     Ok(out)
+}
+
+/// `write`, waiting for the lock no longer than `deadline` (and no longer than the
+/// connection's own wait). With nothing left the answer is `Busy` and nothing is begun: an
+/// exact retry is safe. The connection's wait is put back after.
+// RULING: v2 c18a review, item 4. The call is answered before the rpc thread gives up on it,
+// so no write of a call it answered `Busy` commits later.
+fn write_by<T>(st: &FrontState, deadline: Instant, work: impl FnOnce(&Connection) -> Result<T>) -> Result<T> {
+    let left = deadline.saturating_duration_since(Instant::now());
+    if left.is_zero() {
+        return Err(ToolError::Busy);
+    }
+    let conn = connection(st)?;
+    let waits_ms: u64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).map_err(sql(st, false))?;
+    conn.busy_timeout(left.min(Duration::from_millis(waits_ms))).map_err(sql(st, false))?;
+    let out = write(st, work);
+    let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
+    out
 }
 
 /// The system clock: `hide` and `supersede` stamp it themselves, so the cap and every time
@@ -916,6 +938,8 @@ fn forget(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<String>
     let Some(session_id) = caller.session_id.clone() else {
         return Err(ToolError::Refused(WORKER_REFUSAL.to_string()));
     };
+    // The mark and the write after it share one budget; the write waits only what is left.
+    let deadline = Instant::now() + FORGET_BUDGET;
     // Before the input is read (R3-2e): a refused call, an unknown id and a call past the
     // cap are marked too.
     mark_turn(st, &session_id)?;
@@ -926,13 +950,13 @@ fn forget(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<String>
         return Err(invalid("reason"));
     }
     match (id, stop) {
-        (Some(id), None) => hide_one(st, &session_id, caller, id),
-        (None, Some(what)) => stop_chat(st, &session_id, what),
+        (Some(id), None) => hide_one(st, &session_id, caller, id, deadline),
+        (None, Some(what)) => stop_chat(st, &session_id, what, deadline),
         _ => Err(ToolError::Invalid("forget: give id, or stop, not both".to_string())),
     }
 }
 
-fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str) -> Result<String> {
+fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str, deadline: Instant) -> Result<String> {
     let given = given.trim();
     if given.starts_with("doc:") {
         return Err(ToolError::Refused(A_FILE.to_string()));
@@ -946,7 +970,7 @@ fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str)
     let (view, _) = view_of(st, caller)?;
     let now = (st.clock)();
     let hidden_by = format!("model:{session_id}");
-    let vid = write(st, |conn| {
+    let vid = write_by(st, deadline, |conn| {
         let target = visible_row(conn, id, &view, now).map_err(sql(st, true))?;
         let Some(target) = target else { return Err(ToolError::Refused(NOT_FOUND.to_string())) };
         match target.origin.as_str() {
@@ -970,7 +994,7 @@ fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str)
     ))
 }
 
-fn stop_chat(st: &FrontState, session_id: &str, what: &str) -> Result<String> {
+fn stop_chat(st: &FrontState, session_id: &str, what: &str, deadline: Instant) -> Result<String> {
     let logical = project::logical(session_id);
     let whats: &[&str] = match what {
         "learning" => &["learning"],
@@ -978,7 +1002,7 @@ fn stop_chat(st: &FrontState, session_id: &str, what: &str) -> Result<String> {
         _ => &["learning", "recall"],
     };
     // A pause's hides are not counted against the cap.
-    let hidden = write(st, |conn| {
+    let hidden = write_by(st, deadline, |conn| {
         let mut hidden = 0;
         for what in whats {
             hidden += store::set_pause(conn, &logical, Some(session_id), what, "model").map_err(db(st, true))?;

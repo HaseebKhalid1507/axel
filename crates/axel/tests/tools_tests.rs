@@ -1955,3 +1955,43 @@ fn r5_the_status_file_carries_the_process_start_ticks() {
     }
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
+
+// RULING: v2 c18a review, item 4: the mark and the hide share one budget under the rpc
+// thread's 2 s. A mark that took all of it leaves the hide undone and the answer `Busy`;
+// the model's exact retry then hides the row, it is not told "not found".
+#[test]
+fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_retry_hides() {
+    let mut lab = Lab::new();
+    let s = lab.chat(&lab.a.clone(), "S");
+    let id = lab.remember(&s, "the little egret fishes in the shallow lagoon at noon");
+    // The front's own wait is 1.5 s; here the mark may wait longer, so that it alone uses
+    // the budget.
+    lab.st.conn.as_ref().unwrap().busy_timeout(Duration::from_secs(4)).unwrap();
+    let (held_tx, held_rx) = mpsc::channel();
+    let brain = lab.ext.brain.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = Connection::open(&brain).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(2_000));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    held_rx.recv().unwrap();
+    let start = Instant::now();
+    let first = lab.call("forget", json!({ "id": format!("m:{id}") }), &s);
+    let took = start.elapsed();
+    holder.join().unwrap();
+    assert_eq!(first, Err(ToolError::Busy), "after {took:?}");
+    assert!(took < Duration::from_millis(2_600), "{took:?}");
+    assert_eq!(hidden_by(lab.conn(), &id), None, "the hide ran past the budget");
+    let marks = |lab: &Lab| {
+        count_id(lab.conn(), "SELECT COUNT(*) FROM forgotten_turns WHERE source = 'call' AND logical = ?1", &project::logical("S"))
+    };
+    assert_eq!(marks(&lab), 1, "the mark stands");
+    let wait: i64 = lab.st.conn.as_ref().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
+    assert_eq!(wait, 4_000, "the connection's own wait was not put back");
+
+    let answer = lab.ok("forget", json!({ "id": format!("m:{id}") }), &s);
+    assert!(answer.starts_with(&format!("Hidden m:{id}.")), "{answer}");
+    assert_eq!(hidden_by(lab.conn(), &id), Some("model:S".to_string()));
+}
