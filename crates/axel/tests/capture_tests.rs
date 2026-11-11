@@ -1924,3 +1924,30 @@ fn final_5_a_turn_that_is_not_stored_keeps_log_rows_that_hold_no_text() {
     assert_eq!(log_times(conn, ""), [at]);
     nothing_stored(conn);
 }
+
+/// Item 7 (chrollo 6): a forget call retried while the write lock is held keeps one mark,
+/// not one per try; it ends at the last try, and another chat's mark stays kept.
+// RULING: v2 final capture round, item 7
+#[test]
+fn final_7_a_retried_forget_call_keeps_one_mark() {
+    let lab = Lab::new();
+    let (ctx, mut st, _jobs, _status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let clock = clock_at(&mut st, 1_600);
+    user(&mut st, "S", &cwd, "forget the phone number of Bob that I gave you this morning", 1_000);
+    user(&mut st, "T", &cwd, "forget the address of Alice that I gave you this morning", 1_000);
+
+    ctx_conn(&ctx).execute_batch("BEGIN IMMEDIATE").unwrap();
+    let _ = forget_call(&mut st, "T", &cwd);
+    for at in [1_600, 1_700, 1_800] {
+        clock.store(at, Ordering::SeqCst);
+        let answer = forget_call(&mut st, "S", &cwd);
+        assert!(matches!(answer, Err(axel::ext::types::ToolError::Busy)), "{answer:?}");
+    }
+    ctx_conn(&ctx).execute_batch("ROLLBACK").unwrap();
+    let kept: Vec<(&str, i64, i64)> =
+        st.forget_marks.iter().map(|m| (m.session_id.as_str(), m.from_ms, m.to_ms)).collect();
+    assert_eq!(kept, [("T", 1_000, 1_600), ("S", 1_000, 1_800)]);
+    assert_eq!(front::retry_written(&mut st), 2);
+    assert_eq!(to_ms(ctx_conn(&ctx), "S"), 1_800);
+}

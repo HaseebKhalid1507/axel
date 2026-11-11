@@ -310,6 +310,18 @@ pub(crate) fn mark_forgotten(st: &mut FrontState, session_id: &str) -> MarkEnd {
 
 /// A mark that could not be written now, kept for a later try.
 fn keep_mark(st: &mut FrontState, mark: ForgetMark) {
+    // RULING: v2 final capture round, item 7. A model that retries a busy call would
+    // otherwise push copies of one mark, and at the limit they push other chats' marks out.
+    // The one kept takes the later end.
+    if let Some(kept) = st
+        .forget_marks
+        .iter_mut()
+        .find(|m| m.session_id == mark.session_id && m.from_ms == mark.from_ms && m.turn_key == mark.turn_key)
+    {
+        kept.to_ms = kept.to_ms.max(mark.to_ms);
+        log_line("front carry: forget mark not written, already kept");
+        return;
+    }
     // RULING: wave3-c12b ruling 7. At most `FORGET_MARKS_KEPT` wait; one more gives up the
     // oldest, so a brain that stays locked cannot grow the list without end.
     if st.forget_marks.len() >= FORGET_MARKS_KEPT {
