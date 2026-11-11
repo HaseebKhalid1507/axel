@@ -111,9 +111,12 @@ impl Origin {
 // SPEC: 3215 and 3304-3310 name `skipped:<why>`, `nothing_relevant` and `timeout`; no line
 // lists the rest. `recall` answers `selected` (it has picks), `nothing_relevant`, `timeout`
 // or `error` (a read of the brain failed: no picks). The hook turns `selected` into
-// `injected`, or into `over_budget` when no item fits the block, and its skips are
-// `skipped:off`, `skipped:breaker`, `skipped:not_ready`, `skipped:event`,
-// `skipped:continuation`, `skipped:short` and `skipped:paused`.
+// `injected`, or into `over_budget` when no item fits the block.
+// RULING: wave 4 ruling R-15 item 4: of the hook's skips only `skipped:breaker`,
+// `skipped:not_ready` and `skipped:paused` become a row. Recall switched off, a host
+// message and a prompt too short to look up write none: each row is a write transaction,
+// and such rows would push real ones out of the 1,000 the log keeps. A failed read of the
+// chat's pauses is `error`, with no recall.
 /// The text of `recall_log.outcome`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Outcome(pub String);
@@ -1336,27 +1339,34 @@ pub fn on_before_message(st: &mut FrontState, ev: &HookEvent, recall_allowed: bo
     let logical = session_id.map(project::logical);
     let ready = st.conn.is_some() && st.mode.load(Ordering::SeqCst) == Mode::Ready as u8;
 
-    // The chat's pauses. A read that fails is read as both: nothing is recalled into the
-    // chat and nothing of its prompt is kept.
-    let (learning_paused, recall_paused) = match (st.conn.as_ref(), logical.as_deref()) {
-        (Some(conn), Some(logical)) => pauses(conn, logical).unwrap_or((true, true)),
-        _ => (false, false),
+    // The chat's pauses. A read that fails is read as both for what is kept (nothing of the
+    // prompt), and the recall is not made: it is logged as `error`, not as a pause.
+    let read = match (st.conn.as_ref(), logical.as_deref()) {
+        (Some(conn), Some(logical)) => pauses(conn, logical),
+        _ => Ok((false, false)),
     };
+    let pauses_unread = read.is_err();
+    let (learning_paused, recall_paused) = read.unwrap_or((true, true));
 
-    let skip = if !st.cfg.recall {
-        Some("skipped:off")
+    // `Some(None)`: answered at once and no row is written. `Some(Some(outcome))`: answered
+    // at once, and the row says why.
+    let skip: Option<Option<&str>> = if !st.cfg.recall {
+        Some(None)
     } else if !recall_allowed {
-        Some("skipped:breaker")
+        Some(Some("skipped:breaker"))
     } else if !ready {
-        Some("skipped:not_ready")
-    } else if prompt.starts_with("<event ") && !st.cfg.recall_on_events {
-        Some("skipped:event")
-    } else if prompt.starts_with("[Context continuation") || prompt.starts_with("[Host context advisory") {
-        Some("skipped:continuation")
-    } else if prompt.chars().count() < 12 || word_count(text) < 3 {
-        Some("skipped:short")
+        Some(Some("skipped:not_ready"))
+    } else if (prompt.starts_with("<event ") && !st.cfg.recall_on_events)
+        || prompt.starts_with("[Context continuation")
+        || prompt.starts_with("[Host context advisory")
+        || prompt.chars().count() < 12
+        || word_count(text) < 3
+    {
+        Some(None)
+    } else if pauses_unread {
+        Some(Some("error"))
     } else if recall_paused {
-        Some("skipped:paused")
+        Some(Some("skipped:paused"))
     } else {
         None
     };
@@ -1366,10 +1376,10 @@ pub fn on_before_message(st: &mut FrontState, ev: &HookEvent, recall_allowed: bo
         &st.cfg,
     );
     let (mut out, mut trace) = (HookOut::Continue, None);
-    if let Some(why) = skip {
-        // SPEC: 3250 says every recall becomes a log row and 3215 gives a skip an outcome,
-        // so a skip is logged; it keeps no preview and no tokens (nothing was looked for).
-        trace = Some(RecallTrace {
+    if let Some(logged) = skip {
+        // SPEC: 3250 says every recall becomes a log row and 3215 gives a skip an outcome.
+        // A skip that is logged keeps no preview and no tokens (nothing was looked for).
+        trace = logged.map(|why| RecallTrace {
             ts_ms: now,
             session_id: ev.session_id.clone(),
             logical: logical.clone(),

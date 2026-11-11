@@ -308,6 +308,15 @@ impl Hook {
         recall::on_before_message(&mut self.st, &ev, true)
     }
 
+    /// The last `before_message` sent no log job: no row will be written for it.
+    fn no_log(&self) {
+        while let Ok(job) = self.jobs.try_recv() {
+            if let Job::LogRecall(trace) = job {
+                panic!("a log job was sent: {trace:?}");
+            }
+        }
+    }
+
     /// The one log job the last `before_message` sent.
     fn trace(&self) -> RecallTrace {
         let mut found = Vec::new();
@@ -591,12 +600,18 @@ fn t05_nothing_relevant_is_no_injection() {
     assert_eq!(h.before("s1", "what colour should the garden fence be painted"), HookOut::Continue);
     assert_eq!(h.trace().outcome, "nothing_relevant");
     // A message that is no question at all is not looked up.
-    assert_eq!(h.before("s1", "ok thanks"), HookOut::Continue);
-    assert_eq!(h.trace().outcome, "skipped:short");
-    assert_eq!(h.before("s1", "<event kind=\"x\">the billing export job runs nightly</event>"), HookOut::Continue);
-    assert_eq!(h.trace().outcome, "skipped:event");
-    assert_eq!(h.before("s1", "[Context continuation: the billing export job runs nightly]"), HookOut::Continue);
-    assert_eq!(h.trace().outcome, "skipped:continuation");
+    // Such a message, and a message of the host, leave no row in the log either: they would
+    // push real rows out of it.
+    for prompt in [
+        "ok thanks",
+        "billing export",
+        "<event kind=\"x\">the billing export job runs nightly</event>",
+        "[Context continuation: the billing export job runs nightly]",
+        "[Host context advisory: the billing export job runs nightly]",
+    ] {
+        assert_eq!(h.before("s1", prompt), HookOut::Continue, "{prompt}");
+        h.no_log();
+    }
     // The breaker is open.
     let ev = h.event("before_message", "s1", Some("when does the billing export job run"));
     assert_eq!(recall::on_before_message(&mut h.st, &ev, false), HookOut::Continue);
@@ -1290,7 +1305,24 @@ fn t12_the_log_keeps_no_credential_and_no_text_of_a_turn_that_is_not_captured() 
     // `recall = off`: nothing is looked up.
     let mut off = Hook::new(json!({"recall": "off"}));
     assert_eq!(off.before("s1", question), HookOut::Continue);
-    assert_eq!(off.trace().outcome, "skipped:off");
+    off.no_log();
+
+    // The brain is not ready: no recall, and the row says so.
+    h.st.mode.store(Mode::Degraded as u8, Ordering::SeqCst);
+    assert_eq!(h.before("s-free", question), HookOut::Continue);
+    let unready = h.trace();
+    assert_eq!((unready.outcome.as_str(), unready.query_preview, unready.query_tokens.len()), ("skipped:not_ready", None, 0));
+    h.st.mode.store(Mode::Ready as u8, Ordering::SeqCst);
+
+    // The pauses cannot be read: no recall, logged as an error and not as a pause.
+    h.brain.conn.execute_batch("DROP TABLE chat_pauses").unwrap();
+    assert_eq!(h.before("s-free", question), HookOut::Continue);
+    let unread = h.trace();
+    assert_eq!((unread.outcome.as_str(), unread.query_preview, unread.query_tokens.len()), ("error", None, 0));
+    assert_eq!(unread.query_hash, recall::query_hash(question));
+    // A prompt that is not looked up at all is still not logged.
+    assert_eq!(h.before("s-free", "ok thanks"), HookOut::Continue);
+    h.no_log();
 }
 
 #[test]
