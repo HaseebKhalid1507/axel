@@ -145,7 +145,8 @@ struct Arch {
     created_ms: Option<i64>,
     carried: Option<u32>,
     first_index: u32,
-    turns: Vec<(String, String)>,
+    /// The stored messages, in order: `{"role", "content"}`.
+    items: Vec<Value>,
     note: String,
 }
 
@@ -159,7 +160,7 @@ impl Arch {
             created_ms: Some(T0),
             carried: None,
             first_index: 0,
-            turns: Vec::new(),
+            items: Vec::new(),
             note: String::new(),
         }
     }
@@ -167,8 +168,38 @@ impl Arch {
         self.created_ms = Some(created_ms);
         self
     }
-    fn turn(mut self, prompt: &str, reply: &str) -> Arch {
-        self.turns.push((prompt.to_string(), reply.to_string()));
+    fn turn(self, prompt: &str, reply: &str) -> Arch {
+        self.user(prompt).says(reply)
+    }
+    /// A user message with one text.
+    fn user(mut self, text: &str) -> Arch {
+        self.items.push(json!({"role": "user", "content": text}));
+        self
+    }
+    /// A prompt core withheld.
+    fn withheld(self) -> Arch {
+        self.user("[archive: withheld]")
+    }
+    /// An assistant message with one text.
+    fn says(mut self, text: &str) -> Arch {
+        self.items.push(json!({"role": "assistant", "content": text}));
+        self
+    }
+    /// An assistant message with a text and a call of `tool`.
+    fn calls(mut self, text: &str, tool: &str) -> Arch {
+        self.items.push(json!({"role": "assistant", "content": [
+            {"type": "text", "text": text},
+            {"type": "tool_use", "id": "toolu_01", "name": tool, "input": {"id": "m:mem_0000000000000000"}},
+        ]}));
+        self
+    }
+    /// A file that starts at `source_index` 1: read with no event, it is a successor.
+    fn successor(mut self) -> Arch {
+        self.first_index = 1;
+        self
+    }
+    fn noted(mut self, note: &str) -> Arch {
+        self.note = note.to_string();
         self
     }
     /// One exchange about `topic`, long enough to be a unit.
@@ -179,18 +210,18 @@ impl Arch {
         )
     }
     fn json(&self, scope: &str) -> String {
-        let mut messages = Vec::new();
-        for (i, (prompt, reply)) in self.turns.iter().enumerate() {
-            let at = self.first_index + 2 * i as u32;
-            messages.push(json!({"source_index": at, "block_indices": [],
-                                 "message": {"role": "user", "content": prompt}}));
-            messages.push(json!({"source_index": at + 1, "block_indices": [],
-                                 "message": {"role": "assistant", "content": reply}}));
-        }
+        let messages: Vec<Value> = self
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, message)| {
+                json!({"source_index": self.first_index + i as u32, "block_indices": [], "message": message})
+            })
+            .collect();
         let mut record = json!({
             "version": 1, "scope": scope, "logical": self.logical, "id": self.id, "digest": self.digest,
             "body": {"state": "live",
-                     "source_message_count": self.first_index + 2 * self.turns.len() as u32,
+                     "source_message_count": self.first_index + self.items.len() as u32,
                      "messages": messages, "note": self.note},
         });
         if let Some(ms) = self.created_ms {
@@ -284,6 +315,19 @@ fn has(conn: &Connection, id: &str) -> bool {
 
 /// A captured turn of `session` in `scope`, written the way capture writes one.
 fn capture(run: &Run, id: &str, scope: &str, session: &str, created_ms: i64, hidden_by: Option<&str>) {
+    capture_keyed(run, id, scope, session, created_ms, hidden_by, &format!("{:016x}", created_ms));
+}
+
+/// The same, for a turn whose prompt has the key `turn_key`.
+fn capture_keyed(
+    run: &Run,
+    id: &str,
+    scope: &str,
+    session: &str,
+    created_ms: i64,
+    hidden_by: Option<&str>,
+    turn_key: &str,
+) {
     let logical = project::logical(session);
     let new = NewRow {
         id: id.to_string(),
@@ -305,7 +349,7 @@ fn capture(run: &Run, id: &str, scope: &str, session: &str, created_ms: i64, hid
         session_id: Some(session),
         logical: Some(&logical),
         links: RecordLinks::default(),
-        turn_key: Some(format!("{:016x}", created_ms)),
+        turn_key: Some(turn_key.to_string()),
         hidden: hidden_by.map(|by| (created_ms, by.to_string())),
     };
     tx(run.db(), || store::insert_row(run.db(), run.ctx.signer.as_ref(), &new).unwrap());
@@ -719,6 +763,10 @@ fn t11_a_hidden_capture_stays_until_the_forget_and_one_older_than_the_window_sta
     assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
     assert!(!has(conn, "mem_cap_in_window"));
     assert!(has(conn, "mem_cap_hidden"), "a hidden capture was deleted by an archive");
+    // Commit 13b's clause: no unit of the archive has the hidden capture's key, so nothing
+    // is hidden with it and the archive counts it.
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE origin_kind = 'archive' AND hidden_ms IS NOT NULL"), 0);
+    assert_eq!(unmatched_hidden(conn, &dir, &a), 1);
     assert!(has(conn, "mem_cap_old"), "a capture older than the window was deleted");
 
     env.put_tombstone(&dir, &a);
@@ -1630,4 +1678,907 @@ fn an_archive_whose_reply_holds_a_credential_shaped_token_is_indexed_with_the_to
     assert_eq!(in_tables(conn, &token), 0);
     assert_eq!(in_tables(conn, &token[3..]), 0);
     assert_eq!(run.errors(), 0);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Commit 13b: the forget marks, the twins, the live call
+// (section 2: tests 24 to 27, 29 to 31, 33 (a) and (b), 34 (d))
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// One window apart.
+const W: i64 = 600_000;
+const FORGET_PROMPT: &str = "forget that I told you about the offer from Acme, I have not accepted it";
+
+fn key_of(prompt: &str) -> String {
+    axel::archive::turn_key(&axel::screen::redact(prompt).text)
+}
+
+fn forget_units(conn: &Connection, scope: &str, a: &Arch) -> i64 {
+    conn.query_row(
+        "SELECT forget_units FROM archive_index WHERE scope_dir = ?1 AND archive_id = ?2",
+        params![scope, a.id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn unmatched_hidden(conn: &Connection, scope: &str, a: &Arch) -> i64 {
+    conn.query_row(
+        "SELECT unmatched_hidden FROM archive_index WHERE scope_dir = ?1 AND archive_id = ?2",
+        params![scope, a.id],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// `(source, turn_key, head, tail, archive_id)` of every `forgotten_turns` row.
+fn forgot_rows(conn: &Connection) -> Vec<(String, String, i64, i64, String)> {
+    let mut stmt = conn
+        .prepare("SELECT source, turn_key, head, tail, archive_id FROM forgotten_turns ORDER BY id")
+        .unwrap();
+    let got = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))).unwrap();
+    got.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// `hidden_by` of an archive's rows, by position.
+fn hidden_by(conn: &Connection, scope: &str, a: &Arch) -> Vec<(String, Option<String>)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT e.unit_pos, e.hidden_by FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+              WHERE e.origin_kind = 'archive' AND e.origin_ref = ?1 AND m.project_key = ?2 ORDER BY e.vid",
+        )
+        .unwrap();
+    let got = stmt.query_map(params![a.id, scope], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    got.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// The live call, as the front thread makes it: inside a transaction of the caller.
+fn live_call(run: &Run, session: &str, from_ms: i64, to_ms: i64, key: Option<&str>) -> Vec<String> {
+    let logical = project::logical(session);
+    tx(run.db(), || {
+        index_archives::mark_forgotten_turn(run.db(), &logical, Some(session), "call", from_ms, to_ms, key).unwrap()
+    })
+}
+
+/// Every archive row of the brain: `(id, archive id, unit_pos, hidden_by)`, sorted.
+fn all_rows(conn: &Connection) -> Vec<(String, String, String, Option<String>)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT mem_id, origin_ref, unit_pos, hidden_by FROM memory_ext WHERE origin_kind = 'archive'
+              ORDER BY mem_id",
+        )
+        .unwrap();
+    let got = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))).unwrap();
+    got.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// Puts the files one at a time, in this order, with a scan after each.
+fn index_in_order(env: &Env, run: &mut Run, scope: &str, files: &[Arch], order: &[usize]) {
+    for at in order {
+        env.put_live(scope, &files[*at]);
+        run.scan();
+    }
+    assert_eq!(run.errors(), 0);
+}
+
+fn reply(mark: &str) -> String {
+    format!("{mark} is what I have to say about it, and it is long enough to be a unit of its own")
+}
+
+// ── Test 24: the forget turn across a seal, by time ─────────────────────────
+
+/// A first window with two exchanges, and its successor: a carried prompt, the tail, new
+/// assistant text, a new exchange.
+fn sealed_pair(n: u32, session: &str, first_ms: i64, second_ms: i64) -> (Arch, Arch) {
+    let a = Arch::new(n, session)
+        .at(first_ms)
+        .turn("what is the first thing on the list for today?", &reply("FIRSTANSWER"))
+        .turn("and what did the vendor say about the contract?", &reply("VENDORANSWER"));
+    let b = Arch::new(n + 1, session)
+        .at(second_ms)
+        .successor()
+        .user("and what did the vendor say about the contract?")
+        .says(&reply("CARRIEDTAIL"))
+        .says(&reply("RUNNINGON"))
+        .turn("what is next on the list after the vendor?", &reply("NEXTANSWER"));
+    (a, b)
+}
+
+#[test]
+fn t24_a_call_row_leaves_out_the_turn_on_both_sides_of_a_seal_and_only_in_its_chat() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    assert!(live_call(&run, "s-time", 1_000, 2_000, None).is_empty());
+    assert_eq!(forgot_rows(run.db()), [("call".to_string(), String::new(), 0, 0, String::new())]);
+
+    let (a, b) = sealed_pair(1, "s-time", 1_500, 900_000);
+    let (other_a, other_b) = sealed_pair(3, "t-time", 1_500, 900_000);
+    index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone(), other_a.clone(), other_b.clone()], &[0, 1, 2, 3]);
+    let conn = run.db();
+    // A was sealed inside the turn: its last exchange is the turn's beginning.
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+    assert_eq!(in_tables(conn, "VENDORANSWER"), 2, "only the other chat's row and word row hold it");
+    // B's window starts inside the turn: its leading span is the turn running on.
+    assert_eq!(positions(conn, &dir, &b), ["x4.0"]);
+    assert_eq!((forget_units(conn, &dir, &a), forget_units(conn, &dir, &b)), (1, 1));
+    // The other chat, with the same times, is indexed whole.
+    assert_eq!(positions(conn, &dir, &other_a), ["x0.0", "x2.0"]);
+    assert_eq!(positions(conn, &dir, &other_b), ["c3.0", "x4.0"]);
+    assert_eq!((forget_units(conn, &dir, &other_a), forget_units(conn, &dir, &other_b)), (0, 0));
+}
+
+#[test]
+fn t24_the_live_call_removes_exactly_the_last_exchange_of_an_archive_sealed_inside_the_turn() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let (a, b) = sealed_pair(1, "s-time", 1_500, 900_000);
+    index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone()], &[0, 1]);
+    let before = rows(run.db(), &dir, &a);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0", "x2.0"]);
+    assert_eq!(positions(run.db(), &dir, &b), ["c3.0", "x4.0"]);
+    // A recall of the turn was logged before the call, and one long before it.
+    let own_log = log_row(run.db(), &a.logical, &dir, 1_200, "and what did the vendor say");
+    let old_log = log_row(run.db(), &a.logical, &dir, 500, "an older question");
+
+    let purged = live_call(&run, "s-time", 1_000, 2_000, None);
+    let conn = run.db();
+    let b_rows = rows(conn, &dir, &b);
+    // A's last exchange, and B's leading `Continued` unit (its window starts at 1,500).
+    assert_eq!(purged.len(), 2);
+    assert!(purged.contains(&before[1].0), "the id of A's last exchange was not returned");
+    assert_eq!(rows(conn, &dir, &a), before[..1]);
+    assert_eq!(b_rows.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["x4.0"]);
+    assert_eq!((forget_units(conn, &dir, &a), forget_units(conn, &dir, &b)), (1, 1));
+    assert!(purge_pending(conn));
+    assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM recall_log WHERE id = {own_log}")), 0);
+    assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM recall_log WHERE id = {old_log}")), 1);
+
+    // A second forget in the same turn is the same row with a later end, and takes
+    // nothing more: the archives the row already covered are not visited again.
+    assert!(live_call(&run, "s-time", 1_000, 2_500, None).is_empty());
+    assert_eq!(count(run.db(), "SELECT COUNT(*) FROM forgotten_turns"), 1);
+    assert_eq!(count(run.db(), "SELECT to_ms FROM forgotten_turns"), 2_500);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0"]);
+    assert_eq!(positions(run.db(), &dir, &b), ["x4.0"]);
+}
+
+#[test]
+fn t24_an_archive_whose_time_is_from_mtime_takes_no_part() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    live_call(&run, "s-mtime", NOW - 10, NOW + 10, None);
+    live_call(&run, "s-timed", NOW - 10, NOW + 10, None);
+    // No `created_ms`: found by the scan, its time is the file's, and its cover time is
+    // when it was first seen, which is inside the interval.
+    let mut untimed = Arch::new(1, "s-mtime").about("retry limit").about("upload queue");
+    untimed.created_ms = None;
+    let timed = Arch::new(2, "s-timed").at(NOW).about("retry limit").about("upload queue");
+    index_in_order(&env, &mut run, &dir, &[untimed.clone(), timed.clone()], &[0, 1]);
+    let conn = run.db();
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM archive_index WHERE time_source = 'mtime' AND cover_ms BETWEEN 1749999999990 AND 1750000000010"), 1);
+    assert_eq!(positions(conn, &dir, &untimed), ["x0.0", "x2.0"], "a file timed by mtime was touched");
+    assert_eq!(positions(conn, &dir, &timed), ["x0.0"]);
+}
+
+#[test]
+fn the_live_call_reaches_one_window_each_way_by_key_and_refuses_what_it_is_not_for() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let files: Vec<Arch> = (1..=5u32)
+        .map(|n| Arch::new(n, "s-key").at(T0 + i64::from(n) * W).turn("continue", &reply(&format!("CONTINUED{n}"))))
+        .collect();
+    let other = Arch::new(9, "t-key").at(T0 + 4 * W).turn("continue", &reply("OTHERCHAT"));
+    let mut all = files.clone();
+    all.push(other.clone());
+    index_in_order(&env, &mut run, &dir, &all, &[0, 1, 2, 3, 4, 5]);
+
+    // The call is made in the fifth window, with the key of the hook's text.
+    let key = key_of("continue");
+    let purged = live_call(&run, "s-key", T0 + 4 * W + W / 2, T0 + 4 * W + W / 2 + 5_000, Some(&key));
+    let conn = run.db();
+    assert_eq!(purged.len(), 2);
+    for (n, a) in files.iter().enumerate() {
+        // Its own window and the one before; never further.
+        let expect: &[&str] = if n >= 3 { &[] } else { &["x0.0"] };
+        assert_eq!(positions(conn, &dir, a), expect, "archive {}", n + 1);
+    }
+    assert_eq!(positions(conn, &dir, &other), ["x0.0"]);
+    assert_eq!(forgot_rows(conn), [("call".to_string(), key.clone(), 0, 0, String::new())]);
+
+    // No transaction of the caller: refused, and nothing is written.
+    let logical = project::logical("s-key");
+    assert!(index_archives::mark_forgotten_turn(conn, &logical, Some("s-key"), "call", 1, 2, None).is_err());
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM forgotten_turns"), 1);
+    // `archive` rows are the indexer's.
+    brain_v2::begin_write(conn).unwrap();
+    assert!(index_archives::mark_forgotten_turn(conn, &logical, Some("s-key"), "archive", 1, 2, None).is_err());
+    conn.execute_batch("ROLLBACK").unwrap();
+}
+
+// ── Test 25: twins ──────────────────────────────────────────────────────────
+
+const HIDDEN_PROMPT: &str = "what did the doctor say about the results of last week?";
+const SEEN_PROMPT: &str = "what is the name of the hotel we booked for the trip?";
+
+#[test]
+fn t25_a_unit_with_the_key_of_a_hidden_capture_is_born_hidden_as_its_twin() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    capture_keyed(&run, "mem_cap_h", &dir, "s-twin", T0 - 100_000, Some("cli"), &key_of(HIDDEN_PROMPT));
+    capture_keyed(&run, "mem_cap_v", &dir, "s-twin", T0 - 50_000, None, &key_of(SEEN_PROMPT));
+    let a = Arch::new(1, "s-twin")
+        .turn(HIDDEN_PROMPT, &reply("DOCTORANSWER"))
+        .turn(SEEN_PROMPT, &reply("HOTELANSWER"))
+        .about("upload queue");
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
+    let conn = run.db();
+    assert_eq!(
+        hidden_by(conn, &dir, &a),
+        [
+            ("x0.0".to_string(), Some("twin:mem_cap_h".to_string())),
+            ("x2.0".to_string(), None),
+            ("x4.0".to_string(), None)
+        ]
+    );
+    // The twin is hidden since the capture was.
+    assert_eq!(
+        count(conn, "SELECT COUNT(*) FROM memory_ext WHERE hidden_by = 'twin:mem_cap_h' AND hidden_ms = (SELECT hidden_ms FROM memory_ext WHERE mem_id = 'mem_cap_h')"),
+        1
+    );
+    assert!(!has(conn, "mem_cap_v"), "the visible stand-in outlived its archive");
+    assert!(has(conn, "mem_cap_h"), "the record of the hide was deleted");
+    assert_eq!(unmatched_hidden(conn, &dir, &a), 0);
+
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap_h").unwrap()), 1);
+    assert!(hidden_by(conn, &dir, &a).iter().all(|(_, by)| by.is_none()));
+    assert!(!has(conn, "mem_cap_h"));
+}
+
+#[test]
+fn t25_when_core_changed_the_text_no_key_matches_nothing_is_hidden_and_it_is_counted() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    capture_keyed(&run, "mem_cap_h", &dir, "s-twin", T0 - 100_000, Some("cli"), &key_of(HIDDEN_PROMPT));
+    // The prompt of the hidden turn is stored as the placeholder.
+    let a = Arch::new(1, "s-twin")
+        .withheld()
+        .says(&reply("DOCTORANSWER"))
+        .turn(SEEN_PROMPT, &reply("HOTELANSWER"))
+        .about("upload queue");
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
+    let conn = run.db();
+    let got = hidden_by(conn, &dir, &a);
+    assert_eq!(got.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(), ["c1.0", "x2.0", "x4.0"]);
+    assert!(got.iter().all(|(_, by)| by.is_none()), "a unit was hidden with no key to go by: {got:?}");
+    assert_eq!(unmatched_hidden(conn, &dir, &a), 1);
+
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap_h").unwrap()), 1);
+    assert!(has(conn, "mem_cap_h"));
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem_cap_h' AND hidden_ms IS NULL"), 1);
+}
+
+// ── Test 26, the rest: what a move takes with it ────────────────────────────
+
+#[test]
+fn t26_a_moved_archive_takes_the_visible_capture_it_covered_and_writes_no_tombstone() {
+    let env = Env::new();
+    let (wrong, right) = (scope(KEY), scope(KEY_2));
+    let moved = Arch::new(1, "s-moved").about("retry limit");
+    let wrong_path = env.put_live(&wrong, &moved);
+    let mut run = env.run();
+    run.scan();
+    let old_ids: Vec<String> = rows(run.db(), &wrong, &moved).into_iter().map(|r| r.0).collect();
+    // Captures of the chat filed under the wrong directory: one the archive covers, one
+    // it covers that is hidden, one from after it.
+    capture(&run, "mem_cap_covered", &wrong, "s-moved", T0 - 1_000, None);
+    capture(&run, "mem_cap_hidden", &wrong, "s-moved", T0 - 2_000, Some("cli"));
+    capture(&run, "mem_cap_later", &wrong, "s-moved", T0 + 60_000, None);
+
+    // Both copies exist: both directories hold its rows.
+    env.put_live(&right, &moved);
+    run.scan();
+    assert_eq!(positions(run.db(), &wrong, &moved), ["x0.0"]);
+    assert_eq!(positions(run.db(), &right, &moved), ["x0.0"]);
+    assert!(has(run.db(), "mem_cap_covered"));
+
+    std::fs::remove_file(&wrong_path).unwrap();
+    run.scan();
+    let conn = run.db();
+    assert!(rows(conn, &wrong, &moved).is_empty());
+    assert_eq!(positions(conn, &right, &moved), ["x0.0"]);
+    assert!(!has(conn, "mem_cap_covered"), "the stand-in under the old directory outlived the move");
+    assert!(has(conn, "mem_cap_hidden") && has(conn, "mem_cap_later"));
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM archive_index WHERE state = 'tombstone'"), 0);
+    assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM archive_index WHERE archive_id = '{}'", moved.id)), 1);
+    for id in &old_ids {
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM memory_tombstones WHERE id = ?1", [id], |r| r.get::<_, i64>(0)).unwrap(),
+            0
+        );
+    }
+    // What a search from each folder can find: the word rows are under R's key only.
+    assert_eq!(
+        conn.query_row(
+            "SELECT group_concat(DISTINCT m.project_key) FROM memories_fts f JOIN memories m ON m.id = f.mem_id
+              WHERE memories_fts MATCH 'retry' AND m.id LIKE 'mem_%' AND m.topic = 'episodic_turn'
+                AND m.id IN (SELECT mem_id FROM memory_ext WHERE origin_kind = 'archive')",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        right
+    );
+    assert_eq!(run.errors(), 0);
+}
+
+// ── Test 27: pause by session ───────────────────────────────────────────────
+
+#[test]
+fn t27_a_pause_set_for_the_session_holds_for_an_archive_with_another_logical() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    tx(run.db(), || store::set_pause(run.db(), "some-other-logical", Some("ephemeral-1234"), "learning", "cli").unwrap());
+    let a = Arch::new(1, "the-records-own-chat-id").about("retry limit");
+    env.put_live(&dir, &a);
+    run.job(archived(&a, KEY, None, Some("ephemeral-1234"), Some(2), Some(1)));
+    let conn = run.db();
+    assert_eq!(state(conn, &dir, &rel(&a.id)), Some(("skipped".to_string(), Some("paused".to_string()))));
+    assert!(rows(conn, &dir, &a).is_empty());
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM archive_index WHERE session_id = 'ephemeral-1234'"), 1);
+    assert_eq!(run.errors(), 0);
+}
+
+// ── Test 29: marks between files ────────────────────────────────────────────
+
+/// Chat `session`, five archives one window apart. A: its last exchange is `p` with a
+/// first reply. B, a successor: `p` carried, the tail, assistant text with a forget call,
+/// a new exchange. C, a successor: `p` carried, and a new exchange whose prompt is `p`
+/// again. D and E: an exchange whose prompt is `p`.
+fn five_windows(first: u32, session: &str, p: &str) -> Vec<Arch> {
+    let at = |n: u32| T0 + i64::from(n) * W;
+    vec![
+        Arch::new(first, session)
+            .at(at(1))
+            .turn("what is on the calendar for the rest of this week?", &reply("CALENDAR"))
+            .turn(p, &reply("FIRSTREPLYTOP")),
+        Arch::new(first + 1, session)
+            .at(at(2))
+            .successor()
+            .user(p)
+            .says(&reply("TAILOFA"))
+            .calls(&reply("FORGETTINGNOW"), "axel_forget")
+            .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER")),
+        Arch::new(first + 2, session)
+            .at(at(3))
+            .successor()
+            .user(p)
+            .says(&reply("TAILOFB"))
+            .turn(p, &reply("ASKEDAGAININC")),
+        Arch::new(first + 3, session).at(at(4)).turn(p, &reply("ASKEDAGAININD")),
+        Arch::new(first + 4, session).at(at(5)).turn(p, &reply("ASKEDAGAININE")),
+    ]
+}
+
+#[test]
+fn t29_a_mark_reaches_the_file_before_and_the_window_after_and_no_further() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let files = five_windows(1, "s-marks", FORGET_PROMPT);
+    // Chat T, with the same prompt text in the same windows and no forget call.
+    let other = [
+        Arch::new(21, "t-marks").at(T0 + W).turn(FORGET_PROMPT, &reply("OTHERCHATONE")),
+        Arch::new(22, "t-marks").at(T0 + 3 * W).turn(FORGET_PROMPT, &reply("OTHERCHATTHREE")),
+    ];
+    index_in_order(&env, &mut run, &dir, &other, &[0, 1]);
+    index_in_order(&env, &mut run, &dir, &files, &[0, 1, 2, 3, 4]);
+    let conn = run.db();
+    // No row of S holds A's exchange of P (the `head` mark, and the key).
+    assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
+    assert_eq!(in_tables(conn, "FIRSTREPLYTOP"), 0);
+    // B's leading span yields nothing and its new exchange is a row.
+    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+    assert_eq!(in_tables(conn, "FORGETTINGNOW"), 0);
+    // C's exchange with P's key is not a row: the window after, by key.
+    assert!(rows(conn, &dir, &files[2]).is_empty());
+    // D's and E's are rows: out of reach.
+    assert_eq!(positions(conn, &dir, &files[3]), ["x0.0"]);
+    assert_eq!(positions(conn, &dir, &files[4]), ["x0.0"]);
+    assert_eq!(
+        forgot_rows(conn),
+        [("archive".to_string(), key_of(FORGET_PROMPT), 1, 0, files[1].id.clone())]
+    );
+    let units: Vec<i64> = files.iter().map(|a| forget_units(conn, &dir, a)).collect();
+    assert_eq!(units, [1, 1, 1, 0, 0]);
+    // Chat T is untouched.
+    assert_eq!(positions(conn, &dir, &other[0]), ["x0.0"]);
+    assert_eq!(positions(conn, &dir, &other[1]), ["x0.0"]);
+    assert!(purge_pending(conn), "A's exchange was purged and left no mark for the log");
+}
+
+#[test]
+fn t29_the_order_in_which_the_files_arrive_does_not_matter() {
+    let dir = scope(KEY);
+    let files = five_windows(1, "s-marks", FORGET_PROMPT);
+    let end_state = |order: &[usize]| {
+        let env = Env::new();
+        let mut run = env.run();
+        index_in_order(&env, &mut run, &dir, &files, order);
+        let units: Vec<i64> = files.iter().map(|a| forget_units(run.db(), &dir, a)).collect();
+        (all_rows(run.db()), units, forgot_rows(run.db()))
+    };
+    let in_order = end_state(&[0, 1, 2, 3, 4]);
+    assert_eq!(in_order.0.len(), 4);
+    for order in [[4, 3, 2, 1, 0], [1, 0, 2, 3, 4], [2, 1, 0, 4, 3]] {
+        assert_eq!(end_state(&order), in_order, "indexed in the order {order:?}");
+    }
+}
+
+#[test]
+fn t29_the_same_with_a_token_in_the_prompt_and_with_the_prompt_withheld() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    // A token that `redact` blanks: the key is of the text as stored, in both files.
+    let token = ["sk", "-", &"a1B2c3D4e5".repeat(4)].concat();
+    let with_token = format!("{FORGET_PROMPT}, and the key was {token}");
+    let files = five_windows(1, "s-token", &with_token);
+    index_in_order(&env, &mut run, &dir, &files, &[0, 1, 2, 3, 4]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
+    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+    assert!(rows(conn, &dir, &files[2]).is_empty());
+    assert_eq!(positions(conn, &dir, &files[3]), ["x0.0"]);
+
+    // Stored as the placeholder in A and in B: B's mark has no key, and A's last unit, a
+    // `Continued` after the withheld prompt, goes by `head` alone.
+    let a = Arch::new(11, "s-withheld")
+        .at(T0 + W)
+        .turn("what is on the calendar for the rest of this week?", &reply("CALENDAR"))
+        .withheld()
+        .says(&reply("REPLYTOWITHHELD"));
+    let b = Arch::new(12, "s-withheld")
+        .at(T0 + 2 * W)
+        .successor()
+        .withheld()
+        .says(&reply("TAILOFA"))
+        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"));
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0", "c3.0"]);
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&b), &[0]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+    assert_eq!(in_tables(conn, "REPLYTOWITHHELD"), 0);
+    assert_eq!(positions(conn, &dir, &b), ["x4.0"]);
+    assert!(forgot_rows(conn).contains(&("archive".to_string(), String::new(), 1, 0, b.id.clone())));
+}
+
+#[test]
+fn t29_a_tail_mark_takes_the_leading_continued_unit_of_the_file_after_and_parts_are_neighbours() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let asked = "please forget what I said about the salary of my colleague";
+    // A' ends with a span that holds the call and more assistant text.
+    let ends_in_call = |n: u32, session: &str| {
+        Arch::new(n, session)
+            .at(T0 + W)
+            .turn("what is on the calendar for the rest of this week?", &reply("CALENDAR"))
+            .user(asked)
+            .calls(&reply("FORGETTINGNOW"), "axel_forget")
+            .says(&reply("MORETEXTAFTER"))
+    };
+    // B', its successor: new assistant text in its leading span, and no call.
+    let runs_on = |n: u32, session: &str| {
+        Arch::new(n, session)
+            .at(T0 + 2 * W)
+            .successor()
+            .user(asked)
+            .says(&reply("TAILOFA"))
+            .says(&reply("STILLRUNNING"))
+            .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"))
+    };
+    let (a, b) = (ends_in_call(1, "s-tail"), runs_on(2, "s-tail"));
+    index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone()], &[0, 1]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+    assert_eq!(positions(conn, &dir, &b), ["x4.0"], "the turn running on past the seal is a row");
+    assert_eq!(in_tables(conn, "STILLRUNNING"), 0);
+    assert!(forgot_rows(conn).contains(&("archive".to_string(), key_of(asked), 0, 1, a.id.clone())));
+
+    // With a human prompt after the call's span in A' (`tail = 0`), it is a row.
+    let a = ends_in_call(3, "s-no-tail").turn("and now something else entirely, what time is it?", &reply("TIME"));
+    let b = runs_on(4, "s-no-tail");
+    index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone()], &[0, 1]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &b), ["c3.0", "x4.0"]);
+    assert!(forgot_rows(conn).contains(&("archive".to_string(), key_of(asked), 0, 0, a.id.clone())));
+
+    // Parts of one seal: part 1 ends with a prompt and a reply; part 2, one millisecond
+    // later and counted from 0, begins with assistant text that holds the call.
+    let part_1 = Arch::new(5, "s-parts")
+        .at(T0 + W)
+        .turn("what is on the calendar for the rest of this week?", &reply("CALENDAR"))
+        .turn(asked, &reply("FIRSTREPLYTOP"));
+    let part_2 = Arch::new(6, "s-parts")
+        .at(T0 + W + 1)
+        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"));
+    index_in_order(&env, &mut run, &dir, &[part_1.clone(), part_2.clone()], &[0, 1]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &part_1), ["x0.0"], "part 1's last exchange is still a row");
+    assert_eq!(in_tables(conn, "FIRSTREPLYTOP"), 0);
+    assert_eq!(positions(conn, &dir, &part_2), ["x1.0"]);
+    assert!(forgot_rows(conn).contains(&("archive".to_string(), String::new(), 1, 0, part_2.id.clone())));
+}
+
+// ── Test 30: left-out turns are counted and can be brought back ─────────────
+
+#[test]
+fn t30_left_out_turns_are_counted_and_come_back_when_the_row_says_keep() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let a = Arch::new(1, "s-keep")
+        .about("retry limit")
+        .user("forget the thing about the first matter, the one from Monday")
+        .calls(&reply("FIRSTFORGET"), "axel_forget")
+        .about("upload queue")
+        .user("and forget the note about the second matter as well, please")
+        .calls(&reply("SECONDFORGET"), "memory_forget_2")
+        .about("deploy window");
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
+    let before = rows(run.db(), &dir, &a);
+    assert_eq!(before.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["x0.0", "x4.0", "x8.0"]);
+    assert_eq!(forget_units(run.db(), &dir, &a), 2);
+    assert_eq!(forgot_rows(run.db()).len(), 2);
+    let vids = |conn: &Connection| -> Vec<i64> {
+        before.iter().map(|r| count(conn, &format!("SELECT vid FROM memory_ext WHERE mem_id = '{}'", r.0))).collect()
+    };
+    let old_vids = vids(run.db());
+
+    // What `restore --forget-turns` does.
+    tx(run.db(), || {
+        run.db().execute("UPDATE archive_index SET keep_forget_turns = 1 WHERE archive_id = ?1", [&a.id]).unwrap();
+        run.db().execute("DELETE FROM forgotten_turns WHERE archive_id = ?1", [&a.id]).unwrap();
+    });
+    run.scan();
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &a), ["x0.0", "x4.0", "x8.0", "x2.0", "x6.0"]);
+    assert_eq!(rows(conn, &dir, &a)[..3], before[..]);
+    assert_eq!(vids(conn), old_vids, "a row that was there was written again");
+    assert_eq!(forget_units(conn, &dir, &a), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM forgotten_turns"), 0, "a restored file gave marks again");
+    assert_eq!(count(conn, "SELECT keep_forget_turns FROM archive_index"), 1);
+
+    // The scan after that has nothing to do.
+    let newest = count(conn, "SELECT MAX(vid) FROM memory_ext");
+    run.scan();
+    assert_eq!(count(run.db(), "SELECT MAX(vid) FROM memory_ext"), newest);
+    assert_eq!(run.errors(), 0);
+}
+
+// ── Test 31: twins are bounded ──────────────────────────────────────────────
+
+#[test]
+fn t31_a_hidden_capture_hides_its_twins_in_three_windows_and_no_further() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let windows = [2u32, 4, 5, 6, 8];
+    let files: Vec<Arch> = windows
+        .iter()
+        .map(|n| Arch::new(*n, "s-bounded").at(T0 + i64::from(*n) * W).turn("continue", &reply(&format!("WINDOW{n}"))))
+        .collect();
+    // A hidden capture with the prompt "continue", made in window 5.
+    capture_keyed(&run, "mem_cap_h", &dir, "s-bounded", T0 + 4 * W + W / 2, Some("cli"), &key_of("continue"));
+    // Windows 4, 5, 6 and 8 as they were sealed; window 2 is found last. (A file indexed
+    // while it is the newest known takes a later hidden capture for one of the window
+    // that is still open: that is the only window "after it" it knows.)
+    index_in_order(&env, &mut run, &dir, &files, &[1, 2, 3, 4, 0]);
+    let conn = run.db();
+    for (n, a) in windows.iter().zip(&files) {
+        let expect = if matches!(n, 4..=6) { Some("twin:mem_cap_h".to_string()) } else { None };
+        assert_eq!(hidden_by(conn, &dir, a), [("x0.0".to_string(), expect)], "window {n}");
+        assert_eq!(unmatched_hidden(conn, &dir, a), 0);
+    }
+    assert!(has(conn, "mem_cap_h"));
+
+    // `store::hide` of a capture marks rows of the chat's newest archive only.
+    capture_keyed(&run, "mem_cap_late", &dir, "s-bounded", T0 + 8 * W + W / 2, None, &key_of("continue"));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_cap_late", "cli").unwrap()), 2);
+    assert_eq!(hidden_by(conn, &dir, &files[4])[0].1.as_deref(), Some("twin:mem_cap_late"));
+    assert_eq!(hidden_by(conn, &dir, &files[0])[0].1, None);
+}
+
+#[test]
+fn t31_a_hidden_capture_whose_key_no_unit_has_hides_nothing_else_and_is_counted() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    capture_keyed(&run, "mem_cap_h", &dir, "s-bounded", T0 - 100_000, Some("cli"), &key_of("a prompt the archive does not hold"));
+    let a = Arch::new(1, "s-bounded").about("retry limit").about("upload queue");
+    let later = Arch::new(2, "s-bounded").at(T0 + W).about("deploy window");
+    index_in_order(&env, &mut run, &dir, &[a.clone(), later.clone()], &[0, 1]);
+    let conn = run.db();
+    assert!(hidden_by(conn, &dir, &a).iter().all(|(_, by)| by.is_none()));
+    assert!(hidden_by(conn, &dir, &later).iter().all(|(_, by)| by.is_none()));
+    // Counted by the archive of its own window, and by no other.
+    assert_eq!((unmatched_hidden(conn, &dir, &a), unmatched_hidden(conn, &dir, &later)), (1, 0));
+}
+
+// ── Test 33 (a): two marks without a key ────────────────────────────────────
+
+#[test]
+fn t33a_two_marks_of_one_file_without_a_key_are_one_row_with_head_and_tail() {
+    let dir = scope(KEY);
+    let before = Arch::new(1, "s-two")
+        .at(T0 + W)
+        .turn("what is on the calendar for the rest of this week?", &reply("CALENDAR"))
+        .turn("there is a thing I should not have told you, about my brother", &reply("LASTBEFORE"));
+    // Its leading span holds a forget call, and its last span, opened by a withheld
+    // prompt, holds another.
+    let marks = Arch::new(2, "s-two")
+        .at(T0 + 2 * W)
+        .calls(&reply("FIRSTCALL"), "axel_forget")
+        .withheld()
+        .calls(&reply("SECONDCALL"), "axel_forget");
+    let after = Arch::new(3, "s-two")
+        .at(T0 + 3 * W)
+        .says(&reply("LEADINGAFTER"))
+        .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"));
+    let files = [before, marks, after];
+    for order in [[0usize, 2, 1], [1, 0, 2], [0, 1, 2]] {
+        let env = Env::new();
+        let mut run = env.run();
+        index_in_order(&env, &mut run, &dir, &files, &order);
+        let conn = run.db();
+        assert_eq!(
+            forgot_rows(conn),
+            [("archive".to_string(), String::new(), 1, 1, files[1].id.clone())],
+            "order {order:?}"
+        );
+        assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"], "order {order:?}");
+        assert!(rows(conn, &dir, &files[1]).is_empty());
+        assert_eq!(positions(conn, &dir, &files[2]), ["x1.0"], "order {order:?}");
+        assert_eq!(in_tables(conn, "LASTBEFORE") + in_tables(conn, "LEADINGAFTER"), 0);
+        assert_eq!((forget_units(conn, &dir, &files[0]), forget_units(conn, &dir, &files[2])), (1, 1));
+    }
+}
+
+// ── Test 33 (b): a restored archive is spared ───────────────────────────────
+
+#[test]
+fn t33b_no_forget_mark_of_any_source_takes_a_row_of_a_restored_archive() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let yes = |n: u32, at: i64, mark: &str| Arch::new(n, "s-yes").at(T0 + at * W).turn("yes", &reply(mark));
+    let forgets = |n: u32, at: i64| {
+        Arch::new(n, "s-yes")
+            .at(T0 + at * W)
+            .user("yes")
+            .calls(&reply("FORGETTINGNOW"), "axel_forget")
+            .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"))
+    };
+    let (a, b, c) = (yes(1, 1, "YESINA"), forgets(2, 3), yes(3, 4, "YESINC"));
+    index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone(), c.clone()], &[0, 1, 2]);
+    assert!(rows(run.db(), &dir, &a).is_empty() && rows(run.db(), &dir, &c).is_empty());
+    assert_eq!((forget_units(run.db(), &dir, &a), forget_units(run.db(), &dir, &c)), (1, 1));
+
+    // `restore --forget-turns` on A, and a scan.
+    tx(run.db(), || {
+        run.db().execute("UPDATE archive_index SET keep_forget_turns = 1 WHERE archive_id = ?1", [&a.id]).unwrap();
+        run.db().execute("DELETE FROM forgotten_turns WHERE archive_id = ?1", [&a.id]).unwrap();
+    });
+    run.scan();
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0"], "the restored turn is not back");
+    assert_eq!(forget_units(run.db(), &dir, &a), 0);
+
+    // A fourth archive between A and B holds another forget turn with the prompt "yes".
+    let between = forgets(4, 2);
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&between), &[0]);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0"], "an archive's mark took a row of a restored archive");
+    // And the live call with that key.
+    let purged = live_call(&run, "s-yes", T0 + 2 * W - 5_000, T0 + 2 * W - 1_000, Some(&key_of("yes")));
+    let conn = run.db();
+    assert!(purged.is_empty(), "{purged:?}");
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"], "the live call took a row of a restored archive");
+    assert!(rows(conn, &dir, &c).is_empty());
+    assert_eq!(in_tables(conn, "YESINC"), 0);
+    assert_eq!(forget_units(conn, &dir, &a), 0);
+}
+
+// ── Test 34 (d): the next file's note ───────────────────────────────────────
+
+#[test]
+fn t34d_a_tail_mark_takes_the_leading_continued_unit_and_the_note_of_the_next_file() {
+    let dir = scope(KEY);
+    // A ends in a forget span with no human prompt after it.
+    let a = Arch::new(1, "s-note")
+        .at(T0 + W)
+        .about("retry limit")
+        .user("forget what I told you about the diagnosis, all of it")
+        .calls(&reply("FORGETTINGNOW"), "axel_forget");
+    // B follows, with a leading `Continued` unit and a working note.
+    let b = Arch::new(2, "s-note")
+        .at(T0 + 2 * W)
+        .says(&reply("RUNNINGONINB"))
+        .about("upload queue")
+        .noted("Working on: the user asked to forget NOTERESTATESIT, done.");
+    // The same B in a chat with no forget.
+    let plain = {
+        let mut plain = b.clone();
+        plain.id = format!("{:032x}", 9);
+        plain.logical = project::logical("t-note");
+        plain
+    };
+    for order in [[0usize, 1], [1, 0]] {
+        let env = Env::new();
+        let mut run = env.run();
+        index_in_order(&env, &mut run, &dir, std::slice::from_ref(&plain), &[0]);
+        assert_eq!(positions(run.db(), &dir, &plain), ["c0.0", "x1.0", "n0.0"]);
+        index_in_order(&env, &mut run, &dir, &[a.clone(), b.clone()], &order);
+        let conn = run.db();
+        assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+        assert_eq!(positions(conn, &dir, &b), ["x1.0"], "order {order:?}");
+        assert_eq!(forget_units(conn, &dir, &b), 2, "order {order:?}");
+        assert_eq!(positions(conn, &dir, &plain), ["c0.0", "x1.0", "n0.0"]);
+        // Only the other chat's rows hold the two texts.
+        assert_eq!(in_tables(conn, "RUNNINGONINB"), 2);
+        assert_eq!(in_tables(conn, "NOTERESTATESIT"), 2);
+    }
+}
+
+// ── Three more of commit 13a's: paths that had no test ──────────────────────
+
+#[test]
+fn a_record_whose_created_ms_is_no_time_is_skipped_with_a_reason() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let a = Arch::new(1, "s-time").at(i64::MAX).about("retry limit");
+    let good = Arch::new(2, "s-time").about("upload queue");
+    index_in_order(&env, &mut run, &dir, &[a.clone(), good.clone()], &[0, 1]);
+    let conn = run.db();
+    assert_eq!(
+        state(conn, &dir, &rel(&a.id)),
+        Some(("skipped".to_string(), Some("created_ms is not a time".to_string())))
+    );
+    assert!(rows(conn, &dir, &a).is_empty());
+    assert_eq!(positions(conn, &dir, &good), ["x0.0"]);
+    run.scan();
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_job_that_names_a_slot_file_indexes_it_and_one_with_another_id_writes_nothing() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let a = Arch::new(1, "s-slot").about("retry limit");
+    std::fs::create_dir_all(env.archives().join(&dir)).unwrap();
+    let slot = env.archives().join(&dir).join("007.json");
+    std::fs::write(&slot, a.json(&dir)).unwrap();
+    let mut run = env.run();
+
+    // The slot holds another archive than the event names: the job leaves it to the scan.
+    run.job(archived(&Arch::new(2, "s-slot"), KEY, Some(&slot), None, Some(2), Some(1)));
+    assert_eq!((index_rows(run.db()), archive_memories(run.db())), (0, 0));
+
+    run.job(archived(&a, KEY, Some(&slot), Some("s-slot"), Some(2), Some(1)));
+    let conn = run.db();
+    assert_eq!(state(conn, &dir, "007.json").map(|s| s.0).as_deref(), Some("indexed"));
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_file_that_panicked_is_read_again_by_a_binary_with_a_higher_indexer_version() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let a = Arch::new(1, "s-panic").about("retry limit");
+    env.put_live(&dir, &a);
+    {
+        let mut run = env.run_with(TestHooks { panic_archive_id: Some(a.id.clone()), ..TestHooks::default() }, None);
+        run.scan();
+        assert_eq!(state(run.db(), &dir, &rel(&a.id)).unwrap().1.as_deref(), Some("panic"));
+        // The row was written by an older indexer than this binary's.
+        tx(run.db(), || {
+            run.db()
+                .execute("UPDATE archive_index SET indexer_version = ?1", [index_archives::INDEXER_VERSION - 1])
+                .unwrap()
+        });
+    }
+    let mut run = env.run();
+    run.scan();
+    let conn = run.db();
+    assert_eq!(state_of(conn, &dir, &a), "indexed");
+    assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
+    assert_eq!(
+        count(conn, "SELECT indexer_version FROM archive_index"),
+        index_archives::INDEXER_VERSION
+    );
+    assert_eq!((run.panics(), run.errors()), (0, 0));
+}
+
+#[test]
+fn t33a_two_marks_with_one_key_keep_the_head_of_the_first_and_the_tail_of_the_second() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let before = Arch::new(1, "s-max")
+        .at(T0 + W)
+        .about("retry limit")
+        .turn("tell me again what the plan for Friday was, in one line", &reply("LASTBEFORE"));
+    // The leading span holds a call (key from the carried prompt, `head`), and the last
+    // exchange, with the same prompt, holds another (`tail`): one row, both set.
+    let marks = Arch::new(2, "s-max")
+        .at(T0 + 2 * W)
+        .successor()
+        .user(FORGET_PROMPT)
+        .says(&reply("TAILOFBEFORE"))
+        .calls(&reply("FIRSTCALL"), "axel_forget")
+        .user(FORGET_PROMPT)
+        .calls(&reply("SECONDCALL"), "axel_forget");
+    let after = Arch::new(3, "s-max").at(T0 + 3 * W).says(&reply("LEADINGAFTER")).about("upload queue");
+    // The file with the marks first: its neighbours are judged from the row alone.
+    index_in_order(&env, &mut run, &dir, &[before.clone(), marks.clone(), after.clone()], &[1, 0, 2]);
+    let conn = run.db();
+    assert_eq!(forgot_rows(conn), [("archive".to_string(), key_of(FORGET_PROMPT), 1, 1, marks.id.clone())]);
+    assert_eq!(positions(conn, &dir, &before), ["x0.0"], "the head of the first mark was lost");
+    assert_eq!(positions(conn, &dir, &after), ["x1.0"], "the tail of the second mark was lost");
+}
+
+// ── The turn's own recall-log row (review of commit 15) ─────────────────────
+
+#[test]
+fn the_forget_mark_takes_the_recall_log_rows_of_its_turn_and_of_no_other_chat_or_time() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let run = env.run();
+    let conn = run.db();
+    let plant = |ts_ms: i64, logical: Option<&str>, session: Option<&str>, preview: &str| -> i64 {
+        tx(conn, || {
+            conn.execute(
+                "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome,
+                                        total_ms, detail)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'feedfacefeedface', 'ok', 1.0, '{}')",
+                params![ts_ms, session, logical, dir, preview],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        })
+    };
+    let chat = project::logical("s-log");
+    let other = project::logical("t-log");
+    // Written at the start of the turn, before the model called anything.
+    let of_turn = plant(T0, Some(&chat), Some("s-log"), "forget what I said about LOGGEDPROMPT");
+    let by_session = plant(T0 + 10, None, Some("s-log"), "the same turn, known by its session only");
+    let older = plant(T0 - 1, Some(&chat), Some("s-log"), "an older question of the same chat");
+    let elsewhere = plant(T0, Some(&other), Some("t-log"), "another chat at the same moment");
+    let there = |id: i64| count(conn, &format!("SELECT COUNT(*) FROM recall_log WHERE id = {id}")) == 1;
+
+    assert!(live_call(&run, "s-log", T0, T0 + 30_000, None).is_empty());
+    assert!(!there(of_turn), "the turn's prompt is still in the recall log");
+    assert!(!there(by_session));
+    assert!(there(older) && there(elsewhere));
+    assert_eq!(in_tables(conn, "LOGGEDPROMPT"), 0);
+    assert!(purge_pending(conn), "the log row went and nothing asks for the checkpoint");
+
+    // A `cli` mark has one moment, and takes the log rows of that moment only.
+    let at_it = plant(T0 + 50_000, Some(&chat), None, "the hidden turn's own recall");
+    let after_it = plant(T0 + 50_001, Some(&chat), None, "a later question");
+    tx(conn, || {
+        index_archives::mark_forgotten_turn(conn, &chat, None, "cli", T0 + 50_000, T0 + 50_000, None).unwrap()
+    });
+    assert!(!there(at_it));
+    assert!(there(after_it));
 }

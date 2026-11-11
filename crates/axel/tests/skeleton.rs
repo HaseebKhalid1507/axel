@@ -183,10 +183,6 @@ fn every_stub_gives_its_fixed_answer() {
     assert!(project::derive_key(missing).is_none());
     assert!(project::resolve(Some("/nonexistent/skeleton")).is_none());
 
-    // store, index_archives
-    assert!(index_archives::mark_forgotten_turn(&conn, "l", Some("s1"), "tool", 0, 1, None)
-        .unwrap()
-        .is_empty());
 
     // capture
     let mut cap = CaptureState::default();

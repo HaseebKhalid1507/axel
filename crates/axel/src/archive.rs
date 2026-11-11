@@ -126,6 +126,18 @@ pub struct Unit {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SkipReason(pub String);
 
+/// The reason for a path that `lstat`, or the opened handle, says is not a regular file.
+const NOT_REGULAR: &str = "not a regular file";
+
+impl SkipReason {
+    /// Nothing was read from the path: an I/O failure (`cannot stat | open | read the
+    /// file`), or a path that is not a regular file (a directory, a link, a FIFO). Any
+    /// other reason is the refusal of a file that was looked at.
+    pub fn nothing_read(&self) -> bool {
+        self.0.starts_with("cannot ") || self.0 == NOT_REGULAR
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct ArchivePolicy {
     pub event_sources: Vec<String>,
@@ -271,7 +283,7 @@ fn read_listed(path: &Path, listed: &fs::Metadata) -> Result<Vec<u8>, SkipReason
     };
     match file.metadata() {
         Ok(meta) if meta.file_type().is_file() && same_file(listed, &meta) => {}
-        _ => return skip("not a regular file"),
+        _ => return skip(NOT_REGULAR),
     }
     let mut bytes = Vec::with_capacity(listed.len().min(MAX_BYTES) as usize + 1);
     if let Err(e) = file.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
@@ -325,7 +337,7 @@ pub fn read_archive(
         Err(e) => return skip(format!("cannot stat the file: {:?}", e.kind())),
     };
     if !listed.file_type().is_file() {
-        return skip("not a regular file");
+        return skip(NOT_REGULAR);
     }
     if listed.len() > MAX_BYTES {
         return skip("larger than 16 MiB");
