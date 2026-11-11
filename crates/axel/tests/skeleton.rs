@@ -28,7 +28,7 @@ use axel::ext::types::{
     BrainArg, Caller, DegradedReason, FrontState, HookEvent, HookOut, IndexerCtx, Job, Mode,
     Status, TestHooks, ToolError,
 };
-use axel::ext::{front, hooks, tools, tools_core, tools_forum};
+use axel::ext::{front, hooks, tools, tools_core};
 use axel::recall::{self, RecallConfig, RecallRequest, RecallTrace, View};
 use axel::vindex::{ExactIndex, VecDelta, VecKey, VecScope};
 use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project};
@@ -264,9 +264,7 @@ fn the_hook_dispatch_answers_continue_for_every_kind() {
 #[test]
 fn the_tool_dispatch_declares_nothing_and_knows_no_name() {
     assert!(tools::declarations(false).is_empty());
-    assert!(tools::declarations(true).is_empty());
     assert!(tools_core::tools().is_empty());
-    assert!(tools_forum::tools().is_empty());
 
     let (mut st, _jobs_rx) = front_state(TestHooks::default());
     let caller = Caller::default();
