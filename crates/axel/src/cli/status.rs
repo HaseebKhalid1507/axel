@@ -1,9 +1,10 @@
 //! `status [--json] [--check]`: the one place a person looks (section 7).
 //!
 //! It never writes: not to the brain, not to a status file, not to the old brain it
-//! `lstat`s. The brain is opened read-only, and with `immutable=1` when there is no `-wal`
-//! beside it, so no `-wal` or `-shm` appears beside a file that had none (wave 4 rulings,
-//! the line for 21). Everything it prints that came from a row or a file passes
+//! `lstat`s. The brain is opened read-only, and with `immutable=1` when there is no
+//! `-journal` and no non-empty `-wal` beside it, so no `-wal` or `-shm` appears beside a file
+//! that had none (wave 4 rulings, the line for 21); if the file changed during that read it
+//! is read again with `mode=ro` (`brain.read_as` says which). Everything it prints that came from a row or a file passes
 //! `screen::show`.
 
 use std::io::Read;
@@ -63,13 +64,117 @@ pub struct Report {
 }
 
 pub fn collect(path: &Path, check: bool, now: i64, home: Option<&Path>) -> Report {
+    collect_with(path, check, now, home, &|_: &Path| {})
+}
+
+/// `collect`, with `after_reads` called on the file read once every read of the first try
+/// is done and before the file is looked at again: a test seam, to change the file there.
+pub fn collect_with(
+    path: &Path,
+    check: bool,
+    now: i64,
+    home: Option<&Path>,
+    after_reads: &dyn Fn(&Path),
+) -> Report {
     let data_dir = match path.parent() {
         Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
         _ => PathBuf::from("."),
     };
     let files = status_files(&data_dir, now);
+    // RULING: wave 5 fix round of 21, finding 2: SQLite names the side files after the file
+    // a link points to, so they are looked for there.
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
 
-    let opened = open_read_only(path).and_then(|conn| {
+    let before = FileState::of(&real);
+    if before.journal || before.wal_size > 0 {
+        return read_once(path, &real, &files, check, now, home, ReadAs::ReadOnly);
+    }
+    let first = read_once(path, &real, &files, check, now, home, ReadAs::Immutable);
+    after_reads(&real);
+    // RULING: wave 5 fix round of 21, finding 2: `immutable=1` takes no lock. A file that
+    // changed, or a side file that appeared, while it was read may have been read torn: it
+    // is read once more, the ordinary way.
+    if FileState::of(&real).changed_since(&before) {
+        return read_once(path, &real, &files, check, now, home, ReadAs::AfterAChange);
+    }
+    first
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ReadAs {
+    Immutable,
+    ReadOnly,
+    AfterAChange,
+}
+
+impl ReadAs {
+    fn as_str(self) -> &'static str {
+        match self {
+            ReadAs::Immutable => "immutable",
+            ReadAs::ReadOnly => "read-only",
+            ReadAs::AfterAChange => "read-only after a change",
+        }
+    }
+}
+
+/// What tells that the file was written: the main file's (dev, inode, size, mtime_ns), and
+/// which side files there are.
+#[derive(PartialEq, Eq)]
+struct FileState {
+    main: Option<(u64, u64, u64, i64)>,
+    wal: bool,
+    shm: bool,
+    journal: bool,
+    wal_size: u64,
+}
+
+impl FileState {
+    fn of(real: &Path) -> FileState {
+        let main = real.metadata().ok().map(|m| (m.dev(), m.ino(), m.size(), mtime_ns(&m)));
+        let wal = side(real, "-wal").symlink_metadata().ok();
+        FileState {
+            main,
+            wal: wal.is_some(),
+            shm: side(real, "-shm").symlink_metadata().is_ok(),
+            journal: side(real, "-journal").symlink_metadata().is_ok(),
+            wal_size: wal.map_or(0, |m| m.len()),
+        }
+    }
+
+    fn changed_since(&self, before: &FileState) -> bool {
+        self.main != before.main
+            || (self.wal && !before.wal)
+            || (self.shm && !before.shm)
+            || (self.journal && !before.journal)
+    }
+}
+
+/// One try: open `real` as `how` says, read everything, say how it was read.
+#[allow(clippy::too_many_arguments)]
+fn read_once(
+    path: &Path,
+    real: &Path,
+    files: &Files,
+    check: bool,
+    now: i64,
+    home: Option<&Path>,
+    how: ReadAs,
+) -> Report {
+    let mut report = read_report(path, real, files, check, now, home, how != ReadAs::Immutable);
+    report.json["brain"]["read_as"] = json!(how.as_str());
+    report
+}
+
+fn read_report(
+    path: &Path,
+    real: &Path,
+    files: &Files,
+    check: bool,
+    now: i64,
+    home: Option<&Path>,
+    read_only: bool,
+) -> Report {
+    let opened = open_read_only(path, real, read_only).and_then(|conn| {
         let version = version_of(&conn, path)?;
         Ok((conn, version))
     });
@@ -78,7 +183,7 @@ pub fn collect(path: &Path, check: bool, now: i64, home: Option<&Path>) -> Repor
         Err(e) => {
             // `status` is not behind the gate (B3-5.3): its first line is what `require_v2`
             // would have said, in that function's words.
-            let extension = shown(extension_json(&files, None, now));
+            let extension = shown(extension_json(files, None, now));
             let json = json!({
                 "brain": { "path": path.to_string_lossy(), "error": e.to_string(), "kind": kind_of(&e) },
                 "extension": extension,
@@ -89,13 +194,13 @@ pub fn collect(path: &Path, check: bool, now: i64, home: Option<&Path>) -> Repor
         }
     };
 
-    match brain_report(&conn, path, version, &files, check, now, home) {
+    match brain_report(&conn, path, version, files, check, now, home) {
         Ok(report) => report,
         Err(e) => {
             let msg = format!("could not read the brain {}: {e}", path.display());
             let json = json!({
                 "brain": { "path": path.to_string_lossy(), "error": msg, "kind": kind_of(&e) },
-                "extension": shown(extension_json(&files, None, now)),
+                "extension": shown(extension_json(files, None, now)),
             });
             let mut lines = vec![msg];
             extension_lines(&json["extension"], &mut lines);
@@ -137,17 +242,17 @@ fn damaged(e: rusqlite::Error) -> AxelError {
 
 // RULING: wave 4 rulings, the line for 21: `status` must not create a `-wal` or `-shm`
 // beside a file that had none. `brain_v2::require_v2` and `connect` (spec 1113, 4815) both
-// can: a `mode=ro` look at a WAL file creates the two. With no `-wal` there is no frame
-// to read and no process has the file open in WAL mode, so `immutable=1` reads the main
-// file alone and creates nothing. With a `-wal` there, `mode=ro` reads its frames; it
-// may then create a missing `-shm` beside the `-wal` (a file that already has a side file).
-fn open_read_only(path: &Path) -> Result<Connection> {
+// can: a `mode=ro` look at a WAL file creates the two. With no `-journal` and no frame in a
+// `-wal` there is nothing but the main file to read, so `immutable=1` reads it alone and
+// creates nothing; `collect_with` reads again the ordinary way if it changed meanwhile.
+// Otherwise `mode=ro`, which may create a missing `-shm` beside a file that has a side file.
+fn open_read_only(path: &Path, real: &Path, read_only: bool) -> Result<Connection> {
     if !path.exists() {
         return Err(AxelError::NoBrain(path.to_path_buf()));
     }
-    let query = if side(path, "-wal").symlink_metadata().is_ok() { "mode=ro" } else { "mode=ro&immutable=1" };
+    let query = if read_only { "mode=ro" } else { "mode=ro&immutable=1" };
     let conn = Connection::open_with_flags(
-        file_uri(path, query),
+        file_uri(real, query),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(damaged)?;

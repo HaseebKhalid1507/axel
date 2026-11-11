@@ -616,6 +616,46 @@ fn status_creates_no_side_file_and_changes_no_file() {
     }
 }
 
+// RULING: wave 5 fix round of 21, finding 2: a symlinked brain's side files are named
+// after the target, and a `-wal` with frames in it means an ordinary read-only open.
+#[test]
+fn a_brain_reached_through_a_link_whose_target_has_a_wal_is_not_read_immutable() {
+    let dir = TempDir::new().unwrap();
+    let real = new_brain(&dir);
+    let link = dir.path().join("link.r8");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    assert_eq!(status_json(&link).1["brain"]["read_as"], json!("immutable"));
+
+    // An open writer whose frames are still in the `-wal`.
+    let writer = Connection::open(&real).unwrap();
+    let mode: String = writer.query_row("PRAGMA journal_mode = WAL", [], |r| r.get(0)).unwrap();
+    assert_eq!(mode, "wal");
+    writer.execute_batch("PRAGMA wal_autocheckpoint = 0; CREATE TABLE held(x); INSERT INTO held VALUES (1);").unwrap();
+    assert!(std::fs::metadata(dir.path().join("brain.r8-wal")).unwrap().len() > 0);
+    assert!(!dir.path().join("link.r8-wal").exists());
+    let (_, v) = status_json(&link);
+    drop(writer);
+    assert_eq!(v["brain"]["read_as"], json!("read-only"), "{v:#}");
+    assert_eq!(v["brain"]["version"], json!(brain_v2::LATEST), "{v:#}");
+}
+
+// RULING: wave 5 fix round of 21, finding 2: a file written between the check and the end
+// of an immutable read is read again with `mode=ro`.
+#[test]
+fn a_change_during_an_immutable_read_leads_to_a_second_read() {
+    let dir = TempDir::new().unwrap();
+    let path = new_brain(&dir);
+    let home = dir.path().join("home");
+    let quiet = axel::cli::status::collect(&path, false, now_ms(), Some(&home));
+    assert_eq!(quiet.json["brain"]["read_as"], json!("immutable"));
+
+    let changed = axel::cli::status::collect_with(&path, false, now_ms(), Some(&home), &|real: &Path| {
+        sql(real, "CREATE TABLE written_meanwhile(x); DROP TABLE written_meanwhile;")
+    });
+    assert_eq!(changed.json["brain"]["read_as"], json!("read-only after a change"), "{:#}", changed.json);
+    assert!(!changed.wrong, "{:#}", changed.json);
+}
+
 #[test]
 fn check_on_a_sound_brain_exits_0() {
     let dir = TempDir::new().unwrap();
