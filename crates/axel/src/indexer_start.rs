@@ -174,23 +174,26 @@ fn recorded_base_unopened(path: &Path) -> Result<Option<String>> {
 // inode numbers. A brain restored over the path, or a path that is gone, leaves the open
 // connections on a file nobody will read again. Unix only: elsewhere there is no number to
 // compare, nothing is kept, and the check never fires.
-#[cfg(unix)]
-fn file_id(path: &Path) -> Option<(u64, u64)> {
-    use std::os::unix::fs::MetadataExt;
-    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
-}
-
-#[cfg(not(unix))]
-fn file_id(_path: &Path) -> Option<(u64, u64)> {
-    None
-}
-
 /// True when the path no longer names the file that was opened.
 fn brain_file_changed(ctx: &IndexerCtx) -> bool {
     match ctx.brain_file {
-        Some(opened) => file_id(&ctx.cfg.brain) != Some(opened),
+        Some(opened) => brain_v2::file_id(&ctx.cfg.brain) != Some(opened),
         None => false,
     }
+}
+
+/// True, and the process is `Degraded(BrainChanged)`, when the path no longer names the
+/// file that was opened. Said once in the log: a degraded process is not looked at again.
+// RULING: v2 r5. Called before every handler (`indexer::guarded`), not only by the status
+// tick: what a handler would write, and a checkpoint, go to the `-wal` the new file now has
+// beside it.
+pub fn degrade_if_replaced(ctx: &IndexerCtx) -> bool {
+    if !brain_file_changed(ctx) {
+        return false;
+    }
+    log_line("brain file replaced or gone");
+    degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
+    true
 }
 
 /// `open_v2`, with the base guard on both sides of it: a brain recorded for another Synaps
@@ -236,7 +239,8 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
     ctx.status.unreadable_memories.store(brain.unreadable_memories as u64, Ordering::Relaxed);
     ctx.conn = Some(brain.conn);
     ctx.signer = brain.signer;
-    ctx.brain_file = file_id(&path);
+    // RULING: v2 r5. The numbers `open_v2` recorded when its connection was made.
+    ctx.brain_file = brain.file;
     let usable = model_usable(ctx).unwrap_or(false);
     ctx.status.model_loaded.store(usable, Ordering::Relaxed);
     if ctx.embed.model_id().is_some() && !usable {
@@ -524,9 +528,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         return Ok(());
     }
     // RULING: wave3-c12b ruling 5. Before the row, every 30 s.
-    if brain_file_changed(ctx) {
-        log_line("brain file replaced or gone");
-        degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
+    if degrade_if_replaced(ctx) {
         return Ok(());
     }
     // RULING: wave3-c12b ruling 9. What the brain was made for, beside what is running:

@@ -1439,6 +1439,89 @@ fn r5_a_brain_file_replaced_under_the_process_degrades_it_and_the_new_file_is_no
     assert!(!other.brain().exists(), "a brain was made where one had gone");
 }
 
+// RULING: v2 r5. The front thread connects by path when the indexer reports the brain open;
+// a rename before that connection was made gave it the new file, and its close checkpointed
+// the old process's `-wal` into it. The rename here comes as soon as the status row is
+// written, before the front thread's first idle turn (250 ms).
+#[test]
+fn r5_a_brain_replaced_before_the_front_connects_is_not_connected_to_or_written() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks { status_tick_ms: Some(50), ..TestHooks::default() });
+    let copy = dirs.brain().with_extension("copy");
+    std::fs::copy(dirs.brain(), &copy).unwrap();
+    let before = sha256(&copy);
+    std::fs::rename(&copy, dirs.brain()).unwrap();
+
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(10));
+    assert_eq!(said["reason"], "BrainChanged", "{said}");
+    assert_eq!(
+        host.tool("search")["result"]["content"],
+        "Axel is unavailable: BrainChanged. Synaps itself is not affected."
+    );
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert_eq!(sha256(&dirs.brain()), before, "the new file was written");
+}
+
+// RULING: v2 r5. Where the connection is made and where the write begins, not only at the
+// status tick: a new connection to the path, a write on a connection made before, and an
+// indexer handler are all refused once the path names another file.
+#[test]
+fn r5_a_replaced_brain_gets_no_new_connection_and_no_write_through_an_old_one() {
+    let dirs = Dirs::new();
+    let brain = brain_v2::open_v2(&dirs.brain(), &OpenOpts { agent: None, model: "hash-384", dim: 384, upgrade_v1: false })
+        .unwrap();
+    assert!(brain.file.is_some());
+    let front = brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
+    let writing = AtomicBool::new(false);
+    // Control: the file is the one opened, and both connections write.
+    brain_v2::begin_write(&brain.conn).unwrap();
+    brain.conn.execute_batch("COMMIT").unwrap();
+    drop(brain_v2::begin_write_front(&front, &writing).unwrap());
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    let mut ran = false;
+    indexer::guarded(&mut ctx, |_| {
+        ran = true;
+        Ok(())
+    });
+    assert!(ran, "the control ran no handler");
+
+    let copy = dirs.brain().with_extension("copy");
+    std::fs::copy(dirs.brain(), &copy).unwrap();
+    std::fs::rename(&copy, dirs.brain()).unwrap();
+    let before = sha256(&dirs.brain());
+
+    assert!(
+        matches!(brain_v2::connect(&dirs.brain(), brain_v2::Role::Front), Err(AxelError::BrainChanged)),
+        "a new connection was made to the new file"
+    );
+    assert!(matches!(brain_v2::begin_write(&brain.conn), Err(AxelError::BrainChanged)), "the indexer's connection wrote");
+    assert!(brain.conn.is_autocommit());
+    assert!(
+        matches!(brain_v2::begin_write_front(&front, &writing), Err(AxelError::BrainChanged)),
+        "the front's connection wrote"
+    );
+    assert!(front.is_autocommit() && !writing.load(Ordering::SeqCst));
+    let mut ran = false;
+    indexer::guarded(&mut ctx, |_| {
+        ran = true;
+        Ok(())
+    });
+    assert!(!ran, "a handler ran on a replaced brain");
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Degraded as u8);
+    assert_eq!(DegradedReason::from_u8(status.reason.load(Ordering::SeqCst)), DegradedReason::BrainChanged);
+    drop((front, brain, ctx));
+    assert_eq!(sha256(&dirs.brain()), before, "the new file was written");
+
+    // A new `open_v2` records the file now at the path, and writes to it.
+    let again = brain_v2::open_v2(&dirs.brain(), &OpenOpts { agent: None, model: "hash-384", dim: 384, upgrade_v1: false })
+        .unwrap();
+    brain_v2::begin_write(&again.conn).unwrap();
+    again.conn.execute_batch("ROLLBACK").unwrap();
+    brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
+}
+
 #[test]
 fn r6_a_look_that_cannot_read_the_brain_is_not_ready_and_open_v2_does_not_run() {
     let dirs = Dirs::new();

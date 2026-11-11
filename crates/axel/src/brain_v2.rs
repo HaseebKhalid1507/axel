@@ -4,6 +4,7 @@
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use axel_memkoshi::security::MemorySigner;
@@ -38,6 +39,9 @@ pub struct V2Brain {
     /// Memories this open could not adopt because their `id` or `content` is not readable
     /// text (finding 5). They are still in `memories`, untouched.
     pub unreadable_memories: usize,
+    /// The device and inode numbers of the file `conn` opened, as recorded for `replaced`.
+    // RULING: v2 r5.
+    pub file: Option<(u64, u64)>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -175,19 +179,80 @@ fn too_new(file: i32) -> AxelError {
     AxelError::BrainTooNew { file: i64::from(file), binary: i64::from(LATEST) }
 }
 
+// ── The file this process opened ────────────────────────────────────────────
+
+// RULING: v2 r5. A brain file replaced or gone is never written (section 7), through any
+// connection. `open_v2` records the device and inode numbers of the file it opened, under
+// the name SQLite gives that file; a later connection to the name, and every `begin_write`
+// on it, is refused with `BrainChanged` when the name no longer leads to that file. The
+// status tick alone came too late: the front thread connects by path once the indexer
+// reports the brain open, and a connection made after a rename was the only one on the new
+// file, so its close checkpointed the old process's `-wal` into it.
+static OPENED: Mutex<Vec<(String, (u64, u64))>> = Mutex::new(Vec::new());
+
+fn opened() -> MutexGuard<'static, Vec<(String, (u64, u64))>> {
+    OPENED.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The device and inode numbers of the file at `path`. Unix only: elsewhere there is no
+/// number to compare, nothing is recorded, and nothing is refused.
+#[cfg(unix)]
+pub fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+pub fn file_id(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// What `open_v2` recorded for the file of `conn`; `None` when it opened no such file.
+fn recorded(conn: &Connection) -> Option<(u64, u64)> {
+    let name = conn.path().filter(|name| !name.is_empty())?;
+    opened().iter().find(|(n, _)| n == name).map(|(_, id)| *id)
+}
+
+/// True when `open_v2` opened the file of `conn` in this process and its path now names
+/// another file, or none.
+pub fn replaced(conn: &Connection) -> bool {
+    match (recorded(conn), conn.path()) {
+        (Some(id), Some(name)) => file_id(Path::new(name)) != Some(id),
+        _ => false,
+    }
+}
+
 // ── Connections ─────────────────────────────────────────────────────────────
 
 /// The pragmas of `connect`. With `check`, `user_version` is read before any pragma is
-/// set and anything but `LATEST` is refused.
+/// set and anything but `LATEST` is refused. With `record` (`open_v2`'s own connection) the
+/// file it opened is recorded; without, a file that is no longer the recorded one is
+/// refused.
 // SPEC: 955 reads the version after the pragmas. It is read first here: `journal_mode=WAL`
 // rewrites the header of a file that is not in WAL mode, and a refused file must not be
 // written. The answer is the same.
-fn connect_raw(path: &Path, role: Role, check: bool) -> Result<Connection> {
+fn connect_raw(path: &Path, role: Role, check: bool, record: bool) -> Result<Connection> {
+    let before = if record { file_id(path) } else { None };
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(damaged)?;
+    // RULING: v2 r5. Here, before anything is read: a connection that has read nothing
+    // closes without touching the file or its `-wal`.
+    if record {
+        if file_id(path) != before {
+            return Err(AxelError::BrainChanged);
+        }
+        let name = conn.path().unwrap_or_default().to_string();
+        let mut opened = opened();
+        opened.retain(|(n, _)| *n != name);
+        if let (Some(id), false) = (before, name.is_empty()) {
+            opened.push((name, id));
+        }
+    } else if replaced(&conn) {
+        return Err(AxelError::BrainChanged);
+    }
     let (busy_ms, synchronous) = match role {
         Role::Indexer => (5_000, "NORMAL"),
         Role::Front => (1_500, "FULL"),
@@ -212,7 +277,7 @@ pub fn connect(path: &Path, role: Role) -> Result<Connection> {
     if !path.exists() {
         return Err(AxelError::NoBrain(path.to_path_buf()));
     }
-    connect_raw(path, role, true)
+    connect_raw(path, role, true, false)
 }
 
 /// A source of `migrate synaps`: read-only, immutable, and the file itself may not be a
@@ -327,7 +392,8 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     drop(brain);
 
     // 3 to 5. Our connection, JR's layer, velocirag's tables.
-    let conn = connect_raw(path, Role::Indexer, false)?;
+    // RULING: v2 r5. This connection records the file: what this process writes from now on.
+    let conn = connect_raw(path, Role::Indexer, false, true)?;
     // RULING: wave2-c4-review finding 4: both layers look for a column and add it later, so
     // of two processes on a file that lacks the columns one fails with "duplicate column
     // name". Steps 4 and 5 run again, once, when they fail. Velocirag's statements run in
@@ -335,7 +401,7 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     // second run never meets a step 5 that is half done.
     let layers = || -> Result<()> {
         crate::project_memory::migrate(&conn)?;
-        let own = connect_raw(path, Role::Indexer, false)?;
+        let own = connect_raw(path, Role::Indexer, false, false)?;
         own.execute_batch("BEGIN IMMEDIATE")?;
         let db = Database::from_connection(own, path.to_path_buf())?;
         commit(db.conn())
@@ -363,7 +429,9 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     let unreadable_memories =
         adopt_orphans_counted(&conn, if opts.upgrade_v1 { "legacy" } else { "cli" })?.skipped;
 
-    Ok(V2Brain { conn, signer, embedder_model, path: path.to_path_buf(), unreadable_memories })
+    // RULING: v2 r5.
+    let file = recorded(&conn);
+    Ok(V2Brain { conn, signer, embedder_model, path: path.to_path_buf(), unreadable_memories, file })
 }
 
 /// One migration in one transaction. Another process may have won: the version is read
@@ -466,10 +534,16 @@ pub fn require_v2(path: &Path) -> Result<()> {
 
 // ── Writing ─────────────────────────────────────────────────────────────────
 
-/// `BEGIN IMMEDIATE` and the version check.
+/// `BEGIN IMMEDIATE`, the version check, and the file: one replaced or gone since
+/// `open_v2` opened it is `BrainChanged`.
 pub fn begin_write(conn: &Connection) -> Result<()> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     match user_version(conn) {
+        // RULING: v2 r5. Under the write lock, as the version is.
+        Ok(v) if v == LATEST && replaced(conn) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(AxelError::BrainChanged)
+        }
         Ok(v) if v == LATEST => Ok(()),
         Ok(_) => {
             let _ = conn.execute_batch("ROLLBACK");

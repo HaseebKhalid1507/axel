@@ -156,12 +156,20 @@ pub fn guarded(ctx: &mut IndexerCtx, f: impl FnOnce(&mut IndexerCtx) -> Result<(
     if ctx.stop.load(Ordering::SeqCst) {
         return;
     }
+    // RULING: v2 r5. A brain file replaced or gone is not written by any handler.
+    if indexer_start::degrade_if_replaced(ctx) {
+        return;
+    }
     brain_v2::stand_aside(&ctx.writing);
     let failed = match catch_unwind(AssertUnwindSafe(|| f(ctx))) {
         Ok(Ok(())) => false,
         Ok(Err(e)) => {
             ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
-            brain_v2::degrade_on(&e, &ctx.status, &ctx.mode);
+            // RULING: v2 r5. A file replaced while the handler ran (its `begin_write` was
+            // refused) is said as it is before a handler.
+            if !indexer_start::degrade_if_replaced(ctx) {
+                brain_v2::degrade_on(&e, &ctx.status, &ctx.mode);
+            }
             true
         }
         Err(_) => {
