@@ -148,6 +148,10 @@ fn peek(path: &Path) -> Result<Peek> {
     // Another process may be creating or recovering the file at this moment (finding 8).
     conn.busy_timeout(Duration::from_secs(5))?;
     let version = user_version(&conn).map_err(damaged)?;
+    // `open_v2` and `require_v2` look here first, before anything is written.
+    if version == LATEST {
+        check_shape(&conn, path)?;
+    }
     let empty: bool = conn
         .query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master)", [], |r| r.get(0))
         .map_err(damaged)?;
@@ -306,12 +310,48 @@ fn connect_raw(path: &Path, role: Role, check: bool, record: bool) -> Result<Con
     if check && user_version(&conn).map_err(damaged)? != LATEST {
         return Err(AxelError::BrainNotReady);
     }
+    if check {
+        check_shape(&conn, path)?;
+    }
     conn.execute_batch(&format!(
         "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA secure_delete=ON; \
          PRAGMA synchronous={synchronous};"
     ))
     .map_err(damaged)?;
     Ok(conn)
+}
+
+/// The unique key of `forgotten_turns` that every upsert of a mark names.
+const MARK_KEY: &str = "logical,source,from_ms,turn_key,archive_id,text_hash";
+
+/// A version-1 v2 brain made before the round-3 shape: `forgotten_turns` without
+/// `text_hash` in its unique key, or `archive_index` without `cli_units` and
+/// `cli_unproven`. Its first mark would fail ("does not match any UNIQUE constraint").
+// RULING: v2 c18b review round 4, item 6. No version bump: no v2 brain is in use yet; one
+// made by an older build is refused, unchanged, and made again.
+fn check_shape(conn: &Connection, path: &Path) -> Result<()> {
+    let columns: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('archive_index') WHERE name IN ('cli_units', 'cli_unproven')",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(damaged)?;
+    let mut keys = conn
+        .prepare(
+            "SELECT (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(l.name) ORDER BY seqno))
+               FROM pragma_index_list('forgotten_turns') l WHERE l.\"unique\" = 1",
+        )
+        .map_err(damaged)?;
+    let keys: Vec<Option<String>> =
+        keys.query_map([], |r| r.get(0)).map_err(damaged)?.collect::<rusqlite::Result<_>>().map_err(damaged)?;
+    if columns == 2 && keys.iter().any(|k| k.as_deref() == Some(MARK_KEY)) {
+        return Ok(());
+    }
+    Err(AxelError::Other(format!(
+        "the brain at {} was made by an older build of axel-v2 and lacks tables this build writes; it is not changed. Move it aside and make it again (\"axel-v2 init\", or \"axel-v2 migrate init --from-axel <axel.r8>\").",
+        path.display()
+    )))
 }
 
 /// Pragmas only; never creates, never migrates.

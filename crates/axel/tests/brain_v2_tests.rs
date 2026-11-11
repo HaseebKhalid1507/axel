@@ -1706,3 +1706,41 @@ fn degrade_on_sets_the_reason_then_the_mode_for_a_brain_error_only() {
         assert_eq!(mode.load(Ordering::SeqCst), Mode::Ready as u8, "{err:?}");
     }
 }
+
+/// v2 c18b review round 4, item 6: a v2 brain made before the round-3 shape (the mark key
+/// without `text_hash`; `archive_index` without `cli_unproven` or `cli_units`) is refused
+/// by `connect` and by `open_v2`, unchanged, with a message that says to make it again.
+#[test]
+fn a_v2_brain_of_the_pre_round_3_shape_is_refused_unchanged() {
+    let shapes: [(&str, &str); 3] = [
+        ("no cli_unproven", "ALTER TABLE archive_index DROP COLUMN cli_unproven;"),
+        ("no cli_units", "ALTER TABLE archive_index DROP COLUMN cli_units;"),
+        ("the old mark key", ""),
+    ];
+    for (name, sql) in shapes {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("brain.r8");
+        drop(brain_v2::open_v2(&path, &opts(false)).unwrap());
+        assert!(brain_v2::connect(&path, Role::Cli).is_ok(), "{name}: a brain of this build is refused");
+        {
+            let raw = Connection::open(&path).unwrap();
+            if sql.is_empty() {
+                let create: String = raw
+                    .query_row("SELECT sql FROM sqlite_master WHERE name = 'forgotten_turns'", [], |r| r.get(0))
+                    .unwrap();
+                let old = create.replace("archive_id, text_hash)", "archive_id)");
+                assert_ne!(old, create, "the key was not found: the test proves nothing");
+                raw.execute_batch(&format!("PRAGMA foreign_keys=OFF; DROP TABLE forgotten_turns; {old};")).unwrap();
+            } else {
+                raw.execute_batch(sql).unwrap();
+            }
+            raw.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+        }
+        let before = std::fs::read(&path).unwrap();
+        for result in [brain_v2::connect(&path, Role::Cli).map(drop), brain_v2::open_v2(&path, &opts(false)).map(drop)] {
+            let error = result.expect_err(name).to_string();
+            assert!(error.contains("made by an older build of axel-v2") && error.contains("make it again"), "{name}: {error}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), before, "{name}: the file was changed");
+    }
+}
