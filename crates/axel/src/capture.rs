@@ -22,7 +22,7 @@ use crate::ext::front;
 use crate::ext::types::{FrontState, HookEvent, Job};
 use crate::project_memory::{RecordLinks, Sensitivity};
 use crate::store::{self, Inserted, NewRow};
-use crate::{archive, brain_v2, project, screen};
+use crate::{archive, brain_v2, project, recall, screen};
 
 /// Pending turns kept at most; one more evicts the oldest.
 pub const MAX_PENDING: usize = 64;
@@ -326,6 +326,14 @@ pub fn write_turn(
     // each hook; the test is made again on what the turn carries, so that no caller can
     // hand over a turn this function stores and core would not.
     if turn.withheld || screen::core_withholds(&turn.prompt) || screen::core_withholds(&turn.reply) {
+        // RULING: wave4 R-16 item 3. The recall log wrote its row of this prompt at the
+        // start of the turn, when the reply was not yet known, and may hold the prompt's
+        // first characters and words: the row goes with the turn. `turn_key` is the
+        // `query_hash` of that row (`recall::query_hash`). This is the indexer thread and
+        // the connection is bare, so the call makes its own write transaction; the log's
+        // job was queued before this one, so the row is there. With capture off (above)
+        // the log keeps no text of a prompt and nothing is deleted.
+        recall::drop_logged_turn(conn, &turn.session_id, &turn.turn_key)?;
         return Ok(Written::Skipped);
     }
     if turn.session_id.is_empty() {

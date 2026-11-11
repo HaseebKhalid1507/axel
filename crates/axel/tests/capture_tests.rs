@@ -15,7 +15,7 @@ use axel::ext::front;
 use axel::ext::server::serve;
 use axel::ext::types::{Boot, FrontState, HookEvent, IndexerCtx, Job, Mode, ServeEnd, Status, TestHooks};
 use axel::vindex::VecDelta;
-use axel::{archive, indexer, indexer_start, project, screen, store};
+use axel::{archive, indexer, indexer_start, project, recall, screen, store};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
 use tempfile::TempDir;
@@ -1212,4 +1212,88 @@ fn r16_1_a_turn_the_queue_refuses_is_counted() {
     assert!(next_capture(&jobs).is_none());
     assert_eq!(dropped(&status), 1);
     assert_eq!(status.jobs_dropped.load(Ordering::Relaxed), 1);
+}
+
+fn log_row(conn: &Connection, session_id: &str, prompt: &str) {
+    tx(conn, || {
+        conn.execute(
+            "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome, total_ms, detail)
+             VALUES (1000, ?1, ?1, NULL, ?2, ?3, 'injected', 1.0, '{}')",
+            params![session_id, prompt, recall::query_hash(prompt)],
+        )
+        .unwrap();
+    });
+}
+
+fn log_rows(conn: &Connection, session_id: &str, prompt: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM recall_log WHERE session_id = ?1 AND query_preview = ?2",
+        params![session_id, prompt],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// Item 3: the recall log wrote its row at the prompt. A turn that ends withheld takes
+/// that row with it: the row of this prompt of this chat, and no other.
+#[test]
+fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, _status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let other = "what did we decide about the order of the archive windows last week";
+
+    // A clean prompt whose reply core would withhold.
+    for chat in ["S", "T"] {
+        log_row(ctx_conn(&ctx), chat, PROMPT);
+        log_row(ctx_conn(&ctx), chat, other);
+    }
+    user(&mut st, "S", &cwd, PROMPT, 1_000);
+    assistant(&mut st, "S", &cwd, "It reads them in the order the secret of the build names.", false, 2_000);
+    let turn = next_capture(&jobs).unwrap();
+    assert!(turn.withheld);
+    assert_eq!(turn.turn_key, recall::query_hash(PROMPT), "capture's key is the log's hash");
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    let conn = ctx_conn(&ctx);
+    assert!(conn.is_autocommit());
+    assert_eq!(log_rows(conn, "S", PROMPT), 0, "the log kept the prompt of a withheld turn");
+    assert_eq!(log_rows(conn, "S", other), 1, "another prompt of the chat");
+    assert_eq!(log_rows(conn, "T", PROMPT), 1, "the same prompt in another chat");
+    assert_eq!(captures(conn), 0);
+    assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
+
+    // A turn that is stored keeps its row.
+    user(&mut st, "T", &cwd, PROMPT, 3_000);
+    assistant(&mut st, "T", &cwd, REPLY, false, 4_000);
+    indexer::dispatch(&mut ctx, Job::Capture(next_capture(&jobs).unwrap()));
+    let conn = ctx_conn(&ctx);
+    assert_eq!(captures_of(conn, "T"), 1);
+    assert_eq!(log_rows(conn, "T", PROMPT), 1);
+
+    // `write_turn` by itself, for a turn whose flag says clean and whose text does not.
+    let brain = Lab::new();
+    let cfg = brain.cfg();
+    let b = brain.open();
+    log_row(&b.conn, "S", PROMPT);
+    let turn = CompletedTurn {
+        session_id: "S".to_string(),
+        cwd: Some(brain.project("alpha")),
+        prompt: PROMPT.to_string(),
+        turn_key: archive::turn_key(PROMPT),
+        reply: "the password of the build machine is in the vault".to_string(),
+        started_ms: 1_000,
+        at_ms: 2_000,
+        suppressed: false,
+        withheld: false,
+    };
+    assert_eq!(write(&b, &cfg, &turn), Written::Skipped);
+    assert!(b.conn.is_autocommit());
+    assert_eq!(log_rows(&b.conn, "S", PROMPT), 0);
+
+    // Capture off: `write_turn` touches nothing (the log keeps no text of a prompt then).
+    log_row(&b.conn, "S", PROMPT);
+    let mut off = cfg.clone();
+    off.capture = false;
+    assert_eq!(write(&b, &off, &CompletedTurn { withheld: true, ..turn }), Written::Skipped);
+    assert_eq!(log_rows(&b.conn, "S", PROMPT), 1);
 }
