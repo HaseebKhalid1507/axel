@@ -21,7 +21,7 @@ use serde_json::{json, Value};
 
 use axel::archive::{self, ArchivePolicy, LiveArchive, Start};
 use axel::brain_v2::{self, OpenOpts};
-use axel::capture::{self, CaptureState, CompletedTurn, Written};
+use axel::capture::{CaptureState, CompletedTurn};
 use axel::embed::EmbedService;
 use axel::ext::config::{EmbedderKind, ExtConfig, ForumMode};
 use axel::ext::types::{
@@ -166,8 +166,6 @@ fn policy() -> ArchivePolicy {
 #[test]
 fn every_stub_gives_its_fixed_answer() {
     let missing = Path::new("/nonexistent/skeleton/brain.r8");
-    let conn = Connection::open_in_memory().unwrap();
-
     // brain_v2 (commit 4) and screen (commit 8) are real: `brain_v2_tests.rs` and the tests
     // in `screen.rs` hold their contracts now.
 
@@ -190,7 +188,6 @@ fn every_stub_gives_its_fixed_answer() {
     cap.on_user(Some("s1"), None, "hello", 1);
     cap.drop_session("s1");
     cap.on_session_end("s1");
-    assert_eq!(capture::write_turn(&conn, None, &cfg(), &turn()).unwrap(), Written::Skipped);
 
     // vindex, embed
     let mut index = ExactIndex::new(384);
