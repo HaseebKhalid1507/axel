@@ -102,6 +102,8 @@ CREATE TABLE IF NOT EXISTS forgotten_turns(
   archive_id TEXT NOT NULL DEFAULT '',
   head       INTEGER NOT NULL DEFAULT 0, -- archive: the forget span is the file's leading span
   tail       INTEGER NOT NULL DEFAULT 0, -- archive: no human prompt follows the span in the file
+  text_hash  TEXT NOT NULL DEFAULT '',   -- cli: the deleted turn's text, hashed (index_archives::TurnText); no text is kept
+  cut_hash   TEXT NOT NULL DEFAULT '',   -- cli: the same of its first 4096 bytes when it is longer ('' when not)
   added_ms   INTEGER NOT NULL,
   UNIQUE (logical, source, from_ms, turn_key, archive_id)   -- the upsert's conflict target (R3-2e)
 );

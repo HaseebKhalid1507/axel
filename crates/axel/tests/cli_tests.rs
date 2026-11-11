@@ -1266,6 +1266,7 @@ fn t10_a_turn_deleted_with_forget_now_is_not_brought_back_by_the_archive_of_its_
     let mut cap = capture("mem_cap_gone", "s-gone", &key_of(GONE));
     cap.project = scope();
     cap.created_ms = T0 - 100_000;
+    cap.content = format!("User: {GONE}\nAssistant: {}", reply("DOCTORANSWER"));
     world.put(&cap);
     tx(world.db(), || {
         store::hide(world.db(), "mem_cap_gone", "cli").unwrap();
@@ -1300,6 +1301,7 @@ fn a_kept_archive_obeys_the_mark_of_a_turn_deleted_with_forget_now() {
     let mut cap = capture("mem_cap_kept", "s-kept", &key_of(GONE));
     cap.project = scope();
     cap.created_ms = T0 - 100_000;
+    cap.content = format!("User: {GONE}\nAssistant: {}", reply("DOCTORANSWER"));
     world.put(&cap);
     tx(world.db(), || {
         store::hide(world.db(), "mem_cap_kept", "cli").unwrap();
@@ -1335,6 +1337,7 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let mut world = Indexed::new();
     let old = Arch::new(11, "s-seven", T0)
         .turn(PROMPT, &reply("OLDCONTINUE"))
+        .turn(PROMPT, &reply("OLDOTHER"))
         .forget_call("forget the thing about the landlord from this morning please", "SEVENFORGET")
         .about("deploy window");
     let newer = Arch::new(12, "s-seven", T0 + 1_000_000).about("lunch order");
@@ -1346,11 +1349,16 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
         .db()
         .query_row("SELECT id FROM memories WHERE content LIKE '%OLDCONTINUE%'", [], |r| r.get(0))
         .expect("the older archive's turn is a row: the test proves nothing");
-    // The same prompt again, another turn, captured inside the newer archive's window.
+    let other_row: String = world
+        .db()
+        .query_row("SELECT id FROM memories WHERE content LIKE '%OLDOTHER%'", [], |r| r.get(0))
+        .expect("the older archive's other turn is a row: the test proves nothing");
+    // The turn of the older archive again, as a capture of the newer archive's window (the
+    // same text: its copy), and another turn with the same prompt (OLDOTHER) beside it.
     let mut cap = capture("mem_cap_seven", "s-seven", &key_of(PROMPT));
     cap.project = scope();
     cap.created_ms = T0 + 500_000;
-    cap.content = format!("User: {PROMPT}\nAssistant: NEWCONTINUE is another reply");
+    cap.content = format!("User: {PROMPT}\nAssistant: {}", reply("OLDCONTINUE"));
     world.put(&cap);
     tx(world.db(), || {
         store::hide(world.db(), "mem_cap_seven", "cli").unwrap();
@@ -1366,14 +1374,17 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let listed = out.find(&format!("m:{old_row} \u{b7} ")).unwrap_or_else(|| panic!("the taken row is not listed: {out}"));
     let archive = out.find(&format!("  ctx-{}:", old.id)).unwrap_or_else(|| panic!("{out}"));
     assert!(archive < listed && listed < asked, "{out}");
-    assert!(out.contains(&format!("User: {PROMPT}")), "{out}");
+    assert!(out.contains("OLDCONTINUE"), "{out}");
+    // v2 c18b review round 2, item 1: another turn with the same prompt is not taken.
+    assert!(!out.contains(&format!("m:{other_row}")), "{out}");
     assert_eq!(all(&world), before, "the listing changed a row");
 
     let yes = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "y\n");
     assert!(yes.out.contains("Deleted 1 memories for good."), "{}{}", yes.out, yes.err);
-    assert!(yes.out.contains("The forget mark took 1 archived rows"), "{}", yes.out);
+    assert!(yes.out.contains("The forget mark took 1 archived copies"), "{}", yes.out);
     let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
     assert!(!has(&old_row));
+    assert!(has(&other_row), "the mark took another turn with the same prompt");
 
     // As said: a kept archive obeys the mark (item 4), so the row does not come back.
     restore_turns(&world.path(), &format!("ctx-{}", old.id));
@@ -1381,6 +1392,81 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let texts = world.rows(&old).into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n");
     assert!(texts.contains("SEVENFORGET"), "the kept archive was not read again: {texts}");
     assert!(!texts.contains("OLDCONTINUE"), "{texts}");
+    assert!(texts.contains("OLDOTHER"), "{texts}");
+}
+
+/// A capture of `prompt` and `answer` in chat `session`, hidden 25 hours ago, then deleted
+/// with `forget --now`.
+fn deleted_capture(world: &mut Indexed, id: &str, session: &str, prompt: &str, answer: &str, created_ms: i64) {
+    let mut cap = capture(id, session, &key_of(prompt));
+    cap.project = scope();
+    cap.created_ms = created_ms;
+    cap.content = format!("User: {prompt}\nAssistant: {answer}");
+    world.put(&cap);
+    tx(world.db(), || {
+        store::hide(world.db(), id, "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
+    });
+    let run = forget_cmd(&world.path(), &[id], true, false, "y\n");
+    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+}
+
+/// v2 c18b review round 2, item 1: a `cli` mark takes only the deleted turn. An archive of
+/// its window indexed after the purge holds it and another turn with the same prompt: the
+/// deleted one is left out, the other is a row. No text is in the mark.
+#[test]
+fn a_cli_mark_leaves_out_only_the_deleted_turn_of_an_archive_indexed_after_the_purge() {
+    const PROMPT: &str = "yes, go ahead and do that the way you described it";
+    let mut world = Indexed::new();
+    deleted_capture(&mut world, "mem_cap_yes", "s-yes", PROMPT, &reply("DELETEDYES"), T0 - 100_000);
+    let mark: (String, String, String) = world
+        .db()
+        .query_row("SELECT turn_key, text_hash, cut_hash FROM forgotten_turns WHERE source = 'cli'", [], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?))
+        })
+        .unwrap();
+    assert_eq!(mark.0, key_of(PROMPT));
+    assert_eq!(mark.1.len(), 32);
+    assert_eq!(mark.2, "", "a text under 4096 bytes has no cut hash");
+    assert_eq!(in_tables(world.db(), "DELETEDYES"), 0, "the mark keeps text");
+
+    let a = Arch::new(21, "s-yes", T0)
+        .turn(PROMPT, &reply("DELETEDYES"))
+        .about("upload queue")
+        .turn(PROMPT, &reply("KEPTYES"));
+    world.file(&a);
+    world.scan();
+    let rows = world.rows(&a);
+    let texts = rows.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(texts.contains("upload queue"), "the archive was not indexed: the test proves nothing");
+    assert!(!texts.contains("DELETEDYES"), "the deleted turn came back: {texts}");
+    assert!(texts.contains("KEPTYES"), "another turn with the same prompt was left out: {texts}");
+    assert_eq!(rows.len(), 2, "{rows:?}");
+}
+
+/// v2 c18b review round 2, item 1: a deleted turn over 4096 bytes. Its archived unit's body
+/// is cut there, and the mark's cut hash takes it; another long turn with the same prompt,
+/// cut too, stays.
+#[test]
+fn a_cli_mark_takes_the_cut_body_of_a_long_deleted_turn_and_not_another() {
+    const PROMPT: &str = "write the whole migration plan out for me in one go please";
+    let long = |tag: &str| (0..900).map(|i| format!("{tag}{i}")).collect::<Vec<_>>().join(" ");
+    let (gone, other) = (long("gone"), long("other"));
+    assert!(gone.len() > 5000 && other.len() > 5000);
+    let mut world = Indexed::new();
+    deleted_capture(&mut world, "mem_cap_long", "s-long", PROMPT, &gone, T0 - 100_000);
+    let cut: String = world.db().query_row("SELECT cut_hash FROM forgotten_turns WHERE source = 'cli'", [], |r| r.get(0)).unwrap();
+    assert_eq!(cut.len(), 32, "a text over 4096 bytes has a cut hash");
+
+    let a = Arch::new(22, "s-long", T0).turn(PROMPT, &gone).about("upload queue").turn(PROMPT, &other);
+    world.file(&a);
+    world.scan();
+    let rows = world.rows(&a);
+    let texts = rows.iter().map(|(_, text)| text.as_str()).collect::<Vec<_>>().join("\n");
+    assert!(texts.contains("upload queue"), "the archive was not indexed: the test proves nothing");
+    assert!(texts.contains("other0 other1") && rows.iter().any(|(_, t)| t.len() >= 4093), "the long turn is not cut: {rows:?}");
+    assert!(!texts.contains("gone0 gone1"), "the deleted long turn came back");
+    assert_eq!(rows.len(), 2, "{rows:?}");
 }
 
 /// An archive with two forget spans (`forget_units = 2`), and a neighbour of the same chat

@@ -332,7 +332,7 @@ fn forget_now(
     if !taken.is_empty() {
         writeln!(
             term.out,
-            "The forget mark of the deleted turns also takes these {} archived rows of the chat with the same prompt out of the brain (each stays in its Synaps archive):",
+            "The forget mark of the deleted turns also takes these {} archived copies of them out of the brain (the same prompt and the same text; each stays in its Synaps archive):",
             taken.len()
         )?;
         let mut archives: Vec<&str> = Vec::new();
@@ -349,10 +349,11 @@ fn forget_now(
         }
         // RULING: v2 c18b review, item 7, read with item 4: a kept archive obeys a `cli` mark
         // (item 4), so "restore --forget-turns ctx-…" does not bring these rows back while
-        // the mark stands. Said as it is, not as a way back.
+        // the mark stands. Said as it is, not as a way back. Since round 2, item 1, the mark
+        // takes only copies of the turns named, so this is true of those turns only.
         writeln!(
             term.out,
-            "  No command brings these back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too."
+            "  No command brings these copies back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too. Other turns with the same prompt stay."
         )?;
     }
     write!(term.out, "Delete {total} memories for good? [y/N] ")?;
@@ -420,7 +421,7 @@ fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) -> Result<()> {
     if !purged.left_out.is_empty() {
         writeln!(
             term.out,
-            "The forget mark took {} archived rows of the chat with the same prompt out of the brain, as listed above.",
+            "The forget mark took {} archived copies of the deleted turns out of the brain, as listed above.",
             purged.left_out.len()
         )?;
     }
@@ -534,8 +535,8 @@ fn busy_or(e: crate::error::AxelError) -> crate::error::AxelError {
 fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Purged> {
     let mut ids: Vec<String> = Vec::new();
     let mut changed = Vec::new();
-    // `(logical, session_id, turn_key, created_ms)` of each turn deleted by its own id.
-    let mut marks: Vec<(String, Option<String>, String, i64)> = Vec::new();
+    // `(logical, session_id, turn_key, created_ms, text)` of each turn deleted by its own id.
+    let mut marks: Vec<(String, Option<String>, String, i64, index_archives::TurnText)> = Vec::new();
     // The twins left hidden, with their key: the forget mark below must not take them.
     let mut kept: Vec<(String, Option<String>)> = Vec::new();
     for (row, its) in ripe.iter().zip(twins) {
@@ -561,7 +562,17 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
         // A hidden turn, deleted: the archive of its window must not bring it back (B3-1.7).
         if row.origin == "capture" || row.origin == "archive" {
             if let (Some(logical), Some(key), Some(at)) = (&row.logical, &row.turn_key, row.created_ms) {
-                marks.push((logical.clone(), row.session_id.clone(), key.clone(), at));
+                // RULING: v2 c18b review round 2, item 1: the mark keeps hashes of the turn's
+                // text, read inside this transaction, and takes only that turn.
+                let content: String = conn
+                    .query_row("SELECT content FROM memories WHERE id = ?1", [&row.id], |r| crate::brain_v2::text_at(r, 0))?
+                    .unwrap_or_default();
+                let text = if row.origin == "archive" {
+                    index_archives::TurnText::of_archived(&content)
+                } else {
+                    index_archives::TurnText::of(&content)
+                };
+                marks.push((logical.clone(), row.session_id.clone(), key.clone(), at, text));
             }
         }
     }
@@ -600,16 +611,8 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
         conn.execute("UPDATE memory_ext SET turn_key = NULL WHERE mem_id = ?1", [id])?;
     }
     let mut left_out = Vec::new();
-    for (logical, session_id, key, at) in &marks {
-        left_out.extend(index_archives::mark_forgotten_turn(
-            conn,
-            logical,
-            session_id.as_deref(),
-            "cli",
-            *at,
-            *at,
-            Some(key.as_str()),
-        )?);
+    for (logical, session_id, key, at, text) in &marks {
+        left_out.extend(index_archives::mark_deleted_turn(conn, logical, session_id.as_deref(), *at, Some(key.as_str()), text)?);
     }
     for (id, key) in &kept {
         conn.execute("UPDATE memory_ext SET turn_key = ?2 WHERE mem_id = ?1", params![id, key])?;

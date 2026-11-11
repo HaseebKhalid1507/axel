@@ -2030,12 +2030,23 @@ struct Forgot {
     archive_id: String,
     head: bool,
     tail: bool,
+    /// `cli`: the deleted turn's text, hashed.
+    text: TurnText,
+}
+
+impl Forgot {
+    /// True when this row's key rule takes a unit with this body: any row with the key,
+    /// except a `cli` row, which takes only the turn it stands for.
+    fn takes_body(&self, body: &str) -> bool {
+        self.source != "cli" || self.text.takes(body)
+    }
 }
 
 /// Every `forgotten_turns` row of a chat, of any source.
 fn forgotten_of(conn: &Connection, logical: &str, session_id: Option<&str>) -> Result<Vec<Forgot>> {
     let mut stmt = conn.prepare(
-        "SELECT source, turn_key, from_ms, to_ms, scope_dir, archive_id, head, tail FROM forgotten_turns
+        "SELECT source, turn_key, from_ms, to_ms, scope_dir, archive_id, head, tail, text_hash, cut_hash
+           FROM forgotten_turns
           WHERE (?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2)",
     )?;
     let rows = stmt.query_map(params![logical, session_id], |r| {
@@ -2048,9 +2059,78 @@ fn forgotten_of(conn: &Connection, logical: &str, session_id: Option<&str>) -> R
             archive_id: r.get(5)?,
             head: r.get(6)?,
             tail: r.get(7)?,
+            text: TurnText { whole: r.get(8)?, cut: r.get(9)? },
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// The bytes an archived unit's body is cut at (`archive::BODY_BYTES`).
+const UNIT_BODY_BYTES: usize = 4096;
+
+/// What comes between an archived row's body and the tool lines its unit adds.
+const TOOLS_PART: &str = "\n\n[tools]\n";
+
+/// hex(sha256("axel/turntext/1" || 0 || normalise(text)))[..32].
+pub fn turn_text_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(b"axel/turntext/1\0");
+    hasher.update(archive::normalise(text).as_bytes());
+    hex::encode(hasher.finalize())[..32].to_string()
+}
+
+/// What a `cli` mark keeps of the turn it stands for: hashes of its text, never the text.
+// RULING: v2 c18b review round 2, item 1. A `cli` mark takes ONLY the deleted turn, never
+// another turn with the same prompt: a unit (or an archived row) with the mark's key is
+// taken only when its own text, after `archive::normalise`, hashes to the mark's `whole`,
+// or, when the unit's body was cut at its size limit, to the mark's `cut` (the hash of the
+// deleted text's first 4096 bytes).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TurnText {
+    pub whole: String,
+    /// `''` when the text is not over 4096 bytes.
+    pub cut: String,
+}
+
+impl TurnText {
+    /// Of a turn's text as a capture holds it ("User: …\nAssistant: …").
+    pub fn of(text: &str) -> TurnText {
+        let cut = if text.len() > UNIT_BODY_BYTES {
+            let mut at = UNIT_BODY_BYTES;
+            while !text.is_char_boundary(at) {
+                at -= 1;
+            }
+            turn_text_hash(&text[..at])
+        } else {
+            String::new()
+        };
+        TurnText { whole: turn_text_hash(text), cut }
+    }
+
+    /// Of an archived row's content: its body, before the tool lines its unit added.
+    // SPEC: a row does not say where its body ends when the body itself holds the tools
+    // heading; the last one is taken (the tool lines are one per call and hold none). A
+    // wrong split only makes the mark take less.
+    pub fn of_archived(content: &str) -> TurnText {
+        TurnText::of(content.rfind(TOOLS_PART).map_or(content, |at| &content[..at]))
+    }
+
+    /// True when a unit's body is this turn.
+    pub fn takes(&self, body: &str) -> bool {
+        if self.whole.is_empty() {
+            return false;
+        }
+        let hash = turn_text_hash(body);
+        // `archive::cut` steps back at most 3 bytes to a character boundary.
+        hash == self.whole || (!self.cut.is_empty() && body.len() + 4 > UNIT_BODY_BYTES && hash == self.cut)
+    }
+
+    /// True when an archived row's content is this turn: its body is whatever comes before
+    /// one of its tools headings, or all of it.
+    pub fn takes_row(&self, content: &str) -> bool {
+        content.match_indices(TOOLS_PART).map(|(at, _)| at).chain([content.len()]).any(|end| self.takes(&content[..end]))
+    }
 }
 
 fn is_turn(unit: &Unit) -> bool {
@@ -2102,7 +2182,7 @@ fn left_out(units: &[Unit], marks: &[Forgot], place: &Place) -> Vec<bool> {
     let near = |m: &Forgot| m.to_ms > place.stretch.0 && m.from_ms <= place.stretch.1;
     for (unit, left) in units.iter().zip(out.iter_mut()) {
         if let Some(key) = unit.turn_key.as_deref().filter(|k| !k.is_empty()) {
-            *left = marks.iter().any(|m| m.turn_key == key && near(m));
+            *left = marks.iter().any(|m| m.turn_key == key && near(m) && m.takes_body(&unit.body));
         }
     }
     let of_file = |file: Option<&ChatFile>, head: bool| {
@@ -2334,6 +2414,37 @@ pub fn mark_forgotten_turn_vids(
     to_ms: i64,
     turn_key: Option<&str>,
 ) -> Result<(Vec<String>, Vec<i64>)> {
+    mark_turn(conn, logical, session_id, source, from_ms, to_ms, turn_key, &TurnText::default())
+}
+
+/// The `cli` row of a hidden turn that `forget --now` deleted, with the hashes of its text
+/// (`TurnText::of` of a capture's content, `TurnText::of_archived` of an archived row's),
+/// and what it leaves out among the rows indexed so far: the archived rows of the chat
+/// with its key, near it, whose own text is that turn's. Returns the ids it purged. As
+/// `mark_forgotten_turn` otherwise; `mark_forgotten_turn` with `cli` and no text takes no
+/// row by its key (nothing proves one the same turn).
+pub fn mark_deleted_turn(
+    conn: &Connection,
+    logical: &str,
+    session_id: Option<&str>,
+    at_ms: i64,
+    turn_key: Option<&str>,
+    text: &TurnText,
+) -> Result<Vec<String>> {
+    mark_turn(conn, logical, session_id, "cli", at_ms, at_ms, turn_key, text).map(|(ids, _)| ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn mark_turn(
+    conn: &Connection,
+    logical: &str,
+    session_id: Option<&str>,
+    source: &str,
+    from_ms: i64,
+    to_ms: i64,
+    turn_key: Option<&str>,
+    text: &TurnText,
+) -> Result<(Vec<String>, Vec<i64>)> {
     if conn.is_autocommit() {
         return Err(crate::error::AxelError::Other(
             "mark_forgotten_turn: no transaction is open; the caller begins and commits".into(),
@@ -2368,13 +2479,27 @@ pub fn mark_forgotten_turn_vids(
         params![logical, source, from_ms],
         |r| r.get(0),
     )?;
+    // A `cli` row keeps the text it was first written with: a second turn with the same
+    // chat, key and moment is the same turn.
     conn.execute(
-        "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, added_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+        "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, added_ms, text_hash, cut_hash)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT(logical, source, from_ms, turn_key, archive_id) DO UPDATE
             SET to_ms = max(to_ms, excluded.to_ms),
-                session_id = COALESCE(forgotten_turns.session_id, excluded.session_id)",
-        params![logical, session_id, source, key, from_ms, to_ms, chrono::Utc::now().timestamp_millis()],
+                session_id = COALESCE(forgotten_turns.session_id, excluded.session_id),
+                text_hash = CASE WHEN forgotten_turns.text_hash = '' THEN excluded.text_hash ELSE forgotten_turns.text_hash END,
+                cut_hash = CASE WHEN forgotten_turns.text_hash = '' THEN excluded.cut_hash ELSE forgotten_turns.cut_hash END",
+        params![
+            logical,
+            session_id,
+            source,
+            key,
+            from_ms,
+            to_ms,
+            chrono::Utc::now().timestamp_millis(),
+            if source == "cli" { text.whole.as_str() } else { "" },
+            if source == "cli" { text.cut.as_str() } else { "" },
+        ],
     )?;
     let to_ms = covered_to.map_or(to_ms, |old| old.max(to_ms));
     let seen_before = |t: i64| call_covered_to.is_some_and(|old| t <= old);
@@ -2385,7 +2510,22 @@ pub fn mark_forgotten_turn_vids(
           WHERE (?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2)",
         params![logical, session_id],
     )?;
-    let keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
+    let mut keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
+    // RULING: v2 c18b review round 2, item 1: a `cli` row takes only the rows whose own
+    // text is the deleted turn's.
+    if source == "cli" {
+        let mut proven = Vec::new();
+        for (id, archive_id) in keyed {
+            let content: Option<String> = conn
+                .query_row("SELECT content FROM memories WHERE id = ?1", [&id], |r| brain_v2::text_at(r, 0))
+                .optional()?
+                .flatten();
+            if content.is_some_and(|c| text.takes_row(&c)) {
+                proven.push((id, archive_id));
+            }
+        }
+        keyed = proven;
+    }
     let mut purged: Vec<String> = Vec::new();
     // The front thread owns the vector array and removes these from it after its commit.
     let mut vids: Vec<i64> = Vec::new();
