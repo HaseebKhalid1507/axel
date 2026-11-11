@@ -338,6 +338,124 @@ fn t04_upgrade_v1_keeps_every_row_and_adopts_the_memories_with_their_vectors() {
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 2);
 }
 
+// ── Review finding 1: migration 1 adopts what it finds, as `legacy` ─────
+
+fn origins(conn: &Connection) -> Vec<(String, i64)> {
+    let mut stmt = conn
+        .prepare("SELECT origin_kind, COUNT(*) FROM memory_ext GROUP BY origin_kind ORDER BY origin_kind")
+        .unwrap();
+    let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    rows.map(|r| r.unwrap()).collect()
+}
+
+#[test]
+fn f1a_what_migration_1_finds_is_legacy_whoever_the_opener_is() {
+    // `migrate init`: step 7 is given `legacy`.
+    let dir = TempDir::new().unwrap();
+    let (path, _, _) = legacy_file(&dir);
+    let brain = brain_v2::open_v2(&path, &opts(true)).unwrap();
+    assert_eq!(origins(&brain.conn), vec![("legacy".to_string(), 2)]);
+    drop(brain);
+
+    // An ordinary opener: step 7 is given `cli`. The only file with memories that an
+    // ordinary `open_v2` migrates is one whose `brain_meta` already says 2 while
+    // `user_version` is 0; the test makes it by hand.
+    let dir = TempDir::new().unwrap();
+    let (path, _, _) = legacy_file(&dir);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE brain_meta SET value = json_set(value, '$.schema_version', 2) WHERE key = 'meta'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(count(&conn, "PRAGMA user_version"), 0);
+    drop(conn);
+    let brain = brain_v2::open_v2(&path, &opts(false)).unwrap();
+    assert_eq!(count(&brain.conn, "SELECT COUNT(*) FROM axel_migrations"), 1);
+    assert_eq!(origins(&brain.conn), vec![("legacy".to_string(), 2)]);
+    assert_eq!(brain_v2::adopt_orphans(&brain.conn, "cli").unwrap(), 0, "nothing is left for step 7");
+
+    // A row written later without a `memory_ext` row is still step 7's, and the others stay.
+    let later = Memory::new(MemoryCategory::Events, "test", "later note", "an ibis stood on the weir");
+    project_memory::store_scoped(&brain.conn, &later, &scope()).unwrap();
+    assert_eq!(brain_v2::adopt_orphans(&brain.conn, "cli").unwrap(), 1);
+    assert_eq!(origins(&brain.conn), vec![("cli".to_string(), 1), ("legacy".to_string(), 2)]);
+}
+
+#[test]
+fn f1b_a_failure_inside_migration_1_leaves_a_version_1_brain_and_a_second_run_completes() {
+    let dir = TempDir::new().unwrap();
+    let (path, a, b) = legacy_file(&dir);
+
+    // The injected failure: migration 1 updates `brain_meta` after its schema and after the
+    // adoption, so both must be undone with it.
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER test_injected_failure BEFORE UPDATE ON brain_meta
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .unwrap();
+    drop(conn);
+    match brain_v2::open_v2(&path, &opts(true)) {
+        Err(e) => assert!(e.to_string().contains("injected failure"), "{e}"),
+        Ok(_) => panic!("migration 1 passed the injected failure"),
+    }
+
+    let conn = Connection::open(&path).unwrap();
+    assert_eq!(count(&conn, "PRAGMA user_version"), 0);
+    assert_eq!(count(&conn, "SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'"), 1);
+    for table in V2_TABLES {
+        assert_eq!(
+            count_id(&conn, "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1", table),
+            0,
+            "table {table} survived the rollback"
+        );
+    }
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'idx_memory_ext%' OR name IN
+             ('memories_ad_ext', 'memories_bd_guard', 'kv_v2_guard_insert', 'kv_v2_guard_update')"
+        ),
+        0,
+        "an index or a trigger of migration 1 survived the rollback"
+    );
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM memories"), 2);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents"), 3);
+    assert!(conn.is_autocommit());
+    conn.execute_batch("DROP TRIGGER test_injected_failure").unwrap();
+    drop(conn);
+    assert!(old_brain_open(&path).is_ok(), "the old binary's check still passes");
+    assert!(matches!(brain_v2::require_v2(&path), Err(AxelError::V1Brain(_))));
+
+    let brain = brain_v2::open_v2(&path, &opts(true)).unwrap();
+    let conn = &brain.conn;
+    assert_eq!(count(conn, "PRAGMA user_version"), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_migrations"), 1);
+    assert_eq!(origins(conn), vec![("legacy".to_string(), 2)]);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 2);
+    for memory in [&a, &b] {
+        let content: String =
+            conn.query_row("SELECT content FROM memories WHERE id = ?1", [&memory.id], |r| r.get(0)).unwrap();
+        assert_eq!(content, memory.content);
+    }
+}
+
+#[test]
+fn f1c_a_new_brain_has_no_legacy_row() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("brain.r8");
+    let brain = brain_v2::open_v2(&path, &opts(false)).unwrap();
+    assert_eq!(count(&brain.conn, "SELECT COUNT(*) FROM memory_ext"), 0);
+    let memory = Memory::new(MemoryCategory::Events, "test", "first", "written by version 2");
+    project_memory::store_scoped(&brain.conn, &memory, &scope()).unwrap();
+    drop(brain);
+
+    let brain = brain_v2::open_v2(&path, &opts(false)).unwrap();
+    assert_eq!(origins(&brain.conn), vec![("cli".to_string(), 1)]);
+    assert_eq!(count(&brain.conn, "SELECT COUNT(*) FROM memory_ext WHERE origin_kind = 'legacy'"), 0);
+}
+
 // ── 5 ───────────────────────────────────────────────────────────────────
 
 #[test]

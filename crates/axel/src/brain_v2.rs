@@ -279,7 +279,8 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
         return Err(too_new(now));
     }
 
-    // 7. Adoption and the word index.
+    // 7. Adoption and the word index, for rows written after migration 1 without a
+    // `memory_ext` row. What migration 1 found it adopted itself, as `legacy`.
     adopt_orphans(&conn, if opts.upgrade_v1 { "legacy" } else { "cli" })?;
 
     Ok(V2Brain { conn, signer, embedder_model, path: path.to_path_buf() })
@@ -328,7 +329,8 @@ fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
     Ok(false)
 }
 
-/// The block, then the statements that depend on what the file already has.
+/// The block, the statements that depend on what the file already has, and the adoption of
+/// the memories that are there. The caller holds the transaction.
 fn migration_1(conn: &Connection) -> Result<()> {
     conn.execute_batch(MIGRATION_1_DEFINITIONS)?;
     for (column, ddl) in [
@@ -339,6 +341,12 @@ fn migration_1(conn: &Connection) -> Result<()> {
             conn.execute_batch(ddl)?;
         }
     }
+    // RULING: wave2-c4-review finding 1: the spec adopts in step 7, after migration 1 has
+    // committed. Every memory that exists when migration 1 runs predates version 2, whoever
+    // the opener is: it is adopted here, in migration 1's transaction, as `legacy`. A run
+    // that stops before the commit leaves a version 1 brain; one that stops after it leaves
+    // nothing for step 7 to label `cli`.
+    adopt_in_transaction(conn, "legacy")?;
     conn.execute(
         "UPDATE brain_meta SET value = json_set(value, '$.schema_version', ?1) WHERE key = 'meta'",
         [V2_SCHEMA_VERSION],
