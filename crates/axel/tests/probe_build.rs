@@ -14,7 +14,7 @@
 //! | e | the `kv` guard triggers stop `INSERT OR REPLACE … '2'`, and let `'3'` through |
 //! | f | on the store's own connection: its `INSERT OR REPLACE` fires neither delete trigger; a plain delete is stopped by the guard unless `axel_purge` has its row |
 //! | g | `json_set` and `json_extract` exist in the bundled SQLite |
-//! | h | `instr(supersedes, '"<id>"')` finds an id in the arrays the store writes |
+//! | h | the link scrub `purge_many` runs (`<> '[]'`, filtered in Rust), and the probe table's `instr(supersedes, '"<id>"')`, find an id in the arrays the store writes |
 //! | i | the cost of an exact scan of 25,000 vectors (`#[ignore]`, prints ms) |
 //! | j | the suite runs with `HOME` moved: not a test here, it is the gate itself (`scripts/dirty-home.sh`) |
 //!
@@ -258,7 +258,7 @@ fn c_generators_a_and_c_run_on_the_existing_tables() {
     conn.execute_batch(SCHEMA_V2_SQL).unwrap();
     conn.execute_batch(DOCUMENTS_V2_SQL).unwrap();
 
-    // Generator a, five rows.
+    // Generator a, eight rows: every arm of its WHERE runs.
     let both = store(conn, PROJECT, "both words", "alpha beta in one project row");
     let one = store(conn, PROJECT, "one word", "alpha alone in a project row");
     let hidden = store(conn, PROJECT, "hidden", "alpha beta in a hidden row");
@@ -270,8 +270,34 @@ fn c_generators_a_and_c_run_on_the_existing_tables() {
     adopt(conn, &global, None);
     adopt(conn, &other, None);
 
+    // expires_at in the past, in the future; a legacy row with no project_key.
+    let now_utc = chrono::Utc::now();
+    let store_expiring = |title: &str, content: &str, expires_at| {
+        let mut memory = Memory::new(MemoryCategory::Events, "probe", title, content);
+        memory.expires_at = Some(expires_at);
+        project_memory::store_scoped(conn, &memory, &scope(PROJECT)).unwrap();
+        memory.id
+    };
+    let expired = store_expiring("expired", "alpha in an expired row", now_utc - chrono::Duration::days(1));
+    let future = store_expiring("future", "alpha in a row that expires later", now_utc + chrono::Duration::days(1));
+    let unkeyed = store(conn, GLOBAL_KEY, "unkeyed", "beta in a legacy row with no project");
+    conn.execute("UPDATE memories SET project_key = NULL WHERE id = ?1", [&unkeyed]).unwrap();
+    for id in [&expired, &future] {
+        let set: Option<String> = conn
+            .query_row("SELECT expires_at FROM memories WHERE id = ?1", [id], |r| r.get(0))
+            .unwrap();
+        assert!(set.is_some(), "the store wrote expires_at");
+    }
+    let key: Option<String> = conn
+        .query_row("SELECT project_key FROM memories WHERE id = ?1", [&unkeyed], |r| r.get(0))
+        .unwrap();
+    assert_eq!(key, None);
+    adopt(conn, &expired, None);
+    adopt(conn, &future, None);
+    adopt(conn, &unkeyed, None);
+
     let expr = "\"alpha\" OR \"beta\"";
-    let now = chrono::Utc::now().to_rfc3339();
+    let now = now_utc.to_rfc3339();
     let run_a = |scope_dir: &str, with_global: bool| {
         ids(
             conn,
@@ -291,12 +317,28 @@ fn c_generators_a_and_c_run_on_the_existing_tables() {
     assert_eq!(found[0], both, "bm25 puts the row with both words first");
     assert_eq!(
         sorted(found),
-        sorted(vec![both.clone(), one.clone(), global.clone()]),
-        "the project's rows and the global row; not the hidden one, not the other project's"
+        sorted(vec![both.clone(), one.clone(), future.clone(), global.clone(), unkeyed.clone()]),
+        "the project's live rows, the global row and the unkeyed one; not the hidden, the expired or the other project's"
     );
-    assert_eq!(run_a(PROJECT, false), vec![both.clone(), one.clone()]);
-    assert_eq!(run_a("no row has this", true), vec![global.clone()]);
+    let found = run_a(PROJECT, false);
+    assert_eq!(found[0], both);
+    assert_eq!(sorted(found), sorted(vec![both.clone(), one.clone(), future.clone()]));
+    assert_eq!(
+        sorted(run_a("no row has this", true)),
+        sorted(vec![global.clone(), unkeyed.clone()]),
+        "with the global flag: the global row and the row with a NULL project_key"
+    );
     assert!(run_a("no row has this", false).is_empty());
+    // Without the expiry arm the expired row would be found: the arm is what
+    // keeps it out.
+    let unfiltered = ids(
+        conn,
+        "SELECT m.id FROM memories_fts f JOIN memories m ON m.id = f.mem_id
+          WHERE memories_fts MATCH :expr AND m.project_key = :scope_dir",
+        named_params! { ":expr": expr, ":scope_dir": PROJECT },
+        0,
+    );
+    assert!(unfiltered.contains(&expired));
 
     // Generator c, five rows. chunks_fts indexes doc_id, content and
     // file_path; the column filter must keep the match to content.
@@ -734,7 +776,7 @@ fn g_json_set_and_json_extract_exist() {
 // ── h ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn h_instr_finds_an_id_in_the_supersedes_array() {
+fn h_link_scrub_finds_an_id_in_the_arrays_the_store_writes() {
     let dir = TempDir::new().unwrap();
     let (_path, db) = legacy_brain(&dir);
     let conn = db.conn();
@@ -750,8 +792,63 @@ fn h_instr_finds_an_id_in_the_supersedes_array() {
         .query_row("SELECT supersedes FROM memories WHERE id = ?1", [&newer.id], |r| r.get(0))
         .unwrap();
     assert_eq!(stored, format!("[\"{old}\"]"), "the array as the store writes it");
+    let empty: (String, String, String) = conn
+        .query_row(
+            "SELECT supersedes, contradicts, confirmed_by FROM memories WHERE id = ?1",
+            [&unrelated],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(empty, ("[]".into(), "[]".into(), "[]".into()), "an empty link is the text []");
 
-    // The scrub's statement (spec section 2, delete_row), ?2 = the id in double quotes.
+    // The spec has two forms. The one purge_many runs (section 2.7, step 2):
+    // one read over the purge set, filtered in Rust to the rows whose arrays
+    // name an id of the set.
+    conn.execute_batch("CREATE TEMP TABLE purge_ids(id TEXT PRIMARY KEY)").unwrap();
+    let scrub = |id: &str| -> (Vec<String>, Vec<String>) {
+        conn.execute("DELETE FROM purge_ids", []).unwrap();
+        conn.execute("INSERT INTO purge_ids(id) VALUES (?1)", [id]).unwrap();
+        let mut stmt = conn
+            .prepare(
+                "SELECT id, supersedes, contradicts, confirmed_by FROM memories
+   WHERE superseded_by IN purge_ids OR supersedes <> '[]' OR contradicts <> '[]' OR
+   confirmed_by <> '[]'",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, [r.get::<_, String>(1)?, r.get(2)?, r.get(3)?])))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        let read = sorted(rows.iter().map(|(id, _)| id.clone()).collect());
+        let naming = sorted(
+            rows.into_iter()
+                .filter(|(_, arrays)| {
+                    arrays.iter().any(|a| {
+                        serde_json::from_str::<Vec<String>>(a).unwrap().iter().any(|x| x == id)
+                    })
+                })
+                .map(|(id, _)| id)
+                .collect(),
+        );
+        (read, naming)
+    };
+    let (read, naming) = scrub(&old);
+    assert_eq!(read, vec![newer.id.clone()], "rows with only empty arrays are not read");
+    assert_eq!(naming, vec![newer.id.clone()]);
+    // The reverse edge: the read returns the row by superseded_by, but its
+    // select list has no superseded_by, so the filter on arrays drops it.
+    let (read, naming) = scrub(&newer.id);
+    assert!(read.contains(&old), "superseded_by IN purge_ids reads the reverse edge");
+    assert!(naming.is_empty(), "the arrays of the superseded row name nothing");
+    let (read, naming) = scrub(&unrelated);
+    assert_eq!(read, vec![newer.id.clone()]);
+    assert!(naming.is_empty());
+    // A shorter id that is a prefix of a stored one is not named.
+    assert!(scrub(&old[..old.len() - 1]).1.is_empty());
+
+    // The form the probe table names (spec section 9, row h): instr over the
+    // arrays, ?2 = the id in double quotes.
     let naming = |id: &str| {
         sorted(ids(
             conn,
