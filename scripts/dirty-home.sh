@@ -48,8 +48,20 @@ env -u AXEL_BRAIN \
     XDG_RUNTIME_DIR="$home/.runtime" \
     cargo test --locked "$@" || status=$?
 
-left="$(cd "$home" && find . -mindepth 1 -printf '%y %s %p\n' | LC_ALL=C sort)"
-if [ -n "$left" ]; then
+# The gate must fail when it could not look: a moved HOME that is gone, or a
+# `find` that failed, is not "still empty".
+looked=1
+left=""
+if [ ! -d "$home" ]; then
+    echo "dirty-home: FAIL: the moved HOME ($home) no longer exists; the run removed it, so nothing could be checked" >&2
+    looked=0
+elif ! left="$(find "$home" -mindepth 1 -printf '%y %s %P\n' | LC_ALL=C sort)"; then
+    echo "dirty-home: FAIL: could not list the moved HOME ($home); GNU find is needed" >&2
+    looked=0
+fi
+if [ "$looked" -eq 0 ]; then
+    [ "$status" -eq 0 ] && status=1
+elif [ -n "$left" ]; then
     echo "dirty-home: FAIL: the tests wrote into the moved HOME ($(printf '%s\n' "$left" | wc -l) entries; type, bytes, path):" >&2
     printf '%s\n' "$left" | head -n 60 >&2
     [ "$status" -eq 0 ] && status=1
