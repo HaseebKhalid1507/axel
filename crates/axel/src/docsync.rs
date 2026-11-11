@@ -127,9 +127,8 @@ pub fn sync(ctx: &mut IndexerCtx) -> Result<SyncReport> {
         match write(ctx, |conn| set_hidden(conn, id, None)) {
             Some(true) => {
                 report.restored += 1;
-                if model_loaded {
-                    send_stored(ctx, id);
-                }
+                // RULING: R-22.3 (SH-B3): the vector is stored; it goes back whatever the model.
+                send_stored(ctx, id);
             }
             Some(false) => {}
             None => report.skipped += 1,
@@ -498,7 +497,9 @@ fn needs_index(conn: &Connection, doc_id: &str, abs: &str, mtime_ms: i64) -> Res
     match row {
         // A row someone else hid (not this file's mark) is left as it is.
         Some((_, Some(mark), _, _)) if mark != MISSING => Ok(None),
-        Some((id, _, Some(stored), _)) => Ok(has_row(id, mtime_ms > stored)),
+        // RULING: R-22.3 (SH-B4): any other time, an older one too (a file restored from a
+        // backup keeps its old time).
+        Some((id, _, Some(stored), _)) => Ok(has_row(id, mtime_ms != stored)),
         // As today: `indexed_at` has whole seconds, so half a second of slack.
         Some((id, _, None, indexed)) => Ok(has_row(id, mtime_ms as f64 / 1000.0 > indexed.unwrap_or(0.0) + 0.5)),
         None => {

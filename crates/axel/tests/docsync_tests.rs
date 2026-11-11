@@ -645,3 +645,35 @@ fn r22_2_the_row_hidden_last_is_taken_and_no_other_mark() {
     assert_ne!(w.row("notes::d").unwrap().0, id_a);
     assert_eq!(w.row("notes::a").unwrap().2.as_deref(), Some("memory_hidden"));
 }
+
+/// R-22.3: a restored row's stored vector is sent even when the model is not loaded.
+#[test]
+fn r22_3_a_restored_row_gets_its_vector_without_a_model() {
+    let mut w = world();
+    let a = w.file("notes/a.md", BODY);
+    w.sync();
+    let (id, ..) = w.row("notes::a").unwrap();
+    let time = std::fs::metadata(&a).unwrap().modified().unwrap();
+    std::fs::remove_file(&a).unwrap();
+    w.sync();
+    w.deltas();
+    w.ctx.status.model_loaded.store(false, Ordering::Relaxed);
+    w.file("notes/a.md", BODY);
+    std::fs::File::options().write(true).open(&a).unwrap().set_modified(time).unwrap();
+    assert_eq!(w.sync().restored, 1);
+    assert_eq!(upserted(&w.deltas()), vec![id]);
+}
+
+/// R-22.3: a file replaced by an older version (a backup) is seen.
+#[test]
+fn r22_3_a_file_replaced_by_an_older_one_is_indexed() {
+    let mut w = world();
+    let a = w.file("notes/a.md", &format!("{BODY} The newer text."));
+    w.sync();
+    std::fs::write(&a, format!("{BODY} The older text, from a backup.")).unwrap();
+    let f = std::fs::File::options().write(true).open(&a).unwrap();
+    f.set_modified(SystemTime::now() - Duration::from_secs(86_400)).unwrap();
+    drop(f);
+    assert_eq!(w.sync().indexed, 1);
+    assert!(w.row("notes::a").unwrap().1.ends_with("from a backup."));
+}
