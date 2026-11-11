@@ -121,6 +121,12 @@ pub fn insert_row(conn: &Connection, signer: Option<&MemorySigner>, row: &NewRow
     if !TIME_SOURCES.contains(&row.time_source) {
         return Err(AxelError::Memory(format!("insert_row: time_source {:?}", row.time_source)));
     }
+    // RULING: wave3-c11 ruling 6: no row is born hidden as its own twin.
+    if let Some((_, by)) = &row.hidden {
+        if by.strip_prefix("twin:") == Some(row.id.as_str()) {
+            return Err(AxelError::Memory(format!("insert_row: {} cannot be hidden as its own twin", row.id)));
+        }
+    }
     atomic(conn, || {
         if exists(conn, "SELECT 1 FROM memory_tombstones WHERE id = ?1", &row.id)? {
             return Ok(Inserted::Tombstoned);
@@ -233,12 +239,20 @@ fn replacement_after(
     None
 }
 
-fn without(json: &str, set: &HashSet<&str>) -> (Vec<String>, bool) {
-    let all: Vec<String> = serde_json::from_str(json).unwrap_or_default();
+/// The link array without the ids of the set, when it names one of them; `None` leaves
+/// the column exactly as it is.
+// RULING: wave3-c11 ruling 6: a value that does not parse as a JSON array of strings is
+// never overwritten with `[]`.
+fn without(json: Option<&str>, set: &HashSet<&str>) -> Result<Option<String>> {
+    let Some(all) = json.and_then(|j| serde_json::from_str::<Vec<String>>(j).ok()) else {
+        return Ok(None);
+    };
     let before = all.len();
     let kept: Vec<String> = all.into_iter().filter(|id| !set.contains(id.as_str())).collect();
-    let changed = kept.len() != before;
-    (kept, changed)
+    if kept.len() == before {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::to_string(&kept)?))
 }
 
 /// Inside the caller's transaction; the one way rows leave. Returns the number of
@@ -312,7 +326,7 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
             rows.collect::<rusqlite::Result<_>>()?
         };
         let mut after: Vec<(String, Option<String>)> = Vec::new();
-        let linked: Vec<(String, String, String, String)> = {
+        let linked: Vec<(String, [Option<String>; 3])> = {
             let mut stmt = conn.prepare(
                 "SELECT id, superseded_by, supersedes, contradicts, confirmed_by FROM memories
                   WHERE superseded_by IN (SELECT id FROM temp.purge_ids) OR supersedes <> '[]'
@@ -322,25 +336,22 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
-                    r.get::<_, Option<String>>(2)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(3)?.unwrap_or_default(),
-                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                    r.get::<_, Option<String>>(2)?,
+                    r.get::<_, Option<String>>(3)?,
+                    r.get::<_, Option<String>>(4)?,
                 ))
             })?;
             let mut out = Vec::new();
             for row in rows {
                 let (id, superseded_by, supersedes, contradicts, confirmed_by) = row?;
-                let (supersedes, a) = without(&supersedes, &set);
-                let (contradicts, b) = without(&contradicts, &set);
-                let (confirmed_by, c) = without(&confirmed_by, &set);
+                let arrays = [
+                    without(supersedes.as_deref(), &set)?,
+                    without(contradicts.as_deref(), &set)?,
+                    without(confirmed_by.as_deref(), &set)?,
+                ];
                 let purged = superseded_by.filter(|s| set.contains(s.as_str()));
-                if purged.is_some() || a || b || c {
-                    out.push((
-                        id.clone(),
-                        serde_json::to_string(&supersedes)?,
-                        serde_json::to_string(&contradicts)?,
-                        serde_json::to_string(&confirmed_by)?,
-                    ));
+                if arrays.iter().any(Option::is_some) {
+                    out.push((id.clone(), arrays));
                 }
                 if let Some(purged) = purged {
                     if !set.contains(id.as_str()) {
@@ -352,9 +363,13 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
             out
         };
         {
-            let mut update =
-                conn.prepare("UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3 WHERE id = ?4")?;
-            for (id, supersedes, contradicts, confirmed_by) in &linked {
+            // A column whose array did not change, or did not parse, keeps its bytes.
+            let mut update = conn.prepare(
+                "UPDATE memories SET supersedes = COALESCE(?1, supersedes), contradicts = COALESCE(?2, contradicts),
+                        confirmed_by = COALESCE(?3, confirmed_by)
+                  WHERE id = ?4",
+            )?;
+            for (id, [supersedes, contradicts, confirmed_by]) in &linked {
                 update.execute(params![supersedes, contradicts, confirmed_by, id])?;
             }
         }
@@ -465,6 +480,11 @@ pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
     if hidden_by.trim().is_empty() {
         return Err(AxelError::Memory("hide: empty hidden_by".into()));
     }
+    // RULING: wave3-c11 ruling 6: a `twin:` mark is never an argument. This function
+    // writes it itself, below, for the archived rows of a capture it hides.
+    if hidden_by.starts_with("twin:") {
+        return Err(AxelError::Memory(format!("hide: hidden_by {hidden_by:?} is a twin mark, not who hides")));
+    }
     atomic(conn, || {
         let now = now_ms();
         let mut hidden = conn.execute(
@@ -519,7 +539,7 @@ pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
 
 /// Marks `id` as replaced by `by`: the old row is kept, text unchanged, and no longer
 /// recalled. By id, so an old memory with a NULL project can be superseded (R1). Returns
-/// the number of rows marked.
+/// the number of rows marked (0: no such row, or superseded already).
 // SPEC: 538 and 4508 give `store.rs` "supersede" and 3202-3205 its statement; no signature
 // is written anywhere. This is the one commit 18a calls for each id of `supersedes`.
 pub fn supersede(conn: &Connection, id: &str, by: &str) -> Result<usize> {
@@ -528,7 +548,10 @@ pub fn supersede(conn: &Connection, id: &str, by: &str) -> Result<usize> {
     }
     atomic(conn, || {
         let n = conn.execute(
-            "UPDATE memories SET superseded_by = ?1, invalidated_at = ?2 WHERE id = ?3",
+            // RULING: wave3-c11 ruling 6: a row that is already superseded stays as it is:
+            // who replaced it first, and when. Like a second hide, it returns 0.
+            "UPDATE memories SET superseded_by = ?1, invalidated_at = ?2
+              WHERE id = ?3 AND superseded_by IS NULL AND invalidated_at IS NULL",
             params![by, Utc::now().to_rfc3339(), id],
         )?;
         if n > 0 {
@@ -562,11 +585,18 @@ fn restore_one(conn: &Connection, id: &str) -> Result<usize> {
     // A twin made visible alone would leave the capture hidden beside it, and a later
     // restore of the capture would show the turn twice: the turn is restored as one,
     // through its capture, while that capture is still there.
-    if let (true, Some(capture)) = (hidden, hidden_by.as_deref().and_then(|by| by.strip_prefix("twin:"))) {
+    // RULING: wave3-c11 ruling 6: a twin mark is followed one step only. A capture that
+    // is itself marked `twin:` is treated as gone, so the call below meets no twin mark
+    // and cannot come back here, whatever the marks say; and a row that carries a twin
+    // mark is unhidden alone, never as the capture of other rows.
+    let twin_of = if hidden { hidden_by.as_deref().and_then(|by| by.strip_prefix("twin:")) } else { None };
+    if let Some(capture) = twin_of {
         let waiting = capture != id
             && exists(
                 conn,
-                "SELECT 1 FROM memory_ext WHERE mem_id = ?1 AND origin_kind = 'capture' AND hidden_ms IS NOT NULL",
+                "SELECT 1 FROM memory_ext
+                  WHERE mem_id = ?1 AND origin_kind = 'capture' AND hidden_ms IS NOT NULL
+                    AND substr(COALESCE(hidden_by, ''), 1, 5) <> 'twin:'",
                 capture,
             )?;
         if waiting {
@@ -580,7 +610,7 @@ fn restore_one(conn: &Connection, id: &str) -> Result<usize> {
         [id],
     )?;
     if hidden {
-        let twins = if origin == "capture" {
+        let twins = if origin == "capture" && twin_of.is_none() {
             conn.execute(
                 "UPDATE memory_ext SET hidden_ms = NULL, hidden_by = NULL WHERE hidden_by = ?1",
                 [format!("twin:{id}")],

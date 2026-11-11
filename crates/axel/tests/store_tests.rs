@@ -1562,3 +1562,170 @@ fn the_old_remember_command_and_a_version_1_brain() {
     assert!(!stderr.contains("this brain is version 2"), "{stderr}");
     assert_eq!(file_bytes(&path), before);
 }
+
+// ── Ruling 6 of the commit 11 review ─────────────────────────────────────────
+
+/// A mark written straight into the table, as no function of `store` writes it.
+fn force_mark(conn: &Connection, id: &str, by: &str) {
+    let n = conn
+        .execute("UPDATE memory_ext SET hidden_ms = ?1, hidden_by = ?2 WHERE mem_id = ?3", params![now_ms(), by, id])
+        .unwrap();
+    assert_eq!(n, 1, "{id}");
+}
+
+#[test]
+fn hide_refuses_a_twin_mark_as_who_hides() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_row", "note", "tool", "a row nobody may hide as a twin"));
+    put(&brain, &capture_row("mem_cap", TURN_KEY));
+    brain_v2::begin_write(conn).unwrap();
+    for (id, by) in [("mem_row", "twin:mem_cap"), ("mem_cap", "twin:mem_cap"), ("mem_row", "twin:")] {
+        let refused = store::hide(conn, id, by).expect_err("hide took a twin mark as who hides");
+        assert!(refused.to_string().contains("twin mark"), "{refused}");
+        assert_eq!(mark_of(conn, id), (None, None), "nothing is written");
+    }
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(returned(conn), vec!["mem_cap".to_string(), "mem_row".to_string()]);
+    // Who hides is anything else.
+    assert_eq!(tx(conn, || store::hide(conn, "mem_row", "cli").unwrap()), 1);
+}
+
+#[test]
+fn insert_row_refuses_a_row_hidden_as_its_own_twin() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    let mut own = archive_row("mem_self", "aaaa1111aaaa1111aaaa1111aaaa1111", TURN_KEY);
+    own.hidden = Some((now_ms(), "twin:mem_self".to_string()));
+    brain_v2::begin_write(conn).unwrap();
+    let refused = store::insert_row(conn, brain.signer.as_ref(), &own).expect_err("a row was born hidden as its own twin");
+    assert!(refused.to_string().contains("its own twin"), "{refused}");
+    conn.execute_batch("ROLLBACK").unwrap();
+    for table in ["memories", "memories_fts", "memory_ext"] {
+        assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
+    }
+    // The twin of another row is written as given.
+    own.hidden = Some((now_ms(), "twin:mem_cap".to_string()));
+    put(&brain, &own);
+    assert_eq!(hidden_by(conn, "mem_self").as_deref(), Some("twin:mem_cap"));
+}
+
+#[test]
+fn restore_follows_a_twin_mark_one_step_only() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+
+    // Two captures marked as each other's twin: no function writes that.
+    put(&brain, &capture_row("mem_cap1", TURN_KEY));
+    put(&brain, &capture_row("mem_cap2", "1234123412341234"));
+    let texts = [saved(conn, "mem_cap1"), saved(conn, "mem_cap2")];
+    force_mark(conn, "mem_cap1", "twin:mem_cap2");
+    force_mark(conn, "mem_cap2", "twin:mem_cap1");
+
+    // The restore returns, and unhides the one row alone: the other keeps its mark, and
+    // neither is purged as a capture "replaced" by its twin.
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap1").unwrap()), 1);
+    assert_eq!(mark_of(conn, "mem_cap1"), (None, None));
+    assert_eq!(hidden_by(conn, "mem_cap2").as_deref(), Some("twin:mem_cap1"));
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap2").unwrap()), 1);
+    assert_eq!(returned(conn), vec!["mem_cap1".to_string(), "mem_cap2".to_string()]);
+    assert_eq!([saved(conn, "mem_cap1"), saved(conn, "mem_cap2")], texts);
+
+    // A ring of three.
+    put(&brain, &capture_row("mem_cap3", "5678567856785678"));
+    force_mark(conn, "mem_cap1", "twin:mem_cap2");
+    force_mark(conn, "mem_cap2", "twin:mem_cap3");
+    force_mark(conn, "mem_cap3", "twin:mem_cap1");
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap1").unwrap()), 1);
+    assert_eq!(returned(conn), vec!["mem_cap1".to_string()]);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 3);
+
+    // An archived row whose capture is itself marked as a twin: the capture counts as
+    // gone, the row comes back alone and the capture is left as it is.
+    put(&brain, &archive_row("mem_arch", "bbbb1111bbbb1111bbbb1111bbbb1111", "5678567856785678"));
+    force_mark(conn, "mem_arch", "twin:mem_cap3");
+    let cap3 = mark_of(conn, "mem_cap3");
+    assert_eq!(tx(conn, || store::restore(conn, "mem_arch").unwrap()), 1);
+    assert_eq!(mark_of(conn, "mem_arch"), (None, None));
+    assert_eq!(mark_of(conn, "mem_cap3"), cap3);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 4, "no restore of this test purges");
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
+}
+
+#[test]
+fn the_scrub_leaves_a_link_array_it_cannot_read() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    for id in ["mem_gone", "mem_odd", "mem_mixed", "mem_other"] {
+        put(&brain, &row(id, "note", "tool", &format!("what {id} says")));
+    }
+    // Three values that are not a JSON array of strings, on a row the purge must rewrite
+    // (its replacement goes); and a row with one good array and one bad.
+    let not_json = "mem_gone, mem_other";
+    let an_object = r#"{"ids":["mem_gone"]}"#;
+    let not_all_strings = r#"["mem_gone", 7]"#;
+    conn.execute(
+        "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3 WHERE id = 'mem_odd'",
+        params![not_json, an_object, not_all_strings],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3 WHERE id = 'mem_mixed'",
+        params![r#"["mem_gone", "mem_other"]"#, not_json, r#"[ "mem_other" ]"#],
+    )
+    .unwrap();
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_odd", "mem_gone").unwrap()), 1);
+    let arrays = |id: &str| {
+        ["supersedes", "contradicts", "confirmed_by"]
+            .map(|column| text_of(conn, &format!("SELECT {column} FROM memories WHERE id = ?1"), id).unwrap())
+    };
+
+    assert_eq!(tx(conn, || store::purge(conn, "mem_gone", false, true).unwrap()), 1);
+
+    assert_eq!(
+        arrays("mem_odd"),
+        [not_json.to_string(), an_object.to_string(), not_all_strings.to_string()],
+        "an array the scrub cannot read was overwritten"
+    );
+    assert_eq!(text_of(conn, "SELECT superseded_by FROM memories WHERE id = ?1", "mem_odd"), None);
+    // The good array lost the id; the bad one and the untouched one keep their bytes.
+    assert_eq!(
+        arrays("mem_mixed"),
+        [r#"["mem_other"]"#.to_string(), not_json.to_string(), r#"[ "mem_other" ]"#.to_string()]
+    );
+}
+
+#[test]
+fn a_second_supersede_changes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    for id in ["mem_old", "mem_first", "mem_second", "mem_dated"] {
+        put(&brain, &row(id, "decision", "tool", &format!("what {id} says about the retry limit")));
+    }
+    shadow(&path, "mem_old", "the shadow document of mem_old");
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_old", "mem_first").unwrap()), 1);
+    conn.execute("UPDATE memories SET invalidated_at = '2026-01-02T03:04:05+00:00' WHERE id = 'mem_old'", []).unwrap();
+    let before = whole(conn, "mem_old");
+
+    // Who replaced it first, and when, stay.
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_old", "mem_second").unwrap()), 0, "a second supersede took the row over");
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_old", "mem_first").unwrap()), 0);
+    assert_eq!(whole(conn, "mem_old"), before);
+    assert_eq!(shadow_mark(conn, "mem_old").as_deref(), Some("memory_hidden"));
+
+    // A row with `invalidated_at` alone is superseded already.
+    conn.execute("UPDATE memories SET invalidated_at = '2026-01-02T03:04:05+00:00' WHERE id = 'mem_dated'", []).unwrap();
+    let dated = whole(conn, "mem_dated");
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_dated", "mem_second").unwrap()), 0);
+    assert_eq!(whole(conn, "mem_dated"), dated);
+
+    // After a restore the row can be replaced again.
+    assert_eq!(tx(conn, || store::restore(conn, "mem_old").unwrap()), 1);
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_old", "mem_second").unwrap()), 1);
+    assert_eq!(text_of(conn, "SELECT superseded_by FROM memories WHERE id = ?1", "mem_old").as_deref(), Some("mem_second"));
+}
