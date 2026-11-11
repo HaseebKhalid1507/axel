@@ -744,7 +744,7 @@ fn forget_now_deletes_only_the_twin_proven_the_same_turn_and_leaves_another_turn
     let asked = run.out.find("Delete 2 memories for good? [y/N]").unwrap_or_else(|| panic!("{}", run.out));
     let left = run
         .out
-        .find("not proven the same turn; left hidden (\"axel-v2 restore mem_cont_other\" brings it back): m:mem_cont_other")
+        .find("not proven the same turn; left hidden (\"axel-v2 restore mem_cont_other\" brings it back; \"axel-v2 forget --now mem_cont_other\" deletes it too): m:mem_cont_other")
         .unwrap_or_else(|| panic!("{}", run.out));
     assert!(left < asked, "{}", run.out);
     assert!(run.out.contains("Deleted 2 memories for good."), "{}", run.out);
@@ -1591,6 +1591,46 @@ fn forget_now_deletes_nothing_when_the_mark_would_take_a_row_it_did_not_list() {
     let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
     assert!(has("mem_cap_drift") && has(&other_row));
     assert_eq!(count(world.db(), "SELECT COUNT(*) FROM forgotten_turns"), 0);
+}
+
+/// v2 c18b review round 2, item 7: `forget --now A B` with A visible hides A first; a busy
+/// brain after that says so, not "nothing was changed".
+#[test]
+fn forget_now_says_what_step_one_did_when_the_brain_is_busy_after_it() {
+    let w = World::new();
+    w.put(&r("mem_vis", "tool", "a decision still visible"));
+    w.put(&r("mem_old", "tool", "a decision hidden yesterday"));
+    w.hide("mem_old", "cli", 25 * HOUR_MS);
+    let holder: std::cell::RefCell<Option<Connection>> = std::cell::RefCell::new(None);
+    let run = forget_now_meanwhile(&w.path, &["mem_vis", "mem_old"], || {
+        let other = brain_v2::connect(&w.path, Role::Indexer).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        *holder.borrow_mut() = Some(other);
+    });
+    if let Some(other) = holder.borrow_mut().take() {
+        other.execute_batch("ROLLBACK").unwrap();
+    }
+    assert_eq!(run.code, 75, "{}{}", run.out, run.err);
+    assert!(run.err.contains("nothing was deleted, but m:mem_vis was hidden first and stays hidden"), "{}", run.err);
+    assert!(!run.err.contains("nothing was changed"), "{}", run.err);
+    assert_eq!(w.hidden_by("mem_vis").as_deref(), Some("cli"));
+    assert!(w.has("mem_old") && w.has("mem_vis"));
+}
+
+/// v2 c18b review round 2, item 7: the NULL-and-back of a kept twin's key puts back the
+/// key as it is stored, an empty one too.
+#[test]
+fn forget_now_puts_back_a_kept_twins_key_as_it_is_stored() {
+    let w = World::new();
+    two_continues(&w, true);
+    forget_cmd(&w.path, &["mem_cont"], false, false, "");
+    w.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE hidden_ms IS NOT NULL", [now_ms() - 25 * HOUR_MS]).unwrap();
+    w.db().execute("UPDATE memory_ext SET turn_key = '' WHERE mem_id = 'mem_cont_other'", []).unwrap();
+    let run = forget_cmd(&w.path, &["mem_cont"], true, false, "y\n");
+    assert!(run.out.contains("Deleted 2 memories for good."), "{}{}", run.out, run.err);
+    let key: Option<String> =
+        w.db().query_row("SELECT turn_key FROM memory_ext WHERE mem_id = 'mem_cont_other'", [], |r| r.get(0)).unwrap();
+    assert_eq!(key.as_deref(), Some(""));
 }
 
 /// v2 c18b review round 2, item 1: a `cli` mark takes only the deleted turn. An archive of

@@ -261,10 +261,9 @@ fn forget_now(
     let hours = min_hidden_hours(conn, bases)?;
     let wait_ms = i64::try_from(hours.saturating_mul(HOUR_MS as u64)).unwrap_or(i64::MAX);
     let now = now_ms();
-    let cutoff = now.saturating_sub(wait_ms);
 
     // 1. Named rows that are not hidden yet are hidden now and deleted on a later day.
-    let (visible, mut chosen): (Vec<RowInfo>, Vec<RowInfo>) = rows.into_iter().partition(|r| r.hidden_ms.is_none());
+    let (visible, chosen): (Vec<RowInfo>, Vec<RowInfo>) = rows.into_iter().partition(|r| r.hidden_ms.is_none());
     if !visible.is_empty() {
         write(conn, || {
             for row in &visible {
@@ -282,6 +281,37 @@ fn forget_now(
         }
     }
 
+    // RULING: v2 c18b review round 2, item 7. Step 1 is committed: an error after it (a
+    // busy brain) says what it did, not "nothing was changed".
+    match delete_hidden(conn, path, hidden, chosen, hours, wait_ms, now, term) {
+        Err(e) if !visible.is_empty() && e.to_string().contains(show::BUSY) => {
+            let ids: Vec<String> = visible.iter().map(|r| format!("m:{}", one(&r.id))).collect();
+            writeln!(
+                term.err,
+                "the brain is busy (the extension or another command is writing to it); nothing was deleted, but {} {} hidden first and {} hidden (\"axel-v2 restore <id>\" undoes that); try again in a moment",
+                ids.join(", "),
+                if ids.len() == 1 { "was" } else { "were" },
+                if ids.len() == 1 { "stays" } else { "stay" }
+            )?;
+            Ok(AGAIN)
+        }
+        other => other,
+    }
+}
+
+/// Steps 2 to 4 of `forget --now`: what is hidden long enough goes, once asked.
+#[allow(clippy::too_many_arguments)]
+fn delete_hidden(
+    conn: &Connection,
+    path: &Path,
+    hidden: bool,
+    mut chosen: Vec<RowInfo>,
+    hours: u64,
+    wait_ms: i64,
+    now: i64,
+    term: &mut Term,
+) -> Result<u8> {
+    let cutoff = now.saturating_sub(wait_ms);
     // 2. What is hidden: the named rows (a pause row is deleted by id only), and with
     // `--hidden` every row hidden by a model or from the command line.
     if hidden {
@@ -335,9 +365,9 @@ fn forget_now(
             } else {
                 writeln!(
                     term.out,
-                    "    not proven the same turn; left hidden (\"axel-v2 restore {}\" brings it back): {}",
-                    one(&twin.row.id),
-                    twin_line(&twin.row)
+                    "    not proven the same turn; left hidden (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it too): {}",
+                    twin_line(&twin.row),
+                    id = one(&twin.row.id)
                 )?;
             }
         }
@@ -569,8 +599,8 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
     let mut ids: Vec<String> = Vec::new();
     // `(logical, session_id, turn_key, created_ms, text)` of each turn deleted by its own id.
     let mut marks: Vec<(String, Option<String>, String, i64, index_archives::TurnText)> = Vec::new();
-    // The twins left hidden, with their key: the forget mark below must not take them.
-    let mut kept: Vec<(String, Option<String>)> = Vec::new();
+    // The twins left hidden: the forget mark below must not take them.
+    let mut kept: Vec<String> = Vec::new();
     for (row, its) in ripe.iter().zip(twins) {
         if hidden_ms_of(conn, &row.id)? != Some(row.hidden_ms) {
             if listed.is_some() {
@@ -606,7 +636,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
             if row.origin == "capture" && store::proven_twin(conn, &row.id, &twin.row.id)? {
                 ids.push(twin.row.id.clone());
             } else {
-                kept.push((twin.row.id.clone(), twin.row.turn_key.clone()));
+                kept.push(twin.row.id.clone());
             }
         }
         // A hidden turn, deleted: the archive of its window must not bring it back (B3-1.7).
@@ -657,14 +687,20 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
     // RULING: v2 c18b review, item 1: a twin not proven the same turn is never purged. The
     // forget mark takes the chat's archived rows by key, hidden ones too, so for the length
     // of the calls below the kept twins have no key; it is put back before the commit.
-    for (id, _) in &kept {
+    // RULING: v2 c18b review round 2, item 7: the key put back is the one read here, inside
+    // the transaction, as it is stored ('' stays '').
+    let mut keys: Vec<(String, rusqlite::types::Value)> = Vec::new();
+    for id in &kept {
+        let key: rusqlite::types::Value =
+            conn.query_row("SELECT turn_key FROM memory_ext WHERE mem_id = ?1", [id], |r| r.get(0))?;
+        keys.push((id.clone(), key));
         conn.execute("UPDATE memory_ext SET turn_key = NULL WHERE mem_id = ?1", [id])?;
     }
     let mut left_out = Vec::new();
     for (logical, session_id, key, at, text) in &marks {
         left_out.extend(index_archives::mark_deleted_turn(conn, logical, session_id.as_deref(), *at, Some(key.as_str()), text)?);
     }
-    for (id, key) in &kept {
+    for (id, key) in &keys {
         conn.execute("UPDATE memory_ext SET turn_key = ?2 WHERE mem_id = ?1", params![id, key])?;
     }
     if let Some(listed) = listed {
