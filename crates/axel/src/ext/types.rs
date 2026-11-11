@@ -271,6 +271,8 @@ pub struct TestHooks {
     pub embed_stuck_limit_ms: Option<u64>,
     /// Replaces the 60 s between two attempts to open the brain.
     pub open_retry_ms: Option<u64>,
+    /// Replaces the 10 minutes the breaker stays open.
+    pub breaker_open_ms: Option<u64>,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.

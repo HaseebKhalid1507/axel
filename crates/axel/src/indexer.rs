@@ -139,6 +139,11 @@ pub fn guarded(ctx: &mut IndexerCtx, f: impl FnOnce(&mut IndexerCtx) -> Result<(
     if ctx.mode.load(Ordering::SeqCst) == Mode::Degraded as u8 {
         return;
     }
+    // RULING: wave3-c12b ruling 12. After `shutdown` no handler begins: what a job would
+    // have written is found again at the next start.
+    if ctx.stop.load(Ordering::SeqCst) {
+        return;
+    }
     brain_v2::stand_aside(&ctx.writing);
     let failed = match catch_unwind(AssertUnwindSafe(|| f(ctx))) {
         Ok(Ok(())) => false,

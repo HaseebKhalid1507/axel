@@ -14,7 +14,7 @@ use crate::brain_v2::{self, OpenOpts};
 use crate::embed::EmbedService;
 use crate::error::{AxelError, Result};
 use crate::ext::config::{base_config_value, ExtConfig};
-use crate::ext::server::{degrade, log_line, JOB_QUEUE};
+use crate::ext::server::{degrade, log_line, recover, JOB_QUEUE};
 use crate::ext::types::{Boot, DegradedReason, IndexerCtx, Job, Mode};
 use crate::r8::{DEFAULT_EMBEDDER, EMBEDDING_DIM};
 use crate::vindex::{VecDelta, VecItem, VecKey, VecScope};
@@ -240,9 +240,7 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
     if ctx.embed.model_id().is_some() && !usable {
         log_line("model differs from the brain's: words only");
     }
-    // RULING: wave3-c12b ruling 10. The mode first: nobody reads `Degraded` with no reason.
-    ctx.mode.store(Mode::Ready as u8, Ordering::SeqCst);
-    ctx.status.reason.store(DegradedReason::None as u8, Ordering::SeqCst);
+    recover(&ctx.status, &ctx.mode);
     Ok(())
 }
 

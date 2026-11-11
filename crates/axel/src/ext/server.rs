@@ -81,6 +81,14 @@ pub fn degrade(status: &Status, mode: &AtomicU8, reason: DegradedReason, at: Opt
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
 }
 
+/// The one way back to `Ready`: the mode first, then the reason is cleared, so nobody reads
+/// `Degraded` with no reason (the mirror of `degrade`).
+// RULING: wave3-c12b ruling 10.
+pub fn recover(status: &Status, mode: &AtomicU8) {
+    mode.store(Mode::Ready as u8, Ordering::SeqCst);
+    status.reason.store(DegradedReason::None as u8, Ordering::SeqCst);
+}
+
 /// The `<reason>` of the tool sentence: the variant's name when the mode is `Degraded`.
 // SPEC: 990 says a tool answers "Axel is starting" before the brain is open and 3865 gives
 // one sentence for everything outside `Ready`. The sentence of 3865 is used, with
@@ -866,7 +874,8 @@ impl<W: Write> Pump<W> {
         }
         self.misses += 1;
         if self.misses >= TRIP_AFTER_MISSES && self.open_until.is_none() {
-            self.open_until = Some(Instant::now() + TRIP_OPEN_FOR);
+            let open_for = self.test.breaker_open_ms.map_or(TRIP_OPEN_FOR, Duration::from_millis);
+            self.open_until = Some(Instant::now() + open_for);
             self.status.breaker_trips.fetch_add(1, Ordering::Relaxed);
             self.status.breaker_open.store(true, Ordering::Relaxed);
             self.log("breaker open");

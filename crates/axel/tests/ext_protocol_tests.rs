@@ -14,7 +14,7 @@ use axel::brain_v2::{self, OpenOpts};
 use axel::ext::config::ExtConfig;
 use axel::ext::front;
 use axel::ext::rpc::{write_frame, FrameReader};
-use axel::ext::server::{self, degrade, serve, BUSY_TEXT};
+use axel::ext::server::{self, degrade, recover, serve, BUSY_TEXT};
 use axel::ext::types::{Boot, Caller, DegradedReason, Job, Mode, ServeEnd, Status, TestHooks};
 use axel::error::AxelError;
 use axel::ext::types::IndexerCtx;
@@ -533,6 +533,10 @@ fn t07_a_brain_from_the_future_degrades_and_the_file_is_unchanged() {
     assert_eq!(host.close(), ServeEnd::InputClosed);
 
     assert_eq!(sha256(&dirs.brain()), before, "a brain at version 99 was written");
+    // Wave 3 ruling 12: nor was anything written beside it, to wait there for a checkpoint.
+    let mut wal = dirs.brain().into_os_string();
+    wal.push("-wal");
+    assert_eq!(std::fs::metadata(&wal).map(|m| m.len()).unwrap_or(0), 0, "the log beside the brain has content");
     assert_eq!(host_status_written(&dirs), None);
 }
 
@@ -646,9 +650,9 @@ fn t11_shutdown_returns_within_500_ms_with_a_bulk_embedding_job_queued() {
             insert_memory(&conn, &format!("mem_{i:03}"), None, None, false);
         }
     }
-    // The indexer sleeps 3 s before each job, so the embedded batch that the embed thread
+    // The indexer sleeps 1.5 s before each job, so the embedded batch that the embed thread
     // hands back is still in the indexer's hands when `shutdown` arrives.
-    let test = TestHooks { indexer_sleep_ms: 3000, ..TestHooks::default() };
+    let test = TestHooks { indexer_sleep_ms: 1500, ..TestHooks::default() };
     let mut host = Host::ready(&dirs, Some(Embedder::hashing()), test);
     host.wait_until("the pump has given rows to the embed thread", |h| {
         h.status.vectors_waiting.load(Ordering::Relaxed) == 100
@@ -663,7 +667,9 @@ fn t11_shutdown_returns_within_500_ms_with_a_bulk_embedding_job_queued() {
     assert_eq!(end, ServeEnd::Shutdown);
     assert!(took < Duration::from_millis(500), "shutdown took {took:?}");
 
-    // Nothing of the batch was written: the rows are still the backlog.
+    // Nothing of the batch is written, not even once the indexer has woken with the job in
+    // its hands (in a test the process goes on; a real one has exited by then).
+    std::thread::sleep(Duration::from_millis(1800));
     let conn = Connection::open(dirs.brain()).unwrap();
     let waiting: i64 =
         conn.query_row("SELECT COUNT(*) FROM memory_ext WHERE embedding IS NULL", [], |r| r.get(0)).unwrap();
@@ -1571,4 +1577,104 @@ fn r10_the_stop_flag_ends_an_indexer_loop_whose_queue_is_full() {
     done.recv_timeout(Duration::from_secs(3)).expect("the loop went on after the stop flag");
     assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
     drop(jobs);
+}
+
+// ── Wave 3 ruling 12: the breaker closes; a retry recovers ──────────────────
+
+#[test]
+fn r12_the_breaker_closes_after_its_time_and_the_next_message_is_forwarded() {
+    let dirs = Dirs::new();
+    let test = TestHooks { front_sleep_ms: 400, breaker_open_ms: Some(700), ..TestHooks::default() };
+    let mut host = Host::ready(&dirs, None, test);
+    // One message late at its budget, two answered behind it: three misses.
+    for _ in 0..3 {
+        assert_eq!(host.hook("before_message", "s1"), continues());
+    }
+    assert!(host.status.breaker_open.load(Ordering::Relaxed));
+    assert_eq!(host.status.breaker_trips.load(Ordering::Relaxed), 1);
+
+    let start = Instant::now();
+    while host.status.breaker_open.load(Ordering::Relaxed) {
+        assert!(start.elapsed() < Duration::from_secs(4), "the breaker never closed");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(start.elapsed() >= Duration::from_millis(400), "it closed before its time: {:?}", start.elapsed());
+    assert!(read_log(&dirs).contains("breaker closed"));
+
+    // Forwarded: it waits its budget for a front thread that sleeps again. One miss does
+    // not open the breaker a second time.
+    let (answer, took) = host.timed("hook.handle", hook_params("before_message", "s1"));
+    assert_eq!(answer["result"], continues());
+    assert!(took >= Duration::from_millis(140), "not forwarded: {took:?}");
+    assert!(!host.status.breaker_open.load(Ordering::Relaxed));
+    assert_eq!(host.status.breaker_trips.load(Ordering::Relaxed), 1);
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}
+
+#[test]
+fn r12_a_retry_opens_a_brain_that_has_become_ready() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        conn.execute_batch("PRAGMA user_version = 99; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let mut host = Host::start(None, TestHooks { open_retry_ms: Some(200), ..TestHooks::default() });
+    host.call("initialize", json!({"config": dirs.config("off")}));
+    assert_eq!(host.wait_degraded(), "Axel is unavailable: BrainTooNew. Synaps itself is not affected.");
+    assert_eq!(wait_status_file(&dirs, "degraded", Duration::from_secs(5))["reason"], "BrainTooNew");
+
+    // The brain becomes one this binary reads; nothing tells the process.
+    Connection::open(dirs.brain())
+        .unwrap()
+        .execute_batch(&format!("PRAGMA user_version = {}", brain_v2::LATEST))
+        .unwrap();
+    let said = wait_status_file(&dirs, "ready", Duration::from_secs(10));
+    assert_eq!((&said["reason"], &said["reason_at"]), (&json!("None"), &Value::Null), "{said}");
+    assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::None);
+    host.wait_until("the status row is written", |h| h.status.status_written_ms.load(Ordering::Relaxed) > 0);
+    host.wait_until("a tool is forwarded", |h| h.tool("search")["error"]["code"] == -32602);
+    assert_eq!(read_log(&dirs).matches("brain open").count(), 1);
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}
+
+#[test]
+fn r12_on_recovery_the_mode_is_never_degraded_with_no_reason() {
+    // A watcher reads the mode, the reason, and the mode again. Each round is fenced by a
+    // generation counter, so three reads that span two rounds are not judged.
+    let status = Arc::new(Status::default());
+    let mode = Arc::new(AtomicU8::new(Mode::Ready as u8));
+    let generation = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    let seen_without_reason = Arc::new(AtomicU64::new(0));
+
+    let watcher = {
+        let (status, mode, generation, stop, bad) =
+            (status.clone(), mode.clone(), generation.clone(), stop.clone(), seen_without_reason.clone());
+        std::thread::spawn(move || {
+            let degraded = Mode::Degraded as u8;
+            while !stop.load(Ordering::Relaxed) {
+                let before = generation.load(Ordering::SeqCst);
+                let first = mode.load(Ordering::SeqCst);
+                let reason = status.reason.load(Ordering::SeqCst);
+                let second = mode.load(Ordering::SeqCst);
+                if generation.load(Ordering::SeqCst) == before
+                    && first == degraded
+                    && second == degraded
+                    && DegradedReason::from_u8(reason) == DegradedReason::None
+                {
+                    bad.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+    for _ in 0..400_000 {
+        generation.fetch_add(1, Ordering::SeqCst);
+        degrade(&status, &mode, DegradedReason::BrainNotReady, None);
+        std::hint::spin_loop();
+        recover(&status, &mode);
+    }
+    stop.store(true, Ordering::Relaxed);
+    watcher.join().unwrap();
+    assert_eq!(seen_without_reason.load(Ordering::Relaxed), 0, "Degraded was visible with its reason cleared");
+    assert_eq!(mode.load(Ordering::SeqCst), Mode::Ready as u8);
 }
