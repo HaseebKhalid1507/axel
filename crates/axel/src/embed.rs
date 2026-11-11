@@ -3,7 +3,7 @@
 //! every caller then gets `None` at once, and every wait has a deadline.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -24,6 +24,7 @@ const RETRY_SEND: Duration = Duration::from_millis(5);
 pub struct EmbedService {
     tx: Option<Sender<Req>>,
     stopped: Arc<AtomicBool>,
+    backlog: Arc<AtomicUsize>,
     model: Option<String>,
 }
 
@@ -45,12 +46,22 @@ enum BulkTo {
     Caller { reply: Sender<Vec<Vec<f32>>>, deadline: Instant },
 }
 
-/// Sets `stopped` when the thread ends, by return or by unwinding.
-struct StopGuard(Arc<AtomicBool>);
+/// When the thread ends, by return or by unwinding: nothing it held will be handed over, so
+/// the backlog is 0; then `stopped`.
+struct StopGuard {
+    stopped: Arc<AtomicBool>,
+    backlog: Arc<AtomicUsize>,
+}
 impl Drop for StopGuard {
     fn drop(&mut self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.backlog.store(0, Ordering::SeqCst);
+        self.stopped.store(true, Ordering::SeqCst);
     }
+}
+
+/// Takes `n` off the backlog, never below 0 (the guard may have zeroed it first).
+fn unlog(backlog: &AtomicUsize, n: usize) {
+    let _ = backlog.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |b| Some(b.saturating_sub(n)));
 }
 
 impl EmbedService {
@@ -59,23 +70,34 @@ impl EmbedService {
     // `stopped()` stays false, since nothing ended (`status` says the model is unavailable,
     // not `embedding: stopped`, 3889-3891).
     pub fn start(embedder: Option<Embedder>, jobs: SyncSender<Job>, test: Arc<TestHooks>) -> Self {
-        let stopped = Arc::new(AtomicBool::new(false));
-        let Some(embedder) = embedder else {
-            return EmbedService { tx: None, stopped, model: None };
+        let Some(mut embedder) = embedder else {
+            let (stopped, backlog) = Default::default();
+            return EmbedService { tx: None, stopped, backlog, model: None };
         };
         let model = embedder.model_id().to_string();
+        Self::spawn(move |texts: &[&str]| embedder.embed(texts).ok(), model, jobs, test)
+    }
+
+    /// The thread around any embedding function (`None` is a failed batch).
+    fn spawn<E>(embed: E, model: String, jobs: SyncSender<Job>, test: Arc<TestHooks>) -> Self
+    where
+        E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>> + Send + 'static,
+    {
+        let stopped = Arc::new(AtomicBool::new(false));
+        let backlog = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = mpsc::channel();
-        let guard = StopGuard(stopped.clone());
+        let guard = StopGuard { stopped: stopped.clone(), backlog: backlog.clone() };
         let thread_model = model.clone();
         let spawned = thread::Builder::new()
             .name("axel-embed".to_string())
             .spawn(move || {
+                let backlog = guard.backlog.clone();
                 let _guard = guard;
-                run(embedder, rx, jobs, test, thread_model);
+                run(embed, rx, jobs, test, thread_model, &backlog);
             });
         // A thread that could not be spawned has ended before it began (its guard is dropped).
         let tx = spawned.ok().map(|_| tx);
-        EmbedService { tx, stopped, model: Some(model) }
+        EmbedService { tx, stopped, backlog, model: Some(model) }
     }
 
     pub fn model_id(&self) -> Option<&str> {
@@ -95,8 +117,19 @@ impl EmbedService {
         if items.is_empty() || self.stopped() {
             return;
         }
+        let n = items.len();
         let (keys, texts): (Vec<VecKey>, Vec<String>) = items.into_iter().unzip();
-        let _ = tx.send(Req::Bulk(Bulk { texts, done: Vec::new(), to: BulkTo::Rows(keys) }));
+        self.backlog.fetch_add(n, Ordering::SeqCst);
+        if tx.send(Req::Bulk(Bulk { texts, done: Vec::new(), to: BulkTo::Rows(keys) })).is_err() {
+            unlog(&self.backlog, n);
+        }
+    }
+
+    // RULING: wave2-c9 review finding 4: the depth of the bulk queue, for the indexer's pump.
+    /// Texts accepted by `submit_bulk` and not yet handed to the indexer's queue or dropped
+    /// (a failed batch, an indexer that is gone, an embed thread that ended).
+    pub fn backlog(&self) -> usize {
+        self.backlog.load(Ordering::SeqCst)
     }
 
     /// Through the bulk queue, blocking the caller; the indexer thread only (section 2.8).
@@ -131,7 +164,10 @@ fn wait<T>(answer: &Receiver<T>, deadline: Instant) -> Option<T> {
     answer.recv_timeout(left).ok()
 }
 
-fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: Arc<TestHooks>, model: String) {
+fn run<E>(mut embed: E, rx: Receiver<Req>, jobs: SyncSender<Job>, test: Arc<TestHooks>, model: String, backlog: &AtomicUsize)
+where
+    E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>>,
+{
     let mut queries: VecDeque<(String, Instant, Sender<Vec<f32>>)> = VecDeque::new();
     let mut bulks: VecDeque<Bulk> = VecDeque::new();
     // RULING: wave2-c9 review finding 3: finished bulks wait here for room on the indexer's
@@ -140,7 +176,7 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
     let mut open = true;
 
     loop {
-        flush(&jobs, &mut pending);
+        flush(&jobs, &mut pending, backlog);
 
         // Take every request that has arrived; block only when there is nothing to do.
         let mut first = None;
@@ -181,7 +217,7 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
             if Instant::now() >= deadline {
                 continue;
             }
-            if let Ok(mut v) = embedder.embed(&[text.as_str()]) {
+            if let Some(mut v) = embed(&[text.as_str()][..]) {
                 if let Some(v) = v.pop() {
                     let _ = reply.send(v);
                 }
@@ -189,7 +225,7 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
         }
 
         // Then one batch of the bulk queue.
-        if let Some(job) = step(&mut embedder, &mut bulks, &model) {
+        if let Some(job) = step(&mut embed, &mut bulks, &model, backlog) {
             pending.push_back(job);
         }
 
@@ -197,7 +233,7 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
             if pending.is_empty() {
                 return;
             }
-            flush(&jobs, &mut pending);
+            flush(&jobs, &mut pending, backlog);
             if !pending.is_empty() {
                 thread::sleep(RETRY_SEND);
             }
@@ -207,10 +243,14 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
 
 /// Hands finished bulks to the indexer's queue, oldest first, until it is full. A send that
 /// fails as disconnected drops the job: the indexer is gone.
-fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>) {
+fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>, backlog: &AtomicUsize) {
     while let Some(job) = pending.pop_front() {
+        let n = match &job {
+            Job::Embedded { vectors, .. } => vectors.len(),
+            _ => 0,
+        };
         match jobs.try_send(job) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Ok(()) | Err(TrySendError::Disconnected(_)) => unlog(backlog, n),
             Err(TrySendError::Full(job)) => {
                 pending.push_front(job);
                 return;
@@ -221,7 +261,10 @@ fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>) {
 
 /// Embeds one batch of the oldest bulk request. Returns the `Job::Embedded` of a
 /// `submit_bulk` request it finished; a finished `embed_wait` is answered here.
-fn step(embedder: &mut Embedder, bulks: &mut VecDeque<Bulk>, model: &str) -> Option<Job> {
+fn step<E>(embed: &mut E, bulks: &mut VecDeque<Bulk>, model: &str, backlog: &AtomicUsize) -> Option<Job>
+where
+    E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>>,
+{
     let bulk = bulks.front_mut()?;
     if let BulkTo::Caller { deadline, .. } = &bulk.to {
         if Instant::now() >= *deadline {
@@ -232,8 +275,8 @@ fn step(embedder: &mut Embedder, bulks: &mut VecDeque<Bulk>, model: &str) -> Opt
     let from = bulk.done.len();
     let to = (from + BATCH).min(bulk.texts.len());
     let batch: Vec<&str> = bulk.texts[from..to].iter().map(String::as_str).collect();
-    match embedder.embed(&batch) {
-        Ok(vs) if vs.len() == batch.len() => bulk.done.extend(vs),
+    match embed(&batch[..]) {
+        Some(vs) if vs.len() == batch.len() => bulk.done.extend(vs),
         // SPEC: 1789-1795: a failed batch is not retried here. A caller gets `None`; the
         // rows of `submit_bulk` are left out of `Job::Embedded` and keep `embedding = NULL`,
         // so the indexer's next pump offers them again.
@@ -242,6 +285,7 @@ fn step(embedder: &mut Embedder, bulks: &mut VecDeque<Bulk>, model: &str) -> Opt
                 bulks.pop_front();
                 return None;
             }
+            unlog(backlog, batch.len());
             bulk.done.extend(std::iter::repeat_with(Vec::new).take(batch.len()));
         }
     }
@@ -259,5 +303,53 @@ fn step(embedder: &mut Embedder, bulks: &mut VecDeque<Bulk>, model: &str) -> Opt
                 keys.into_iter().zip(bulk.done).filter(|(_, v)| !v.is_empty()).collect();
             Some(Job::Embedded { model: model.to_string(), vectors })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The hash embedder cannot fail, so this one does: on any batch with a text containing
+    /// "fail" (the indexer's `submit_bulk` path then leaves those rows out).
+    #[test]
+    fn a_failed_batch_leaves_the_backlog_at_zero() {
+        let (jobs, jobs_rx) = mpsc::sync_channel(4);
+        let embed = |texts: &[&str]| {
+            if texts.iter().any(|t| t.contains("fail")) {
+                None
+            } else {
+                Some(texts.iter().map(|_| vec![1.0, 0.0]).collect())
+            }
+        };
+        let svc = EmbedService::spawn(embed, "fake".to_string(), jobs, Arc::new(TestHooks::default()));
+        // Batch 1 (rows 0-3) fails, batch 2 (rows 4-7) works.
+        let items: Vec<(VecKey, String)> =
+            (0..8).map(|i| (VecKey::Mem(i), if i == 2 { "fail".to_string() } else { format!("row {i}") })).collect();
+        svc.submit_bulk(items);
+        match jobs_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(Job::Embedded { vectors, .. }) => {
+                assert_eq!(vectors.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (4..8).map(VecKey::Mem).collect::<Vec<_>>());
+            }
+            other => panic!("expected Job::Embedded, got {other:?}"),
+        }
+        let until = Instant::now() + Duration::from_secs(2);
+        while svc.backlog() != 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(svc.backlog(), 0);
+
+        // A bulk whose every batch fails is handed over empty and leaves nothing counted.
+        svc.submit_bulk(vec![(VecKey::Mem(9), "fail".to_string())]);
+        assert!(matches!(jobs_rx.recv_timeout(Duration::from_secs(5)), Ok(Job::Embedded { vectors, .. }) if vectors.is_empty()));
+        let until = Instant::now() + Duration::from_secs(2);
+        while svc.backlog() != 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(svc.backlog(), 0);
+        // An `embed_wait` with a failing batch is answered `None` at once, not at its deadline.
+        let t0 = Instant::now();
+        assert_eq!(svc.embed_wait(vec!["fail".to_string()], Instant::now() + Duration::from_secs(5)), None);
+        assert!(t0.elapsed() < Duration::from_secs(2));
     }
 }

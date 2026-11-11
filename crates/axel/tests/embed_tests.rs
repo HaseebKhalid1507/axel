@@ -200,3 +200,53 @@ fn bulk_work_goes_on_while_the_indexer_queue_is_full() {
     assert_eq!(second.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (4..8).map(VecKey::Mem).collect::<Vec<_>>());
     assert_eq!(second[0].1, hashed("row number 4 of the bulk"));
 }
+
+/// Waits (bounded) for the backlog to reach `want`.
+fn backlog_reaches(svc: &EmbedService, want: usize) -> usize {
+    let until = Instant::now() + Duration::from_secs(2);
+    while svc.backlog() != want && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    svc.backlog()
+}
+
+#[test]
+fn backlog_counts_up_on_submit_and_is_zero_after_the_hand_over() {
+    let (svc, jobs_rx) = start_latched();
+    assert_eq!(svc.backlog(), 0);
+    svc.submit_bulk(rows(0, 4));
+    assert_eq!(svc.backlog(), 4);
+    svc.submit_bulk(rows(4, 6));
+    assert_eq!(svc.backlog(), 10);
+    // Embedded and not handed over (the queue is full): still counted.
+    assert_eq!(svc.embed_wait(vec!["after both".to_string()], secs(5)).map(|v| v.len()), Some(1));
+    assert_eq!(svc.backlog(), 10);
+
+    assert!(matches!(jobs_rx.recv_timeout(Duration::from_secs(5)), Ok(Job::Tick)));
+    assert_eq!(embedded(&jobs_rx).len(), 4);
+    assert_eq!(embedded(&jobs_rx).len(), 6);
+    assert_eq!(backlog_reaches(&svc, 0), 0);
+}
+
+#[test]
+fn backlog_is_zero_when_the_indexer_is_gone() {
+    let (svc, jobs_rx) = start(TestHooks::default());
+    drop(jobs_rx);
+    svc.submit_bulk(rows(0, 5));
+    assert_eq!(backlog_reaches(&svc, 0), 0);
+}
+
+#[test]
+fn backlog_is_zero_after_the_threads_panic() {
+    let (svc, _jobs) = start(TestHooks { panic_embed: true, ..Default::default() });
+    svc.submit_bulk(rows(0, 8));
+    let until = Instant::now() + Duration::from_secs(2);
+    while !svc.stopped() && Instant::now() < until {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert!(svc.stopped());
+    assert_eq!(svc.backlog(), 0);
+    // A submit to the dead thread is not counted either.
+    svc.submit_bulk(rows(8, 3));
+    assert_eq!(svc.backlog(), 0);
+}
