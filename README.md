@@ -8,6 +8,9 @@ Synaps's archive and note files and never writes them. Nothing leaves this machi
 If Axel is absent, crashed or slow, Synaps loses recall and nothing else: every hook it
 answers late is answered "continue".
 
+Axel runs on Linux and macOS only, the systems on which Synaps writes its archives. A build
+on any other system stops with one line: `axel v2 builds on Linux and macOS only`.
+
 ## What it adds to Synaps
 
 - **Recall before each message.** Before a message goes to the model, Axel looks for earlier
@@ -52,6 +55,13 @@ and indexes in the background.
 `on_memory_forgotten` refuses to load the plugin and runs without it. To use Axel there,
 delete those two hook lines from `plugin.json` by hand; the background scan then does the
 work, up to 10 minutes late.
+
+**A Synaps that sends `caller`.** Every tool, the forum's included, needs a Synaps whose
+`tool.call` names the calling run (`caller`, from core commit `6375d9af` on). Without it the
+tool answers "this Synaps does not say who is calling (tool.call has no caller); Axel's
+tools need a host that does" and reads and writes nothing. A tool call Synaps makes for
+itself, with no chat behind it, carries no `caller` and gets the same answer. Recall before
+each message and learning from chats do not need it.
 
 **A sandbox Synaps.** Set `SYNAPS_BASE_DIR=<dir>`, run `axel-v2 plugin install --plugins-dir
 <dir>/plugins`, and put `brain = <dir>/axel/brain.r8` in `<dir>/plugins/axel/config`, so the
@@ -106,13 +116,20 @@ listed by `status`.
 | `archives` | `on` | index Synaps's context archives |
 | `forum` | `auto` | the forum tools: `auto` (on unless Synaps still uses its Axel backend), `on`, `off`; see below |
 | `worker_scope` | `project` | what subagent workers can search: `project` or `all` |
-| `forget_now_min_hidden_hours` | `24` | hours a memory must have been hidden before `forget --now` deletes it; `0`: at once |
+| `forget_now_min_hidden_hours` | `24` | hours a memory must have been hidden before `forget --now` deletes it; `0`: at once. Read by the command only, from `<base>/config` (below) |
 | `handoff_on_start` | `off` | inject the handoff written with `axel handoff set` at session start |
 | `sources` | `~/.config/axel/sources.toml`, else the built-in list | the note folders to index |
 | `archive_events` | empty | comma-separated event sources to index from archives besides worker reports |
 | `embedder` | `onnx` | `onnx` (the local model), `off` (words only), `hash` (tests only) |
 | `model_dir` | `~/.cache/velocirag/models/all-MiniLM-L6-v2` | the model folder |
 | `log_queries` | `on` | keep the first 120 characters of a prompt in the recall log, for turns that are captured anyway |
+
+The command line reads neither `<plugins>/axel/config` nor the `SYNAPS_EXTENSION_AXEL_<KEY>`
+variables. A brain moved with the key `brain` is named to the command line with `--brain` or
+`AXEL_BRAIN`. `axel-v2 forget --now` takes its hours only from the line
+`extension.axel.forget_now_min_hidden_hours = <hours>` in `<base>/config`, where `<base>` is
+`SYNAPS_BASE_DIR` when it is set, else the base the brain records, else `~/.synaps-cli`; a
+value in `<plugins>/axel/config` does not reach it.
 
 Under `auto`, Axel checks `memory.backend` in `<base>/config` and in the `config` of every
 Synaps profile folder (`<base>/<profile>/config`), because it cannot tell which profile is
@@ -126,8 +143,9 @@ Synaps starts the extension with an empty environment, except `PATH`, `HOME`, `L
 and `XDG_RUNTIME_DIR`. So `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `AXEL_BRAIN` have no effect on
 it, and the command line ignores the first two as well: the default brain and model folder are
 under your home folder on every system. When Synaps itself runs with `SYNAPS_PROJECT_ROOT`
-set, recall and the tools key a chat by its own folder, while Synaps keys its archives and
-notes by the override.
+set, Axel cannot see the override: recall, learning from chats, the tools and the forum key
+a chat by the folder it runs in, while its archives, notes and forgets are filed under the
+override's key, as Synaps files them. Recall in that folder then does not find them.
 
 ## Commands
 
