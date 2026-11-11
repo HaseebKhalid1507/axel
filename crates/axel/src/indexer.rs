@@ -6,7 +6,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
 use crate::error::Result;
-use crate::ext::types::{IndexerCtx, Job};
+use crate::ext::types::{IndexerCtx, Job, Mode};
 use crate::{brain_v2, capture, docsync, index_archives, index_notes, indexer_start, recall};
 
 /// Returns on `Job::Shutdown`, when every sender is gone, and when
@@ -124,16 +124,32 @@ fn due(ctx: &mut IndexerCtx, name: &'static str, every_ms: i64) -> bool {
 // tick call. An `Err` is counted in `Status.write_errors` and handed to
 // `brain_v2::degrade_on` (4809-4817); what becomes of a panic is not written: it is
 // counted in `Status.panics`. Either way the work is dropped.
-fn guarded(ctx: &mut IndexerCtx, f: impl FnOnce(&mut IndexerCtx) -> Result<()>) {
+/// How every job and every tick call is run. Public for its tests.
+pub fn guarded(ctx: &mut IndexerCtx, f: impl FnOnce(&mut IndexerCtx) -> Result<()>) {
+    // RULING: wave3-c12b ruling 8. A degraded process leaves the brain alone: after the
+    // first error that degrades, the rest of the tick and every queued job do nothing.
+    if ctx.mode.load(Ordering::SeqCst) == Mode::Degraded as u8 {
+        return;
+    }
     brain_v2::stand_aside(&ctx.writing);
-    match catch_unwind(AssertUnwindSafe(|| f(ctx))) {
-        Ok(Ok(())) => {}
+    let failed = match catch_unwind(AssertUnwindSafe(|| f(ctx))) {
+        Ok(Ok(())) => false,
         Ok(Err(e)) => {
             ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
             brain_v2::degrade_on(&e, &ctx.status, &ctx.mode);
+            true
         }
         Err(_) => {
             ctx.status.panics.fetch_add(1, Ordering::Relaxed);
+            true
+        }
+    };
+    // RULING: wave3-c11 ruling 2. An error or a panic between `begin_write` and `COMMIT`
+    // must not leave its transaction open on this long-lived connection: the next handler
+    // would write inside it, and whoever committed would commit the failed work too.
+    if failed {
+        if let Some(conn) = ctx.conn.as_ref().filter(|conn| !conn.is_autocommit()) {
+            let _ = conn.execute_batch("ROLLBACK");
         }
     }
 }

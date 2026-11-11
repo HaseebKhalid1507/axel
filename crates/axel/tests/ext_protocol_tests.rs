@@ -16,6 +16,9 @@ use axel::ext::front;
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{self, degrade, serve, BUSY_TEXT};
 use axel::ext::types::{Boot, Caller, DegradedReason, Job, Mode, ServeEnd, Status, TestHooks};
+use axel::error::AxelError;
+use axel::ext::types::IndexerCtx;
+use axel::indexer;
 use axel::indexer_start;
 use axel::vindex::{VecDelta, VecKey, VecScope};
 use rusqlite::Connection;
@@ -1270,4 +1273,94 @@ fn r3_hooks_answered_behind_a_late_tool_are_counted_and_do_not_open_the_breaker(
     host.send(&json!({"jsonrpc": "2.0", "id": 902, "method": "shutdown"}));
     assert_eq!(host.read()["id"], 902);
     assert_eq!(host.end.recv_timeout(Duration::from_secs(5)).unwrap(), ServeEnd::Shutdown);
+}
+
+// ── Wave 3 ruling 8 and commit 11's ruling 2: `indexer::guarded` ────────────
+
+const MARKER_ROW: &str = "INSERT INTO context_data(key, value, layer) VALUES('r8-marker', 'x', 'test')";
+
+fn marker_rows(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM context_data WHERE key = 'r8-marker'", [], |r| r.get(0)).unwrap()
+}
+
+/// A handler that begins a write, writes a row and never ends its transaction.
+fn begin_and_write(ctx: &mut IndexerCtx) {
+    let conn = ctx.conn.as_ref().unwrap();
+    brain_v2::begin_write(conn).unwrap();
+    conn.execute(MARKER_ROW, []).unwrap();
+    assert!(!conn.is_autocommit());
+}
+
+#[test]
+fn r8_a_handler_that_fails_inside_a_write_leaves_no_transaction_and_no_row() {
+    let dirs = Dirs::new();
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+
+    // An error.
+    indexer::guarded(&mut ctx, |ctx| {
+        begin_and_write(ctx);
+        Err(AxelError::Other("the handler failed".to_string()))
+    });
+    assert_eq!(status.write_errors.load(Ordering::Relaxed), 1);
+    // A panic.
+    for round in 0..2 {
+        if round == 1 {
+            indexer::guarded(&mut ctx, |ctx| {
+                begin_and_write(ctx);
+                panic!("the handler panicked")
+            });
+            assert_eq!(status.panics.load(Ordering::Relaxed), 1);
+        }
+        let conn = ctx.conn.as_ref().unwrap();
+        assert!(conn.is_autocommit(), "round {round}: the failed handler's transaction is still open");
+        brain_v2::begin_write(conn).expect("the next write begins");
+        assert_eq!(marker_rows(conn), 0, "round {round}");
+        conn.execute_batch("COMMIT").unwrap();
+        let other = Connection::open(dirs.brain()).unwrap();
+        assert_eq!(marker_rows(&other), 0, "round {round}: the failed handler's row is in the file");
+    }
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+
+    // A handler that ends well keeps what it wrote.
+    indexer::guarded(&mut ctx, |ctx| {
+        begin_and_write(ctx);
+        ctx.conn.as_ref().unwrap().execute_batch("COMMIT").unwrap();
+        Ok(())
+    });
+    assert_eq!(marker_rows(&Connection::open(dirs.brain()).unwrap()), 1);
+}
+
+#[test]
+fn r8_a_degraded_indexer_runs_no_handler() {
+    let dirs = Dirs::new();
+    // Control: on a connection without the tables the tick's handlers fail, and say so.
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    ctx.conn = Some(Connection::open_in_memory().unwrap());
+    ctx.last_run.clear();
+    indexer::tick(&mut ctx);
+    assert!(status.write_errors.load(Ordering::Relaxed) >= 1, "the control ran no handler");
+
+    // The same, degraded: nothing runs, in the tick, for a job, or handed in.
+    let (b, status) = boot(None, TestHooks { panic_on_forgotten_job: true, ..TestHooks::default() });
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    ctx.conn = Some(Connection::open_in_memory().unwrap());
+    ctx.last_run.clear();
+    degrade(&ctx.status, &ctx.mode, DegradedReason::BrainDamaged, None);
+    indexer::tick(&mut ctx);
+    indexer::dispatch(
+        &mut ctx,
+        Job::Forgotten { id: "id".to_string(), kind: "note".to_string(), project_key: "p0123456789abcdef".to_string() },
+    );
+    let mut ran = false;
+    indexer::guarded(&mut ctx, |_| {
+        ran = true;
+        Ok(())
+    });
+    assert!(!ran, "a handler ran in a degraded process");
+    assert_eq!(status.write_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(status.panics.load(Ordering::Relaxed), 0);
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Degraded as u8);
 }
