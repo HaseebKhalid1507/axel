@@ -834,3 +834,27 @@ fn s1_t17_every_gated_subcommand_refuses_a_version_1_brain_and_leaves_it_unchang
     assert_eq!(sha256(&old), hash);
     assert!(files_under(&dir.join("home")).is_empty(), "a command wrote into the temp home");
 }
+
+/// Real-binaries round, item 2: an archive core forgot while no extension ran is not
+/// served by the next extension, not even by its first call, before its first scan.
+// RULING: v2 real-binaries round, item 2
+#[test]
+fn rb2_an_archive_forgotten_while_no_extension_ran_is_not_served_at_the_next_start() {
+    let w = World::new();
+    let proj = w.proj();
+    let path = w.put_e2e_archive("new-archive.json", NEW_ID);
+    let ext = Ext::start(&w, "1");
+    w.wait_ready("the first process ready");
+    wait_for("the archive indexed", || (w.rows_of_archive(NEW_ID) >= 1).then_some(()));
+    ext.shutdown();
+
+    // Core forgets it while nothing runs; the next process is asked at once.
+    w.tombstone(&path);
+    let mut ext = Ext::start(&w, "2");
+    let found = ext.search("how do we roll back the canary deploy", &proj);
+    assert!(!found.contains("quokkaledger"), "the forgotten archive was served: {found}");
+    let block = ext.prompt("s-rb2", &proj, "how do we roll back the canary deploy");
+    assert!(!block.to_string().contains("quokkaledger"), "recall served the forgotten archive: {block}");
+    assert_eq!(w.rows_of_archive(NEW_ID), 0);
+    ext.shutdown();
+}

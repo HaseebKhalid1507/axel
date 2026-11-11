@@ -259,6 +259,12 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
     if ctx.embed.model_id().is_some() && !usable {
         log_line("model differs from the brain's: words only");
     }
+    // RULING: v2 real-binaries round, item 2: an archive forgotten while no extension ran
+    // is gone before the front can read the brain. A failure here fails the open.
+    let forgotten = crate::index_archives::forget_tombstoned(ctx)?;
+    if forgotten > 0 {
+        log_line(&format!("forgotten at open: {forgotten} archives"));
+    }
     recover(&ctx.status, &ctx.mode);
     Ok(())
 }

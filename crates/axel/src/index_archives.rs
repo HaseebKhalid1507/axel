@@ -1228,6 +1228,38 @@ fn forget_indexed(ctx: &IndexerCtx, at: &FileAt, archive_id: &str) -> Result<()>
     })
 }
 
+/// Called by `indexer_start::open` before the mode is `Ready`: every `indexed` file that
+/// is a tombstone now is forgotten, as `scan_file` does. A forget made while no extension
+/// ran (or whose job was dropped) is applied before recall or a tool can read the brain,
+/// not at the first scan, which comes after the notes pass and may be long. Only the files
+/// `archive_index` holds as `indexed` are looked at: `lstat`, and a read for a size that
+/// changed.
+// RULING: v2 real-binaries round, item 2.
+pub fn forget_tombstoned(ctx: &IndexerCtx) -> Result<usize> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(0) };
+    let rows: Vec<(String, String, String, Option<i64>)> = conn
+        .prepare("SELECT scope_dir, rel_name, archive_id, file_size FROM archive_index WHERE state = 'indexed'")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let root = archives_root(ctx);
+    let mut listed: HashMap<String, Vec<ArchiveEntry>> = HashMap::new();
+    let mut forgotten = 0;
+    for (scope_dir, rel_name, archive_id, size) in rows {
+        let dir = root.join(&scope_dir);
+        let entries = listed.entry(scope_dir.clone()).or_insert_with(|| archive::list_project(&dir));
+        let Some(entry) = entries.iter().find(|e| e.rel_name == rel_name) else { continue };
+        let at = FileAt::of(&dir, &scope_dir, entry);
+        if size == Some(at.size) {
+            continue;
+        }
+        if let Ok(Ok(ArchiveFile::Tombstone { .. })) = catch_unwind(AssertUnwindSafe(|| at.read(None))) {
+            forget_indexed(ctx, &at, &archive_id)?;
+            forgotten += 1;
+        }
+    }
+    Ok(forgotten)
+}
+
 // ── The fast path: on_context_archived ──────────────────────────────────────
 
 /// `Job::Archive` (called by `indexer::dispatch`). Any other job is nothing to it. With no
