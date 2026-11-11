@@ -1606,6 +1606,37 @@ fn t34a_a_reader_blocks_the_checkpoint_the_mark_stays_and_the_next_idle_turn_fin
     assert_eq!(run.errors(), 0);
 }
 
+/// Guards what the owner would lose: the front thread forgets a turn just after the
+/// checkpoint, and the mark of that purge is deleted with the one the checkpoint finished.
+#[test]
+fn a_purge_committed_between_the_checkpoint_and_the_marks_delete_keeps_its_mark() {
+    const LATE: &str = "mem_gapmarkerlatepurge";
+    let env = Env::new();
+    let (mut run, _a) = indexed_then_forgotten(&env);
+    capture(&run, LATE, &scope(KEY), "s-gap", T0, None);
+    let front = brain_v2::connect(&env.brain(), Role::Cli).unwrap();
+    let before = count(run.db(), "SELECT CAST(value AS INTEGER) FROM context_data WHERE key = 'purge_pending'");
+    index_archives::checkpoint_after_purge_then(&mut run.ctx, || {
+        // Another writer forgets a row, with its own mark, before the indexer's delete.
+        brain_v2::begin_write(&front).unwrap();
+        assert_eq!(store::purge_many(&front, &[LATE.to_string()], false, true).unwrap(), 1);
+        index_archives::mark_purged(&front).unwrap();
+        front.execute_batch("COMMIT").unwrap();
+    })
+    .unwrap();
+    let conn = run.db();
+    assert!(!has(conn, LATE));
+    assert!(purge_pending(conn), "the mark of a purge the checkpoint did not see was deleted");
+    assert!(count(conn, "SELECT CAST(value AS INTEGER) FROM context_data WHERE key = 'purge_pending'") > before);
+    assert!(in_file(&env.brain(), "gapmarkerlatepurge") > 0, "the brain does not hold the text: the test proves nothing");
+    // The next idle turn finishes it.
+    run.idle_turn();
+    assert!(!purge_pending(run.db()));
+    assert_eq!(in_file(&env.wal(), "gapmarkerlatepurge"), 0, "the marker is in brain.r8-wal");
+    assert_eq!(in_file(&env.brain(), "gapmarkerlatepurge"), 0, "the marker is in brain.r8");
+    assert_eq!(run.errors(), 0);
+}
+
 // ── Test 34 (b): a file that stops being a live record ──────────────────────
 
 #[test]

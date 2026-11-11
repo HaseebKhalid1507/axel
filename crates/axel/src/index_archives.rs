@@ -48,10 +48,18 @@ pub const CHECKPOINT_EVERY_MS: i64 = 5_000;
 /// `COMMIT`; the indexer then truncates the log at its next idle turn
 /// ([`checkpoint_after_purge`]). A row and not a field, so that a purge made by the front
 /// thread or the command line, or just before a crash, is seen too (section 2.7).
+// RULING: wave4 R-13 round 3, item 3. The value changes with every purge: the time in
+// nanoseconds, and one more than the mark already there when the clock gives no more. The
+// checkpoint deletes the mark only when it still holds the value it read before the
+// pragma, so a purge committed after the pragma keeps its mark.
 pub fn mark_purged(conn: &Connection) -> Result<()> {
+    let now_ns = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0);
     conn.execute(
-        "INSERT OR REPLACE INTO context_data(key, layer, value) VALUES('purge_pending', 'axel', '1')",
-        [],
+        "INSERT OR REPLACE INTO context_data(key, layer, value)
+         VALUES('purge_pending', 'axel',
+                CAST(max(?1, COALESCE((SELECT CAST(value AS INTEGER) FROM context_data
+                                        WHERE key = 'purge_pending' AND layer = 'axel'), 0) + 1) AS TEXT))",
+        [now_ns],
     )?;
     Ok(())
 }
@@ -59,18 +67,25 @@ pub fn mark_purged(conn: &Connection) -> Result<()> {
 /// The indexer's idle turn, and its tick every [`CHECKPOINT_EVERY_MS`] (called by
 /// `indexer::run` and `indexer::tick` through `guarded`): when a purge is
 /// pending, `wal_checkpoint(TRUNCATE)`; when the checkpoint was not blocked, the mark is
-/// deleted in one small transaction, whose frame holds no text. When it was blocked
+/// deleted in one small transaction, whose frame holds no text, if no purge wrote it again
+/// since it was read. When it was blocked
 /// (`busy` is 1) the mark stays and the next idle turn tries again (section 2.7).
 pub fn checkpoint_after_purge(ctx: &mut IndexerCtx) -> Result<()> {
+    checkpoint_after_purge_then(ctx, || {})
+}
+
+/// [`checkpoint_after_purge`], with `between` run after a checkpoint that was not blocked
+/// and before the mark's delete: the seam where a test commits another purge.
+#[doc(hidden)]
+pub fn checkpoint_after_purge_then(ctx: &mut IndexerCtx, between: impl FnOnce()) -> Result<()> {
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
-    let pending: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM context_data WHERE key = 'purge_pending' AND layer = 'axel')",
-        [],
-        |r| r.get(0),
-    )?;
-    if !pending {
-        return Ok(());
-    }
+    // The mark as it is before the pragma: only this value is deleted afterwards.
+    let mark: Option<String> = conn
+        .query_row("SELECT value FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", [], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    let Some(mark) = mark else { return Ok(()) };
     // SPEC: 2560-2564 do not say how long the checkpoint may wait. A `TRUNCATE` checkpoint
     // that is blocked by a reader waits for the connection's busy timeout (5 s on the
     // indexer) and keeps every other writer out while it waits, and an idle turn comes
@@ -84,13 +99,19 @@ pub fn checkpoint_after_purge(ctx: &mut IndexerCtx) -> Result<()> {
     // the small transaction below not being free. The mark stays, the next turn tries
     // again, and nothing is counted as a write error.
     let done = match answer {
-        Ok(0) => match in_write(conn, || {
-            conn.execute("DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", [])?;
-            Ok(())
-        }) {
-            Err(e) if is_busy(&e) => Ok(()),
-            other => other,
-        },
+        Ok(0) => {
+            between();
+            match in_write(conn, || {
+                conn.execute(
+                    "DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel' AND value = ?1",
+                    [&mark],
+                )?;
+                Ok(())
+            }) {
+                Err(e) if is_busy(&e) => Ok(()),
+                other => other,
+            }
+        }
         Ok(_) => Ok(()),
         Err(e) => match AxelError::from(e) {
             e if is_busy(&e) => Ok(()),
