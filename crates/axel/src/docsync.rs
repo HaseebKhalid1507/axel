@@ -171,7 +171,13 @@ pub fn sync(ctx: &mut IndexerCtx) -> Result<SyncReport> {
         }
         // RULING: R-22.2: a new file with the text of a row this sync hid in its source takes
         // that row over (a rename or a move): same row id, no embedding, its vector sent back.
-        if let (Some(fresh), true) = (&file.fresh, movable) {
+        // RULING: wave 5 review, finding 6: the write transaction is opened only when a plain
+        // read finds a hidden row with this text; `take_over` looks again inside it.
+        let candidate = match (&file.fresh, movable) {
+            (Some(fresh), true) => ctx.conn.as_ref().is_some_and(|c| has_candidate(c, fresh, &text).unwrap_or(false)),
+            _ => false,
+        };
+        if let (Some(fresh), true) = (&file.fresh, candidate) {
             match write(ctx, |conn| take_over(conn, fresh, &file.doc_id, &path, &text, mtime_ms)) {
                 Some(Some(id)) => {
                     report.moved += 1;
@@ -307,6 +313,16 @@ fn has_hidden(conn: &Connection, fresh: &Fresh) -> Result<bool> {
     let n: i64 = conn.query_row(
         &format!("SELECT EXISTS(SELECT 1 {HIDDEN_SQL})"),
         params![fresh.root, fresh.ids],
+        |r| r.get(0),
+    )?;
+    Ok(n == 1)
+}
+
+/// A row this sync hid in the source has this text. A plain read, outside any transaction.
+fn has_candidate(conn: &Connection, fresh: &Fresh, text: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 {HIDDEN_SQL} AND content = ?3)"),
+        params![fresh.root, fresh.ids, text],
         |r| r.get(0),
     )?;
     Ok(n == 1)

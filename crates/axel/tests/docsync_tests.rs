@@ -651,6 +651,40 @@ fn r22_2_the_row_hidden_last_is_taken_and_no_other_mark() {
     assert_eq!(w.row("notes::a").unwrap().2.as_deref(), Some("memory_hidden"));
 }
 
+/// Wave 5 review, finding 6: a new file whose text no hidden row of its source has opens no
+/// write transaction; one whose text a hidden row has still takes that row over.
+#[test]
+fn r22_2_a_new_file_with_no_candidate_opens_no_write_transaction() {
+    let mut w = world();
+    let a = w.file("notes/a.md", BODY);
+    w.sync();
+    let (id_a, ..) = w.row("notes::a").unwrap();
+    std::fs::remove_file(&a).unwrap();
+    assert_eq!(w.sync().hidden, 1);
+
+    // No slot: the file is read only because its source has a hidden row.
+    w.ctx.status.model_loaded.store(false, Ordering::Relaxed);
+    let commits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = commits.clone();
+    w.conn().commit_hook(Some(move || {
+        seen.fetch_add(1, Ordering::SeqCst);
+        false
+    }));
+
+    w.file("notes/other.md", &format!("{BODY} Another text."));
+    let report = w.sync();
+    assert_eq!((report.moved, report.waiting), (0, 1), "{report:?}");
+    assert_eq!(commits.load(Ordering::SeqCst), 0, "a write transaction was opened for a file with no candidate");
+    assert!(w.row("notes::other").is_none());
+
+    w.file("notes/b.md", BODY);
+    let report = w.sync();
+    assert_eq!((report.moved, report.waiting), (1, 1), "{report:?}");
+    assert_eq!(commits.load(Ordering::SeqCst), 1);
+    assert_eq!(w.row("notes::b").unwrap().0, id_a);
+    w.conn().commit_hook(None::<fn() -> bool>);
+}
+
 /// R-22.3: a restored row's stored vector is sent even when the model is not loaded.
 #[test]
 fn r22_3_a_restored_row_gets_its_vector_without_a_model() {
