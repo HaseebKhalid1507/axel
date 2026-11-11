@@ -55,6 +55,63 @@ fn open_or_create_with_refuses_a_brain_built_with_another_model() {
     assert!(AxelBrain::open_or_create_with(&default_path, None, Embedder::hashing()).is_err());
 }
 
+fn table_count(path: &std::path::Path) -> i64 {
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+        .unwrap()
+}
+
+/// `AxelBrain::open` (and `open_or_create_with`) on a brain they refuse:
+/// an error naming `must_name`, and the file exactly as it was. The brains
+/// are made with `Brain::create_with_model`, so the project-memory migration
+/// has not run on them: a migration before the check would change the file.
+fn assert_refused_unchanged(path: &std::path::Path, must_name: &str) {
+    let bytes_before = std::fs::read(path).unwrap();
+    let tables_before = table_count(path);
+
+    let error = match AxelBrain::open(path) {
+        Ok(_) => panic!("open must refuse {}", path.display()),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("Model mismatch") && error.contains(must_name), "{error}");
+    assert_eq!(std::fs::read(path).unwrap(), bytes_before, "open changed the refused file");
+
+    let default_embedder = Embedder::new(None, None, true);
+    let error = match AxelBrain::open_or_create_with(path, None, default_embedder) {
+        Ok(_) => panic!("open_or_create_with must refuse {}", path.display()),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("Model mismatch") && error.contains(must_name), "{error}");
+    assert_eq!(std::fs::read(path).unwrap(), bytes_before, "open_or_create_with changed the refused file");
+
+    assert_eq!(table_count(path), tables_before);
+    assert!(!path.with_extension("r8.hnsw").exists());
+}
+
+#[test]
+fn a_refused_open_leaves_the_file_byte_identical() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // Another model.
+    let hash_path = temp_dir.path().join("hash.r8");
+    drop(axel::r8::Brain::create_with_model(&hash_path, Some("t"), "hash-384", 384).unwrap());
+    assert_refused_unchanged(&hash_path, "hash-384");
+
+    // The default model's name, another dimension.
+    let wide_path = temp_dir.path().join("wide.r8");
+    drop(axel::r8::Brain::create_with_model(&wide_path, Some("t"), "all-MiniLM-L6-v2", 768).unwrap());
+    assert_refused_unchanged(&wide_path, "768 dimensions");
+
+    // Control: an accepted open of such a file does change it (the
+    // migration adds tables), so "unchanged" above is not trivially true.
+    let plain_path = temp_dir.path().join("plain.r8");
+    drop(axel::r8::Brain::create_with_model(&plain_path, Some("t"), "all-MiniLM-L6-v2", 384).unwrap());
+    let tables_before = table_count(&plain_path);
+    drop(AxelBrain::open(&plain_path).unwrap());
+    assert!(table_count(&plain_path) > tables_before);
+}
+
 #[test]
 fn test_axel_verify_nonexistent_memory() {
     let (brain, _temp_dir) = setup_test_brain();

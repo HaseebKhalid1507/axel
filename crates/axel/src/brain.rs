@@ -98,7 +98,8 @@ impl AxelBrain {
     /// Open an existing brain or create a new one, embedding with `embedder`.
     ///
     /// A new brain is recorded as built with the embedder's model. An
-    /// existing brain built with another model is refused, unchanged.
+    /// existing brain built with another model, or recording another vector
+    /// dimension, is refused, unchanged.
     pub fn open_or_create_with(
         path: impl AsRef<Path>,
         agent_name: Option<&str>,
@@ -107,7 +108,7 @@ impl AxelBrain {
         let path = path.as_ref().to_path_buf();
         let brain = if path.exists() {
             let brain = Brain::open(&path)?;
-            BrainSearch::check_embedder(&brain.meta().embedder_model, &embedder)?;
+            BrainSearch::check_embedder(brain.meta(), &embedder)?;
             brain
         } else {
             Brain::create_with_model(&path, agent_name, embedder.model_id(), embedder.dim())?
@@ -129,9 +130,14 @@ impl AxelBrain {
     }
 
     /// Open an existing brain. Fails if it doesn't exist.
+    ///
+    /// A brain that was not built with the default embedder (its model and
+    /// its vector dimension) is refused, unchanged: the check comes before
+    /// the migration.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         let brain = Brain::open(&path)?;
+        BrainSearch::check_default_embedder(brain.meta())?;
         // Additive, transactional project-memory migration (T32–T36).
         crate::project_memory::migrate(brain.conn())?;
         let search = BrainSearch::open(&path)?;

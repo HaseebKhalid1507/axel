@@ -13,6 +13,7 @@ use velocirag::index::VectorIndex;
 use velocirag::search::{SearchEngine, SearchOptions, SearchResponse};
 
 use crate::error::{AxelError, Result};
+use crate::r8::{BrainMeta, DEFAULT_EMBEDDER, EMBEDDING_DIM};
 
 /// Search handle for a `.r8` brain.
 ///
@@ -40,7 +41,7 @@ impl BrainSearch {
     /// The file is checked first: the default embedder, which reads the
     /// user's embedding cache, is built only for a brain that is accepted.
     pub fn open(brain_path: &Path) -> Result<Self> {
-        Self::open_with(brain_path, crate::r8::DEFAULT_EMBEDDER, Self::default_embedder)
+        Self::open_with(brain_path, DEFAULT_EMBEDDER, EMBEDDING_DIM, Self::default_embedder)
     }
 
     /// The embedder `open` uses: all-MiniLM-L6-v2, loaded on first use, with
@@ -55,20 +56,43 @@ impl BrainSearch {
         Embedder::new(Some(embedding_cache_dir), None, true)
     }
 
-    /// Refuse an embedder whose model is not the one the brain was built
-    /// with: vectors of two models must not share an index.
-    pub(crate) fn check_embedder(recorded_model: &str, embedder: &Embedder) -> Result<()> {
-        Self::check_model(recorded_model, embedder.model_id())
+    /// Refuse an embedder whose model, or whose vector dimension, is not
+    /// the one the brain was built with: vectors of two models must not
+    /// share an index. The model name is one per backend, so the dimension
+    /// is the only other thing the brain records that can tell two apart.
+    pub(crate) fn check_embedder(meta: &BrainMeta, embedder: &Embedder) -> Result<()> {
+        Self::check_model(
+            &meta.embedder_model,
+            i64::from(meta.embedding_dim),
+            embedder.model_id(),
+            embedder.dim(),
+        )
     }
 
-    fn check_model(recorded_model: &str, model_id: &str) -> Result<()> {
-        if recorded_model == model_id {
-            Ok(())
-        } else {
+    /// [`BrainSearch::check_embedder`] for the embedder `open` would build,
+    /// without building it.
+    pub(crate) fn check_default_embedder(meta: &BrainMeta) -> Result<()> {
+        Self::check_model(
+            &meta.embedder_model,
+            i64::from(meta.embedding_dim),
+            DEFAULT_EMBEDDER,
+            EMBEDDING_DIM,
+        )
+    }
+
+    fn check_model(recorded_model: &str, recorded_dim: i64, model_id: &str, dim: usize) -> Result<()> {
+        if recorded_model != model_id {
             Err(AxelError::ModelMismatch {
                 expected: recorded_model.to_string(),
                 actual: model_id.to_string(),
             })
+        } else if i64::try_from(dim).ok() != Some(recorded_dim) {
+            Err(AxelError::ModelMismatch {
+                expected: format!("{recorded_model} ({recorded_dim} dimensions)"),
+                actual: format!("{model_id} ({dim} dimensions)"),
+            })
+        } else {
+            Ok(())
         }
     }
 
@@ -76,19 +100,21 @@ impl BrainSearch {
     /// `embedder`.
     ///
     /// Opens a second SQLite connection to the brain file. Refuses, before
-    /// writing anything, an embedder whose `model_id` differs from the
-    /// brain's `brain_meta.embedder_model`.
+    /// writing anything, an embedder whose `model_id` or `dim` differs from
+    /// the brain's `brain_meta` (`embedder_model`, `embedding_dim`).
     /// If a matching on-disk HNSW cache exists, loads it instead of
     /// rebuilding from raw embeddings.
     pub fn open_with_embedder(brain_path: &Path, embedder: Embedder) -> Result<Self> {
-        Self::open_with(brain_path, embedder.model_id(), move || embedder)
+        Self::open_with(brain_path, embedder.model_id(), embedder.dim(), move || embedder)
     }
 
-    /// Open the file, refuse it unless it records `model_id`, and only then
-    /// call `make_embedder`, which must give an embedder of that model.
+    /// Open the file, refuse it unless it records `model_id` and `dim`, and
+    /// only then call `make_embedder`, which must give an embedder of that
+    /// model.
     fn open_with(
         brain_path: &Path,
         model_id: &'static str,
+        dim: usize,
         make_embedder: impl FnOnce() -> Embedder,
     ) -> Result<Self> {
         // VelociRAG's Database::open expects a directory and creates velocirag.db inside it.
@@ -100,11 +126,12 @@ impl BrainSearch {
         )
         .map_err(AxelError::Db)?;
 
-        let recorded_model: Option<String> = conn
+        let (recorded_model, recorded_dim): (Option<String>, Option<i64>) = conn
             .query_row(
-                "SELECT json_extract(value, '$.embedder_model') FROM brain_meta WHERE key = 'meta'",
+                "SELECT json_extract(value, '$.embedder_model'), json_extract(value, '$.embedding_dim') \
+                 FROM brain_meta WHERE key = 'meta'",
                 [],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| {
                 AxelError::Search(format!(
@@ -118,9 +145,16 @@ impl BrainSearch {
                 brain_path.display()
             ))
         })?;
-        Self::check_model(&recorded_model, model_id)?;
+        let recorded_dim = recorded_dim.ok_or_else(|| {
+            AxelError::Search(format!(
+                "{} does not record its embedding dimension",
+                brain_path.display()
+            ))
+        })?;
+        Self::check_model(&recorded_model, recorded_dim, model_id, dim)?;
         let embedder = make_embedder();
         debug_assert_eq!(embedder.model_id(), model_id);
+        debug_assert_eq!(embedder.dim(), dim);
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(AxelError::Db)?;
@@ -406,6 +440,38 @@ mod tests {
             "{error}"
         );
         assert!(open_hashing(&path).is_ok());
+    }
+
+    #[test]
+    fn a_brain_of_another_dimension_is_refused_unchanged() {
+        // The model's name matches; only the recorded dimension differs.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("wide.r8");
+        drop(Brain::create_with_model(&path, Some("test"), HASH_MODEL_ID, 768).unwrap());
+        let tables_before = table_count(&path);
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let error = refusal(open_hashing(&path));
+        assert!(
+            matches!(
+                &error,
+                AxelError::ModelMismatch { expected, actual }
+                    if expected == "hash-384 (768 dimensions)" && actual == "hash-384 (384 dimensions)"
+            ),
+            "{error}"
+        );
+        assert!(!path.with_extension("r8.hnsw").exists());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before, "the file must be byte-identical");
+        assert_eq!(table_count(&path), tables_before);
+
+        // The same for the default model's name and the default opener.
+        let path = dir.path().join("wide-minilm.r8");
+        drop(Brain::create_with_model(&path, Some("test"), DEFAULT_EMBEDDER, 768).unwrap());
+        let bytes_before = std::fs::read(&path).unwrap();
+        let error = refusal(BrainSearch::open(&path));
+        assert!(matches!(&error, AxelError::ModelMismatch { .. }), "{error}");
+        assert!(error.to_string().contains("768 dimensions"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes_before, "the file must be byte-identical");
     }
 
     #[test]
