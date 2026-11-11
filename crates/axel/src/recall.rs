@@ -846,6 +846,32 @@ fn reason_text(reason: &RankReason) -> String {
     }
 }
 
+impl Cand {
+    /// The title of the row: a memory's, or a file's name.
+    fn title(&self) -> &str {
+        match &self.source {
+            Source::Mem(m) => &m.title,
+            Source::Doc(d) => doc_title(&d.doc_id),
+        }
+    }
+
+    // RULING: wave 4 ruling R-15 item 3: JR's ranker drops a candidate whose title equals,
+    // or nearly equals, one it has already chosen, and it skips both checks for an empty
+    // title. A file's title is its name and a chat row's title is the start of its prompt:
+    // `README.md` in two folders, or two exchanges that both begin "continue", are
+    // different things (equal content is collapsed before, by `duplicate_key`). So the
+    // ranker gets no title for a file and for a row read from a chat (a live capture or an
+    // archive row); a saved memory keeps its title, and two with one title are still one
+    // pick. The ranker itself is not edited; the title shown comes from this candidate.
+    fn ranker_title(&self) -> &str {
+        match &self.source {
+            Source::Doc(_) => "",
+            Source::Mem(m) if matches!(m.origin, Origin::Capture | Origin::Archive) => "",
+            Source::Mem(m) => &m.title,
+        }
+    }
+}
+
 /// JR's candidate for one of ours, and whether it has this chat's affinity.
 fn adapt(c: &Cand, own_session: Option<&str>, now: DateTime<Utc>) -> RecallCandidate {
     // A row whose time is a file's modification time ranks as if it had no date.
@@ -859,7 +885,7 @@ fn adapt(c: &Cand, own_session: Option<&str>, now: DateTime<Utc>) -> RecallCandi
             let descriptor = ScopedDescriptor {
                 id: m.id.clone(),
                 project_key: m.project_key.clone().unwrap_or_default(),
-                title: m.title.clone(),
+                title: c.ranker_title().to_string(),
                 snippet: None,
                 category: m.category.clone(),
                 tags: m.tags.clone(),
@@ -876,7 +902,7 @@ fn adapt(c: &Cand, own_session: Option<&str>, now: DateTime<Utc>) -> RecallCandi
             let descriptor = ScopedDescriptor {
                 id: c.id.clone(),
                 project_key: GLOBAL_KEY.to_string(),
-                title: doc_title(&d.doc_id).to_string(),
+                title: c.ranker_title().to_string(),
                 snippet: None,
                 category: "document".to_string(),
                 tags: vec![format!("source:{source}")],
@@ -1200,7 +1226,8 @@ pub fn recall(
             n,
             r#ref: shown_ref(c),
             descriptor: ScopedDescriptor {
-                title: screen::show(&descriptor.title, PASSAGE_CHARS),
+                // The row's own title: the ranker may have been given none.
+                title: screen::show(c.title(), PASSAGE_CHARS),
                 snippet: Some(screen::show(&passage, PASSAGE_CHARS)),
                 ..descriptor
             },

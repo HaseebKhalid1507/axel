@@ -459,6 +459,53 @@ fn t03_two_doc_ids_of_one_file_a_memory_and_its_shadow_and_one_exchange_in_two_a
     assert_eq!(out.trace.generators.after_dedupe, 1);
 }
 
+#[test]
+fn t03b_two_exchanges_that_begin_alike_and_one_file_name_in_two_folders_stay_two_and_two_saved_titles_stay_one() {
+    let mut fx = Fx::new();
+    // Words only: the scores are exact, and nothing rides on the hash of a word.
+    fx.cfg.model_loaded = false;
+    let turn = |id: &'static str, origin: &'static str, origin_ref: &'static str, session: &'static str, reply: &str| {
+        let mut turn = row(id, "continue", &format!("User: continue\nAssistant: {reply}"));
+        turn.class = "episodic_turn";
+        turn.origin_kind = origin;
+        turn.origin_ref = origin_ref;
+        turn.session_id = Some(session);
+        turn
+    };
+    // Two live captures of other chats, and two rows of an archive: each pair has one title.
+    fx.put(&turn("mem_go1", "capture", "T1", "T1", "the heron migration finished for the first shard"));
+    fx.put(&turn("mem_go2", "capture", "T2", "T2", "the heron migration is rebuilding the second index"));
+    fx.put(&turn("mem_go3", "archive", ARCHIVE_1, "T3", "the heron migration needs a third review"));
+    fx.put(&turn("mem_go4", "archive", ARCHIVE_1, "T3", "the heron migration was rolled back on the fourth day"));
+    let out = fx.recall("heron migration", &chat("s1"), true);
+    assert_eq!(sorted(ids(&out)), ["mem_go1", "mem_go2", "mem_go3", "mem_go4"], "{:?}", out.trace);
+    // The title a pick shows is the row's own.
+    assert!(out.picks.iter().all(|p| p.descriptor.title == "continue"), "{:?}", out.picks);
+
+    // One file name in two folders.
+    let mut fx = Fx::new();
+    fx.cfg.model_loaded = false;
+    fx.put_doc("alpha::README.md", "# Alpha\nthe osprey gateway setup for alpha", Some("/src/alpha/README.md"), "{}");
+    fx.put_doc("beta::README.md", "# Beta\nthe osprey gateway setup for beta", Some("/src/beta/README.md"), "{}");
+    let out = fx.recall("osprey gateway setup", &chat("s1"), true);
+    assert_eq!(sorted(ids(&out)), ["doc:alpha::README.md", "doc:beta::README.md"], "{:?}", out.trace);
+    assert!(out.picks.iter().all(|p| p.descriptor.title == "README.md"), "{:?}", out.picks);
+    let block = inject::format_recall(&out.picks, &fx.cfg).unwrap();
+    assert!(block.contains("for alpha") && block.contains("for beta"), "{block}");
+
+    // Two saved memories with one title are one pick, as before: the ranker's own rule.
+    let mut fx = Fx::new();
+    fx.cfg.model_loaded = false;
+    fx.put(&row("mem_same1", "Kestrel release day", "the kestrel release goes out on thursday"));
+    fx.put(&row("mem_same2", "kestrel release day", "the kestrel release goes out after the smoke run"));
+    fx.put(&row("mem_other", "smoke run owner", "the kestrel release smoke run is owned by ops"));
+    let out = fx.recall("kestrel release", &chat("s1"), true);
+    assert_eq!(out.picks.len(), 2, "{:?}", ids(&out));
+    assert!(ids(&out).contains(&"mem_other".to_string()));
+    assert_eq!(ids(&out).iter().filter(|id| id.starts_with("mem_same")).count(), 1);
+    assert_eq!(out.picks.iter().find(|p| p.descriptor.id.starts_with("mem_same")).map(|p| p.descriptor.title.to_lowercase()).as_deref(), Some("kestrel release day"));
+}
+
 // ── Section 3, test 4 ───────────────────────────────────────────────────────
 
 #[test]
