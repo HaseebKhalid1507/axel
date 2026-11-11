@@ -2587,3 +2587,21 @@ fn rb1_a_tool_called_while_the_brain_opens_waits_for_it() {
     assert!(took >= Duration::from_millis(200), "the brain was open already: {took:?}");
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
+
+/// Real-binaries round 2, item 2: an `on_memory_forgotten` the full queue drops asks for
+/// the forget pass at the next tick.
+// RULING: v2 real-binaries round 2, item 2
+#[test]
+fn rb4_a_forget_job_dropped_on_a_full_queue_asks_for_the_forget_pass() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks { indexer_sleep_ms: 3_000, ..TestHooks::default() });
+    let mut sent = 0;
+    while host.status.jobs_dropped.load(Ordering::Relaxed) == 0 {
+        assert!(sent < 1100, "the queue never filled");
+        host.call("hook.handle", hook_params("on_context_archived", "s-fill"));
+        sent += 1;
+    }
+    assert!(!host.status.forget_pass_due.load(Ordering::SeqCst), "an archive job dropped is not a forget");
+    host.hook("on_memory_forgotten", "s-fill");
+    assert!(host.status.forget_pass_due.load(Ordering::SeqCst));
+}

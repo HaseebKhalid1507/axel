@@ -83,6 +83,14 @@ const STATUS_MS: i64 = 30_000;
 /// The nine calls, in this order, each at most as often as its interval and each inside
 /// `catch_unwind`. There is no sweep: nothing is deleted by time.
 pub fn tick(ctx: &mut IndexerCtx) {
+    // RULING: v2 real-binaries round 2, item 2: a forget whose job the queue refused is
+    // applied now, not at the next full scan. A pass that fails is tried at the next tick.
+    if ctx.status.forget_pass_due.swap(false, Ordering::SeqCst) {
+        guarded(ctx, |ctx| {
+            indexer_start::forget_pass(ctx)
+                .inspect_err(|_| ctx.status.forget_pass_due.store(true, Ordering::SeqCst))
+        });
+    }
     if due(ctx, "adopt_orphans", ADOPT_MS) {
         // RULING: wave4 R-12b item 2. The rows the adoption could not read are counted.
         guarded(ctx, |ctx| {

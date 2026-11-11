@@ -987,6 +987,17 @@ impl<W: Write> Pump<W> {
     /// `try_send`: a full queue drops the job and counts it; a disconnected queue means the
     /// indexer thread has ended.
     fn send_job(&mut self, job: Job) {
+        // RULING: v2 real-binaries round 2, item 2: a forget job dropped asks the indexer's
+        // next tick for the cheap forget pass.
+        let forget = matches!(job, Job::Forgotten { .. });
+        let before = self.status.jobs_dropped.load(Ordering::Relaxed);
+        self.queue_job(job);
+        if forget && self.status.jobs_dropped.load(Ordering::Relaxed) != before {
+            self.status.forget_pass_due.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn queue_job(&mut self, job: Job) {
         let Some(live) = self.live.as_mut() else {
             self.status.jobs_dropped.fetch_add(1, Ordering::Relaxed);
             return;

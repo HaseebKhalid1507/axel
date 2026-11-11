@@ -1463,3 +1463,27 @@ fn a_pass_changes_nothing_in_the_notes_folder() {
     assert_eq!(folder_state(&memory), before);
     assert_eq!(w.notes(), ids(&[N1]));
 }
+
+/// Real-binaries round 2, item 2: a forget job the queue dropped sets `forget_pass_due`;
+/// the next tick then takes a tombstoned note out, though the notes pass and the scan are
+/// not due.
+// RULING: v2 real-binaries round 2, item 2
+#[test]
+fn rb4_a_dropped_forget_is_applied_at_the_next_tick() {
+    let mut w = world();
+    w.write(KEY, &format!("{}{}", rec(N1, 1, "the first note"), n2()));
+    w.pass();
+    assert_eq!(w.notes(), ids(&[N1, N2]));
+    // Every timed call of the tick has just run.
+    for name in ["adopt_orphans", "index_notes::pass", "index_archives::scan", "docsync::tick"] {
+        w.ctx.last_run.insert(name, std::time::Instant::now());
+    }
+    w.write(KEY, &format!("{}{}{}", rec(N1, 1, "the first note"), n2(), tomb(N1)));
+
+    axel::indexer::tick(&mut w.ctx);
+    assert_eq!(w.notes(), ids(&[N1, N2]), "a tick with no dropped forget reads no notes file");
+    w.ctx.status.forget_pass_due.store(true, Ordering::SeqCst);
+    axel::indexer::tick(&mut w.ctx);
+    assert_eq!(w.notes(), ids(&[N2]));
+    assert!(!w.ctx.status.forget_pass_due.load(Ordering::SeqCst));
+}

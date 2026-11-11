@@ -80,6 +80,8 @@ pub struct Status {
     // any thread
     /// `try_send` on a full queue.
     pub jobs_dropped: AtomicU64,
+    /// A forget job was dropped: the indexer's next tick runs `indexer_start::forget_pass`.
+    pub forget_pass_due: AtomicBool,
     pub tokens_blanked: AtomicU64,
     pub turns_withheld: AtomicU64,
     /// Turns the capture buffer let go without storing them and without core's rule being
