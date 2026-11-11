@@ -1166,3 +1166,68 @@ fn r1_a_healthy_process_says_ready_removes_old_files_at_start_and_its_own_at_a_c
     assert!(!status_file(&dirs).exists(), "a clean end leaves its status file");
     assert!(fresh.exists(), "the end removed another process's status file");
 }
+
+// ── Wave 3 ruling 2: the front thread is watched outside a call ─────────────
+
+const FRONT_STOPPED_TEXT: &str = "Axel is unavailable: FrontStopped. Synaps itself is not affected.";
+
+/// After `initialize`: the process is alive, says why in its status file and to a tool, and
+/// answers every hook.
+fn assert_serves_without_a_front_thread(host: &mut Host, dirs: &Dirs) {
+    assert_eq!(host.status.reason.load(Ordering::SeqCst), server::FRONT_STOPPED);
+    assert_eq!(server::reason_name(server::FRONT_STOPPED), "FrontStopped");
+    for kind in HOOKS {
+        assert_eq!(host.hook(kind, "s1"), continues(), "{kind}");
+    }
+    let tool = host.tool("search");
+    assert_eq!(tool["result"]["is_error"], true, "{tool}");
+    assert_eq!(tool["result"]["content"], FRONT_STOPPED_TEXT);
+    // The reason stands: no thread brings the mode back.
+    std::thread::sleep(Duration::from_millis(600));
+    assert_eq!(wait_status_file(dirs, "degraded", Duration::from_secs(1))["reason"], "FrontStopped");
+    assert_eq!(host.tool("search")["result"]["content"], FRONT_STOPPED_TEXT);
+    assert!(host.end.try_recv().is_err(), "serve returned");
+    assert!(!dirs.brain().exists(), "a brain was made by a process with no front thread");
+}
+
+#[test]
+fn r2_a_front_thread_that_panics_before_its_loop_degrades_the_process_which_stays() {
+    let dirs = Dirs::new();
+    let test = TestHooks { panic_tool: Some(server::TEST_FRONT_START_PANIC.to_string()), ..TestHooks::default() };
+    let mut host = Host::start(None, test);
+    host.call("initialize", json!({"config": dirs.config("off")}));
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(1));
+    assert_eq!(said["reason"], "FrontStopped", "{said}");
+    let at = said["reason_at"].as_str().expect("the panic's file and line");
+    assert!(at.contains("server.rs:"), "{at}");
+    assert_eq!(host.status.reason_at.get().map(String::as_str), Some(at));
+
+    assert_serves_without_a_front_thread(&mut host, &dirs);
+    let log = read_log(&dirs);
+    assert!(log.contains("front thread ended") && !log.contains("test switch"), "{log}");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert!(!status_file(&dirs).exists());
+}
+
+#[test]
+fn r2_a_front_thread_that_never_hands_over_the_queue_degrades_the_process_which_stays() {
+    let dirs = Dirs::new();
+    // The limit is twice the hook's value: 300 ms.
+    let test = TestHooks {
+        panic_tool: Some(server::TEST_FRONT_START_HANG.to_string()),
+        front_hang_limit_ms: Some(150),
+        ..TestHooks::default()
+    };
+    let mut host = Host::start(None, test);
+    let start = Instant::now();
+    host.call("initialize", json!({"config": dirs.config("off")}));
+    // Before the limit it is a process that is starting.
+    assert_eq!(read_status_file(&dirs).expect("the file is there from initialize")["mode"], "starting");
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(2));
+    assert!(start.elapsed() >= Duration::from_millis(290), "{:?}", start.elapsed());
+    assert_eq!((&said["reason"], &said["reason_at"]), (&json!("FrontStopped"), &Value::Null), "{said}");
+
+    assert_serves_without_a_front_thread(&mut host, &dirs);
+    assert!(read_log(&dirs).contains("front thread did not start in time"));
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}

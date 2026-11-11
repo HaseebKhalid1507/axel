@@ -39,6 +39,16 @@ const HOOK_WAIT_MS: u64 = 150;
 const TOOL_WAIT_MS: u64 = 2_000;
 /// A front thread still inside one call after this long ends the process (R-5).
 const FRONT_HANG_MS: u64 = 30_000;
+/// A front thread that has not handed over the indexer's queue this long after `initialize`
+/// has hung at its start. `TestHooks.front_hang_limit_ms` replaces the 30 s above, and with
+/// it this limit, which is twice that.
+const FRONT_START_MS: u64 = 2 * FRONT_HANG_MS;
+/// `TestHooks.panic_tool` with one of these two names (no tool can have them) makes the
+/// front thread panic, or wait for the end of `serve`, before it has made anything.
+// RULING: wave3-c12b ruling 2. `TestHooks` is in `ext/types.rs`, which this commit may not
+// change; two switches of their own there would replace these names.
+pub const TEST_FRONT_START_PANIC: &str = "@front-start-panic";
+pub const TEST_FRONT_START_HANG: &str = "@front-start-hang";
 /// `before_message` calls in a row that missed the budget before recall is switched off.
 const TRIP_AFTER_MISSES: u32 = 3;
 /// How long the breaker stays open.
@@ -78,13 +88,37 @@ pub fn degrade(status: &Status, mode: &AtomicU8, reason: DegradedReason, at: Opt
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
 }
 
+/// `Status.reason` of a front thread that died or hung before the first `Ready`.
+// RULING: wave3-c12b ruling 2. The reason is `FrontStopped`. `DegradedReason` is in
+// `ext/types.rs`, which this commit may not change, so the number is kept here until the
+// variant `FrontStopped = 9` exists; `DegradedReason::from_u8` reads it as `None`, and
+// every reader of this file's goes through `reason_name`.
+pub const FRONT_STOPPED: u8 = 9;
+
+/// The name of a value of `Status.reason`.
+pub fn reason_name(reason: u8) -> &'static str {
+    match reason {
+        FRONT_STOPPED => "FrontStopped",
+        other => DegradedReason::from_u8(other).as_str(),
+    }
+}
+
+/// `degrade` for `FrontStopped`: the reason first, then the mode.
+fn degrade_front_stopped(status: &Status, mode: &AtomicU8, at: Option<String>) {
+    if let Some(at) = at {
+        let _ = status.reason_at.set(at);
+    }
+    status.reason.store(FRONT_STOPPED, Ordering::SeqCst);
+    mode.store(Mode::Degraded as u8, Ordering::SeqCst);
+}
+
 /// The `<reason>` of the tool sentence: the variant's name when the mode is `Degraded`.
 // SPEC: 990 says a tool answers "Axel is starting" before the brain is open and 3865 gives
 // one sentence for everything outside `Ready`. The sentence of 3865 is used, with
 // `starting` as its reason while the mode is `Starting` (there is no `DegradedReason` yet).
 pub fn unavailable_reason(status: &Status, mode: &AtomicU8) -> &'static str {
     match Mode::from_u8(mode.load(Ordering::SeqCst)) {
-        Some(Mode::Degraded) => DegradedReason::from_u8(status.reason.load(Ordering::SeqCst)).as_str(),
+        Some(Mode::Degraded) => reason_name(status.reason.load(Ordering::SeqCst)),
         _ => "starting",
     }
 }
@@ -348,6 +382,9 @@ where
         status_file: None,
         status_seen: None,
         status_at: None,
+        started: None,
+        was_ready: false,
+        front_gone: false,
     };
     let end = pump.pump(&frames);
     pump.finish(end)
@@ -363,8 +400,8 @@ struct Live {
     /// the rpc thread must not wait for) and sends this end over `jobs_from`.
     jobs: Option<SyncSender<Job>>,
     jobs_from: Receiver<SyncSender<Job>>,
-    /// Closed when the thread has ended.
-    front_done: Receiver<()>,
+    /// Closed when the thread has ended; before that, the file and line of its panic.
+    front_done: Receiver<String>,
     indexer_done: Receiver<()>,
 }
 
@@ -412,6 +449,13 @@ struct Pump<W: Write> {
     /// The mode and reason last written to it, and when.
     status_seen: Option<(u8, u8)>,
     status_at: Option<Instant>,
+    /// When `initialize` started the threads.
+    started: Option<Instant>,
+    /// This thread has seen the mode `Ready`.
+    was_ready: bool,
+    /// The front thread died or hung before that: the mode is `Degraded(FrontStopped)` for
+    /// the rest of this process.
+    front_gone: bool,
 }
 
 fn continue_result() -> Value {
@@ -483,12 +527,56 @@ impl<W: Write> Pump<W> {
             if self.out_closed {
                 return ServeEnd::InputClosed;
             }
-            if self.front_is_dead() {
+            if self.front_is_dead() || self.front_has_stopped() {
                 return ServeEnd::FrontStuck;
             }
             self.close_breaker_when_due();
             self.status_file_when_due();
         }
+    }
+
+    /// Looks at the front thread outside any call: it has ended (its end of `front_done`
+    /// is gone), or it has not handed over the indexer's queue in time. True when the
+    /// process must end (the mode was `Ready` before); before the first `Ready` the process
+    /// stays, `Degraded(FrontStopped)`: the host would start it again into the same failure.
+    // RULING: wave3-c12b ruling 2.
+    fn front_has_stopped(&mut self) -> bool {
+        if self.front_gone {
+            // The indexer may have stored `Ready` in the same instant: the reason stands.
+            let held = self.mode.load(Ordering::SeqCst) == Mode::Degraded as u8
+                && self.status.reason.load(Ordering::SeqCst) == FRONT_STOPPED;
+            if !held {
+                degrade_front_stopped(&self.status, &self.mode, None);
+            }
+            return false;
+        }
+        if self.mode.load(Ordering::SeqCst) == Mode::Ready as u8 {
+            self.was_ready = true;
+        }
+        let Some(live) = self.live.as_mut() else { return false };
+        if live.jobs.is_none() {
+            live.jobs = live.jobs_from.try_recv().ok();
+        }
+        let mut at = None;
+        let ended = loop {
+            match live.front_done.try_recv() {
+                Ok(place) => at = Some(place),
+                Err(TryRecvError::Empty) => break false,
+                Err(TryRecvError::Disconnected) => break true,
+            }
+        };
+        let limit = Duration::from_millis(self.test.front_hang_limit_ms.map_or(FRONT_START_MS, |ms| 2 * ms));
+        let hung = !ended && live.jobs.is_none() && self.started.is_some_and(|t| t.elapsed() >= limit);
+        if !ended && !hung {
+            return false;
+        }
+        self.log(if ended { "front thread ended" } else { "front thread did not start in time" });
+        if self.was_ready {
+            return true;
+        }
+        self.front_gone = true;
+        degrade_front_stopped(&self.status, &self.mode, at);
+        false
     }
 
     /// The status file, when the mode or the reason changed and every 30 s. This thread
@@ -508,7 +596,7 @@ impl<W: Write> Pump<W> {
         let body = json!({
             "pid": std::process::id(),
             "mode": mode_name(mode),
-            "reason": DegradedReason::from_u8(reason).as_str(),
+            "reason": reason_name(reason),
             "reason_at": if degraded { self.status.reason_at.get().cloned() } else { None },
             "written_ms": (self.clock)(),
             "started_ms": self.status.started_ms.load(Ordering::Relaxed),
@@ -584,7 +672,7 @@ impl<W: Write> Pump<W> {
     }
 
     fn ready(&self) -> bool {
-        self.live.is_some() && self.mode.load(Ordering::SeqCst) == Mode::Ready as u8
+        self.live.is_some() && !self.front_gone && self.mode.load(Ordering::SeqCst) == Mode::Ready as u8
     }
 
     // ── initialize ──────────────────────────────────────────────────────────
@@ -630,6 +718,7 @@ impl<W: Write> Pump<W> {
             ));
             remove_old_status_files(&cfg.data_dir);
             self.status_file = Some(status_file_path(&cfg.data_dir, std::process::id()));
+            self.started = Some(Instant::now());
             self.live = self.start(cfg, boot);
             self.status_file_when_due();
         }
@@ -643,7 +732,7 @@ impl<W: Write> Pump<W> {
         let (calls, calls_rx) = mpsc::channel::<FrontCall>();
         let (replies_tx, replies) = mpsc::channel::<FrontReply>();
         let (jobs_to, jobs_from) = mpsc::channel::<SyncSender<Job>>();
-        let (front_alive, front_done) = mpsc::channel::<()>();
+        let (front_alive, front_done) = mpsc::channel::<String>();
         let (indexer_alive, indexer_done) = mpsc::channel::<()>();
         let mode = self.mode.clone();
         let stop = self.stop.clone();
@@ -651,33 +740,54 @@ impl<W: Write> Pump<W> {
         let status = self.status.clone();
 
         let spawned = thread::Builder::new().name("axel-front".to_string()).spawn(move || {
-            let _alive = front_alive;
             set_thread_log(log.clone());
-            let Boot { embedder, clock, test, status } = boot;
-            let embedder = embedder.or_else(|| load_embedder(&cfg));
-            let boot = Boot { embedder, clock, test, status };
-            let (st, jobs_rx, vec_tx) = front::new_state(cfg.clone(), boot, mode);
-            let ctx = IndexerCtx {
-                cfg,
-                conn: None,
-                signer: None,
-                embed: st.embed.clone(),
-                vec_tx,
-                jobs: st.jobs.clone(),
-                status: st.status.clone(),
-                mode: st.mode.clone(),
-                last_run: HashMap::new(),
-                bulk_out: false,
-                clock: st.clock.clone(),
-                test: st.test.clone(),
-                writing: st.writing.clone(),
-            };
-            let _ = jobs_to.send(st.jobs.clone());
-            start_indexer(ctx, jobs_rx, stop, log, indexer_alive);
-            front::run(st, calls_rx, replies_tx);
+            let panics = boot.status.clone();
+            let ran = catch_unwind(AssertUnwindSafe(move || {
+                let Boot { embedder, clock, test, status } = boot;
+                match test.panic_tool.as_deref() {
+                    Some(TEST_FRONT_START_PANIC) => panic!("test switch: front start"),
+                    Some(TEST_FRONT_START_HANG) => {
+                        while !stop.load(Ordering::SeqCst) {
+                            thread::sleep(Duration::from_millis(20));
+                        }
+                        return;
+                    }
+                    _ => {}
+                }
+                let embedder = embedder.or_else(|| load_embedder(&cfg));
+                let boot = Boot { embedder, clock, test, status };
+                let (st, jobs_rx, vec_tx) = front::new_state(cfg.clone(), boot, mode);
+                let ctx = IndexerCtx {
+                    cfg,
+                    conn: None,
+                    signer: None,
+                    embed: st.embed.clone(),
+                    vec_tx,
+                    jobs: st.jobs.clone(),
+                    status: st.status.clone(),
+                    mode: st.mode.clone(),
+                    last_run: HashMap::new(),
+                    bulk_out: false,
+                    clock: st.clock.clone(),
+                    test: st.test.clone(),
+                    writing: st.writing.clone(),
+                };
+                let _ = jobs_to.send(st.jobs.clone());
+                start_indexer(ctx, jobs_rx, stop, log, indexer_alive);
+                front::run(st, calls_rx, replies_tx);
+            }));
+            // The place of a panic outside a call, for the rpc thread; then the channel
+            // closes, which is how it knows this thread has ended.
+            if ran.is_err() {
+                panics.panics.fetch_add(1, Ordering::Relaxed);
+                if let Some(at) = take_last_panic() {
+                    let _ = front_alive.send(at);
+                }
+            }
         });
         if spawned.is_err() {
-            degrade(&status, &self.mode, DegradedReason::IndexerStopped, Some(here(line!())));
+            self.front_gone = true;
+            degrade_front_stopped(&status, &self.mode, Some(here(line!())));
             self.log("front thread not started");
             return None;
         }
@@ -993,6 +1103,11 @@ impl<W: Write> Pump<W> {
     fn finish(&mut self, end: ServeEnd) -> ServeEnd {
         self.stop.store(true, Ordering::SeqCst);
         self.log(&format!("serve ends: {end:?}"));
+        // A front thread that ended the process: the file that stays says so.
+        if end == ServeEnd::FrontStuck {
+            degrade_front_stopped(&self.status, &self.mode, None);
+            self.status_file_when_due();
+        }
         // A clean end leaves no status file behind.
         if let (Some(path), ServeEnd::Shutdown | ServeEnd::InputClosed) = (self.status_file.as_ref(), end) {
             let _ = std::fs::remove_file(path);
