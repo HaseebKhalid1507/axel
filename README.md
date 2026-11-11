@@ -39,7 +39,8 @@ axel-v2 plugin install --plugins-dir ~/.synaps-cli/plugins
 ```
 
 This writes `~/.synaps-cli/plugins/axel/.synaps-plugin/plugin.json` with `command` set to the
-absolute path of the binary you ran. `--plugins-dir` has no default. An existing manifest is
+absolute path of the binary you ran, with every link resolved: run it through a symlink and
+the manifest names the file the link points to. `--plugins-dir` has no default. An existing manifest is
 not replaced unless you add `--force`, which first keeps the old one as
 `plugin.json.bak-<stamp>`. `--print` prints the manifest and writes nothing. A copy of the
 manifest is in [`plugin/plugin.json`](plugin/plugin.json).
@@ -53,7 +54,7 @@ delete those two hook lines from `plugin.json` by hand; the background scan then
 work, up to 10 minutes late.
 
 **A sandbox Synaps.** Set `SYNAPS_BASE_DIR=<dir>`, run `axel-v2 plugin install --plugins-dir
-<dir>/plugins`, and put `extension.axel.brain = <dir>/axel/brain.r8` in `<dir>/config`, so the
+<dir>/plugins`, and put `brain = <dir>/axel/brain.r8` in `<dir>/plugins/axel/config`, so the
 sandbox never opens your real brain. If you forget the last step, Axel sees that the brain
 belongs to another Synaps base and writes nothing.
 
@@ -81,9 +82,13 @@ The old brain `~/.config/axel/axel.r8` is not changed by this version; it is the
 
 ## Configuration
 
-Set a key in the Synaps config as `extension.axel.<key> = <value>`, or in the environment as
-`SYNAPS_EXTENSION_AXEL_<KEY>`. The manifest gives every default. Switches take
-`on|off|true|false|1|0`; a value Axel cannot read keeps its default and is listed by `status`.
+Synaps reads each key from, in this order: the environment variable
+`SYNAPS_EXTENSION_AXEL_<KEY>`; the plugin's own config file `<plugins>/axel/config` (lines
+`<key> = <value>`, `#` starts a comment line, the first line for a key wins); the key
+`extension.axel.<key>` in the Synaps config, which still works but Synaps calls deprecated;
+then the manifest's default. Switches take `on|off|true|false|1|0`. Paths must be absolute;
+a leading `~/` means your home folder. A value Axel cannot read keeps its default and is
+listed by `status`.
 
 | key | default | meaning |
 |---|---|---|
@@ -92,14 +97,14 @@ Set a key in the Synaps config as `extension.axel.<key> = <value>`, or in the en
 | `recall` | `on` | recall before each message |
 | `recall_max_items` | `5` | most items injected per message (1-8) |
 | `recall_max_chars` | `1600` | most characters injected per message |
-| `recall_budget_ms` | `150` | time allowed for one recall |
+| `recall_budget_ms` | `150` | time allowed for one recall, at most 2000 |
 | `recall_min_sem` | `0.30` | least similarity by meaning (0-1) |
 | `recall_min_lex` | `0.50` | least share of the prompt's words, when meaning does not pass (0-1) |
 | `recall_on_events` | `off` | also recall on host event messages |
 | `recall_exclude_paths` | empty | comma-separated folders never recalled or searched |
 | `capture` | `turns` | learning from chats as they happen: `turns` or `off` |
 | `archives` | `on` | index Synaps's context archives |
-| `forum` | `auto` | the forum tools: `auto` (on unless Synaps still uses its Axel backend), `on`, `off` |
+| `forum` | `auto` | the forum tools: `auto` (on unless Synaps still uses its Axel backend), `on`, `off`; see below |
 | `worker_scope` | `project` | what subagent workers can search: `project` or `all` |
 | `forget_now_min_hidden_hours` | `24` | hours a memory must have been hidden before `forget --now` deletes it; `0`: at once |
 | `handoff_on_start` | `off` | inject the handoff written with `axel handoff set` at session start |
@@ -108,6 +113,21 @@ Set a key in the Synaps config as `extension.axel.<key> = <value>`, or in the en
 | `embedder` | `onnx` | `onnx` (the local model), `off` (words only), `hash` (tests only) |
 | `model_dir` | `~/.cache/velocirag/models/all-MiniLM-L6-v2` | the model folder |
 | `log_queries` | `on` | keep the first 120 characters of a prompt in the recall log, for turns that are captured anyway |
+
+Under `auto`, Axel checks `memory.backend` in `<base>/config` and in the `config` of every
+Synaps profile folder (`<base>/<profile>/config`), because it cannot tell which profile is
+active: if any of them says `axel`, the forum tools stay off. A base folder with more than
+4,096 entries is not checked and the forum tools stay off; `status` names the file (or the
+folder) that decided.
+
+### What the extension cannot see
+
+Synaps starts the extension with an empty environment, except `PATH`, `HOME`, `LANG`, `TERM`
+and `XDG_RUNTIME_DIR`. So `XDG_DATA_HOME`, `XDG_CACHE_HOME` and `AXEL_BRAIN` have no effect on
+it, and the command line ignores the first two as well: the default brain and model folder are
+under your home folder on every system. When Synaps itself runs with `SYNAPS_PROJECT_ROOT`
+set, recall and the tools key a chat by its own folder, while Synaps keys its archives and
+notes by the override.
 
 ## Commands
 
@@ -139,10 +159,11 @@ The commands of the first version (`init`, `index`, `index-sync`, `stats`, `cons
 
 ## Turning it off
 
-- Recall only: `extension.axel.recall = off`.
-- Learning from chats only: `extension.axel.capture = off`; archives only:
-  `extension.axel.archives = off`.
-- The forum tools only: `extension.axel.forum = off`.
+Each key below goes in `<plugins>/axel/config` (or any place listed under Configuration).
+
+- Recall only: `recall = off`.
+- Learning from chats only: `capture = off`; archives only: `archives = off`.
+- The forum tools only: `forum = off`.
 - One chat: `axel-v2 pause <session id>`, or the model's `axel_forget {"stop":"both"}`.
 - The whole extension: add `axel` to `disabled_plugins` in the Synaps config, or remove the
   folder `<plugins>/axel`. Putting the old plugin folder back returns Synaps to the old
