@@ -2726,17 +2726,23 @@ fn mark_turn(
                 }
             }
         }
-        purged.extend(purge_left_out_by(conn, scope_dir, &targets, source == "cli", &mut vids)?);
+        // RULING: v2 c18b review round 3, item 2 (fail closed). What has the key, is near and
+        // is not proven may be the deleted turn as the archive holds it: hidden, in this
+        // transaction. So is the leading `Continued` row of the file after one whose last
+        // turn has the key: the rest of a turn whose window was split.
+        // RULING: v2 c18b review round 4, item 1: the rests are read before the purge; once
+        // a proven last turn is gone, the turn before it is "the last" and no rest is found.
+        let mut doubt: Vec<String> = Vec::new();
         if source == "cli" {
-            // RULING: v2 c18b review round 3, item 2 (fail closed). What has the key, is near
-            // and is not proven may be the deleted turn as the archive holds it: hidden, in
-            // this transaction. So is the leading `Continued` row of the file after one whose
-            // last turn has the key: the rest of a turn whose window was split.
-            let mut doubt: Vec<String> =
-                not_proven.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())).map(|(id, _)| id.clone()).collect();
+            doubt.extend(
+                not_proven.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())).map(|(id, _)| id.clone()),
+            );
             for (id, archive_id) in all_keyed.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())) {
                 doubt.extend(rest_of(conn, scope_dir, &files, archive_id, id)?);
             }
+        }
+        purged.extend(purge_left_out_by(conn, scope_dir, &targets, source == "cli", &mut vids)?);
+        if source == "cli" {
             hide_unproven(conn, &doubt, &purged, unproven)?;
         }
     }

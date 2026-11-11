@@ -2054,16 +2054,14 @@ enum Order {
     After,
     /// They are indexed while the capture is hidden, before `forget --now`.
     Before,
+    /// They are indexed before the capture is hidden (round 4, item 1).
+    BeforeHide,
 }
 
 /// The capture of chat `chat` is hidden 25 hours ago and deleted with `forget --now`; the
 /// archives are indexed before or after. Returns the output of `forget --now`.
 fn delete_the_capture(world: &mut Indexed, archives: &[&Arch], order: Order) -> Ran {
     let id = the_capture(world);
-    tx(world.db(), || {
-        store::hide(world.db(), &id, "cli").unwrap();
-        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
-    });
     let file = |world: &mut Indexed| {
         for a in archives {
             world.file_in(&work_scope(world), a);
@@ -2071,6 +2069,13 @@ fn delete_the_capture(world: &mut Indexed, archives: &[&Arch], order: Order) -> 
         world.scan();
         assert!(visible_with(world.db(), "upload queue") > 0, "the archive was not indexed: the test proves nothing");
     };
+    if order == Order::BeforeHide {
+        file(world);
+    }
+    tx(world.db(), || {
+        store::hide(world.db(), &id, "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
+    });
     if order == Order::Before {
         file(world);
     }
@@ -2141,15 +2146,26 @@ fn a_deleted_turn_continued_by_a_workers_report_is_born_hidden() {
 /// middle of it). The first file's part and the next file's leading `Continued` unit,
 /// whose carried head holds the prompt, are born hidden.
 fn split_case(order: Order) -> Indexed {
+    split_case_with(order, "")
+}
+
+/// `split_case`, the first half's reply followed by `more` (round 4, item 1: over 4096
+/// bytes, so that the first file's copy is proven by the cut hash and taken).
+fn split_case_with(order: Order, more: &str) -> Indexed {
     const P: &str = "migrate the ledger tables to the new schema and tell me when it is done";
+    let first = format!("SPLITFIRST I will start with the ledger tables and move them one at a time{more}");
     let mut world = Indexed::new();
     let mut chat = Chat::new(&world, "s-split");
     let at = T0 - 100_000;
     chat.user(P, at);
-    chat.says(&world, "SPLITFIRST I will start with the ledger tables and move them one at a time", true, at + 1_000);
-    chat.says(&world, "SPLITSECOND the ledger tables are on the new schema now, every one of them", false, T0 + 50_000);
+    chat.says(&world, &first, true, at + 1_000);
+    // Indexed before the hide, the capture must outlive both files: its time (the turn's
+    // end) just after the second file's seal, so that no window covers it (and the first
+    // file is still near it).
+    let end = if order == Order::BeforeHide { T0 + 105_000 } else { T0 + 50_000 };
+    chat.says(&world, "SPLITSECOND the ledger tables are on the new schema now, every one of them", false, end);
     let call = json!({"role": "assistant", "content": [
-        {"type": "text", "text": "SPLITFIRST I will start with the ledger tables and move them one at a time"},
+        {"type": "text", "text": first},
         {"type": "tool_use", "id": "toolu_02", "name": "bash", "input": {"command": "migrate"}},
     ]});
     let result = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "ok"}]});
@@ -2441,4 +2457,15 @@ fn a_listed_row_shows_its_reply_when_the_prompt_holds_a_line_that_starts_with_as
     assert_eq!(run.code, 0, "{}", run.err);
     let twin = run.out.lines().find(|l| l.contains(&format!("ctx-{}", a.id))).unwrap_or_else(|| panic!("no twin listed: {}", run.out));
     assert!(twin.contains("REPLYREAL") && !twin.contains("PROMPTFAKE"), "{twin}");
+}
+
+/// v2 c18b review round 4, item 1: a split turn over 4096 bytes, both files indexed before
+/// the hide: the first file's copy is proven by the cut hash and taken, and the second
+/// file's leading `Continued` row, the rest of the deleted reply, does not stay visible.
+#[test]
+fn the_rest_of_a_long_split_turn_is_hidden_when_its_first_half_is_taken() {
+    let more: String = (0..700).map(|i| format!(" LONGSTEP{i}")).collect();
+    let world = split_case_with(Order::BeforeHide, &more);
+    assert_eq!(rows_with(world.db(), "SPLITFIRST"), 0, "the first half was not proven and taken: the test proves nothing");
+    assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "the second half stayed visible");
 }
