@@ -1044,16 +1044,18 @@ fn s4_t12_the_turns_recall_log_row_goes_and_a_late_log_job_writes_nothing() {
     let chat = lab.chat(&lab.a.clone(), "S");
     let prompt = "forget what I said about the jetty survey";
     let at = now_ms() - 2_000;
-    let log = |conn: &Connection, ts: i64| {
+    // The earlier row is another turn of the chat, with another prompt. (A row of the same
+    // prompt in the window before goes too, by key: commit 13's R-13 round 2, ruling 2.)
+    let log = |conn: &Connection, ts: i64, said: &str| {
         conn.execute(
             "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome, total_ms, detail)
              VALUES (?1, 'S', ?2, '', 'forget what I said', ?3, 'nothing_relevant', 1.0, '{}')",
-            params![ts, project::logical("S"), recall::query_hash(prompt)],
+            params![ts, project::logical("S"), recall::query_hash(said)],
         )
         .unwrap();
     };
-    log(lab.conn(), at - 60_000);
-    log(lab.conn(), at);
+    log(lab.conn(), at - 60_000, "what did the jetty survey find");
+    log(lab.conn(), at, prompt);
     lab.hook("before_message", "S", prompt, json!({}), at);
     lab.refused("forget", json!({ "id": "m:mem_0000000000000000" }), &chat);
     let left: Vec<i64> = {
