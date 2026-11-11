@@ -403,9 +403,10 @@ impl Embedder {
             }
         }
 
-        // The models folder. Offline (the default) this is an error when the
-        // files are missing; it downloads only after `set_offline(false)`.
-        crate::download::ensure_model(&crate::download::EMBEDDER_MODEL)
+        // The models folder, accepted in either layout the loader reads.
+        // Offline (the default) this is an error when the files are missing;
+        // it downloads only after `set_offline(false)`.
+        crate::download::ensure_embedder_model()
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -516,21 +517,19 @@ impl Embedder {
 /// Load the ONNX session and the tokenizer from `model_dir`. Reads only;
 /// missing files are an error.
 fn load_model(model_dir: &Path, threads: usize) -> Result<(Session, Tokenizer)> {
-    // Support both layouts: onnx/model.onnx (HF style) and model.onnx (flat/Python style)
-    let onnx_path = if model_dir.join("onnx").join("model.onnx").exists() {
-        model_dir.join("onnx").join("model.onnx")
-    } else {
-        model_dir.join("model.onnx")
+    // Both layouts: onnx/model.onnx (HF style) and model.onnx (flat/Python
+    // style). The same test as the offline check's.
+    let Some(onnx_path) = crate::download::model_files_in(model_dir) else {
+        // FETCH_COMMAND is not built yet; until it is, the message also says
+        // what to copy.
+        return Err(VelociError::Embedding(format!(
+            "the model files are not in {}. Copy model.onnx (or onnx/model.onnx) and \
+             tokenizer.json into it; `{}` will do this once it is built",
+            model_dir.display(),
+            crate::download::FETCH_COMMAND
+        )));
     };
     let tokenizer_path = model_dir.join("tokenizer.json");
-
-    if !onnx_path.exists() || !tokenizer_path.exists() {
-        return Err(VelociError::Embedding(format!(
-            "Model files not found at {} (onnx/model.onnx or model.onnx, and tokenizer.json). \
-             Run `axel model fetch`.",
-            model_dir.display()
-        )));
-    }
 
     tracing::info!("Loading ONNX model from {}", onnx_path.display());
 
@@ -734,6 +733,7 @@ mod tests {
         };
 
         assert!(error.contains(&dir.path().display().to_string()), "{error}");
+        assert!(error.contains(crate::download::FETCH_COMMAND), "{error}");
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the folder must stay empty");
 
         // A folder that does not exist is an error too, and is not created.

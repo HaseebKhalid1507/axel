@@ -69,8 +69,8 @@ mod offline_download_tests {
     use tempfile::TempDir;
 
     use crate::download::{
-        ensure_model, ensure_model_in, is_offline, models_cache_dir, EMBEDDER_MODEL,
-        RERANKER_MODEL,
+        ensure_embedder_model_in, ensure_model, ensure_model_in, is_offline, model_files_in,
+        models_cache_dir, EMBEDDER_MODEL, FETCH_COMMAND, RERANKER_MODEL,
     };
 
     // Offline is the default and the flag is process-wide: no test may call
@@ -86,8 +86,10 @@ mod offline_download_tests {
             let error = ensure_model_in(&models, spec).unwrap_err().to_string();
             let folder = models.join(spec.local_dir).display().to_string();
             assert!(error.contains(&folder), "the error must name the folder: {error}");
-            assert!(error.contains("axel model fetch"), "the error must name the command: {error}");
+            assert!(error.contains(FETCH_COMMAND), "the error must name the command: {error}");
         }
+        let error = ensure_embedder_model_in(&models).unwrap_err().to_string();
+        assert!(error.contains(FETCH_COMMAND), "{error}");
 
         assert_eq!(
             std::fs::read_dir(home.path()).unwrap().count(),
@@ -123,11 +125,88 @@ mod offline_download_tests {
             Err(error) => {
                 let error = error.to_string();
                 assert!(error.contains(&folder.display().to_string()), "{error}");
-                assert!(error.contains("axel model fetch"), "{error}");
+                assert!(error.contains(FETCH_COMMAND), "{error}");
             }
         }
 
         assert_eq!(folder.exists(), existed);
+    }
+
+    #[test]
+    fn the_fetch_command_is_the_installed_name() {
+        assert_eq!(FETCH_COMMAND, "axel-v2 model fetch");
+    }
+
+    // The files are empty stand-ins: these functions only check existence.
+
+    /// A models folder holding the embedding model's folder with `files`.
+    fn models_folder_with(files: &[&str]) -> (TempDir, std::path::PathBuf, std::path::PathBuf) {
+        let home = TempDir::new().unwrap();
+        let models = home.path().join("models");
+        let folder = models.join(EMBEDDER_MODEL.local_dir);
+        for file in files {
+            let path = folder.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"").unwrap();
+        }
+        (home, models, folder)
+    }
+
+    #[test]
+    fn the_flat_layout_alone_passes_the_offline_check() {
+        assert!(is_offline());
+        let (_home, models, folder) = models_folder_with(&["model.onnx", "tokenizer.json"]);
+
+        assert_eq!(model_files_in(&folder), Some(folder.join("model.onnx")));
+        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+        assert!(!folder.join("onnx").exists(), "nothing may be created");
+    }
+
+    #[test]
+    fn the_hub_layout_passes_the_offline_check_and_is_preferred() {
+        let (_home, models, folder) = models_folder_with(&["onnx/model.onnx", "tokenizer.json"]);
+        assert_eq!(model_files_in(&folder), Some(folder.join("onnx").join("model.onnx")));
+        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+
+        let (_home, models, folder) =
+            models_folder_with(&["model.onnx", "onnx/model.onnx", "tokenizer.json"]);
+        assert_eq!(model_files_in(&folder), Some(folder.join("onnx").join("model.onnx")));
+        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+    }
+
+    #[test]
+    fn a_graph_without_the_tokenizer_or_a_tokenizer_without_a_graph_is_not_a_model() {
+        for files in [&["model.onnx"][..], &["onnx/model.onnx"][..], &["tokenizer.json"][..]] {
+            let (_home, models, folder) = models_folder_with(files);
+            assert_eq!(model_files_in(&folder), None, "{files:?}");
+            let error = ensure_embedder_model_in(&models).unwrap_err().to_string();
+            assert!(error.contains(&folder.display().to_string()), "{error}");
+            assert!(error.contains(FETCH_COMMAND), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_loader_and_the_offline_check_agree_on_both_layouts() {
+        // The loader gets past its own file check exactly when the offline
+        // check accepts the folder: with stand-in files it then fails in
+        // ONNX Runtime, not with the "files are not in" message.
+        for files in [&["model.onnx", "tokenizer.json"][..], &["onnx/model.onnx", "tokenizer.json"][..]] {
+            let (_home, models, folder) = models_folder_with(files);
+            assert!(ensure_embedder_model_in(&models).is_ok());
+            let error = match crate::embedder::Embedder::from_model_dir(&folder, 1, true) {
+                Ok(_) => panic!("an empty file is not a model"),
+                Err(error) => error.to_string(),
+            };
+            assert!(!error.contains("are not in"), "{files:?}: {error}");
+            assert!(error.contains("Failed to load ONNX model"), "{files:?}: {error}");
+        }
+        let (_home, models, folder) = models_folder_with(&["model.onnx"]);
+        assert!(ensure_embedder_model_in(&models).is_err());
+        let error = match crate::embedder::Embedder::from_model_dir(&folder, 1, true) {
+            Ok(_) => panic!("a folder without a tokenizer is not a model"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("are not in") && error.contains(FETCH_COMMAND), "{error}");
     }
 }
 

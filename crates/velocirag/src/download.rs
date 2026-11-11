@@ -18,11 +18,15 @@ use crate::error::{Result, VelociError};
 
 const HF_BASE: &str = "https://huggingface.co";
 
+/// The command that puts the model files in place. Every message that tells
+/// a person how to get a model takes the name from here.
+pub const FETCH_COMMAND: &str = "axel-v2 model fetch";
+
 /// While true, nothing in this crate downloads a model.
 static OFFLINE: AtomicBool = AtomicBool::new(true);
 
 /// Forbid (`true`) or allow (`false`) model downloads in this process.
-/// Offline is the default for every entry point; only `axel model fetch`
+/// Offline is the default for every entry point; only [`FETCH_COMMAND`]
 /// switches it off.
 pub fn set_offline(offline: bool) {
     OFFLINE.store(offline, Ordering::SeqCst);
@@ -115,15 +119,45 @@ pub fn models_cache_dir() -> PathBuf {
 /// Return the local folder of a model whose files are all present.
 ///
 /// When files are missing: offline (the default), an error that names the
-/// folder and `axel model fetch`, with nothing created and no URL built;
+/// folder and [`FETCH_COMMAND`], with nothing created and no URL built;
 /// otherwise the files are downloaded from HuggingFace.
 pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf> {
     ensure_model_in(&models_cache_dir(), spec)
 }
 
+/// What "the embedding model's files are in `dir`" means, for the loader and
+/// for the offline check alike: `tokenizer.json` and one of
+/// `onnx/model.onnx` (HuggingFace layout) and `model.onnx` (flat layout,
+/// what Python velocirag leaves), in that order of preference. Returns the
+/// graph it found. Only existence is checked.
+pub fn model_files_in(dir: &Path) -> Option<PathBuf> {
+    if !dir.join("tokenizer.json").exists() {
+        return None;
+    }
+    [dir.join("onnx").join("model.onnx"), dir.join("model.onnx")]
+        .into_iter()
+        .find(|graph| graph.exists())
+}
+
+/// The embedding model's folder in the user's models folder: accepted as it
+/// is when [`model_files_in`] finds the files in either layout, otherwise
+/// [`ensure_model`]'s answer.
+pub(crate) fn ensure_embedder_model() -> Result<PathBuf> {
+    ensure_embedder_model_in(&models_cache_dir())
+}
+
+/// [`ensure_embedder_model`] with the models folder given by the caller.
+pub(crate) fn ensure_embedder_model_in(models_dir: &Path) -> Result<PathBuf> {
+    let model_dir = models_dir.join(EMBEDDER_MODEL.local_dir);
+    if model_files_in(&model_dir).is_some() {
+        return Ok(model_dir);
+    }
+    ensure_model_in(models_dir, &EMBEDDER_MODEL)
+}
+
 /// [`ensure_model`] with the models folder given by the caller instead of
 /// taken from the user's cache directory.
-pub fn ensure_model_in(models_dir: &Path, spec: &ModelSpec) -> Result<PathBuf> {
+pub(crate) fn ensure_model_in(models_dir: &Path, spec: &ModelSpec) -> Result<PathBuf> {
     let model_dir = models_dir.join(spec.local_dir);
 
     // Check if all files already exist
@@ -133,10 +167,15 @@ pub fn ensure_model_in(models_dir: &Path, spec: &ModelSpec) -> Result<PathBuf> {
     }
 
     if is_offline() {
+        // FETCH_COMMAND is not built yet; until it is, the message also
+        // says what to copy.
+        let files: Vec<&str> = spec.files.iter().map(|(_, local)| *local).collect();
         return Err(VelociError::Embedding(format!(
-            "model files for {} are not in {} and downloads are off; run `axel model fetch`",
+            "model files for {} are not in {} and downloads are off. Copy {} into it; \
+             `{FETCH_COMMAND}` will do this once it is built",
             spec.repo,
-            model_dir.display()
+            model_dir.display(),
+            files.join(" and "),
         )));
     }
 
