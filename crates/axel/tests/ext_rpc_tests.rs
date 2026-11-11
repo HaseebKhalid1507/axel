@@ -317,3 +317,44 @@ fn the_base_config_reader() {
     write("memory.backend = \"files\" # comment\nmemory.backend.x = axel\n");
     assert_eq!(base_config_value(tmp.path(), key).as_deref(), Some("files"));
 }
+
+/// Section 6, "The clash": `auto` declares the forum unless the host's config says the host
+/// still owns it; `on` and `off` do not look.
+#[test]
+fn forum_on_follows_the_hosts_backend_line() {
+    let tmp = tempfile::tempdir().unwrap();
+    let write = |text: &str| std::fs::write(tmp.path().join("config"), text).unwrap();
+    let with = |mode: ForumMode| {
+        let mut c = cfg(json!({}));
+        c.base = tmp.path().to_path_buf();
+        c.forum = mode;
+        c.forum_on()
+    };
+
+    // No config file: the host's default is plain files, so the forum is ours.
+    assert!(with(ForumMode::Auto));
+    assert!(with(ForumMode::On));
+    assert!(!with(ForumMode::Off));
+
+    // The host still uses its Axel backend: its forum is live, ours is not declared.
+    write("model = x\nmemory.backend = axel\n");
+    assert!(!with(ForumMode::Auto));
+    assert!(with(ForumMode::On), "on overrides the check");
+    assert!(!with(ForumMode::Off));
+
+    // Plain files, a commented-out line, a later line that wins.
+    write("memory.backend = legacy\n");
+    assert!(with(ForumMode::Auto));
+    write("# memory.backend = axel\n");
+    assert!(with(ForumMode::Auto));
+    write("memory.backend = axel\nmemory.backend = legacy\n");
+    assert!(with(ForumMode::Auto));
+    write("memory.backend = legacy\n  memory.backend=axel\n");
+    assert!(!with(ForumMode::Auto));
+
+    // A base folder that does not exist reads as no config.
+    let mut c = cfg(json!({}));
+    c.base = PathBuf::from("/nonexistent/axel-tests/base");
+    c.forum = ForumMode::Auto;
+    assert!(c.forum_on());
+}

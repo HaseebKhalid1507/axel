@@ -4,8 +4,9 @@
 //! line that fails without that is a stub whose contract was changed by accident: another
 //! commit of the same wave is built against it.
 //!
-//! Nothing here opens a brain: the two connections are in memory and the paths are never
-//! opened.
+//! The stub checks open no brain: their connection is in memory and their paths are never
+//! opened. The indexer's tick has run the real `adopt_orphans` since commit 4, so that one
+//! test makes a fresh version 2 brain in a temp folder.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,10 +20,9 @@ use rusqlite::Connection;
 use serde_json::{json, Value};
 
 use axel::archive::{self, ArchivePolicy, LiveArchive, Start};
-use axel::brain_v2::{self, OpenOpts, Role};
+use axel::brain_v2::{self, OpenOpts};
 use axel::capture::{self, CaptureState, CompletedTurn, Written};
 use axel::embed::EmbedService;
-use axel::error::AxelError;
 use axel::ext::config::{EmbedderKind, ExtConfig, ForumMode};
 use axel::ext::types::{
     BrainArg, Caller, DegradedReason, FrontState, HookEvent, HookOut, IndexerCtx, Job, Mode,
@@ -32,7 +32,7 @@ use axel::ext::{front, hooks, tools, tools_core, tools_forum};
 use axel::recall::{self, RecallConfig, RecallRequest, RecallTrace, View};
 use axel::store::{self, Inserted};
 use axel::vindex::{ExactIndex, VecDelta, VecKey, VecScope};
-use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project, screen};
+use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project};
 
 fn cfg() -> ExtConfig {
     ExtConfig {
@@ -164,33 +164,8 @@ fn every_stub_gives_its_fixed_answer() {
     let missing = Path::new("/nonexistent/skeleton/brain.r8");
     let conn = Connection::open_in_memory().unwrap();
 
-    // brain_v2
-    let opts = OpenOpts { agent: None, model: "m", dim: 384, upgrade_v1: false };
-    assert!(matches!(brain_v2::open_v2(missing, &opts), Err(AxelError::BrainNotReady)));
-    assert!(matches!(brain_v2::connect(missing, Role::Cli), Err(AxelError::BrainNotReady)));
-    assert!(brain_v2::require_v2(missing).is_ok());
-    assert!(brain_v2::begin_write(&conn).is_ok());
-    assert!(brain_v2::signer(&conn).unwrap().is_none());
-    assert_eq!(brain_v2::adopt_orphans(&conn, "cli").unwrap(), 0);
-    let writing = AtomicBool::new(true);
-    brain_v2::stand_aside(&writing);
-    drop(brain_v2::begin_write_front(&conn, &writing).unwrap());
-    assert!(!writing.load(Ordering::Relaxed), "the guard clears the flag when dropped");
-    assert!(!missing.exists());
-    let (status, mode) = (Status::default(), AtomicU8::new(Mode::Ready as u8));
-    assert!(!brain_v2::degrade_on(&AxelError::BrainChanged, &status, &mode));
-    assert!(!brain_v2::degrade_on(&AxelError::BrainDamaged("x".to_string()), &status, &mode));
-    assert_eq!(mode.load(Ordering::Relaxed), Mode::Ready as u8);
-    assert_eq!(status.reason.load(Ordering::Relaxed), 0);
-
-    // screen: its input unchanged
-    let secret = "key sk-ant-REDACTED and\nmore";
-    let r = screen::redact(secret);
-    assert_eq!((r.text.as_ref(), r.blanked, r.hits.len()), (secret, 0, 0));
-    assert_eq!(screen::show(secret, 5), secret);
-    assert_eq!(screen::show_block(secret, 5), secret);
-    assert!(screen::certain_hit(secret).is_none());
-    assert!(!screen::core_withholds(secret));
+    // brain_v2 (commit 4) and screen (commit 8) are real: `brain_v2_tests.rs` and the tests
+    // in `screen.rs` hold their contracts now.
 
     // archive
     let a = live_archive();
@@ -199,8 +174,6 @@ fn every_stub_gives_its_fixed_answer() {
     assert!(archive::extract_units(&a, &policy()).is_empty());
     assert!(archive::list_project(missing).is_empty());
     assert!(archive::read_archive(missing, "scope", None).is_err());
-    assert!(!policy().is_forget_tool("axel_forget"));
-    assert_eq!(Start::from_event(Some(5), Some(2)), Start::Unknown);
     assert_eq!(Start::default(), Start::Unknown);
 
     // project
@@ -281,7 +254,6 @@ fn every_stub_gives_its_fixed_answer() {
     };
     let out = recall::recall(&conn, &st.index, &st.embed, &RecallConfig { now: 1_000 }, &req);
     assert!(out.picks.is_empty());
-    assert!(!st.cfg.forum_on());
 
     // types
     for v in 0..=8u8 {
@@ -353,7 +325,12 @@ fn the_tool_dispatch_panics_on_the_test_switch() {
 
 #[test]
 fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
-    let conn = Connection::open_in_memory().unwrap();
+    // A fresh version 2 brain: the tick's first call is the real `adopt_orphans`, which
+    // reports an error on a connection without the tables (and must: on a real brain that
+    // is damage).
+    let dir = tempfile::TempDir::new().unwrap();
+    let opts = OpenOpts { agent: None, model: "hash-384", dim: 384, upgrade_v1: false };
+    let conn = brain_v2::open_v2(&dir.path().join("brain.r8"), &opts).unwrap().conn;
     let (mut ctx, _jobs_rx) = indexer_ctx(
         TestHooks { panic_on_forgotten_job: true, ..TestHooks::default() },
         Some(conn),

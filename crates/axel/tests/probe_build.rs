@@ -635,7 +635,11 @@ fn e_kv_guard_refuses_schema_version_2_even_with_or_replace() {
         conn.query_row("SELECT value FROM kv WHERE key = 'schema_version'", [], |r| r.get(0))
             .unwrap()
     };
-    // What today's code wrote when it opened the file (db.rs, init_schema).
+    // Since commit 4 this tree's db.rs writes '3' when it opens the file. The binary the
+    // guard is for wrote '2' (db.rs, init_schema, before commit 4): put that back, as that
+    // binary left it, before the block's trigger exists.
+    assert_eq!(version(conn), "3");
+    conn.execute("UPDATE kv SET value = '2' WHERE key = 'schema_version'", []).unwrap();
     assert_eq!(version(conn), "2");
 
     conn.execute_batch(SCHEMA_V2_SQL).unwrap();
@@ -669,13 +673,19 @@ fn e_kv_guard_refuses_schema_version_2_even_with_or_replace() {
     conn.execute("INSERT OR REPLACE INTO kv (key, value) VALUES ('other', '1')", [])
         .unwrap();
 
-    // The lock itself: the call BrainSearch::open makes (search.rs) runs
-    // that same statement with '2', so the old code cannot open this file.
+    // The lock itself: the old binary's BrainSearch::open (search.rs) ran that same
+    // statement with '2' on its own connection, so the old code cannot open this file.
+    // The statement is written out here because this tree's Database writes '3' since
+    // commit 4; `brain_v2_tests::t07` holds the same on a brain made by `open_v2`.
     let second = Connection::open(&path).unwrap();
-    let refused = Database::from_connection(second, path.clone())
-        .err()
-        .expect("today's Database::from_connection must fail on a guarded brain");
+    let refused = write(&second, "2").unwrap_err();
     assert!(refused.to_string().contains(KV_GUARD_MESSAGE), "{refused}");
+    assert_eq!(version(conn), "3");
+
+    // And this tree's Database, which writes '3', opens the guarded file.
+    if let Err(e) = Database::from_connection(second, path.clone()) {
+        panic!("the new Database must open a guarded brain: {e}");
+    }
     assert_eq!(version(conn), "3");
 }
 

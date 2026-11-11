@@ -315,14 +315,21 @@ impl ExtConfig {
         }
     }
 
-    /// Auto: reads `<base>/config` once (section 6).
-    // SPEC: 5047 and tests/skeleton.rs:284 fix this stub's answer at `false`, while section 6
-    // ("The clash") makes `auto` with an unreadable config mean on. 12a's row does not name
-    // this function, so the stub stays (forum off: fails closed). The body section 6 wants is
-    // `On => true, Off => false, Auto => base_config_value(&self.base, "memory.backend")
-    // .as_deref() != Some("axel")`, once the skeleton test's line is changed.
+    /// Whether this process declares the forum tools (section 6, "The clash").
+    ///
+    /// `on` and `off` are taken as given. `auto` reads `<base>/config`: a line
+    /// `memory.backend = axel` that is not commented out means the host still owns the forum
+    /// and this returns false. No such line, or a config that cannot be read, means on: the
+    /// host's own default for that key is plain files, where its forum tools are disabled.
+    /// The caller reads this once, at start.
     pub fn forum_on(&self) -> bool {
-        false
+        match self.forum {
+            ForumMode::On => true,
+            ForumMode::Off => false,
+            ForumMode::Auto => {
+                base_config_value(&self.base, "memory.backend").as_deref() != Some("axel")
+            }
+        }
     }
 }
 

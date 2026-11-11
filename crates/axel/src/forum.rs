@@ -1,9 +1,7 @@
 //! Pure project-forum contract, shared by host and independently built Axel service.
 //! Digests are content identity, not authentication. Peer text is lower-authority data.
 //!
-//! Copied from core (`agent-core/src/memory/forum.rs` at babe8511) with its four tests. One
-//! replacement: `uuid::Uuid::new_v4().simple()` is `random_hex32()` (this crate has no
-//! `uuid`).
+//! Copied from core (`agent-core/src/memory/forum.rs` at babe8511) with its four tests.
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -28,14 +26,14 @@ pub struct Author {
 impl Author {
     pub fn fresh() -> Self {
         Self {
-            actor: format!("actor-{}", random_hex32()),
-            group: format!("group-{}", random_hex32()),
+            actor: format!("actor-{}", uuid::Uuid::new_v4().simple()),
+            group: format!("group-{}", uuid::Uuid::new_v4().simple()),
             parent: None,
         }
     }
     pub fn child(&self) -> Self {
         Self {
-            actor: format!("actor-{}", random_hex32()),
+            actor: format!("actor-{}", uuid::Uuid::new_v4().simple()),
             group: self.group.clone(),
             parent: Some(self.actor.clone()),
         }
@@ -59,31 +57,6 @@ impl Default for Author {
     }
 }
 
-/// 32 lowercase hex, unique per call: the stand-in for `uuid::Uuid::new_v4().simple()`.
-/// `RandomState` keys are random per process; the counter and the clock make each call
-/// differ. An identity, not a secret, as core's v4 uuid is here.
-fn random_hex32() -> String {
-    use std::hash::{BuildHasher, Hasher};
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let mut h = Sha256::new();
-    for _ in 0..2 {
-        let mut s = std::collections::hash_map::RandomState::new().build_hasher();
-        s.write_u64(n);
-        s.write_u128(nanos);
-        s.write_u32(std::process::id());
-        h.update(s.finish().to_be_bytes());
-    }
-    h.update(n.to_be_bytes());
-    h.update(nanos.to_be_bytes());
-    h.update(std::process::id().to_be_bytes());
-    format!("{:x}", h.finalize())[..32].to_string()
-}
 pub fn is_digest(s: &str) -> bool {
     hex(s, 64)
 }
