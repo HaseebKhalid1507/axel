@@ -72,10 +72,12 @@ pub fn unavailable_text(reason: &str) -> String {
 
 /// The one way a thread of this process sets `Degraded`: the reason is stored first, then
 /// the mode, so a reader that sees the mode always finds its reason. `at` is a file and
-/// line; the first writer wins.
+/// line, kept with this reason (the first place given for a reason stays): a reader never
+/// finds the place of an earlier, different failure beside this one.
+// RULING: wave4 R-12b item 6.
 pub fn degrade(status: &Status, mode: &AtomicU8, reason: DegradedReason, at: Option<String>) {
     if let Some(at) = at {
-        let _ = status.reason_at.set(at);
+        status.set_reason_place(reason, at);
     }
     status.reason.store(reason as u8, Ordering::SeqCst);
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
@@ -587,7 +589,7 @@ impl<W: Write> Pump<W> {
             "pid": std::process::id(),
             "mode": mode_name(mode),
             "reason": DegradedReason::from_u8(reason).as_str(),
-            "reason_at": if degraded { self.status.reason_at.get().cloned() } else { None },
+            "reason_at": if degraded { self.status.reason_place() } else { None },
             "written_ms": (self.clock)(),
             "started_ms": self.status.started_ms.load(Ordering::Relaxed),
         });

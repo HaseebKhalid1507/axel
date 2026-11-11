@@ -697,7 +697,7 @@ fn t13_an_indexer_that_ends_degrades_the_process_and_every_frame_is_still_answer
         DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)),
         DegradedReason::IndexerStopped
     );
-    let at = host.status.reason_at.get().expect("a file and line").clone();
+    let at = host.status.reason_place().expect("a file and line").to_string();
     let (file, line) = at.rsplit_once(':').unwrap();
     assert!(file.ends_with(".rs") && line.parse::<u32>().is_ok(), "{at}");
 
@@ -888,7 +888,7 @@ fn the_reason_is_stored_before_the_mode() {
     assert_eq!(server::unavailable_reason(&status, &AtomicU8::new(Mode::Starting as u8)), "starting");
     degrade(&status, &mode, DegradedReason::IndexerStopped, Some("a.rs:1".to_string()));
     degrade(&status, &mode, DegradedReason::IndexerStopped, Some("b.rs:2".to_string()));
-    assert_eq!(status.reason_at.get().map(String::as_str), Some("a.rs:1"), "the first writer wins");
+    assert_eq!(status.reason_place(), Some("a.rs:1"), "the first writer wins");
 }
 
 // ── Row 12b: open_state and open_ctx hand back the other ends (B3-3a) ───────
@@ -914,7 +914,7 @@ fn open_state_and_open_ctx_hand_back_the_other_ends_of_their_channels() {
     assert!(!front::send_job(&st, Job::Tick));
     assert_eq!(st.mode.load(Ordering::SeqCst), Mode::Degraded as u8);
     assert_eq!(DegradedReason::from_u8(st.status.reason.load(Ordering::SeqCst)), DegradedReason::IndexerStopped);
-    assert!(st.status.reason_at.get().is_some());
+    assert!(st.status.reason_place().is_some());
     drop(st);
 
     // The indexer's side makes the brain, records the base and writes the status row.
@@ -1230,7 +1230,7 @@ fn r2_a_front_thread_that_panics_before_its_loop_degrades_the_process_which_stay
     assert_eq!(said["reason"], "FrontStopped", "{said}");
     let at = said["reason_at"].as_str().expect("the panic's file and line");
     assert!(at.contains("server.rs:"), "{at}");
-    assert_eq!(host.status.reason_at.get().map(String::as_str), Some(at));
+    assert_eq!(host.status.reason_place(), Some(at));
 
     assert_serves_without_a_front_thread(&mut host, &dirs);
     let log = read_log(&dirs);
@@ -1959,4 +1959,31 @@ fn w4_5_rows_whose_vectors_wait_in_the_queue_are_not_offered_a_second_time() {
     indexer::dispatch(&mut ctx, job);
     assert_eq!(ctx.embed.backlog(), 0);
     assert_eq!(stored_vector(&conn, "mem_d"), None);
+}
+
+// ── Wave 4, R-12b item 6: the place is kept with its reason ─────────────────
+
+#[test]
+fn w4_6_after_a_recovery_a_second_failure_does_not_show_the_place_of_the_first() {
+    // On the counters: a place is read only beside the reason it was given with.
+    let mode = AtomicU8::new(Mode::Ready as u8);
+    let status = Status::default();
+    degrade(&status, &mode, DegradedReason::IndexerStopped, Some("first.rs:1".to_string()));
+    assert_eq!(status.reason_place(), Some("first.rs:1"));
+    recover(&status, &mode);
+    assert_eq!(status.reason_place(), None);
+    degrade(&status, &mode, DegradedReason::BrainChanged, None);
+    assert_eq!(status.reason_place(), None, "the place of the first failure beside the second");
+    degrade(&status, &mode, DegradedReason::FrontStopped, Some("second.rs:2".to_string()));
+    assert_eq!(status.reason_place(), Some("second.rs:2"));
+
+    // In the status file of a running process: an earlier failure left its place, then the
+    // brain file goes.
+    let dirs = Dirs::new();
+    let host = Host::ready(&dirs, None, TestHooks { status_tick_ms: Some(50), ..TestHooks::default() });
+    host.status.set_reason_place(DegradedReason::IndexerStopped, "first.rs:1".to_string());
+    std::fs::remove_file(dirs.brain()).unwrap();
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(10));
+    assert_eq!((&said["reason"], &said["reason_at"]), (&json!("BrainChanged"), &Value::Null), "{said}");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
 }

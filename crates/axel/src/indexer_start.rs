@@ -524,7 +524,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "version": env!("CARGO_PKG_VERSION"),
         "mode": "ready",
         "reason": DegradedReason::from_u8(s.reason.load(Ordering::SeqCst)).as_str(),
-        "reason_at": s.reason_at.get(),
+        "reason_at": s.reason_place(),
         "written_ms": now,
         "started_ms": s.started_ms.load(Ordering::Relaxed),
         "scan": match s.scan.load(Ordering::Relaxed) { 0 => "pending", 1 => "running", _ => "done" },

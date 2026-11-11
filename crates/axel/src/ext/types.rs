@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
@@ -104,8 +104,25 @@ pub struct Status {
     // why the mode is Degraded: whoever sets the mode stores the reason FIRST, then the mode
     /// A `DegradedReason`.
     pub reason: AtomicU8,
-    /// "file:line" for `IndexerStopped`; first writer wins.
-    pub reason_at: OnceLock<String>,
+    /// "file:line", kept with the reason it belongs to: one place per `DegradedReason`, the
+    /// first writer of each wins. Read it with `reason_place` (wave 4, R-12b item 6).
+    pub reason_at: [OnceLock<String>; 10],
+}
+
+impl Status {
+    /// Records where `reason` was set; the first place given for a reason stays.
+    pub fn set_reason_place(&self, reason: DegradedReason, at: String) {
+        if let Some(slot) = self.reason_at.get(reason as usize) {
+            let _ = slot.set(at);
+        }
+    }
+
+    /// The place recorded for the reason that stands now; `None` when that reason has none,
+    /// whatever an earlier reason recorded.
+    pub fn reason_place(&self) -> Option<&str> {
+        let reason = self.reason.load(Ordering::SeqCst) as usize;
+        self.reason_at.get(reason)?.get().map(String::as_str)
+    }
 }
 
 #[repr(u8)]
