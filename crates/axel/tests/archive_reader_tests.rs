@@ -933,11 +933,13 @@ fn t23_the_forget_turn_by_position() {
 
     // The leading span, before the first prompt, holds the call: no `Continued` unit.
     let leading_text = "LEADMARK the rest of an answer that began before this file, long enough to keep.";
+    // RULING: v2 archives round 5, item 3. The text right after the call's result was sent
+    // while the turn ran: it goes with the turn, and `tail` stays.
     let a = arch(vec![asst_tool(0, leading_text, "axel_forget"), result(1), user(2, Q3), asst(3, A3)]);
     let units = units_of(&a);
-    assert_eq!(positions(&units), vec!["x2.0"]);
+    assert_eq!(positions(&units), Vec::<String>::new());
     assert!(!holds(&units, "LEADMARK"));
-    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(None, true, false)]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(None, true, true)]);
     // Without the call it is one.
     let a = arch(vec![asst_tool(0, leading_text, "bash"), result(1), user(2, Q3), asst(3, A3)]);
     assert_eq!(positions(&units_of(&a)), vec!["c0.0", "x2.0"]);
@@ -977,8 +979,10 @@ fn t23_the_forget_turn_by_position() {
     assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, true)]);
 
     // A worker's report inside the span that holds the call goes with it.
+    // RULING: v2 archives round 5, item 3. Q3 was sent while the turn ran (right after
+    // the call, past the report): it goes with the turn.
     let a = arch(vec![user(0, Q2), asst_tool(1, A2, "axel_forget"), user(2, REPORT), user(3, Q3), asst(4, A3)]);
-    assert_eq!(positions(&units_of(&a)), vec!["x3.0"]);
+    assert_eq!(positions(&units_of(&a)), Vec::<String>::new());
 
     // `keep_forget_turns`: all three exchanges are units and there is no mark.
     let mut keep = policy();
@@ -1013,12 +1017,14 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
         user(7, Q3),
         asst(8, A3),
     ]);
+    // RULING: v2 archives round 5, item 3. Q3 right after the call's result was sent while
+    // the turn ran: it goes with the turn, and `tail` stays.
     let units = units_of(&a);
-    assert_eq!(positions(&units), vec!["x0.0", "x7.0"]);
+    assert_eq!(positions(&units), vec!["x0.0"]);
     for marker in ["Q2MARK", "A2MARK", "A2MORE", "Acme"] {
         assert!(!holds(&units, marker), "{marker}");
     }
-    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, false)]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, true)]);
     // The same file with another tool: the exchange is there, and the reply after the
     // placeholder is a unit of its own when it is long enough.
     let mut plain = a.clone();
@@ -1047,10 +1053,12 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
         asst(4, A3),
     ]);
     second.start = Start::Whole;
+    // RULING: v2 archives round 5, item 3. Q3 was sent while the turn ran (right after
+    // the call's result): it goes with the turn, and `tail` stays.
     let units = units_of(&second);
-    assert_eq!(positions(&units), vec!["x3.0"]);
+    assert_eq!(positions(&units), Vec::<String>::new());
     assert!(!holds(&units, "MIDMARK"));
-    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(None, true, false)]);
+    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(None, true, true)]);
     // As a successor: the prompt is carried, then the tail, then the placeholder and the
     // call. The key is the carried prompt's, as this file stores it.
     let second = arch(vec![
@@ -1063,10 +1071,12 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
         asst(7, A3),
     ]);
     assert_eq!(archive::carried_head(&second), Some(1));
+    // RULING: v2 archives round 5, item 3. Q3 was sent while the turn ran (right after
+    // the call's result): it goes with the turn, and `tail` stays.
     let units = units_of(&second);
-    assert_eq!(positions(&units), vec!["x6.0"]);
+    assert_eq!(positions(&units), Vec::<String>::new());
     assert!(!holds(&units, "MIDMARK") && !holds(&units, "Q2MARK"));
-    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(Some(key_of(Q2)), true, false)]);
+    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(Some(key_of(Q2)), true, true)]);
 
     // Two withheld texts in a row before the call: the walk passes both.
     let a = arch(vec![
@@ -1081,12 +1091,14 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
         user(8, Q3),
         asst(9, A3),
     ]);
+    // RULING: v2 archives round 5, item 3. Q3 was sent while the turn ran (right after
+    // the call): it goes with the turn, and `tail` stays.
     let units = units_of(&a);
-    assert_eq!(positions(&units), vec!["x0.0", "x8.0"]);
+    assert_eq!(positions(&units), vec!["x0.0"]);
     for marker in ["Q2MARK", "A2MARK", "MIDMARK", "A2MORE"] {
         assert!(!holds(&units, marker), "{marker}");
     }
-    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, false)]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, true)]);
 
     // A withheld text AFTER the call does not clear `tail`: only a human prompt shows that
     // the turn ended here. What follows the placeholder is still read in this file.
@@ -1119,7 +1131,9 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
         user(4, Q3),
         asst_tool(5, A3, "memory_forget"),
     ]);
-    assert_eq!(positions(&units_of(&a)), vec!["x2.0"]);
+    // RULING: v2 archives round 5, item 3. Q1 was sent while the turn ran (right after
+    // the first call): it goes with the turn.
+    assert_eq!(positions(&units_of(&a)), Vec::<String>::new());
     assert_eq!(
         archive::forgotten_keys(&a, &p),
         vec![mark(Some(key_of(Q2)), false, false), mark(Some(key_of(Q3)), false, true)]
@@ -1632,4 +1646,52 @@ fn r5_a_steer_after_a_withheld_text_takes_the_prompt_before_both() {
         assert!(!holds(&units, "P1MARK"), "{between}");
         assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, true)], "{between}");
     }
+}
+
+// ------------------------------------------------- v2 archives round 5, item 3 (ruling)
+
+/// Guards what the owner would see: the model's work after "forget that", steered on the
+/// same thing, indexed as if the turn had ended at the call.
+#[test]
+fn r5_a_steer_after_the_forget_call_keeps_the_turn_forgotten() {
+    let p = policy();
+    let more = "MOREMARK and Bob's address too, the one on the contacts card, drop it as well";
+    let done = "DONEMARK both are gone now, the number and the address, and nothing else changed.";
+    // The call, a tool round, a steer, a final reply: the steer and the reply go with the
+    // turn, and `tail` stays (the turn went on).
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, P1),
+        asst_tool(3, A2, "axel_forget"),
+        result(4),
+        user(5, more),
+        asst(6, done),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0"], "the steer after the call was kept");
+    for marker in ["P1MARK", "A2MARK", "MOREMARK", "DONEMARK"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, true)]);
+
+    // After the final reply a human text is a new turn: it is kept and clears `tail`.
+    let mut messages = a.messages.clone();
+    messages.push(user(7, Q3));
+    messages.push(asst(8, A3));
+    let a = arch(messages);
+    assert_eq!(positions(&units_of(&a)), vec!["x0.0", "x7.0"]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
+
+    // The call answered by a final reply, then a human text: a new turn, as before.
+    let a = arch(vec![
+        user(0, P1),
+        asst_tool(1, A2, "axel_forget"),
+        result(2),
+        asst(3, A2B),
+        user(4, more),
+        asst(5, done),
+    ]);
+    assert_eq!(positions(&units_of(&a)), vec!["x4.0"]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
 }

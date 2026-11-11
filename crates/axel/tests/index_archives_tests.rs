@@ -199,6 +199,14 @@ impl Arch {
         self.items.push(json!({"role": "assistant", "content": text}));
         self
     }
+    /// The tool's result and the model's last reply: the turn of the call ends, as core
+    /// stores it. A human text right after a call is one sent while the turn ran (round 5).
+    fn answered(mut self) -> Arch {
+        self.items.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"},
+        ]}));
+        self.says("Done.")
+    }
     /// An assistant message with a text and a call of `tool`.
     fn calls(mut self, text: &str, tool: &str) -> Arch {
         self.items.push(json!({"role": "assistant", "content": [
@@ -2148,7 +2156,7 @@ fn five_windows(first: u32, session: &str, p: &str) -> Vec<Arch> {
             .successor()
             .user(p)
             .says(&reply("TAILOFA"))
-            .calls(&reply("FORGETTINGNOW"), "axel_forget")
+            .calls(&reply("FORGETTINGNOW"), "axel_forget").answered()
             .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER")),
         Arch::new(first + 2, session)
             .at(at(3))
@@ -2179,7 +2187,7 @@ fn t29_a_mark_reaches_the_file_before_and_the_window_after_and_no_further() {
     assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
     assert_eq!(in_tables(conn, "FIRSTREPLYTOP"), 0);
     // B's leading span yields nothing and its new exchange is a row.
-    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+    assert_eq!(positions(conn, &dir, &files[1]), ["x6.0"]);
     assert_eq!(in_tables(conn, "FORGETTINGNOW"), 0);
     // C's exchange with P's key is not a row: the window after, by key.
     assert!(rows(conn, &dir, &files[2]).is_empty());
@@ -2228,7 +2236,7 @@ fn t29_the_same_with_a_token_in_the_prompt_and_with_the_prompt_withheld() {
     index_in_order(&env, &mut run, &dir, &files, &[0, 1, 2, 3, 4]);
     let conn = run.db();
     assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
-    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+    assert_eq!(positions(conn, &dir, &files[1]), ["x6.0"]);
     assert!(rows(conn, &dir, &files[2]).is_empty());
     assert_eq!(positions(conn, &dir, &files[3]), ["x0.0"]);
 
@@ -2244,7 +2252,7 @@ fn t29_the_same_with_a_token_in_the_prompt_and_with_the_prompt_withheld() {
         .successor()
         .withheld()
         .says(&reply("TAILOFA"))
-        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .calls(&reply("FORGETTINGNOW"), "axel_forget").answered()
         .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"));
     index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
     assert_eq!(positions(run.db(), &dir, &a), ["x0.0", "c3.0"]);
@@ -2252,7 +2260,7 @@ fn t29_the_same_with_a_token_in_the_prompt_and_with_the_prompt_withheld() {
     let conn = run.db();
     assert_eq!(positions(conn, &dir, &a), ["x0.0"]);
     assert_eq!(in_tables(conn, "REPLYTOWITHHELD"), 0);
-    assert_eq!(positions(conn, &dir, &b), ["x4.0"]);
+    assert_eq!(positions(conn, &dir, &b), ["x6.0"]);
     assert!(forgot_rows(conn).contains(&("archive".to_string(), String::new(), 1, 0, b.id.clone())));
 }
 
@@ -2305,13 +2313,13 @@ fn t29_a_tail_mark_takes_the_leading_continued_unit_of_the_file_after_and_parts_
         .turn(asked, &reply("FIRSTREPLYTOP"));
     let part_2 = Arch::new(6, "s-parts")
         .at(T0 + W + 1)
-        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .calls(&reply("FORGETTINGNOW"), "axel_forget").answered()
         .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"));
     index_in_order(&env, &mut run, &dir, &[part_1.clone(), part_2.clone()], &[0, 1]);
     let conn = run.db();
     assert_eq!(positions(conn, &dir, &part_1), ["x0.0"], "part 1's last exchange is still a row");
     assert_eq!(in_tables(conn, "FIRSTREPLYTOP"), 0);
-    assert_eq!(positions(conn, &dir, &part_2), ["x1.0"]);
+    assert_eq!(positions(conn, &dir, &part_2), ["x3.0"]);
     assert!(forgot_rows(conn).contains(&("archive".to_string(), String::new(), 1, 0, part_2.id.clone())));
 }
 
@@ -2325,14 +2333,14 @@ fn t30_left_out_turns_are_counted_and_come_back_when_the_row_says_keep() {
     let a = Arch::new(1, "s-keep")
         .about("retry limit")
         .user("forget the thing about the first matter, the one from Monday")
-        .calls(&reply("FIRSTFORGET"), "axel_forget")
+        .calls(&reply("FIRSTFORGET"), "axel_forget").answered()
         .about("upload queue")
         .user("and forget the note about the second matter as well, please")
-        .calls(&reply("SECONDFORGET"), "memory_forget_2")
+        .calls(&reply("SECONDFORGET"), "memory_forget_2").answered()
         .about("deploy window");
     index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
     let before = rows(run.db(), &dir, &a);
-    assert_eq!(before.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["x0.0", "x4.0", "x8.0"]);
+    assert_eq!(before.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(), ["x0.0", "x6.0", "x12.0"]);
     assert_eq!(forget_units(run.db(), &dir, &a), 2);
     assert_eq!(forgot_rows(run.db()).len(), 2);
     let vids = |conn: &Connection| -> Vec<i64> {
@@ -2347,7 +2355,7 @@ fn t30_left_out_turns_are_counted_and_come_back_when_the_row_says_keep() {
     });
     run.scan();
     let conn = run.db();
-    assert_eq!(positions(conn, &dir, &a), ["x0.0", "x4.0", "x8.0", "x2.0", "x6.0"]);
+    assert_eq!(positions(conn, &dir, &a), ["x0.0", "x6.0", "x12.0", "x2.0", "x8.0"]);
     assert_eq!(rows(conn, &dir, &a)[..3], before[..]);
     assert_eq!(vids(conn), old_vids, "a row that was there was written again");
     assert_eq!(forget_units(conn, &dir, &a), 0);
@@ -2464,7 +2472,7 @@ fn t33b_no_forget_mark_of_any_source_takes_a_row_of_a_restored_archive() {
         Arch::new(n, "s-yes")
             .at(T0 + at * W)
             .user("yes")
-            .calls(&reply("FORGETTINGNOW"), "axel_forget")
+            .calls(&reply("FORGETTINGNOW"), "axel_forget").answered()
             .turn("thank you, and what is the weather doing tomorrow?", &reply("WEATHER"))
     };
     let (a, b, c) = (yes(1, 1, "YESINA"), forgets(2, 3), yes(3, 4, "YESINC"));
@@ -2820,7 +2828,7 @@ fn the_archived_job_changes_nothing_under_context_archives() {
     let b = Arch::new(2, "s-jobtree")
         .at(T0 + W)
         .user(FORGET_PROMPT)
-        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .calls(&reply("FORGETTINGNOW"), "axel_forget").answered()
         .about("upload queue");
     let path = env.put_live(&dir, &a);
     env.put_live(&dir, &b);
@@ -2834,7 +2842,7 @@ fn the_archived_job_changes_nothing_under_context_archives() {
     run.job(archived(&b, KEY, None, Some("s-jobtree"), Some(2), Some(1)));
     run.job(archived(&Arch::new(9, "s-jobtree"), KEY, None, None, None, None));
     assert_eq!(positions(run.db(), &dir, &a), ["x0.0"]);
-    assert_eq!(positions(run.db(), &dir, &b), ["x2.0"]);
+    assert_eq!(positions(run.db(), &dir, &b), ["x4.0"]);
     run.idle_turn();
     assert_eq!(tree(&env.archives()), before);
     assert_eq!(run.errors(), 0);
@@ -2878,7 +2886,7 @@ fn sealed_in_order() -> Shape {
     index_in_order(&env, &mut run, &dir, &files, &[0, 1, 2, 3]);
     let got = shape(run.db(), &dir, &files);
     // A keeps its first exchange, B its new one, C nothing, and D, out of reach, its own.
-    assert_eq!(got.0.iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(), [(0, "x0.0"), (1, "x4.0"), (3, "x0.0")]);
+    assert_eq!(got.0.iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(), [(0, "x0.0"), (1, "x6.0"), (3, "x0.0")]);
     assert_eq!(got.1, [1, 1, 1, 0]);
     got
 }
@@ -3060,7 +3068,7 @@ fn a_file_that_fails_in_the_sorted_pass_stops_the_mark_before_it_and_indexed_lat
             "{kind}: the file that failed has no place"
         );
         assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
-        assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+        assert_eq!(positions(conn, &dir, &files[1]), ["x6.0"]);
         assert_eq!(positions(conn, &dir, &files[3]), ["x0.0"], "{kind}: B's mark took D's turn past the file that failed");
         assert_eq!(forget_units(conn, &dir, &files[3]), 0);
         assert_eq!((run.panics(), run.errors()), if kind == "panic" { (1, 0) } else { (0, 1) });
@@ -3490,12 +3498,12 @@ fn a_replaced_file_gives_up_the_marks_and_the_keep_flag_of_the_file_before_it() 
     let mut third = Arch::new(1, "s-swap")
         .about("release notes")
         .user("forget the thing about the first matter, the one from Monday")
-        .calls(&reply("THIRDFORGET"), "axel_forget")
+        .calls(&reply("THIRDFORGET"), "axel_forget").answered()
         .about("rollback plan");
     third.digest = format!("{:064x}", 92);
     index_in_order(&env, &mut run, &dir, std::slice::from_ref(&third), &[0]);
     let conn = run.db();
-    assert_eq!(positions(conn, &dir, &third), ["x0.0", "x4.0"], "the forget turn of a new file was indexed");
+    assert_eq!(positions(conn, &dir, &third), ["x0.0", "x6.0"], "the forget turn of a new file was indexed");
     assert_eq!(in_tables(conn, "THIRDFORGET"), 0);
     assert_eq!(count(conn, "SELECT keep_forget_turns FROM archive_index"), 0);
     assert_eq!(forgot_rows(conn).len(), 1);

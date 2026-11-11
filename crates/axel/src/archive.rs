@@ -782,7 +782,14 @@ fn forget_spans(spans: &[Span<'_>]) -> (Vec<bool>, Vec<(usize, usize)>) {
         while root > 0 && matches!(spans[root].opener, Opener::Withheld | Opener::Human { mid_turn: true, .. }) {
             root -= 1;
         }
-        dropped[root..=at].iter_mut().for_each(|d| *d = true);
+        // RULING: v2 archives round 5, item 3. The turn goes on past the call through the
+        // spans that human texts sent while it ran opened, and the forget goes on with it:
+        // they yield no unit either. A withheld text after the call stops it, as before.
+        let mut end = at;
+        while matches!(spans.get(end + 1).map(|s| &s.opener), Some(Opener::Human { mid_turn: true, .. })) {
+            end += 1;
+        }
+        dropped[root..=end].iter_mut().for_each(|d| *d = true);
         turns.push((at, root));
     }
     (dropped, turns)
@@ -930,7 +937,9 @@ pub fn forgotten_keys(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<ForgetMark
             // The turn began before this file's first prompt.
             head: root == 0,
             // Only a human prompt after the call shows that the turn ended in this file.
-            tail: !spans[at + 1..].iter().any(|s| matches!(s.opener, Opener::Human { .. })),
+            // RULING: v2 archives round 5, item 3. A human text sent while the turn ran (a
+            // steer) does not: the turn, and its forget, go on.
+            tail: !spans[at + 1..].iter().any(|s| matches!(s.opener, Opener::Human { mid_turn: false, .. })),
         })
         .collect()
 }
