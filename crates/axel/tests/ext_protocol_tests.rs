@@ -220,12 +220,14 @@ impl Host {
     }
 
     /// Asks a tool until the answer names a reason other than `starting`; returns the text.
+    /// NO_CALLER is the real tool's answer while the mode is still Ready (the test host sends
+    /// no `caller`), so it means "not degraded yet".
     fn wait_degraded(&mut self) -> String {
         let start = Instant::now();
         loop {
             let answer = self.tool("search");
             let text = answer["result"]["content"].as_str().unwrap_or("").to_string();
-            if answer["result"]["is_error"] == true && !text.contains("starting") {
+            if answer["result"]["is_error"] == true && !text.contains("starting") && text != NO_CALLER {
                 return text;
             }
             assert!(start.elapsed() < Duration::from_secs(15), "never degraded: {answer}");
