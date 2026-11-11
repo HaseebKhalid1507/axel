@@ -132,22 +132,29 @@ fn core_rule() -> &'static CoreRule {
 
 /// Removed by `show` and skipped by the scanner: format characters (general category Cf),
 /// variation selectors, private-use and unassigned-plane characters.
+// RULING: wave2-c8 review A2: and the characters that print as nothing without being Cf:
+// U+034F, the Hangul fillers U+115F, U+1160, U+3164 and U+FFA0, the Khmer inherent vowels
+// U+17B4 and U+17B5, the Mongolian selectors U+180B to U+180D, and the unassigned U+2065.
 const INVISIBLE: &[(u32, u32)] = &[
     (0x00AD, 0x00AD),
+    (0x034F, 0x034F),
     (0x0600, 0x0605),
     (0x061C, 0x061C),
     (0x06DD, 0x06DD),
     (0x070F, 0x070F),
     (0x0890, 0x0891),
     (0x08E2, 0x08E2),
-    (0x180E, 0x180E),
+    (0x115F, 0x1160),
+    (0x17B4, 0x17B5),
+    (0x180B, 0x180E),
     (0x200B, 0x200F),
     (0x202A, 0x202E),
-    (0x2060, 0x2064),
-    (0x2066, 0x206F),
+    (0x2060, 0x206F),
+    (0x3164, 0x3164),
     (0xE000, 0xF8FF),
     (0xFE00, 0xFE0F),
     (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0),
     (0xFFF9, 0xFFFB),
     (0x110BD, 0x110BD),
     (0x110CD, 0x110CD),
@@ -514,6 +521,10 @@ fn url_password(b: &[u8], i: usize) -> Option<(usize, usize)> {
 // (`"api_key": "…"`), so that JSON is covered. A value that opened with a quote ends at
 // that quote. The Hit's name is the matched ending, in lowercase, not the whole name: the
 // text before it is free text and could itself be a token.
+// RULING: wave2-c8 review A2: an escaped quote (`\"`, as in JSON inside a JSON string or a
+// log line) is accepted wherever one plain quote is: after the name and before the value. A
+// value that opened with an escaped quote ends at the next escaped quote. `Basic ` is
+// skipped the way `Bearer ` is.
 fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
     let b = s.as_bytes();
     if !matches!(b[i] | 0x20, b'p' | b's' | b't' | b'a') {
@@ -522,23 +533,32 @@ fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
     let name = NAMES
         .into_iter()
         .find(|n| b.len() - i >= n.len() && b[i..i + n.len()].eq_ignore_ascii_case(n.as_bytes()))?;
-    let is_quote = |at: usize| matches!(b.get(at), Some(b'"' | b'\''));
+    // A quote at `at`, plain or escaped: its length in bytes and the quote.
+    let quote_at = |at: usize| match (b.get(at), b.get(at + 1)) {
+        (Some(&q @ (b'"' | b'\'')), _) => Some((1, q)),
+        (Some(b'\\'), Some(&q @ (b'"' | b'\''))) => Some((2, q)),
+        _ => None,
+    };
     let mut j = i + name.len();
-    if is_quote(j) {
-        j += 1;
+    if let Some((len, _)) = quote_at(j) {
+        j += len;
     }
     j = skip_blank(b, j);
     if !matches!(b.get(j), Some(b'=' | b':')) {
         return None;
     }
     j = skip_blank(b, j + 1);
-    let mut quote = None;
-    if is_quote(j) {
-        quote = Some(b[j] as char);
-        j += 1;
+    let (mut quote, mut escaped) = (None, false);
+    if let Some((len, q)) = quote_at(j) {
+        quote = Some(q as char);
+        escaped = len == 2;
+        j += len;
     }
-    if b.len() - j >= 7 && b[j..j + 7].eq_ignore_ascii_case(b"bearer ") {
-        j += 7;
+    for scheme in ["bearer ", "basic "] {
+        if b.len() - j >= scheme.len() && b[j..j + scheme.len()].eq_ignore_ascii_case(scheme.as_bytes()) {
+            j += scheme.len();
+            break;
+        }
     }
     let start = j;
     if quote.is_none() && memo.code.is_some_and(|(from, at)| from <= start && start < at) {
@@ -546,7 +566,9 @@ fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
     }
     let (mut end, mut chars, mut digit, mut colon) = (b.len(), 0usize, false, false);
     for (off, c) in s[start..].char_indices() {
-        if c.is_whitespace() || quote == Some(c) {
+        let closes = quote == Some(c)
+            || (escaped && c == '\\' && b.get(start + off + 1).is_some_and(|&next| quote == Some(next as char)));
+        if c.is_whitespace() || closes {
             end = start + off;
             break;
         }
@@ -692,6 +714,11 @@ mod tests {
         let bearer = mk(&["Bearer ", LOW_A, ".", LOW_B]);
         let open_pem = mk(&["-----BEGIN OPENSSH PRIVATE", " KEY-----\nb3BlbnNzaC1rZXk\nmore"]);
         let json = mk(&["{\"api_key\": \"", "abcd1234", "efgh", "\"}"]);
+        let escaped = mk(&["{\\\"password\\\": \\\"", "abcd1234", "efgh", "\\\"}"]);
+        assert!(escaped.starts_with(r#"{\"password\": \"abcd"#) && escaped.ends_with(r#"efgh\"}"#));
+        let escaped_name = mk(&["\\'api_key\\' = '", "abcd1234", "efgh", "'"]);
+        let basic = mk(&["Authorization: Basic ", "dXNlcjpwYXNz", "d29yZA=="]);
+        let basic_quoted = mk(&["\"authorization\": \"basic ", "dXNlcjpwYXNz", "d29yZA==", "\""]);
         let in_word = mk(&["task", "-", LOW_A, LOW_B]);
         let akia17 = mk(&["AKIA", "ABCDEFGH", "123456789"]);
         let two = format!("a {} b {} c", mk(&["ghp", "_", LOW_A]), mk(&["xoxb", "-", LOW_B]));
@@ -700,6 +727,11 @@ mod tests {
             ("bare bearer", format!("sent {bearer} ok"), "sent Bearer (redacted) ok".into(), 1),
             ("pem with no end", format!("key: {open_pem}"), "key: (redacted)".into(), 1),
             ("json", json, "{\"api_key\": \"(redacted)\"}".into(), 1),
+            ("escaped json", escaped, r#"{\"password\": \"(redacted)\"}"#.into(), 1),
+            ("escaped quote after the name", escaped_name, r"\'api_key\' = '(redacted)'".into(), 1),
+            ("authorization basic", basic, "Authorization: Basic (redacted)".into(), 1),
+            ("basic in quotes", basic_quoted, "\"authorization\": \"basic (redacted)\"".into(), 1),
+            ("basic and a short value", "authorization: basic abc123".into(), "authorization: basic abc123".into(), 0),
             ("prefix inside a word", in_word.clone(), in_word, 0),
             ("AKIA and 17", akia17.clone(), akia17, 0),
             ("url without password", "https://example.com:8080/a@b".into(), "https://example.com:8080/a@b".into(), 0),
@@ -793,6 +825,29 @@ mod tests {
                 assert!(name.len() <= 16, "case {case}: a Hit's name is {} bytes", name.len());
             }
             assert!(certain_hit(&text) == Some(hit("prefix", Some("sk-"))), "case {case}: certain_hit");
+        }
+        // RULING: wave2-c8 review A2: the invisible characters the table lacked. A key split
+        // by one is blanked, and `show` does not put a key back together.
+        let added = [
+            '\u{034F}', '\u{115F}', '\u{1160}', '\u{3164}', '\u{FFA0}', '\u{17B4}', '\u{17B5}', '\u{180B}',
+            '\u{180C}', '\u{180D}', '\u{2065}',
+        ];
+        for invisible in added {
+            let case = format!("U+{:04X}", invisible as u32);
+            let token = format!("{}{LOW_A}{invisible}{LOW_B}", mk(&["sk", "-"]));
+            let text = format!("words before {token} words after");
+            let r = redact(&text);
+            assert!(r.text == "words before (redacted) words after", "case {case}: redact left the key");
+            assert!(r.blanked == 1 && r.hits[0].rule == "prefix", "case {case}: blanked {}", r.blanked);
+            assert!(certain_hit(&text) == Some(hit("prefix", Some("sk-"))), "case {case}: certain_hit");
+            for shown in [show(&text, 200), show_block(&text, 200)] {
+                assert!(shown == "words before (redacted) words after", "case {case}: show printed the key");
+            }
+            // Where there is no key, `show` still removes the character and joins nothing new.
+            assert!(show(&format!("ab{invisible}cd"), 200) == "abcd", "case {case}: show kept it");
+            let halves = format!("{}{LOW_A}{invisible}\n{LOW_B}", mk(&["sk", "-"]));
+            let shown = show(&halves, 200);
+            assert!(!shown.contains(&format!("{LOW_A}{LOW_B}")), "case {case}: show joined two lines into a key");
         }
         // Outside a match nothing is removed by `redact`.
         let kept = "soft\u{00AD}hyphen and zero\u{200B}width";
