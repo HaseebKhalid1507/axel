@@ -234,7 +234,7 @@ fn test_21_bad_lines_are_skipped_and_returned_and_an_empty_file_is_empty() {
     fs::write(&path, cut).unwrap();
     let got = notes::read_file(&path, KEY).unwrap();
     assert_eq!(ids(&got.live), ["mem-b", "mem-c"]);
-    assert_eq!(got.bad, [bad(1, a[..a.len() / 2].as_bytes())]);
+    assert_eq!(got.bad, [bad(1, &a.as_bytes()[..a.len() / 2])]);
 
     // A line that is not UTF-8 in the middle, and JSON that is not an object.
     let mut bytes = format!("{a}\n").into_bytes();
