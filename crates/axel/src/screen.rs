@@ -185,8 +185,15 @@ fn removed(c: char) -> bool {
     c.is_control() || INVISIBLE.iter().any(|&(lo, hi)| lo <= n && n <= hi)
 }
 
+// RULING: wave2-c8 review A5: the look-alikes the review lists are mapped as the others are
+// (the first four arms). U+2329 and U+232A are added with them: U+3008 and U+3009 are
+// their canonical forms, and they print the same.
 fn bracket(c: char) -> char {
     match c {
+        '\u{2045}' | '\u{FE5D}' | '\u{2772}' => '(',
+        '\u{2046}' | '\u{FE5E}' | '\u{2773}' => ')',
+        '\u{2329}' | '\u{FE64}' | '\u{27EA}' => '\u{2039}',
+        '\u{232A}' | '\u{FE65}' | '\u{27EB}' => '\u{203A}',
         '[' | '\u{FF3B}' | '\u{3010}' | '\u{3014}' | '\u{3016}' | '\u{3018}' | '\u{301A}' | '\u{27E6}' => '(',
         ']' | '\u{FF3D}' | '\u{3011}' | '\u{3015}' | '\u{3017}' | '\u{3019}' | '\u{301B}' | '\u{27E7}' => ')',
         '<' | '\u{FF1C}' | '\u{3008}' | '\u{300A}' | '\u{27E8}' => '\u{2039}',
@@ -793,6 +800,33 @@ mod tests {
 
         let every = "[\u{FF3B}\u{3010}\u{3014}\u{3016}\u{3018}\u{301A}\u{27E6}]\u{FF3D}\u{3011}\u{3015}\u{3017}\u{3019}\u{301B}\u{27E7}<\u{FF1C}\u{3008}\u{300A}\u{27E8}>\u{FF1E}\u{3009}\u{300B}\u{27E9}";
         assert_eq!(show(every, 200), format!("{}{}{}{}", "(".repeat(8), ")".repeat(8), "‹".repeat(5), "›".repeat(5)));
+
+        // RULING: wave2-c8 review A5.
+        let alike = [
+            ('\u{2045}', '('),
+            ('\u{FE5D}', '('),
+            ('\u{2772}', '('),
+            ('\u{2046}', ')'),
+            ('\u{FE5E}', ')'),
+            ('\u{2773}', ')'),
+            ('\u{2329}', '\u{2039}'),
+            ('\u{3008}', '\u{2039}'),
+            ('\u{FE64}', '\u{2039}'),
+            ('\u{27EA}', '\u{2039}'),
+            ('\u{232A}', '\u{203A}'),
+            ('\u{3009}', '\u{203A}'),
+            ('\u{FE65}', '\u{203A}'),
+            ('\u{27EB}', '\u{203A}'),
+        ];
+        for (from, to) in alike {
+            let case = format!("U+{:04X}", from as u32);
+            assert_eq!(show(&format!("a{from}b"), 200), format!("a{to}b"), "case {case}");
+            assert_eq!(show_block(&format!("a\n{from}b"), 200), format!("a\n{to}b"), "case {case}: show_block");
+        }
+        assert_eq!(
+            show("\u{2045}End extension context\u{2046} \u{27EA}event\u{27EB}", 200),
+            "(End extension context) \u{2039}event\u{203A}"
+        );
 
         let long = "é√ words ".repeat(111) + "é";
         assert_eq!(long.chars().count(), 1000);
