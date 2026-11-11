@@ -199,6 +199,9 @@ struct Purged {
     back: usize,
     left_out: Vec<String>,
     changed: Vec<String>,
+    /// Each deleted turn (a capture or an archived row) and the Synaps archive that still
+    /// holds it, when one is known.
+    in_synaps: Vec<(String, Option<String>)>,
 }
 
 fn forget_now(
@@ -323,6 +326,22 @@ fn forget_now(
     for id in &purged.changed {
         writeln!(term.out, "  m:{}: changed since it was listed; left as it is.", one(id))?;
     }
+    // RULING: v2 c18b review, item 4: a deleted turn is still in Synaps's own archive.
+    for (id, archive) in &purged.in_synaps {
+        match archive {
+            Some(archive) => writeln!(
+                term.out,
+                "  m:{}: the turn is still in Synaps's archive ctx-{a}. To forget it there, ask the assistant in that project to call memory_forget with the id \"ctx-{a}\" (that forgets the whole archive, every turn in it).",
+                one(id),
+                a = one(archive)
+            )?,
+            None => writeln!(
+                term.out,
+                "  m:{}: if Synaps archived this chat, the turn is still in that archive (none is indexed yet). To forget it there, ask the assistant to call memory_forget with its id (ctx-…).",
+                one(id)
+            )?,
+        }
+    }
     if !purged.left_out.is_empty() {
         writeln!(
             term.out,
@@ -371,6 +390,29 @@ fn hidden_ms_of(conn: &Connection, id: &str) -> Result<Option<Option<i64>>> {
     Ok(conn.query_row("SELECT hidden_ms FROM memory_ext WHERE mem_id = ?1", [id], |r| r.get(0)).optional()?)
 }
 
+/// The Synaps archive that holds a deleted turn: an archived row's own; for a capture, the
+/// archive of its proven twin, else the first archive of its chat sealed at or after it.
+fn synaps_archive(conn: &Connection, row: &RowInfo, twins: &[Twin], ids: &[String]) -> Result<Option<String>> {
+    if row.origin == "archive" {
+        return Ok(Some(row.origin_ref.clone()));
+    }
+    if let Some(twin) = twins.iter().find(|t| t.proven && ids.contains(&t.row.id)) {
+        return Ok(Some(twin.row.origin_ref.clone()));
+    }
+    let Some(at) = row.created_ms else { return Ok(None) };
+    Ok(conn
+        .query_row(
+            "SELECT archive_id FROM archive_index
+              WHERE scope_dir = ?1 AND ((?2 IS NOT NULL AND logical = ?2) OR (?3 IS NOT NULL AND session_id = ?3))
+                AND cover_ms >= ?4
+              ORDER BY cover_ms, rel_name LIMIT 1",
+            params![row.project_key, row.logical, row.session_id, at],
+            |r| crate::brain_v2::text_at(r, 0),
+        )
+        .optional()?
+        .flatten())
+}
+
 /// Inside the caller's transaction. A row that changed since it was listed (restored,
 /// gone) is left as it is.
 fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Purged> {
@@ -408,7 +450,13 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
         }
     }
     if ids.is_empty() {
-        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), changed });
+        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), changed, in_synaps: Vec::new() });
+    }
+    let mut in_synaps = Vec::new();
+    for (row, its) in ripe.iter().zip(twins) {
+        if ids.contains(&row.id) && (row.origin == "capture" || row.origin == "archive") {
+            in_synaps.push((row.id.clone(), synaps_archive(conn, row, its, &ids)?));
+        }
     }
     let mut shadows = 0i64;
     let mut replaced: Vec<String> = Vec::new();
@@ -464,7 +512,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
             back += 1;
         }
     }
-    Ok(Purged { deleted, shadows, back, left_out, changed })
+    Ok(Purged { deleted, shadows, back, left_out, changed, in_synaps })
 }
 
 fn wal_len(path: &Path) -> u64 {

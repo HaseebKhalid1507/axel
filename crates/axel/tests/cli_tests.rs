@@ -337,6 +337,9 @@ fn t10_forget_now_deletes_what_was_hidden_a_day_ago_with_its_shadow_and_twin_and
     assert!(counted < asked && listed < asked, "{out}");
     assert!(!has_control(out), "a control character reached the terminal: {out:?}");
     assert!(out.contains("Deleted 3 memories for good."), "{out}");
+    // Item 4 of the c18b review: where the turn still is, and how to forget it there.
+    let synaps = format!("m:mem_cap: the turn is still in Synaps's archive ctx-{}", "a".repeat(32));
+    assert!(out.contains(&synaps) && out.contains("memory_forget"), "{out}");
 
     for gone in ["mem_old", "mem_cap", "mem_twin"] {
         assert!(!w.has(gone), "{gone} is still there");
@@ -1132,6 +1135,42 @@ fn t10_a_turn_deleted_with_forget_now_is_not_brought_back_by_the_archive_of_its_
     assert!(!rows.is_empty(), "the archive was not indexed: the test proves nothing");
     assert!(rows.iter().all(|(_, text)| !text.contains("DOCTORANSWER")), "the deleted turn came back: {rows:?}");
     assert!(rows.iter().any(|(_, text)| text.contains("upload queue")), "{rows:?}");
+}
+
+/// v2 c18b review, item 4: the archive of a turn deleted with `forget --now`, indexed
+/// afterwards and then kept with `restore --forget-turns`, still leaves that turn out; the
+/// turn a forget tool left out comes back.
+#[test]
+fn a_kept_archive_obeys_the_mark_of_a_turn_deleted_with_forget_now() {
+    const GONE: &str = "please tell me again what the doctor said on Tuesday afternoon";
+    let mut world = Indexed::new();
+    let mut cap = capture("mem_cap_kept", "s-kept", &key_of(GONE));
+    cap.project = scope();
+    cap.created_ms = T0 - 100_000;
+    world.put(&cap);
+    tx(world.db(), || {
+        store::hide(world.db(), "mem_cap_kept", "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = 'mem_cap_kept'", [now_ms() - 25 * HOUR_MS]).unwrap();
+    });
+    let run = forget_cmd(&world.path(), &["mem_cap_kept"], true, false, "y\n");
+    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+    assert!(run.out.contains("m:mem_cap_kept: if Synaps archived this chat, the turn is still in that archive"), "{}", run.out);
+
+    let a = Arch::new(7, "s-kept", T0)
+        .turn(GONE, &reply("DOCTORANSWER"))
+        .forget_call("forget the thing about the landlord from this morning please", "TOOLFORGET")
+        .about("upload queue");
+    world.file(&a);
+    world.scan();
+    let texts = |world: &Indexed| world.rows(&a).into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n");
+    assert!(texts(&world).contains("upload queue"), "the archive was not indexed: the test proves nothing");
+    assert!(!texts(&world).contains("DOCTORANSWER") && !texts(&world).contains("TOOLFORGET"));
+
+    let kept = restore_turns(&world.path(), &format!("ctx-{}", a.id));
+    assert_eq!(kept.code, 0, "{}", kept.err);
+    world.scan();
+    assert!(texts(&world).contains("TOOLFORGET"), "the kept archive was not read again: the test proves nothing");
+    assert!(!texts(&world).contains("DOCTORANSWER"), "restore --forget-turns brought back a turn deleted for good");
 }
 
 /// An archive with two forget spans (`forget_units = 2`), and a neighbour of the same chat

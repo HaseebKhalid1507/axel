@@ -646,9 +646,13 @@ fn index_archive(
 
     // A file whose time is from `mtime` takes no part: it has no place in the chat's order,
     // gives and takes no forget mark, and has no twin. A file whose row has
-    // `keep_forget_turns` gives and takes no mark (step 3 is skipped whole for both).
+    // `keep_forget_turns` gives no mark and takes only `cli` marks.
+    // RULING: v2 c18b review, item 4. A kept archive ignores `call` and `archive` marks and
+    // obeys `cli` marks: a turn deleted with `forget --now` does not come back with
+    // `restore --forget-turns`.
     let timed = time_source != "mtime";
     let marks_on = timed && !policy.keep_forget_turns;
+    let takes_marks = timed;
     let own: &[archive::ForgetMark] = if marks_on { &spans } else { &[] };
     let files: Vec<ChatFile> = if timed {
         // The chat's files with this one at its place, as it will be written: the windows
@@ -768,7 +772,7 @@ fn index_archive(
         // then every row of the chat, of any source, says which units of this file are
         // left out.
         let mut out = vec![false; units.len()];
-        if marks_on {
+        if takes_marks {
             for mark in own {
                 conn.execute(
                     "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, scope_dir,
@@ -789,7 +793,10 @@ fn index_archive(
                     ],
                 )?;
             }
-            let marks = forgotten_of(conn, &a.logical, session_id)?;
+            let mut marks = forgotten_of(conn, &a.logical, session_id)?;
+            if !marks_on {
+                marks.retain(|m| m.source == "cli");
+            }
             let place = Place { scope_dir: at.scope_dir, cover_ms, window_from, stretch: mark_stretch, prev, next };
             out = left_out(&units, &marks, &place);
 
