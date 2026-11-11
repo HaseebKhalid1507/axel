@@ -107,9 +107,19 @@ pub struct Status {
     /// "file:line", kept with the reason it belongs to: one place per `DegradedReason`, the
     /// first writer of each wins. Read it with `reason_place` (wave 4, R-12b item 6).
     pub reason_at: [OnceLock<String>; DegradedReason::COUNT],
+    /// Set once the brain file was seen replaced or gone; never cleared, whatever reason
+    /// comes later (v2 r5 round 2, item 2).
+    pub brain_replaced: AtomicBool,
 }
 
 impl Status {
+    /// True once this process has seen its brain file replaced or gone.
+    // RULING: v2 r5 round 2, item 2.
+    pub fn brain_changed(&self) -> bool {
+        self.brain_replaced.load(Ordering::SeqCst)
+            || DegradedReason::from_u8(self.reason.load(Ordering::SeqCst)) == DegradedReason::BrainChanged
+    }
+
     /// Records where `reason` was set; the first place given for a reason stays.
     pub fn set_reason_place(&self, reason: DegradedReason, at: String) {
         if let Some(slot) = self.reason_at.get(reason as usize) {
@@ -272,6 +282,21 @@ pub struct IndexerCtx {
     pub clock: Clock,
     pub test: Arc<TestHooks>,
     pub writing: Arc<AtomicBool>,
+}
+
+// RULING: v2 r5 round 2, item 2. The thread's connection is given up through
+// `brain_v2::release`: one to a brain file seen replaced is never closed through SQLite.
+impl Drop for IndexerCtx {
+    fn drop(&mut self) {
+        crate::brain_v2::release(self.conn.take(), &self.status);
+    }
+}
+
+// RULING: v2 r5 round 2, item 2.
+impl Drop for FrontState {
+    fn drop(&mut self) {
+        crate::brain_v2::release(self.conn.take(), &self.status);
+    }
 }
 
 #[derive(Clone, Debug)]

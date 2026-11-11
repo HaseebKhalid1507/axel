@@ -74,7 +74,8 @@ pub fn ensure_open(ctx: &mut IndexerCtx) {
     let degraded = mode_of(ctx) == Some(Mode::Degraded);
     if ctx.conn.is_some() {
         if degraded {
-            ctx.conn = None;
+            // RULING: v2 r5 round 2, item 2.
+            brain_v2::release(ctx.conn.take(), &ctx.status);
             ctx.signer = None;
             ctx.brain_file = None;
         }
@@ -193,6 +194,8 @@ pub fn degrade_if_replaced(ctx: &IndexerCtx) -> bool {
         return false;
     }
     log_line("brain file replaced or gone");
+    // RULING: v2 r5 round 2, item 2.
+    ctx.status.brain_replaced.store(true, Ordering::SeqCst);
     degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
     true
 }
@@ -213,7 +216,12 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
     let brain = brain_v2::open_v2(&path, &opts)?;
 
     // Again under the write lock (a brain made a moment ago has none), then record ours.
-    brain_v2::begin_write(&brain.conn)?;
+    if let Err(e) = brain_v2::begin_write(&brain.conn) {
+        // RULING: v2 r5 round 2, item 2. Refused because the file was replaced meanwhile:
+        // the connection is not closed.
+        brain_v2::release(Some(brain.conn), &ctx.status);
+        return Err(e);
+    }
     let recorded = (|| -> Result<Option<String>> {
         let recorded = brain.conn.query_row(BASE_SQL, [], |r| r.get::<_, String>(0)).optional()?;
         if recorded.is_none() {

@@ -1586,6 +1586,72 @@ fn r5_r2_1_a_stat_that_fails_without_not_found_is_not_a_replaced_brain() {
     brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
 }
 
+/// The files open in this process under `path` (Linux: `/proc/self/fd`).
+fn open_fds_on(path: &Path) -> usize {
+    let Ok(dir) = std::fs::read_dir("/proc/self/fd") else { return 0 };
+    dir.flatten().filter(|e| std::fs::read_link(e.path()).is_ok_and(|t| t == path)).count()
+}
+
+// RULING: v2 r5 round 2, item 2. A brain replaced under a running extension, the way
+// `migrate init --replace` does it (the file, its `-wal` and `-shm` moved aside, the new
+// brain moved in), with a committed row in the new brain's `-wal` that no checkpoint has
+// moved into it. The old process's connections are never closed through SQLite, so its
+// close cannot checkpoint, or unlink `-wal` and `-shm` by name.
+#[test]
+fn r5_r2_2_a_replaced_brain_keeps_its_wal_when_the_old_process_ends() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks { status_tick_ms: Some(50), ..TestHooks::default() });
+    let _ = wait_status_file(&dirs, "ready", Duration::from_secs(15));
+    let _ = host.tool("search");
+    let d = dirs.brain();
+    let side = |p: &Path, s: &str| PathBuf::from(format!("{}{s}", p.display()));
+    assert!(side(&d, "-wal").exists() && side(&d, "-shm").exists(), "the old brain has no -wal");
+
+    // The new brain, beside: a row committed into its `-wal` by a connection that stays
+    // open and does not checkpoint.
+    let new = dirs.path().join("new.r8");
+    drop(make_brain(&new));
+    let writer = Connection::open(&new).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA wal_autocheckpoint = 0;
+             INSERT INTO context_data(key, value, layer) VALUES('r5r2', 'the new brain', 'test');",
+        )
+        .unwrap();
+    let wal_len = std::fs::metadata(side(&new, "-wal")).unwrap().len();
+    assert!(wal_len > 0);
+
+    let aside = side(&d, ".replaced");
+    for s in ["", "-wal", "-shm"] {
+        std::fs::rename(side(&d, s), side(&aside, s)).unwrap();
+    }
+    for s in ["", "-wal", "-shm"] {
+        std::fs::rename(side(&new, s), side(&d, s)).unwrap();
+    }
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(10));
+    assert_eq!(said["reason"], json!("BrainChanged"), "{said}");
+    let _ = host.tool("search");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+
+    assert!(side(&d, "-shm").exists(), "the new brain's -shm was unlinked");
+    assert!(side(&d, "-wal").exists(), "the new brain's -wal was unlinked");
+    assert_eq!(std::fs::metadata(side(&d, "-wal")).unwrap().len(), wal_len, "the new brain's -wal was changed");
+    let reader = Connection::open_with_flags(&d, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+    let row: Vec<String> = reader
+        .prepare("SELECT value FROM context_data WHERE key = 'r5r2'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(row, ["the new brain"], "the committed row is gone");
+    // The old process's connections are still open: never closed through SQLite.
+    if cfg!(target_os = "linux") {
+        assert!(open_fds_on(&aside) > 0, "the old brain's connections were closed");
+    }
+    drop((reader, writer));
+}
+
 #[test]
 fn r6_a_look_that_cannot_read_the_brain_is_not_ready_and_open_v2_does_not_run() {
     let dirs = Dirs::new();

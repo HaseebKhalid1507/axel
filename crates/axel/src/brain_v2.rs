@@ -251,6 +251,20 @@ pub fn replaced(conn: &Connection) -> bool {
     }
 }
 
+/// Gives up a connection. One to a brain file this process has seen replaced or gone, or
+/// whose path now names another file or none, is leaked, not closed.
+// RULING: v2 r5 round 2, item 2. SQLite's close checkpoints and then unlinks `<path>-wal`
+// and `<path>-shm` by name when it holds the last connection; those names now belong to
+// the brain at the path. SQLite 3.46 skips both when its own stat of the path shows another
+// inode (`databaseIsUnmoved`), but the rule does not lean on that: the connection is never
+// closed, and the process ends with it open.
+pub fn release(conn: Option<Connection>, status: &Status) {
+    let Some(conn) = conn else { return };
+    if status.brain_changed() || replaced(&conn) {
+        std::mem::forget(conn);
+    }
+}
+
 // ── Connections ─────────────────────────────────────────────────────────────
 
 /// The pragmas of `connect`. With `check`, `user_version` is read before any pragma is
@@ -821,6 +835,10 @@ pub fn degrade_on(err: &AxelError, status: &Status, mode: &AtomicU8) -> bool {
         }
         _ => return false,
     };
+    // RULING: v2 r5 round 2, item 2.
+    if reason == DegradedReason::BrainChanged {
+        status.brain_replaced.store(true, Ordering::SeqCst);
+    }
     status.reason.store(reason as u8, Ordering::SeqCst);
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
     true
