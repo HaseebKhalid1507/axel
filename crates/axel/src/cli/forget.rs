@@ -2,7 +2,7 @@
 //!
 //! `forget <id>...` hides, as the tool does, with `hidden_by = 'cli'` and no cap: nothing
 //! is deleted. `forget --now <id>...` and `forget --now --hidden` delete for good, and only
-//! rows that have been hidden for `forget_now_min_hidden_hours` (default 24). This is the
+//! rows that have been hidden for `forget_now_min_hidden_hours` (24, or more). This is the
 //! one place text leaves the brain on a person's word: the rows, their word rows, their
 //! shadow documents and graph nodes (`store::purge_many`), then the write-ahead log
 //! (a `TRUNCATE` checkpoint) and the old search's `<brain>.r8.hnsw`.
@@ -37,14 +37,24 @@ pub const DEFAULT_MIN_HIDDEN_HOURS: u64 = 24;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
-pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
-    let base = std::env::var_os("SYNAPS_BASE_DIR").filter(|v| !v.is_empty()).map(PathBuf::from);
-    show::on_std(|term| run_with(args, &brain.path, base.as_deref(), term))
+/// The Synaps bases whose `config` may set the wait, beside the one the brain records.
+#[derive(Clone, Debug, Default)]
+pub struct Bases {
+    /// `$SYNAPS_BASE_DIR`, when it is set.
+    pub env: Option<PathBuf>,
+    /// `~/.synaps-cli`.
+    pub home: Option<PathBuf>,
 }
 
-/// `base`: `$SYNAPS_BASE_DIR` when it is set; `None` looks for the base the brain records,
-/// then `~/.synaps-cli`.
-pub fn run_with(args: &Args, path: &Path, base: Option<&Path>, term: &mut Term) -> Result<u8> {
+pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
+    let bases = Bases {
+        env: std::env::var_os("SYNAPS_BASE_DIR").filter(|v| !v.is_empty()).map(PathBuf::from),
+        home: dirs::home_dir().map(|home| home.join(".synaps-cli")),
+    };
+    show::on_std(|term| run_with(args, &brain.path, &bases, term))
+}
+
+pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Result<u8> {
     if args.hidden && !args.now {
         writeln!(term.err, "--hidden goes with --now: \"axel-v2 forget --now --hidden\"")?;
         return Ok(USAGE);
@@ -86,7 +96,7 @@ pub fn run_with(args: &Args, path: &Path, base: Option<&Path>, term: &mut Term) 
     if !args.now {
         return hide_all(&conn, &rows, term);
     }
-    forget_now(&conn, path, base, args.hidden, rows, term)
+    forget_now(&conn, path, bases, args.hidden, rows, term)
 }
 
 /// `forget <id>...`: one transaction, every id or none.
@@ -152,12 +162,9 @@ fn twin_line(row: &RowInfo) -> String {
 
 // ── --now ───────────────────────────────────────────────────────────────────
 
-/// `$SYNAPS_BASE_DIR` (given by the caller), else the base the brain records, else
-/// `~/.synaps-cli`. The command line gets no `initialize` message.
-pub fn synaps_base(conn: &Connection, given: Option<&Path>) -> Result<PathBuf> {
-    if let Some(base) = given {
-        return Ok(base.to_path_buf());
-    }
+/// The base the brain records (the extension writes it), if any. The command line gets no
+/// `initialize` message.
+pub fn recorded_base(conn: &Connection) -> Result<Option<PathBuf>> {
     let recorded: Option<String> = conn
         .query_row("SELECT value FROM context_data WHERE layer = 'axel' AND key = 'synaps_base'", [], |r| {
             r.get::<_, Option<String>>(0)
@@ -165,18 +172,24 @@ pub fn synaps_base(conn: &Connection, given: Option<&Path>) -> Result<PathBuf> {
         .optional()?
         .flatten()
         .filter(|v| !v.trim().is_empty());
-    Ok(match recorded {
-        Some(base) => PathBuf::from(base),
-        None => dirs::home_dir().unwrap_or_else(|| PathBuf::from("/")).join(".synaps-cli"),
-    })
+    Ok(recorded.map(PathBuf::from))
 }
 
-/// `forget_now_min_hidden_hours` from `<base>/config`; anything but a whole number of hours
-/// is the default.
-pub fn min_hidden_hours(base: &Path) -> u64 {
-    crate::ext::config::base_config_value(base, MIN_HIDDEN_KEY)
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_MIN_HIDDEN_HOURS)
+/// The wait in hours: the largest of the default and of every whole number of hours set in
+/// the `config` of `$SYNAPS_BASE_DIR`, of the base the brain records and of `~/.synaps-cli`.
+// RULING: v2 c18b review, item 3. The environment may only lengthen the wait: a shell that
+// points `SYNAPS_BASE_DIR` at a folder of its own cannot shorten it, and a config that is
+// missing, unreadable or malformed contributes nothing. No value goes below the default.
+pub fn min_hidden_hours(conn: &Connection, bases: &Bases) -> Result<u64> {
+    let mut all: Vec<PathBuf> = Vec::new();
+    all.extend(bases.env.clone());
+    all.extend(recorded_base(conn)?);
+    all.extend(bases.home.clone());
+    Ok(all
+        .iter()
+        .filter_map(|base| crate::ext::config::base_config_value(base, MIN_HIDDEN_KEY))
+        .filter_map(|v| v.trim().parse::<u64>().ok())
+        .fold(DEFAULT_MIN_HIDDEN_HOURS, u64::max))
 }
 
 /// What the purge did, for the lines printed after it.
@@ -191,13 +204,12 @@ struct Purged {
 fn forget_now(
     conn: &Connection,
     path: &Path,
-    base: Option<&Path>,
+    bases: &Bases,
     hidden: bool,
     rows: Vec<RowInfo>,
     term: &mut Term,
 ) -> Result<u8> {
-    let base = synaps_base(conn, base)?;
-    let hours = min_hidden_hours(&base);
+    let hours = min_hidden_hours(conn, bases)?;
     let wait_ms = i64::try_from(hours.saturating_mul(HOUR_MS as u64)).unwrap_or(i64::MAX);
     let now = now_ms();
     let cutoff = now.saturating_sub(wait_ms);

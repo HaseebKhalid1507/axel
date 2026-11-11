@@ -67,7 +67,7 @@ fn strings(ids: &[&str]) -> Vec<String> {
 
 fn forget_cmd(path: &Path, ids: &[&str], now: bool, hidden: bool, answer: &str) -> Ran {
     let args = forget::Args { ids: strings(ids), now, hidden };
-    ran(answer, |t| forget::run_with(&args, path, None, t))
+    ran(answer, |t| forget::run_with(&args, path, &forget::Bases::default(), t))
 }
 
 fn restore_ids(path: &Path, ids: &[&str]) -> Ran {
@@ -352,13 +352,65 @@ fn t10_forget_now_deletes_what_was_hidden_a_day_ago_with_its_shadow_and_twin_and
     );
 }
 
+/// v2 c18b review, item 3: a config value below the default does not shorten the wait.
 #[test]
-fn t10_with_the_config_value_0_both_go() {
+fn t10_the_config_value_0_does_not_shorten_the_wait() {
     let w = ten();
     w.config("extension.axel.forget_now_min_hidden_hours = 0\n");
     let yes = forget_cmd(&w.path, &["mem_old", "mem_cap", "mem_young"], true, false, "y\n");
-    assert!(yes.out.contains("Delete 4 memories for good? [y/N]"), "{}", yes.out);
-    assert_eq!(w.memories(), 0);
+    assert!(yes.out.contains("the wait is 24 h"), "{}", yes.out);
+    assert!(yes.out.contains("Delete 3 memories for good? [y/N]"), "{}", yes.out);
+    assert!(w.has("mem_young"));
+}
+
+/// v2 c18b review, item 3: `$SYNAPS_BASE_DIR`, the recorded base and `~/.synaps-cli` each
+/// may lengthen the wait; the largest wins; none shortens it.
+#[test]
+fn the_environment_can_only_lengthen_the_wait() {
+    let w = World::new();
+    w.put(&r("mem_day", "tool", "a decision hidden a day and a half ago"));
+    w.hide("mem_day", "cli", 36 * HOUR_MS);
+    let own = w._tmp.path().join("own-base");
+    let home = w._tmp.path().join("home-base");
+    std::fs::create_dir_all(&own).unwrap();
+    std::fs::create_dir_all(&home).unwrap();
+    let set = |dir: &Path, hours: &str| {
+        std::fs::write(dir.join("config"), format!("extension.axel.forget_now_min_hidden_hours = {hours}\n")).unwrap()
+    };
+    let now = |bases: &forget::Bases| {
+        let args = forget::Args { ids: Vec::new(), now: true, hidden: true };
+        ran("y\n", |t| forget::run_with(&args, &w.path, bases, t))
+    };
+    let env_only = forget::Bases { env: Some(own.clone()), home: None };
+    let both = forget::Bases { env: Some(own.clone()), home: Some(home.clone()) };
+
+    // A folder of the shell's own that says 0: the wait stays 24 h (no less than the default).
+    set(&own, "0");
+    let w0 = forget_cmd(&w.path, &["mem_day"], true, false, "n\n");
+    assert!(w0.out.contains("Delete 1 memories"), "the control: the row is old enough: {}", w0.out);
+    w.put(&r("mem_young", "tool", "a decision hidden two hours ago"));
+    w.hide("mem_young", "cli", 2 * HOUR_MS);
+    let run = ran("n\n", |t| {
+        forget::run_with(&forget::Args { ids: strings(&["mem_young"]), now: true, hidden: false }, &w.path, &env_only, t)
+    });
+    assert!(run.out.contains("the wait is 24 h") && run.out.contains("Nothing can be deleted now."), "{}", run.out);
+
+    // Each place may lengthen it, and the largest value wins.
+    set(&own, "72");
+    let run = now(&env_only);
+    assert!(run.out.contains("the wait is 72 h") && !run.out.contains("[y/N]"), "{}", run.out);
+    set(&own, "0");
+    w.config("extension.axel.forget_now_min_hidden_hours = 48\n");
+    set(&home, "30");
+    let run = now(&both);
+    assert!(run.out.contains("the wait is 48 h"), "{}", run.out);
+    set(&home, "100");
+    assert!(now(&both).out.contains("the wait is 100 h"));
+    // A config that cannot be read contributes nothing.
+    std::fs::remove_file(home.join("config")).unwrap();
+    std::fs::create_dir(home.join("config")).unwrap();
+    assert!(now(&both).out.contains("the wait is 48 h"));
+    assert!(w.has("mem_day") && w.has("mem_young"));
 }
 
 #[test]
@@ -387,10 +439,13 @@ fn t10_a_config_that_is_missing_unreadable_or_says_soon_gives_24_hours() {
         assert!(run.out.contains("Nothing can be deleted now."), "{what}: {}", run.out);
         assert!(w.has("mem_young"), "{what}: deleted");
     }
-    // The control: a value that parses is used.
+    // A value that parses is read, and a value below 24 is no shorter wait (item 3).
     w.config("extension.axel.forget_now_min_hidden_hours = 1\n");
-    forget_cmd(&w.path, &[], true, true, "y\n");
-    assert!(!w.has("mem_young"));
+    let run = forget_cmd(&w.path, &[], true, true, "y\n");
+    assert!(run.out.contains("the wait is 24 h"), "{}", run.out);
+    assert!(w.has("mem_young"));
+    w.config("extension.axel.forget_now_min_hidden_hours = 30\n");
+    assert!(forget_cmd(&w.path, &[], true, true, "y\n").out.contains("the wait is 30 h"));
 }
 
 #[test]
@@ -473,7 +528,7 @@ fn t10_a_deleted_replacement_says_the_row_it_replaced_is_recalled_again() {
     w.put(&r("mem_first", "tool", "the first answer"));
     w.put(&r("mem_fix", "tool", "the corrected answer"));
     tx(w.db(), || store::supersede(w.db(), "mem_first", "mem_fix").unwrap());
-    w.hide("mem_fix", "cli", HOUR_MS);
+    w.hide("mem_fix", "cli", 25 * HOUR_MS);
     let run = forget_cmd(&w.path, &["mem_fix"], true, false, "y\n");
     assert!(run.out.contains("1 memories that a deleted row had replaced are recalled again"), "{}", run.out);
     let back: Option<String> =
@@ -481,7 +536,7 @@ fn t10_a_deleted_replacement_says_the_row_it_replaced_is_recalled_again() {
     assert_eq!(back, None);
     // Said only when it happened.
     w.put(&r("mem_alone", "tool", "nothing replaced by this"));
-    w.hide("mem_alone", "cli", HOUR_MS);
+    w.hide("mem_alone", "cli", 25 * HOUR_MS);
     let run = forget_cmd(&w.path, &["mem_alone"], true, false, "y\n");
     assert!(!run.out.contains("recalled again"), "{}", run.out);
 }
@@ -705,7 +760,7 @@ fn a_command_that_cannot_get_the_write_lock_says_the_brain_is_busy() {
     let (mut out, mut err) = (Vec::new(), Vec::new());
     let mut input = Cursor::new(Vec::new());
     let mut term = Term { out: &mut out, err: &mut err, input: &mut input };
-    let error = forget::run_with(&args, &w.path, None, &mut term).expect_err("the write went through a held lock");
+    let error = forget::run_with(&args, &w.path, &forget::Bases::default(), &mut term).expect_err("the write went through a held lock");
     assert!(error.to_string().contains("the brain is busy"), "{error}");
     other.execute_batch("ROLLBACK").unwrap();
     assert_eq!(w.hidden_by("mem_wait"), None);
