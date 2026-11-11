@@ -1,48 +1,497 @@
 //! Opening the brain with retry, the base guard, the first vector load, the embedding
-//! backlog, the status row. Commit 12b writes this file.
+//! backlog, the status row. All of it runs on the indexer thread.
 
-use std::sync::mpsc::Receiver;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
+use std::time::Duration;
 
-use crate::error::Result;
-use crate::ext::config::ExtConfig;
-use crate::ext::types::{Boot, IndexerCtx, Job};
-use crate::vindex::{VecDelta, VecKey};
+use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
+use serde_json::json;
 
-/// Hands back the other ends of the channels it makes (B3-3a).
+use crate::brain_v2::{self, OpenOpts};
+use crate::embed::EmbedService;
+use crate::error::{AxelError, Result};
+use crate::ext::config::{base_config_value, ExtConfig};
+use crate::ext::server::{degrade, log_line, JOB_QUEUE};
+use crate::ext::types::{Boot, DegradedReason, IndexerCtx, Job, Mode};
+use crate::r8::{DEFAULT_EMBEDDER, EMBEDDING_DIM};
+use crate::vindex::{VecDelta, VecItem, VecKey, VecScope};
+
+/// The indexer retries `open_v2` this often.
+const OPEN_RETRY_MS: i64 = 60_000;
+/// Rows given to the embed thread at a time, and vectors written per transaction.
+const BATCH: usize = 64;
+/// The project directory of global rows.
+const GLOBAL_DIR: &str = "p0000000000000000";
+
+// What this file keeps in `IndexerCtx.last_run` besides the tick's own times: when the
+// brain was last tried, and what was last sent to the front thread (`resync_vectors`).
+const K_OPEN: &str = "indexer_start::open";
+const K_DOCS: &str = "vectors_sent::docs";
+const K_DOC_MAX: &str = "vectors_sent::doc_max";
+const K_MEMS: &str = "vectors_sent::mems";
+const K_MEM_MAX: &str = "vectors_sent::mem_max";
+
+const DOCS_WHERE: &str =
+    "hidden IS NULL AND COALESCE(json_extract(metadata, '$.type'), '') <> 'memory'";
+
+/// The one constructor of an `IndexerCtx` for tests. It hands back the other ends of the
+/// channels it makes (B3-3a). The brain is opened (created, migrated) before it returns, as
+/// the indexer thread does at the top of its loop: look at `ctx.mode` for how that went.
 pub fn open_ctx(cfg: ExtConfig, boot: Boot) -> (IndexerCtx, Receiver<Job>, Receiver<VecDelta>) {
-    let _ = (cfg, boot);
-    unimplemented!("commit 12b")
+    let (jobs, jobs_rx) = mpsc::sync_channel::<Job>(JOB_QUEUE);
+    let (vec_tx, vec_rx) = mpsc::channel::<VecDelta>();
+    let embed = EmbedService::start(boot.embedder, jobs.clone(), boot.test.clone());
+    let mut ctx = IndexerCtx {
+        cfg,
+        conn: None,
+        signer: None,
+        embed,
+        vec_tx,
+        jobs,
+        status: boot.status,
+        mode: Arc::new(AtomicU8::new(Mode::Starting as u8)),
+        last_run: Default::default(),
+        bulk_out: false,
+        clock: boot.clock,
+        test: boot.test,
+        writing: Arc::new(AtomicBool::new(false)),
+    };
+    ensure_open(&mut ctx);
+    (ctx, jobs_rx, vec_rx)
 }
 
-// SPEC: 4787-4797 name the five functions below without signatures. They take the
-// `IndexerCtx`; `ensure_open` returns nothing (it sets the mode), the others `Result<()>`;
-// `on_embedded` takes the two fields of `Job::Embedded`.
+fn mode_of(ctx: &IndexerCtx) -> Option<Mode> {
+    Mode::from_u8(ctx.mode.load(Ordering::SeqCst))
+}
 
-/// At the top of every turn of the indexer's loop.
+/// At the top of every turn of the indexer's loop. Sets the mode; returns nothing.
+///
+/// With a connection: nothing, unless the mode has become `Degraded`, and then the
+/// connection is given up, so no handler writes again. Without one: `open_v2`, at once and
+/// then every 60 s.
+// SPEC: 3866 says "the indexer retries `open_v2` every 60 s" of every reason. A brain that
+// was changed under this process (3880: "restart Synaps"), one that is damaged (3878: the
+// file is not touched) and a stopped indexer are not retried: a restart of Synaps does that.
 pub fn ensure_open(ctx: &mut IndexerCtx) {
-    let _ = ctx;
+    let degraded = mode_of(ctx) == Some(Mode::Degraded);
+    if ctx.conn.is_some() {
+        if degraded {
+            ctx.conn = None;
+            ctx.signer = None;
+        }
+        return;
+    }
+    if degraded {
+        match DegradedReason::from_u8(ctx.status.reason.load(Ordering::SeqCst)) {
+            DegradedReason::BrainChanged | DegradedReason::BrainDamaged | DegradedReason::IndexerStopped => return,
+            _ => {}
+        }
+    }
+    let now = (ctx.clock)();
+    if ctx.last_run.get(K_OPEN).is_some_and(|&last| now - last < OPEN_RETRY_MS) {
+        return;
+    }
+    ctx.last_run.insert(K_OPEN, now);
+
+    match open(ctx) {
+        Ok(()) => {
+            log_line("brain open");
+            // The row is there early: before the first scan (C-5).
+            if write_status(ctx).is_err() {
+                ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
+            }
+            if send_all(ctx).is_err() {
+                ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        Err(e) => {
+            ctx.conn = None;
+            ctx.signer = None;
+            let reason = reason_of(&e);
+            log_line(&format!("brain not open: {}", reason.as_str()));
+            degrade(&ctx.status, &ctx.mode, reason, None);
+        }
+    }
 }
 
-/// `Job::Embedded` (called by `indexer::dispatch`).
-pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<f32>)>) -> Result<()> {
-    let _ = (ctx, model, vectors);
+fn reason_of(e: &AxelError) -> DegradedReason {
+    match e {
+        AxelError::NoBrain(_) | AxelError::Io(_) => DegradedReason::NoBrain,
+        AxelError::V1Brain(_) => DegradedReason::V1Brain,
+        AxelError::BrainTooNew { .. } => DegradedReason::BrainTooNew,
+        AxelError::BrainDamaged(_) => DegradedReason::BrainDamaged,
+        AxelError::BrainChanged => DegradedReason::BrainChanged,
+        AxelError::OtherBase(_) => DegradedReason::OtherBase,
+        AxelError::Db(e)
+            if matches!(
+                e.sqlite_error_code(),
+                Some(ErrorCode::NotADatabase) | Some(ErrorCode::DatabaseCorrupt)
+            ) =>
+        {
+            DegradedReason::BrainDamaged
+        }
+        _ => DegradedReason::BrainNotReady,
+    }
+}
+
+fn canonical_base(base: &Path) -> String {
+    base.canonicalize().unwrap_or_else(|_| base.to_path_buf()).to_string_lossy().into_owned()
+}
+
+const BASE_SQL: &str = "SELECT value FROM context_data WHERE layer = 'axel' AND key = 'synaps_base'";
+
+/// The base an existing file records, read without writing to it. `None` for a file that
+/// cannot be read this way: `open_v2` says what is wrong with it.
+fn recorded_base_unopened(path: &Path) -> Option<String> {
+    if !path.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let _ = conn.busy_timeout(Duration::from_millis(1_000));
+    conn.query_row(BASE_SQL, [], |r| r.get::<_, String>(0)).optional().ok().flatten()
+}
+
+/// `open_v2`, with the base guard on both sides of it: a brain recorded for another Synaps
+/// base is refused before anything can write to it.
+fn open(ctx: &mut IndexerCtx) -> Result<()> {
+    let path = ctx.cfg.brain.clone();
+    let base = canonical_base(&ctx.cfg.base);
+    if let Some(recorded) = recorded_base_unopened(&path) {
+        if recorded != base {
+            return Err(AxelError::OtherBase(PathBuf::from(recorded)));
+        }
+    }
+
+    let model = ctx.embed.model_id().unwrap_or(DEFAULT_EMBEDDER).to_string();
+    let opts = OpenOpts { agent: None, model: &model, dim: EMBEDDING_DIM, upgrade_v1: false };
+    let brain = brain_v2::open_v2(&path, &opts)?;
+
+    // Again under the write lock (a brain made a moment ago has none), then record ours.
+    brain_v2::begin_write(&brain.conn)?;
+    let recorded = (|| -> Result<Option<String>> {
+        let recorded = brain.conn.query_row(BASE_SQL, [], |r| r.get::<_, String>(0)).optional()?;
+        if recorded.is_none() {
+            brain.conn.execute(
+                "INSERT INTO context_data(key, layer, value) VALUES('synaps_base', 'axel', ?1)",
+                [&base],
+            )?;
+        }
+        Ok(recorded)
+    })();
+    match recorded {
+        Ok(Some(recorded)) if recorded != base => {
+            let _ = brain.conn.execute_batch("ROLLBACK");
+            return Err(AxelError::OtherBase(PathBuf::from(recorded)));
+        }
+        Ok(_) => brain.conn.execute_batch("COMMIT")?,
+        Err(e) => {
+            let _ = brain.conn.execute_batch("ROLLBACK");
+            return Err(e);
+        }
+    }
+
+    ctx.conn = Some(brain.conn);
+    ctx.signer = brain.signer;
+    let usable = model_usable(ctx).unwrap_or(false);
+    ctx.status.model_loaded.store(usable, Ordering::Relaxed);
+    if ctx.embed.model_id().is_some() && !usable {
+        log_line("model differs from the brain's: words only");
+    }
+    ctx.status.reason.store(DegradedReason::None as u8, Ordering::SeqCst);
+    ctx.mode.store(Mode::Ready as u8, Ordering::SeqCst);
     Ok(())
 }
 
-/// Every 1 s (called by `indexer::tick`).
-pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
-    let _ = ctx;
+/// Section 1 (1006): the running model and its dimension are compared with `brain_meta`.
+/// On a mismatch, with no model, or when the embed thread has ended, the process runs on
+/// words alone: no vector is loaded, asked for or written.
+fn model_usable(ctx: &IndexerCtx) -> Result<bool> {
+    let (Some(conn), Some(model)) = (ctx.conn.as_ref(), ctx.embed.model_id()) else { return Ok(false) };
+    if ctx.embed.stopped() {
+        return Ok(false);
+    }
+    let recorded: Option<(Option<String>, Option<i64>)> = conn
+        .query_row(
+            "SELECT json_extract(value, '$.embedder_model'), json_extract(value, '$.embedding_dim')
+             FROM brain_meta WHERE key = 'meta'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    Ok(matches!(recorded, Some((Some(m), Some(d))) if m == model && d == EMBEDDING_DIM as i64))
+}
+
+fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
+    blob.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+}
+
+fn vec_to_blob(v: &[f32]) -> Vec<u8> {
+    v.iter().flat_map(|f| f.to_le_bytes()).collect()
+}
+
+fn scope_of(project_key: Option<String>) -> VecScope {
+    match project_key {
+        None => VecScope::Global,
+        Some(dir) if dir == GLOBAL_DIR => VecScope::Global,
+        Some(dir) => VecScope::Project(dir),
+    }
+}
+
+/// Count and highest id of the visible embedded rows: documents, then memory rows.
+fn signature(conn: &Connection, model: &str) -> Result<[i64; 4]> {
+    let (docs, doc_max): (i64, i64) = conn.query_row(
+        &format!("SELECT COUNT(*), COALESCE(MAX(id), 0) FROM documents WHERE {DOCS_WHERE}"),
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    let (mems, mem_max): (i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(vid), 0) FROM memory_ext
+         WHERE embedding IS NOT NULL AND embed_model = ?1 AND hidden_ms IS NULL",
+        [model],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok([docs, doc_max, mems, mem_max])
+}
+
+/// The stored vectors as one `VecDelta::Replace` (section 3): no hidden row, and no shadow
+/// document of a memory, whose vector is in the array as the memory's own row (R-8).
+fn send_all(ctx: &mut IndexerCtx) -> Result<()> {
+    if !model_usable(ctx)? {
+        return Ok(());
+    }
+    let (Some(conn), Some(model)) = (ctx.conn.as_ref(), ctx.embed.model_id()) else { return Ok(()) };
+    let sig = signature(conn, model)?;
+    let mut items = Vec::new();
+    {
+        let mut stmt = conn.prepare(&format!("SELECT id, embedding FROM documents WHERE {DOCS_WHERE}"))?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, Option<Vec<u8>>>(1)?)))?;
+        for row in rows {
+            let (id, blob) = row?;
+            if let Some(blob) = blob.filter(|b| !b.is_empty()) {
+                items.push(VecItem { key: VecKey::Doc(id), scope: VecScope::Documents, v: blob_to_vec(&blob) });
+            }
+        }
+        let mut stmt = conn.prepare(
+            "SELECT e.vid, m.project_key, e.embedding
+             FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+             WHERE e.embedding IS NOT NULL AND e.embed_model = ?1 AND e.hidden_ms IS NULL",
+        )?;
+        let rows = stmt.query_map([model], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get::<_, Vec<u8>>(2)?))
+        })?;
+        for row in rows {
+            let (vid, project_key, blob) = row?;
+            items.push(VecItem { key: VecKey::Mem(vid), scope: scope_of(project_key), v: blob_to_vec(&blob) });
+        }
+    }
+    // Recorded only when it was sent: a front thread that is gone has been sent nothing.
+    if ctx.vec_tx.send(VecDelta::Replace(items)).is_ok() {
+        for (key, value) in [K_DOCS, K_DOC_MAX, K_MEMS, K_MEM_MAX].into_iter().zip(sig) {
+            ctx.last_run.insert(key, value);
+        }
+    }
     Ok(())
 }
 
-/// Every 60 s (called by `indexer::tick`).
+/// Every 60 s (called by `indexer::tick`): when the count or the highest id of visible
+/// embedded rows differs from what this process has sent to its front thread, the whole set
+/// is sent again. That is how another process's vectors, hides and restores arrive.
 pub fn resync_vectors(ctx: &mut IndexerCtx) -> Result<()> {
-    let _ = ctx;
+    if !model_usable(ctx)? {
+        return Ok(());
+    }
+    let (Some(conn), Some(model)) = (ctx.conn.as_ref(), ctx.embed.model_id()) else { return Ok(()) };
+    let now = signature(conn, model)?;
+    let sent = [K_DOCS, K_DOC_MAX, K_MEMS, K_MEM_MAX].map(|k| ctx.last_run.get(k).copied());
+    if sent.iter().zip(now).all(|(sent, now)| *sent == Some(now)) {
+        return Ok(());
+    }
+    send_all(ctx)
+}
+
+/// Every 1 s (called by `indexer::tick`): up to 64 rows with `embedding IS NULL`, newest
+/// first, never a `secret` row, go to the embed thread's bulk queue when no bulk request is
+/// out. What is embedded for a row is `title + "\n" + body`.
+pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    let waiting: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+         WHERE e.embedding IS NULL AND m.sensitivity <> 'secret'",
+        [],
+        |r| r.get(0),
+    )?;
+    ctx.status.vectors_waiting.store(waiting.max(0) as u64, Ordering::Relaxed);
+    let usable = model_usable(ctx)?;
+    ctx.status.model_loaded.store(usable, Ordering::Relaxed);
+    // The embed thread's bulk queue takes whatever it is given: rows still in flight are
+    // not offered a second time.
+    if !usable || ctx.bulk_out || waiting == 0 || mode_of(ctx) != Some(Mode::Ready) {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT e.vid, m.title, m.content FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+         WHERE e.embedding IS NULL AND m.sensitivity <> 'secret'
+         ORDER BY e.created_ms DESC, e.vid DESC LIMIT ?1",
+    )?;
+    let items = stmt
+        .query_map([BATCH as i64], |r| {
+            Ok((VecKey::Mem(r.get(0)?), format!("{}\n{}", r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+        })?
+        .collect::<rusqlite::Result<Vec<(VecKey, String)>>>()?;
+    drop(stmt);
+    if !items.is_empty() {
+        ctx.embed.submit_bulk(items);
+        ctx.bulk_out = true;
+    }
     Ok(())
 }
 
-/// Every 30 s (called by `indexer::tick`, and by a long scan between two archives).
+/// `Job::Embedded` (called by `indexer::dispatch`): the vectors are written, 64 per
+/// transaction, and the same vectors go to the front thread as a `VecDelta::Upsert`.
+pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<f32>)>) -> Result<()> {
+    // First, so that nothing below can leave the pump waiting for ever.
+    ctx.bulk_out = false;
+    if mode_of(ctx) != Some(Mode::Ready) || ctx.embed.model_id() != Some(model) || !model_usable(ctx)? {
+        return Ok(());
+    }
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+
+    let mut items: Vec<VecItem> = Vec::new();
+    let mut failed = None;
+    for (n, chunk) in vectors.chunks(BATCH).enumerate() {
+        if n > 0 {
+            brain_v2::stand_aside(&ctx.writing);
+        }
+        if let Err(e) = brain_v2::begin_write(conn) {
+            failed = Some(e);
+            break;
+        }
+        let mut written = Vec::new();
+        let wrote = (|| -> Result<()> {
+            for (key, v) in chunk {
+                let VecKey::Mem(vid) = key else { continue };
+                if v.len() != EMBEDDING_DIM {
+                    continue;
+                }
+                let changed = conn.execute(
+                    "UPDATE memory_ext SET embedding = ?1, embed_model = ?2 WHERE vid = ?3 AND embedding IS NULL",
+                    params![vec_to_blob(v), model, vid],
+                )?;
+                if changed != 1 {
+                    continue;
+                }
+                let row: Option<(Option<String>, Option<i64>)> = conn
+                    .query_row(
+                        "SELECT m.project_key, e.hidden_ms FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                         WHERE e.vid = ?1",
+                        [vid],
+                        |r| Ok((r.get(0)?, r.get(1)?)),
+                    )
+                    .optional()?;
+                if let Some((project_key, None)) = row {
+                    written.push(VecItem { key: VecKey::Mem(*vid), scope: scope_of(project_key), v: v.clone() });
+                }
+            }
+            Ok(())
+        })();
+        let ended = match wrote {
+            Ok(()) => conn.execute_batch("COMMIT").map_err(AxelError::from),
+            Err(e) => Err(e),
+        };
+        match ended {
+            Ok(()) => items.extend(written),
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                failed = Some(e);
+                break;
+            }
+        }
+    }
+
+    // What was committed is sent, and counted as sent, whatever happened to a later batch.
+    if !items.is_empty() {
+        let count = items.len() as i64;
+        let highest = items.iter().map(|i| if let VecKey::Mem(v) = i.key { v } else { 0 }).max().unwrap_or(0);
+        if ctx.vec_tx.send(VecDelta::Upsert(items)).is_ok() {
+            if let Some(mems) = ctx.last_run.get_mut(K_MEMS) {
+                *mems += count;
+            }
+            if let Some(max) = ctx.last_run.get_mut(K_MEM_MAX) {
+                *max = (*max).max(highest);
+            }
+        }
+    }
+    match failed {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Every 30 s (called by `indexer::tick`, by a long scan between two archives, and once as
+/// soon as the brain is open): the row `context_data`, layer `axel`, key `status`. It
+/// begins with `begin_write`, which re-reads the brain's version. A process that is not
+/// `Ready` writes nothing.
 pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
-    let _ = ctx;
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    let mode = mode_of(ctx);
+    if mode != Some(Mode::Ready) {
+        return Ok(());
+    }
+    let s = &ctx.status;
+    let now = (ctx.clock)();
+    let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
+    let row = json!({
+        "pid": std::process::id(),
+        "version": env!("CARGO_PKG_VERSION"),
+        "mode": "ready",
+        "reason": DegradedReason::from_u8(s.reason.load(Ordering::SeqCst)).as_str(),
+        "reason_at": s.reason_at.get(),
+        "written_ms": now,
+        "started_ms": s.started_ms.load(Ordering::Relaxed),
+        "scan": match s.scan.load(Ordering::Relaxed) { 0 => "pending", 1 => "running", _ => "done" },
+        "indexer_running": true,
+        "embed_stopped": ctx.embed.stopped(),
+        "model_loaded": s.model_loaded.load(Ordering::Relaxed),
+        "model": ctx.embed.model_id(),
+        "model_dir": ctx.cfg.model_dir.to_string_lossy(),
+        "embedder": ctx.cfg.embedder.to_string(),
+        "vectors_waiting": n(&s.vectors_waiting),
+        "breaker_open": s.breaker_open.load(Ordering::Relaxed),
+        "breaker_trips": n(&s.breaker_trips),
+        "hook_misses": n(&s.hook_misses),
+        "sessions_dropped": n(&s.sessions_dropped),
+        "jobs_dropped": n(&s.jobs_dropped),
+        "tokens_blanked": n(&s.tokens_blanked),
+        "turns_withheld": n(&s.turns_withheld),
+        "write_errors": n(&s.write_errors),
+        "panics": n(&s.panics),
+        "forum": {
+            "declared": ctx.cfg.forum_on(),
+            "core_owns": base_config_value(&ctx.cfg.base, "memory.backend").as_deref() == Some("axel"),
+        },
+        "base": canonical_base(&ctx.cfg.base),
+        "warnings": ctx.cfg.warnings,
+    });
+
+    brain_v2::begin_write(conn)?;
+    let wrote = conn
+        .execute(
+            "INSERT INTO context_data(key, layer, value, updated) VALUES('status', 'axel', ?1, datetime('now'))
+             ON CONFLICT(key, layer) DO UPDATE SET value = excluded.value, updated = excluded.updated",
+            [row.to_string()],
+        )
+        .and_then(|_| conn.execute_batch("COMMIT"));
+    if let Err(e) = wrote {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
+    s.status_written_ms.store(now, Ordering::Relaxed);
     Ok(())
 }
