@@ -306,6 +306,35 @@ fn forget_now(
     if twin_count > 0 {
         writeln!(term.out, "{twin_count} of the {total} are archived rows with the same text as a hidden turn.")?;
     }
+    // RULING: v2 c18b review, item 7. What the forget mark of the deleted turns takes is
+    // found by doing it, in a transaction that is rolled back, and listed before the question.
+    let taken = mark_takes(conn, &ripe, &twins)?;
+    if !taken.is_empty() {
+        writeln!(
+            term.out,
+            "The forget mark of the deleted turns also takes these {} archived rows of the chat with the same prompt out of the brain (each stays in its Synaps archive):",
+            taken.len()
+        )?;
+        let mut archives: Vec<&str> = Vec::new();
+        for row in &taken {
+            if !archives.contains(&row.origin_ref.as_str()) {
+                archives.push(&row.origin_ref);
+            }
+        }
+        for archive in archives {
+            writeln!(term.out, "  ctx-{}:", one(archive))?;
+            for row in taken.iter().filter(|r| r.origin_ref == archive) {
+                writeln!(term.out, "    {}", twin_line(row))?;
+            }
+        }
+        // RULING: v2 c18b review, item 7, read with item 4: a kept archive obeys a `cli` mark
+        // (item 4), so "restore --forget-turns ctx-…" does not bring these rows back while
+        // the mark stands. Said as it is, not as a way back.
+        writeln!(
+            term.out,
+            "  No command brings these back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too."
+        )?;
+    }
     write!(term.out, "Delete {total} memories for good? [y/N] ")?;
     term.out.flush()?;
     let mut answer = String::new();
@@ -371,7 +400,7 @@ fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) -> Result<()> {
     if !purged.left_out.is_empty() {
         writeln!(
             term.out,
-            "The same turns were also taken out of {} more archived rows of the chat.",
+            "The forget mark took {} archived rows of the chat with the same prompt out of the brain, as listed above.",
             purged.left_out.len()
         )?;
     }
@@ -437,6 +466,47 @@ fn synaps_archive(conn: &Connection, row: &RowInfo, twins: &[Twin], ids: &[Strin
         )
         .optional()?
         .flatten())
+}
+
+/// The archived rows the forget marks of `purge` take (beside the rows named and their
+/// proven twins): `purge` itself, run in a transaction that is always rolled back.
+fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Vec<RowInfo>> {
+    let keys: Vec<&str> = ripe
+        .iter()
+        .filter(|r| r.origin == "capture" || r.origin == "archive")
+        .filter_map(|r| r.turn_key.as_deref())
+        .collect();
+    let mut candidates: Vec<RowInfo> = Vec::new();
+    for key in keys {
+        for row in rows_where(conn, "WHERE e.origin_kind = 'archive' AND e.turn_key = ?1 ORDER BY e.created_ms, e.vid", [key])? {
+            if !candidates.iter().any(|c| c.id == row.id) {
+                candidates.push(row);
+            }
+        }
+    }
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Err(e) = crate::brain_v2::begin_write(conn) {
+        return Err(busy_or(e));
+    }
+    let taken = purge(conn, ripe, twins).map(|p| p.left_out);
+    if !conn.is_autocommit() {
+        conn.execute_batch("ROLLBACK")?;
+    }
+    let taken = taken.map_err(busy_or)?;
+    Ok(candidates.into_iter().filter(|c| taken.contains(&c.id)).collect())
+}
+
+/// `show::BUSY` for a lock that did not come in time; any other error as it is.
+fn busy_or(e: crate::error::AxelError) -> crate::error::AxelError {
+    use rusqlite::ErrorCode::{DatabaseBusy, DatabaseLocked};
+    match &e {
+        crate::error::AxelError::Db(rusqlite::Error::SqliteFailure(f, _)) if matches!(f.code, DatabaseBusy | DatabaseLocked) => {
+            crate::error::AxelError::Other(show::BUSY.into())
+        }
+        _ => e,
+    }
 }
 
 /// Inside the caller's transaction. A row that changed since it was listed (restored,

@@ -1276,6 +1276,63 @@ fn a_kept_archive_obeys_the_mark_of_a_turn_deleted_with_forget_now() {
     assert!(!texts(&world).contains("DOCTORANSWER"), "restore --forget-turns brought back a turn deleted for good");
 }
 
+/// v2 c18b review, item 7: the archived rows the forget mark takes are listed before the
+/// question, by archive, with their date and first line; a "no" leaves them. (With item 4,
+/// `restore --forget-turns` does not bring them back: the output says so, and so does this.)
+#[test]
+fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
+    const PROMPT: &str = "continue with the plan we made for the ledger migration";
+    let mut world = Indexed::new();
+    let old = Arch::new(11, "s-seven", T0)
+        .turn(PROMPT, &reply("OLDCONTINUE"))
+        .forget_call("forget the thing about the landlord from this morning please", "SEVENFORGET")
+        .about("deploy window");
+    let newer = Arch::new(12, "s-seven", T0 + 1_000_000).about("lunch order");
+    world.file(&old);
+    world.scan();
+    world.file(&newer);
+    world.scan();
+    let old_row: String = world
+        .db()
+        .query_row("SELECT id FROM memories WHERE content LIKE '%OLDCONTINUE%'", [], |r| r.get(0))
+        .expect("the older archive's turn is a row: the test proves nothing");
+    // The same prompt again, another turn, captured inside the newer archive's window.
+    let mut cap = capture("mem_cap_seven", "s-seven", &key_of(PROMPT));
+    cap.project = scope();
+    cap.created_ms = T0 + 500_000;
+    cap.content = format!("User: {PROMPT}\nAssistant: NEWCONTINUE is another reply");
+    world.put(&cap);
+    tx(world.db(), || {
+        store::hide(world.db(), "mem_cap_seven", "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = 'mem_cap_seven'", [now_ms() - 25 * HOUR_MS]).unwrap();
+    });
+    assert_eq!(world.db().query_row("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", [&old_row], |r| r.get::<_, Option<String>>(0)).unwrap(), None);
+
+    let all = |world: &Indexed| dump(world.db(), "SELECT * FROM memories ORDER BY id");
+    let before = all(&world);
+    let no = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "n\n");
+    let out = &no.out;
+    let asked = out.find("[y/N]").unwrap_or_else(|| panic!("{out}"));
+    let listed = out.find(&format!("m:{old_row} \u{b7} ")).unwrap_or_else(|| panic!("the taken row is not listed: {out}"));
+    let archive = out.find(&format!("  ctx-{}:", old.id)).unwrap_or_else(|| panic!("{out}"));
+    assert!(archive < listed && listed < asked, "{out}");
+    assert!(out.contains(&format!("User: {PROMPT}")), "{out}");
+    assert_eq!(all(&world), before, "the listing changed a row");
+
+    let yes = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "y\n");
+    assert!(yes.out.contains("Deleted 1 memories for good."), "{}{}", yes.out, yes.err);
+    assert!(yes.out.contains("The forget mark took 1 archived rows"), "{}", yes.out);
+    let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
+    assert!(!has(&old_row));
+
+    // As said: a kept archive obeys the mark (item 4), so the row does not come back.
+    restore_turns(&world.path(), &format!("ctx-{}", old.id));
+    world.scan();
+    let texts = world.rows(&old).into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n");
+    assert!(texts.contains("SEVENFORGET"), "the kept archive was not read again: {texts}");
+    assert!(!texts.contains("OLDCONTINUE"), "{texts}");
+}
+
 /// An archive with two forget spans (`forget_units = 2`), and a neighbour of the same chat
 /// that leaves a turn out too.
 fn two_spans(world: &mut Indexed) -> (Arch, Arch) {
