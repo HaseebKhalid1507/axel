@@ -1666,3 +1666,63 @@ fn small_2_a_waiting_forget_mark_ends_with_its_turn() {
     assert_eq!(to_ms(conn, "T"), 1_600, "another chat's mark was moved");
     nothing_stored(conn);
 }
+
+/// Item 3: a marked turn and a withheld turn whose jobs the full queue refused: the front
+/// moves the mark's end to the turn's end and takes the turns' log rows itself. With the
+/// write lock held it does nothing and counts nothing new.
+// RULING: v2 final small round, item 3
+#[test]
+fn small_3_a_forgotten_or_withheld_turn_the_queue_refuses_still_leaves_no_log_rows() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    st.clock = Arc::new(|| 1_600);
+    let earlier = "what did the review say about the archive reader";
+    let marked = "forget the phone number of Bob that I gave you this morning";
+    let withheld = "the db password is hunter2, keep it for the deploy tonight";
+    assert!(screen::core_withholds(withheld));
+
+    // S: a forget turn, its mark written at the call.
+    log_at(&mut ctx, "S", earlier, true, 500);
+    user(&mut st, "S", &cwd, marked, 1_000);
+    log_at(&mut ctx, "S", marked, true, 1_000);
+    assistant(&mut st, "S", &cwd, "I will call the forget tool for that number.", true, 1_500);
+    let _ = forget_call(&mut st, "S", &cwd);
+    assert!(st.forget_marks.is_empty());
+    assert_eq!(to_ms(ctx_conn(&ctx), "S"), 1_600);
+    user(&mut st, "S", &cwd, "and the number of Alice as well, from the same message", 2_000);
+    log_at(&mut ctx, "S", "and the number of Alice as well, from the same message", true, 2_000);
+    // W: a withheld turn. T: another chat, untouched.
+    user(&mut st, "W", &cwd, withheld, 1_000);
+    log_at(&mut ctx, "W", withheld, false, 1_000);
+    log_at(&mut ctx, "T", marked, true, 1_000);
+
+    while st.jobs.try_send(Job::Tick).is_ok() {}
+    let jobs_dropped = status.jobs_dropped.load(Ordering::Relaxed);
+    assistant(&mut st, "S", &cwd, "Done: the numbers of Bob and Alice are forgotten.", false, 3_000);
+    assistant(&mut st, "W", &cwd, "Noted, I will use it for the deploy.", false, 3_000);
+    assert!(next_capture(&jobs).is_none(), "a job was queued");
+    assert_eq!(status.jobs_dropped.load(Ordering::Relaxed), jobs_dropped + 2);
+    let conn = ctx_conn(&ctx);
+    assert!(conn.is_autocommit() && st.conn.as_ref().unwrap().is_autocommit());
+    assert_eq!(to_ms(conn, "S"), 3_000, "the mark still ends at the call");
+    assert_eq!(log_times(conn, "S"), [500], "a log row of the forgotten turn survived");
+    assert_eq!(log_times(conn, "W"), Vec::<i64>::new(), "the withheld turn's log row survived");
+    assert_eq!(log_times(conn, "T"), [1_000], "another chat's row");
+    assert_eq!(dropped(&status), 0);
+    nothing_stored(conn);
+
+    // The write lock held: nothing is written, nothing new is counted, nothing stays open.
+    log_at(&mut ctx, "W", withheld, false, 4_000);
+    user(&mut st, "W", &cwd, withheld, 4_000);
+    ctx_conn(&ctx).execute_batch("BEGIN IMMEDIATE").unwrap();
+    // `next_capture` above emptied the queue.
+    while st.jobs.try_send(Job::Tick).is_ok() {}
+    assistant(&mut st, "W", &cwd, "Noted again.", false, 4_500);
+    ctx_conn(&ctx).execute_batch("ROLLBACK").unwrap();
+    assert_eq!(log_times(ctx_conn(&ctx), "W"), [4_000]);
+    assert!(st.conn.as_ref().unwrap().is_autocommit());
+    assert_eq!(status.jobs_dropped.load(Ordering::Relaxed), jobs_dropped + 3);
+    assert_eq!(status.write_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(dropped(&status), 0);
+}

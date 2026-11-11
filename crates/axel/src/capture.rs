@@ -6,7 +6,8 @@
 //! (`screen::core_withholds`), the turn in which a forget tool was called, a turn of a
 //! paused chat, a turn with no project, a chat filed under another project.
 //!
-//! Pairing runs on the front thread inside a hook's budget: no SQL, no embedding.
+//! Pairing runs on the front thread inside a hook's budget: no SQL, no embedding (but for a
+//! marked or withheld turn the queue refuses: `front::forget_unqueued_turn`).
 //! `write_turn` runs on the indexer thread and owns its transaction.
 
 use std::collections::HashMap;
@@ -341,6 +342,25 @@ fn not_stored(conn: &Connection, turn: &CompletedTurn) -> Result<Written> {
     Ok(Written::Skipped)
 }
 
+/// What a marked turn leaves behind when it ends, inside a transaction the caller holds: the
+/// end of its `call` interval moves to the turn's end, and the turn's log rows go. For a
+/// withheld turn that is not marked, the log rows only.
+// RULING: v2 final small round, item 3: the statements of `write_turn`'s marked branch, so
+// that the front thread runs the same ones for a turn whose job the queue refused.
+pub(crate) fn forget_turn_rows(conn: &Connection, turn: &CompletedTurn) -> Result<()> {
+    if turn.suppressed {
+        // SPEC: 3435-3436 say "sets `to_ms` … to `at_ms`"; an interval is never made
+        // shorter (a second call may have moved its end past this turn's clock).
+        conn.execute(
+            "UPDATE forgotten_turns SET to_ms = max(to_ms, ?1)
+              WHERE source = 'call' AND from_ms = ?2 AND (logical = ?3 OR session_id = ?4)",
+            params![turn.at_ms, turn.started_ms, project::logical(&turn.session_id), turn.session_id],
+        )?;
+    }
+    recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
+    Ok(())
+}
+
 /// Indexer thread. Called on a bare connection: it opens its own transaction, commits it,
 /// and after any error rolls back and returns the error.
 pub fn write_turn(
@@ -356,17 +376,7 @@ pub fn write_turn(
     // rows go (every message of it, by time: a message in the middle of the turn has its
     // own row and its own hash).
     if turn.suppressed {
-        in_transaction(conn, || {
-            // SPEC: 3435-3436 say "sets `to_ms` … to `at_ms`"; an interval is never made
-            // shorter (a second call may have moved its end past this turn's clock).
-            conn.execute(
-                "UPDATE forgotten_turns SET to_ms = max(to_ms, ?1)
-                  WHERE source = 'call' AND from_ms = ?2 AND (logical = ?3 OR session_id = ?4)",
-                params![turn.at_ms, turn.started_ms, logical, turn.session_id],
-            )?;
-            recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
-            Ok(())
-        })?;
+        in_transaction(conn, || forget_turn_rows(conn, turn))?;
         return Ok(Written::Skipped);
     }
     if !cfg.capture {
@@ -485,7 +495,7 @@ pub fn on_user_event(st: &mut FrontState, ev: &HookEvent) {
 }
 
 /// `on_message_complete` (called by `ext::hooks::handle`). No SQL: the turn goes to the
-/// indexer as a job.
+/// indexer as a job (a marked or withheld turn the queue refuses: see `pair_reply`).
 pub fn on_assistant_event(st: &mut FrontState, ev: &HookEvent) {
     if let Some(session_id) = ev.session_id.as_deref() {
         pair_reply(st, session_id, ev);
@@ -519,11 +529,17 @@ fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
             }
         }
     }
+    // RULING: v2 final small round, item 3: a marked or withheld turn carries no text, so
+    // it is kept for the case the queue refuses it.
+    let unstored = (turn.suppressed || (turn.withheld && st.cfg.capture)).then(|| turn.clone());
     // A full queue drops the turn (the job is counted there, the turn here); it arrives
     // with its archive.
     let sent = front::send_job(st, Job::Capture(turn));
     if !sent && storable {
         st.status.turns_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    if let (false, Some(turn)) = (sent, unstored) {
+        front::forget_unqueued_turn(st, &turn);
     }
     if sent && storable {
         st.status.tokens_blanked.fetch_add(blanked, Ordering::Relaxed);

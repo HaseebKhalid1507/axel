@@ -377,6 +377,34 @@ fn write_mark(st: &FrontState, mark: &ForgetMark) -> (MarkEnd, Vec<i64>) {
     }
 }
 
+/// A marked or withheld turn whose `Job::Capture` the queue refused: what `write_turn` would
+/// have done with it, on this thread's connection, in one write transaction. When that
+/// cannot be done now, one log line; nothing is counted.
+// RULING: v2 final small round, item 3. The `call` interval would end at the call and the
+// log would keep the head of a prompt he asked to forget.
+pub(crate) fn forget_unqueued_turn(st: &FrontState, turn: &capture::CompletedTurn) {
+    let Some(conn) = st.conn.as_ref().filter(|_| is_ready(st)) else {
+        log_line("front: a refused turn's forget rows not written: not ready");
+        return;
+    };
+    let guard = match brain_v2::begin_write_front(conn, &st.writing) {
+        Ok(guard) => guard,
+        Err(e) => {
+            let kind = if is_busy(&e) { "busy" } else { error_kind(&e) };
+            log_line(&format!("front: a refused turn's forget rows not written: {kind}"));
+            return;
+        }
+    };
+    let ended = capture::forget_turn_rows(conn, turn)
+        .and_then(|()| conn.execute_batch("COMMIT").map_err(AxelError::from));
+    if let Err(e) = ended {
+        let _ = conn.execute_batch("ROLLBACK");
+        let kind = if is_busy(&e) { "busy" } else { error_kind(&e) };
+        log_line(&format!("front: a refused turn's forget rows not written: {kind}"));
+    }
+    drop(guard);
+}
+
 /// `retry_marks` with `write_mark`; the vectors of what the written marks purged leave
 /// the array after the round (each mark's `COMMIT` has held by then).
 /// Public for its test.
