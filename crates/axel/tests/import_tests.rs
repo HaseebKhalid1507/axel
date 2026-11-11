@@ -1858,3 +1858,23 @@ fn f13_catch_up_adopts_by_adoptions_rules() {
     assert_eq!(word_hits(&new, "cormorant"), ["mem-blob-title"]);
     assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-blob-title'"), "exact");
 }
+
+/// A `created` that is text but not UTF-8 would stop `brain_v2`'s adoption with a panic:
+/// `init` refuses the source first, naming the row, and puts nothing at the destination.
+#[test]
+fn f13_init_refuses_a_created_that_adoption_cannot_read() {
+    let fx = fx();
+    make_axel(&fx.old);
+    change_axel(&fx.old, |conn| {
+        conn.execute_batch("UPDATE memories SET created = CAST(x'c328' AS TEXT) WHERE id = 'mem-aaaa0001'").unwrap();
+    });
+    let before = state(&fx.old);
+    let out = fx.init(&fx.old);
+    show("init, a created that is not UTF-8", &out);
+    assert_eq!(out.code, 3, "{}", out.report);
+    let error = out.report["error"].as_str().unwrap();
+    assert!(error.contains("has 1 memories whose created is text that is not UTF-8 (mem-aaaa0001)"), "{error}");
+    assert!(out.report["temporary_copy_deleted"].is_string(), "{}", out.report);
+    assert!(listing(fx.new.parent().unwrap()).is_empty());
+    assert_eq!(state(&fx.old), before);
+}

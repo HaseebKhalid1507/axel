@@ -1084,6 +1084,7 @@ fn prepare(
             return Err(stop(EXIT_SOURCE, format!("{} is not a brain this command can import: {e}", source.display())))
         }
     }
+    refuse_created_not_utf8(&copy.db, source)?;
     for suffix in SIDES {
         let _ = fs::remove_file(side(&copy.db, suffix));
     }
@@ -1167,6 +1168,38 @@ fn prepare(
         seam("replaced", dest).map_err(|s| stop(s.code, format!("{}.{aside_note}", s.message)))?;
     }
     Ok((copy.db, aside_note))
+}
+
+/// `brain_v2`'s adoption reads `memories.created` of every row it adopts as an SQLite
+/// value, and rusqlite 0.32 panics on a text that is not UTF-8: the whole command would stop
+/// with no report. Such a source is refused first, naming the rows.
+fn refuse_created_not_utf8(db: &Path, source: &Path) -> Res<()> {
+    let conn = Connection::open_with_flags(
+        file_uri(db, "mode=ro&immutable=1"),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let mut stmt = conn.prepare("SELECT id, content, created FROM memories WHERE typeof(created) = 'text'")?;
+    let mut rows = stmt.query([])?;
+    let mut bad = Vec::new();
+    while let Some(r) = rows.next()? {
+        let adopted = brain_v2::text_at(r, 0)?.is_some() && brain_v2::text_at(r, 1)?.is_some();
+        if adopted && brain_v2::text_at(r, 2)?.is_none() {
+            bad.push(Cell::of(r.get_ref(0)?).show());
+        }
+    }
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(stop(
+        EXIT_SOURCE,
+        format!(
+            "{} has {} memories whose created is text that is not UTF-8{}; the adoption of version 2 cannot read \
+             them, and nothing was imported",
+            source.display(),
+            bad.len(),
+            names(&bad)
+        ),
+    ))
 }
 
 fn hnsw_of(brain: &Path) -> PathBuf {
