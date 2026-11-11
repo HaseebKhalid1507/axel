@@ -112,6 +112,44 @@ fn a_refused_open_leaves_the_file_byte_identical() {
     assert!(table_count(&plain_path) > tables_before);
 }
 
+fn sha256(path: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    hex::encode(Sha256::digest(std::fs::read(path).unwrap()))
+}
+
+#[test]
+fn a_768_dimension_brain_is_refused_by_both_openers_with_its_hash_unchanged() {
+    use axel::error::AxelError;
+    use axel::search::BrainSearch;
+
+    // The brain records the default model's name and 768 dimensions; the
+    // embedder has 384. Only the dimension can refuse it.
+    let temp_dir = tempfile::tempdir().unwrap();
+    let path = temp_dir.path().join("wide.r8");
+    drop(axel::r8::Brain::create_with_model(&path, Some("t"), "all-MiniLM-L6-v2", 768).unwrap());
+    let hash_before = sha256(&path);
+    let embedder = Embedder::new(None, None, true);
+    assert_eq!(embedder.dim(), 384);
+
+    // Opener 1: BrainSearch.
+    let error = match BrainSearch::open_with_embedder(&path, embedder) {
+        Ok(_) => panic!("BrainSearch::open_with_embedder must refuse a 768-dimension brain"),
+        Err(error) => error,
+    };
+    assert!(matches!(&error, AxelError::ModelMismatch { .. }), "{error}");
+    assert!(error.to_string().contains("768 dimensions"), "{error}");
+    assert_eq!(sha256(&path), hash_before, "BrainSearch::open_with_embedder changed the file");
+
+    // Opener 2: AxelBrain::open.
+    let error = match AxelBrain::open(&path) {
+        Ok(_) => panic!("AxelBrain::open must refuse a 768-dimension brain"),
+        Err(error) => error,
+    };
+    assert!(matches!(&error, AxelError::ModelMismatch { .. }), "{error}");
+    assert!(error.to_string().contains("768 dimensions"), "{error}");
+    assert_eq!(sha256(&path), hash_before, "AxelBrain::open changed the file");
+}
+
 #[test]
 fn test_axel_verify_nonexistent_memory() {
     let (brain, _temp_dir) = setup_test_brain();
