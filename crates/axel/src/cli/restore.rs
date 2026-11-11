@@ -201,12 +201,11 @@ fn by_model(conn: &Connection, since: i64, yes: bool, term: &mut Term) -> Result
             let by = one(row.superseded_by.as_deref().unwrap_or("?"));
             let mut line = format!("m:{}: no longer superseded by m:{by}", one(&row.id));
             match row.hidden_by.as_deref() {
-                Some(model) if model.starts_with("model:") => {
-                    if store::restore_hide(conn, &row.id)? > 0 {
-                        back_hidden += 1;
-                        line.push_str(&format!("; also no longer hidden (by {})", one(model)));
-                    }
+                Some(model) if model.starts_with("model:") && store::restore_hide(conn, &row.id)? > 0 => {
+                    back_hidden += 1;
+                    line.push_str(&format!("; also no longer hidden (by {})", one(model)));
                 }
+                Some(model) if model.starts_with("model:") => {}
                 Some(other) if row.hidden_ms.is_some() => {
                     line.push_str(&format!("; still hidden (by {}: \"axel-v2 restore {}\" undoes that)", one(other), one(&row.id)));
                 }
