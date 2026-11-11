@@ -67,7 +67,7 @@ pub fn dispatch(ctx: &mut IndexerCtx, job: Job) {
             None => Ok(()),
         },
         Job::LogRecall(trace) => recall::write_log(ctx, &trace),
-        Job::Embedded { model, vectors } => indexer_start::on_embedded(ctx, &model, vectors),
+        Job::Embedded { model, vectors, out } => indexer_start::on_embedded(ctx, &model, vectors, out.as_deref()),
     });
 }
 

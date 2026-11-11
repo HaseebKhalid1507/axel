@@ -2,7 +2,7 @@
 //! queue, served first, and a bulk queue worked in batches of 4. A panic ends this thread only;
 //! every caller then gets `None` at once, and every wait has a deadline.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
@@ -71,9 +71,34 @@ struct Bulk {
     to: BulkTo,
 }
 
+/// One memory row whose text goes to the embed thread (`submit_rows`).
+pub struct BulkRow {
+    pub vid: i64,
+    pub mem_id: String,
+    pub content_hash: String,
+    pub text: String,
+}
+
+// RULING: wave4 R-12b item 4. `vid` alone does not name a row: SQLite gives the number of a
+// purged newest row to the next row inserted. The batch carries what the row was when its
+// text was read, and comes back with its vectors.
+/// What a finished bulk carries beside its vectors: for each `vid` that was sent, the
+/// `mem_id` and `content_hash` the row had then.
+#[derive(Debug, Default)]
+pub struct BatchOut {
+    rows: HashMap<i64, (String, String)>,
+}
+
+impl BatchOut {
+    /// `(mem_id, content_hash)` of the row that was sent under this number.
+    pub fn row(&self, vid: i64) -> Option<(&str, &str)> {
+        self.rows.get(&vid).map(|(mem_id, hash)| (mem_id.as_str(), hash.as_str()))
+    }
+}
+
 enum BulkTo {
-    /// `submit_bulk`: the result goes to the indexer as `Job::Embedded`.
-    Rows(Vec<VecKey>),
+    /// `submit_bulk` and `submit_rows`: the result goes to the indexer as `Job::Embedded`.
+    Rows(Vec<VecKey>, HashMap<i64, (String, String)>),
     /// `embed_wait`: the result goes back to the blocked caller.
     Caller { reply: Sender<Vec<Vec<f32>>>, deadline: Instant },
 }
@@ -145,8 +170,25 @@ impl EmbedService {
         wait(&answer, deadline)
     }
 
-    /// Memory rows; results arrive as `Job::Embedded`.
+    /// Memory rows; results arrive as `Job::Embedded`, whose `out` says which row each
+    /// number stood for.
+    pub fn submit_rows(&self, rows: Vec<BulkRow>) {
+        let mut sent = HashMap::new();
+        let mut items = Vec::with_capacity(rows.len());
+        for row in rows {
+            sent.insert(row.vid, (row.mem_id, row.content_hash));
+            items.push((VecKey::Mem(row.vid), row.text));
+        }
+        self.submit(items, sent);
+    }
+
+    /// Texts by key alone; results arrive as `Job::Embedded`. The indexer writes no vector
+    /// from such a batch: it does not say which rows it was read from.
     pub fn submit_bulk(&self, items: Vec<(VecKey, String)>) {
+        self.submit(items, HashMap::new());
+    }
+
+    fn submit(&self, items: Vec<(VecKey, String)>, sent: HashMap<i64, (String, String)>) {
         let Some(tx) = &self.tx else { return };
         if items.is_empty() || self.stopped() {
             return;
@@ -154,7 +196,7 @@ impl EmbedService {
         let n = items.len();
         let (keys, texts): (Vec<VecKey>, Vec<String>) = items.into_iter().unzip();
         self.backlog.fetch_add(n, Ordering::SeqCst);
-        if tx.send(Req::Bulk(Bulk { texts, done: Vec::new(), to: BulkTo::Rows(keys) })).is_err() {
+        if tx.send(Req::Bulk(Bulk { texts, done: Vec::new(), to: BulkTo::Rows(keys, sent) })).is_err() {
             unlog(&self.backlog, n);
         }
     }
@@ -356,10 +398,10 @@ where
             let _ = reply.send(bulk.done);
             None
         }
-        BulkTo::Rows(keys) => {
+        BulkTo::Rows(keys, rows) => {
             let vectors: Vec<(VecKey, Vec<f32>)> =
                 keys.into_iter().zip(bulk.done).filter(|(_, v)| !v.is_empty()).collect();
-            Some(Job::Embedded { model: model.to_string(), vectors })
+            Some(Job::Embedded { model: model.to_string(), vectors, out: Some(Arc::new(BatchOut { rows })) })
         }
     }
 }

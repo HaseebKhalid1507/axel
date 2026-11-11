@@ -296,7 +296,7 @@ fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
     assert!(indexer_start::pump_embeddings(&mut ctx).is_ok());
     assert!(indexer_start::resync_vectors(&mut ctx).is_ok());
     assert!(indexer_start::write_status(&mut ctx).is_ok());
-    assert!(indexer_start::on_embedded(&mut ctx, "m", Vec::new()).is_ok());
+    assert!(indexer_start::on_embedded(&mut ctx, "m", Vec::new(), None).is_ok());
     assert!(recall::write_log(&mut ctx, &RecallTrace::default()).is_ok());
     assert!(recall::trim_log(&mut ctx).is_ok());
 
@@ -316,7 +316,7 @@ fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
         archive_job,
         Job::Capture(turn()),
         Job::LogRecall(Box::default()),
-        Job::Embedded { model: "m".to_string(), vectors: Vec::new() },
+        Job::Embedded { model: "m".to_string(), vectors: Vec::new(), out: None },
     ] {
         indexer::dispatch(&mut ctx, job);
     }

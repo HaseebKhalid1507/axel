@@ -1034,7 +1034,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert_eq!(ctx.embed.backlog(), 2);
     // While the batch is out, nothing is offered a second time.
     indexer_start::pump_embeddings(&mut ctx).unwrap();
-    let Ok(Job::Embedded { model, vectors }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
         panic!("no Job::Embedded")
     };
     assert!(jobs_rx.recv_timeout(Duration::from_millis(200)).is_err(), "the rows were queued twice");
@@ -1042,7 +1042,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert_eq!(vectors.len(), 2);
     assert!(vectors.iter().all(|(k, _)| *k != VecKey::Mem(vid_a)));
 
-    indexer_start::on_embedded(&mut ctx, &model, vectors.clone()).unwrap();
+    indexer_start::on_embedded(&mut ctx, &model, vectors.clone(), out.as_deref()).unwrap();
     assert_eq!(ctx.embed.backlog(), 0);
     let Ok(VecDelta::Upsert(items)) = vec_rx.try_recv() else { panic!("no Upsert") };
     assert_eq!(items.len(), 2);
@@ -1064,7 +1064,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     // writes nothing.
     indexer_start::resync_vectors(&mut ctx).unwrap();
     assert!(vec_rx.try_recv().is_err());
-    indexer_start::on_embedded(&mut ctx, &model, vectors).unwrap();
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
     assert!(vec_rx.try_recv().is_err());
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(status.vectors_waiting.load(Ordering::Relaxed), 0);
@@ -1074,7 +1074,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     insert_memory(&conn, "mem_d", None, None, false);
     let written = status.status_written_ms.load(Ordering::Relaxed);
     degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
-    indexer_start::on_embedded(&mut ctx, "hash-384", vec![(VecKey::Mem(vid_a), unit(9))]).unwrap();
+    indexer_start::on_embedded(&mut ctx, "hash-384", vec![(VecKey::Mem(vid_a), unit(9))], out.as_deref()).unwrap();
     indexer_start::write_status(&mut ctx).unwrap();
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(ctx.embed.backlog(), 0);
@@ -1824,4 +1824,95 @@ fn w4_3_a_title_that_is_not_text_does_not_stop_the_embedding_of_the_other_rows()
         panic!("no Job::Embedded")
     };
     assert_eq!(vectors.len(), 3);
+}
+
+// ── Wave 4, R-12b item 4: a vector goes only to the row its text was read from ──
+
+fn stored_vector(conn: &Connection, mem_id: &str) -> Option<Vec<u8>> {
+    conn.query_row("SELECT embedding FROM memory_ext WHERE mem_id = ?1", [mem_id], |r| r.get(0)).unwrap()
+}
+
+fn hashed_blob(text: &str) -> Vec<u8> {
+    blob(&Embedder::hashing().embed(&[text]).unwrap()[0])
+}
+
+#[test]
+fn w4_4_a_row_purged_while_its_text_is_embedded_does_not_give_its_vector_to_the_next_row() {
+    let dirs = Dirs::new();
+    let conn = make_brain(&dirs.brain());
+    let old = insert_memory(&conn, "mem_old", None, None, false);
+    // Every batch stays 400 ms with the embed thread.
+    let test = TestHooks { embed_sleep_ms: 400, ..TestHooks::default() };
+    let (b, _status) = boot(Some(Embedder::hashing()), test);
+    let (mut ctx, jobs_rx, vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Replace(_))));
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert_eq!(ctx.embed.backlog(), 1);
+
+    // While the text is out: the row is purged and another is stored. It gets the number.
+    // (The delete guard lets a memory go only while `axel_purge` holds its row, as in
+    // `store::purge_many`; the trigger on `memories` removes the `memory_ext` row.)
+    conn.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT INTO axel_purge(one) VALUES (1);
+         DELETE FROM memories WHERE id = 'mem_old';
+         DELETE FROM axel_purge;
+         COMMIT;",
+    )
+    .unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM memory_ext", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+    let new = insert_memory(&conn, "mem_new", None, None, false);
+    assert_eq!(new, old, "SQLite gives the number of the purged newest row to the next row");
+
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    assert_eq!(vectors.iter().map(|(k, _)| *k).collect::<Vec<_>>(), [VecKey::Mem(old)]);
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
+    assert_eq!(stored_vector(&conn, "mem_new"), None, "the new row got the vector of the purged text");
+    assert!(vec_rx.try_recv().is_err(), "the front thread was sent the vector of the purged text");
+    drop(out);
+
+    // The new row is embedded in its own turn, from its own text.
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
+    assert_eq!(
+        stored_vector(&conn, "mem_new"),
+        Some(hashed_blob("title of mem_new\nthe body of mem_new about retry limits"))
+    );
+    assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Upsert(items)) if items.len() == 1));
+}
+
+#[test]
+fn w4_4_a_row_made_secret_or_rewritten_while_its_text_is_embedded_gets_no_vector() {
+    let dirs = Dirs::new();
+    let conn = make_brain(&dirs.brain());
+    insert_memory(&conn, "mem_kept", None, None, false);
+    insert_memory(&conn, "mem_secret", None, None, false);
+    insert_memory(&conn, "mem_rewritten", None, None, false);
+    let test = TestHooks { embed_sleep_ms: 400, ..TestHooks::default() };
+    let (b, _status) = boot(Some(Embedder::hashing()), test);
+    let (mut ctx, jobs_rx, vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Replace(_))));
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert_eq!(ctx.embed.backlog(), 3);
+
+    conn.execute("UPDATE memories SET sensitivity = 'secret' WHERE id = 'mem_secret'", []).unwrap();
+    conn.execute("UPDATE memory_ext SET content_hash = 'another body' WHERE mem_id = 'mem_rewritten'", []).unwrap();
+
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    assert_eq!(vectors.len(), 3);
+    // A job that does not say which rows it was read from writes nothing.
+    indexer_start::on_embedded(&mut ctx, &model, vectors.clone(), None).unwrap();
+    assert_eq!(stored_vector(&conn, "mem_kept"), None);
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
+    assert!(stored_vector(&conn, "mem_kept").is_some());
+    assert_eq!(stored_vector(&conn, "mem_secret"), None, "a secret row got a vector");
+    assert_eq!(stored_vector(&conn, "mem_rewritten"), None, "a rewritten row got the vector of its old text");
+    assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Upsert(items)) if items.len() == 1));
 }

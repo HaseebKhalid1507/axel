@@ -137,7 +137,7 @@ fn a_query_is_served_while_a_bulk_batch_of_64_is_queued() {
     let first = embedded(&jobs_rx);
     assert_eq!(first.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (0..4).map(VecKey::Mem).collect::<Vec<_>>());
     match jobs_rx.recv_timeout(Duration::from_secs(5)) {
-        Ok(Job::Embedded { model, vectors }) => {
+        Ok(Job::Embedded { model, vectors, .. }) => {
             assert_eq!(model, Embedder::hashing().model_id());
             assert_eq!(vectors.len(), 64);
             for (i, (key, v)) in vectors.iter().enumerate() {

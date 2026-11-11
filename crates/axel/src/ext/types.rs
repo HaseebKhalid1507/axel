@@ -236,10 +236,12 @@ pub enum Job {
     },
     Capture(CompletedTurn),
     LogRecall(Box<RecallTrace>),
-    /// `VecKey::Mem` only (B-2e).
+    /// `VecKey::Mem` only (B-2e). `out` is what the embed thread was given with the texts:
+    /// which row each number stood for (wave 4, R-12b item 4). A job without it writes nothing.
     Embedded {
         model: String,
         vectors: Vec<(VecKey, Vec<f32>)>,
+        out: Option<Arc<crate::embed::BatchOut>>,
     },
 }
 

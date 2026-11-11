@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde_json::json;
 
 use crate::brain_v2::{self, OpenOpts};
-use crate::embed::EmbedService;
+use crate::embed::{BatchOut, BulkRow, EmbedService};
 use crate::error::{AxelError, Result};
 use crate::ext::config::{base_config_value, ExtConfig};
 use crate::ext::server::{degrade, log_line, recover, JOB_QUEUE};
@@ -382,7 +382,8 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
         return Ok(());
     }
     let mut stmt = conn.prepare(
-        "SELECT e.vid, m.title, m.content FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+        "SELECT e.vid, m.title, m.content, e.mem_id, e.content_hash
+         FROM memory_ext e JOIN memories m ON m.id = e.mem_id
          WHERE e.embedding IS NULL AND m.sensitivity <> 'secret'
          ORDER BY e.created_ms DESC, e.vid DESC LIMIT ?1",
     )?;
@@ -393,17 +394,29 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
         .query_map([BATCH as i64], |r| {
             let title = brain_v2::text_at(r, 1)?.unwrap_or_default();
             let body = brain_v2::text_at(r, 2)?.unwrap_or_default();
-            Ok((VecKey::Mem(r.get(0)?), format!("{title}\n{body}")))
+            // RULING: wave4 R-12b item 4. The batch says which row each number stood for.
+            Ok(BulkRow { vid: r.get(0)?, mem_id: r.get(3)?, content_hash: r.get(4)?, text: format!("{title}\n{body}") })
         })?
-        .collect::<rusqlite::Result<Vec<(VecKey, String)>>>()?;
+        .collect::<rusqlite::Result<Vec<BulkRow>>>()?;
     drop(stmt);
-    ctx.embed.submit_bulk(items);
+    ctx.embed.submit_rows(items);
     Ok(())
 }
 
 /// `Job::Embedded` (called by `indexer::dispatch`): the vectors are written, 64 per
 /// transaction, and the same vectors go to the front thread as a `VecDelta::Upsert`.
-pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<f32>)>) -> Result<()> {
+///
+/// A vector is written only to the row its text was read from: the number, the `mem_id` and
+/// the `content_hash` must all be what `out` recorded when the batch was sent, and the
+/// memory must not be `secret` now. A row purged while its text was with the embed thread
+/// may have given its number to a new row, which must not get the purged text's vector.
+// RULING: wave4 R-12b item 4.
+pub fn on_embedded(
+    ctx: &mut IndexerCtx,
+    model: &str,
+    vectors: Vec<(VecKey, Vec<f32>)>,
+    out: Option<&BatchOut>,
+) -> Result<()> {
     if mode_of(ctx) != Some(Mode::Ready) || ctx.embed.model_id() != Some(model) || !model_usable(ctx)? {
         return Ok(());
     }
@@ -426,9 +439,13 @@ pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<
                 if v.len() != EMBEDDING_DIM {
                     continue;
                 }
+                let Some((mem_id, content_hash)) = out.and_then(|out| out.row(*vid)) else { continue };
                 let changed = conn.execute(
-                    "UPDATE memory_ext SET embedding = ?1, embed_model = ?2 WHERE vid = ?3 AND embedding IS NULL",
-                    params![vec_to_blob(v), model, vid],
+                    "UPDATE memory_ext SET embedding = ?1, embed_model = ?2
+                     WHERE vid = ?3 AND mem_id = ?4 AND content_hash = ?5 AND embedding IS NULL
+                       AND EXISTS (SELECT 1 FROM memories m
+                                   WHERE m.id = memory_ext.mem_id AND m.sensitivity <> 'secret')",
+                    params![vec_to_blob(v), model, vid, mem_id, content_hash],
                 )?;
                 if changed != 1 {
                     continue;
