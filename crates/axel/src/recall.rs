@@ -559,7 +559,7 @@ const DOC_RANK: &str = "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'con
 // the word index's row with the body, and `project_key` and `expires_at` come after
 // `content` in `memories`. A `LIMIT` before the view would let rows of other projects take
 // the places; this gives what `ORDER BY bm25 LIMIT 48` over the visible rows gave.
-fn mem_by_words(conn: &Connection, expr: &str, scope: &Scope) -> rusqlite::Result<Vec<MemRow>> {
+fn mem_by_words(conn: &Connection, expr: &str, scope: &Scope, deadline: Instant) -> rusqlite::Result<Vec<MemRow>> {
     let sql = format!(
         "SELECT {MEM_COLUMNS}
      FROM memories_fts f JOIN memories m ON m.id = f.mem_id
@@ -572,6 +572,11 @@ fn mem_by_words(conn: &Connection, expr: &str, scope: &Scope) -> rusqlite::Resul
     let mut ranked = rank.query(named_params! { ":expr": expr })?;
     let (mut out, mut found) = (Vec::new(), 0);
     while found < MEM_WORDS_LIMIT {
+        // RULING: v2 final capture round, item 4: the clock at every row, as in every
+        // other loop of recall; the caller sees the deadline and answers `timeout`.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Some(hit) = ranked.next()? else { break };
         let rowid: i64 = hit.get(0)?;
         let mut rows = read.query(named_params! {
@@ -606,7 +611,7 @@ fn mem_by_vid(conn: &Connection, vid: i64, scope: &Scope) -> rusqlite::Result<Op
 
 /// Generator c: note files, by words. As generator a: the rank alone first (`DOC_RANK`),
 /// then the rows best first until `DOC_WORDS_LIMIT` of them are not hidden.
-fn docs_by_words(conn: &Connection, expr: &str) -> rusqlite::Result<Vec<DocRow>> {
+fn docs_by_words(conn: &Connection, expr: &str, deadline: Instant) -> rusqlite::Result<Vec<DocRow>> {
     let sql = format!(
         "SELECT {DOC_COLUMNS}
      FROM chunks_fts f JOIN documents d ON d.doc_id = f.doc_id
@@ -617,6 +622,10 @@ fn docs_by_words(conn: &Connection, expr: &str) -> rusqlite::Result<Vec<DocRow>>
     let mut ranked = rank.query(named_params! { ":expr": expr })?;
     let (mut out, mut found) = (Vec::new(), 0);
     while found < DOC_WORDS_LIMIT {
+        // RULING: v2 final capture round, item 4.
+        if Instant::now() >= deadline {
+            break;
+        }
         let Some(hit) = ranked.next()? else { break };
         let rowid: i64 = hit.get(0)?;
         let mut rows = read.query(named_params! { ":rowid": rowid })?;
@@ -1144,7 +1153,7 @@ pub fn recall(
 
     // a. Memory, by words.
     if !expr.is_empty() {
-        let rows = match mem_by_words(conn, &expr, &scope) {
+        let rows = match mem_by_words(conn, &expr, &scope, req.deadline) {
             Ok(rows) => rows,
             Err(e) => return finish(trace, started, Vec::new(), failed(&e)),
         };
@@ -1192,7 +1201,7 @@ pub fn recall(
 
     // c. Note files, by words.
     if view.documents && !expr.is_empty() {
-        let rows = match docs_by_words(conn, &expr) {
+        let rows = match docs_by_words(conn, &expr, req.deadline) {
             Ok(rows) => rows,
             Err(e) => return finish(trace, started, Vec::new(), failed(&e)),
         };
@@ -1733,4 +1742,68 @@ pub fn trim_log(ctx: &mut IndexerCtx) -> Result<()> {
         )?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::brain_v2::{self, OpenOpts};
+    use crate::project_memory::{RecordLinks, Sensitivity};
+    use crate::store::{self, NewRow};
+
+    // RULING: v2 final capture round, item 4: the two row-by-row loops stop at the
+    // deadline by themselves, before reading a row; with time left they read them all.
+    #[test]
+    fn the_word_loops_stop_at_the_deadline() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let opts = OpenOpts { agent: Some("test"), model: "hash-384", dim: 384, upgrade_v1: false };
+        let brain = brain_v2::open_v2(&dir.path().join("brain.r8"), &opts).unwrap();
+        let conn = &brain.conn;
+        brain_v2::begin_write(conn).unwrap();
+        for i in 0..5 {
+            let row = NewRow {
+                id: format!("mem_puffin{i:011}"),
+                class: "note",
+                project_key: GLOBAL_KEY,
+                title: format!("puffin note {i}"),
+                abstract_text: String::new(),
+                content: format!("the puffin colony survey number {i}"),
+                tags: Vec::new(),
+                created_ms: 1_700_000_000_000,
+                time_source: "exact",
+                sensitivity: Sensitivity::Normal,
+                provenance: "test".to_string(),
+                expires_ms: None,
+                importance: 0.5,
+                origin_kind: "tool",
+                origin_ref: "",
+                unit_pos: None,
+                session_id: None,
+                logical: None,
+                links: RecordLinks::default(),
+                turn_key: None,
+                hidden: None,
+            };
+            store::insert_row(conn, brain.signer.as_ref(), &row).unwrap();
+            conn.execute(
+                "INSERT INTO documents(doc_id, content, metadata, embedding) VALUES (?1, ?2, '{}', x'00')",
+                params![format!("notes::puffin{i}"), format!("the puffin colony survey file {i}")],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks_fts(doc_id, content, file_path) VALUES (?1, ?2, '')",
+                params![format!("notes::puffin{i}"), format!("the puffin colony survey file {i}")],
+            )
+            .unwrap();
+        }
+        conn.execute_batch("COMMIT").unwrap();
+        let expr = fts_expr(&tokens("puffin colony survey"));
+        let scope = Scope { dir: None, global: true, now: "2026-01-01T00:00:00+00:00".to_string() };
+        let later = Instant::now() + Duration::from_secs(60);
+        assert_eq!(mem_by_words(conn, &expr, &scope, later).unwrap().len(), 5);
+        assert_eq!(docs_by_words(conn, &expr, later).unwrap().len(), 5);
+        let past = Instant::now();
+        assert!(mem_by_words(conn, &expr, &scope, past).unwrap().is_empty());
+        assert!(docs_by_words(conn, &expr, past).unwrap().is_empty());
+    }
 }
