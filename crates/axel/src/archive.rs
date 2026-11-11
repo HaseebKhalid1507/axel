@@ -663,6 +663,39 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
     out
 }
 
+/// Rule 9: which spans yield no unit, and for each span that holds a forget call the pair
+/// `(its place, the place of the span its turn began in)`.
+///
+/// RULING: wave2-c6-review finding 2: a withheld text proves nothing about a new turn
+/// having begun (it may be a worker's report in the middle of a turn, stored as the same
+/// placeholder as a withheld prompt). So when the span that holds the call was opened by a
+/// withheld text, the spans before it go too, back to and including the nearest span a
+/// human prompt opened, or the leading span. The cost, one earlier exchange left out when
+/// the placeholder really was a new prompt, is accepted: `restore --forget-turns` brings
+/// it back, and nothing brings a forgotten prompt back out of the index.
+///
+/// Known limit: a HUMAN text between the prompt and the call (a steer, or "yes, that one"
+/// after the model asked which) opens a span of its own, and the span before it, which
+/// holds the prompt that names the thing, is kept. No rule tells such a text from a new
+/// request without dropping real exchanges.
+fn forget_spans(spans: &[Span<'_>]) -> (Vec<bool>, Vec<(usize, usize)>) {
+    let mut dropped = vec![false; spans.len()];
+    let mut turns = Vec::new();
+    for (at, span) in spans.iter().enumerate() {
+        if !span.forget {
+            continue;
+        }
+        // The first span is always the leading one, so the walk ends there at the latest.
+        let mut root = at;
+        while root > 0 && matches!(spans[root].opener, Opener::Withheld) {
+            root -= 1;
+        }
+        dropped[root..=at].iter_mut().for_each(|d| *d = true);
+        turns.push((at, root));
+    }
+    (dropped, turns)
+}
+
 // ---------------------------------------------------------------------------------------
 // Units
 // ---------------------------------------------------------------------------------------
@@ -690,9 +723,11 @@ fn title_of(text: &str) -> String {
 
 pub fn extract_units(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<Unit> {
     let mut units = Vec::new();
-    for span in spans(a, policy) {
-        // Rule 9: a span that holds a forget call yields no unit, its reports included.
-        if span.forget && !policy.keep_forget_turns {
+    let spans = spans(a, policy);
+    let (dropped, _) = forget_spans(&spans);
+    for (at, span) in spans.iter().enumerate() {
+        // Rule 9: a span of a forget turn yields no unit, its reports included.
+        if dropped[at] && !policy.keep_forget_turns {
             continue;
         }
         // SPEC: 1582 does not say what joins the text blocks of a reply: a line break.
@@ -777,28 +812,30 @@ pub fn extract_units(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<Unit> {
     units
 }
 
-/// Rule 10 of section 2.2: one mark for each span rule 9 drops, in file order.
+/// Rule 10 of section 2.2: one mark for each span that holds a forget call, in file order.
 pub fn forgotten_keys(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<ForgetMark> {
     if policy.keep_forget_turns {
         return Vec::new();
     }
     let spans = spans(a, policy);
-    let mut marks = Vec::new();
-    for (at, span) in spans.iter().enumerate() {
-        if !span.forget {
-            continue;
-        }
-        marks.push(ForgetMark {
-            turn_key: match span.opener {
+    let (_, turns) = forget_spans(&spans);
+    turns
+        .into_iter()
+        .map(|(at, root)| ForgetMark {
+            // RULING: wave2-c6-review finding 2: the key is that of the prompt the turn
+            // began with, past any withheld text between it and the call.
+            turn_key: match spans[root].opener {
                 Opener::Human { text, .. } => Some(turn_key(&redact(text))),
+                // `forget_spans` never stops at a withheld opener.
                 Opener::Withheld => None,
                 Opener::Leading => carried_prompt_key(a),
             },
-            head: at == 0,
+            // The turn began before this file's first prompt.
+            head: root == 0,
+            // Only a human prompt after the call shows that the turn ended in this file.
             tail: !spans[at + 1..].iter().any(|s| matches!(s.opener, Opener::Human { .. })),
-        });
-    }
-    marks
+        })
+        .collect()
 }
 
 /// The key of the nearest human prompt before the leading span: the last one of the

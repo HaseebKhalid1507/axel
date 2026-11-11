@@ -837,15 +837,16 @@ fn t23_the_forget_turn_by_position() {
     let cut_at = long.char_indices().map(|(i, _)| i).take_while(|i| *i <= 4096).last().unwrap();
     assert_ne!(key_of(&long), key_of(&long[..cut_at]));
 
-    // (c) it is stored as `[archive: withheld]`: the span the withheld prompt opens is a
-    // turn of its own. The first exchange stays, the span with the call yields nothing,
-    // the third stays; one mark with no key.
+    // (c) it is stored as `[archive: withheld]`. The placeholder may be a worker's report in
+    // the middle of the turn (wave2-c6-review, finding 2), so the exchange before it goes
+    // as well, and the mark carries that prompt's key. The third stays.
     let a = three(WITHHELD, "axel_forget");
     let units = units_of(&a);
-    assert_eq!(positions(&units), vec!["x0.0", "x6.0"]);
-    assert!(units[0].body.contains("Q1MARK") && units[0].body.contains("A1MARK"));
-    assert!(!holds(&units, "A2MARK") && !holds(&units, "A2MORE"));
-    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(None, false, false)]);
+    assert_eq!(positions(&units), vec!["x6.0"]);
+    for marker in ["Q1MARK", "A1MARK", "A2MARK", "A2MORE"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q1)), false, false)]);
 
     // The leading span, before the first prompt, holds the call: no `Continued` unit.
     let leading_text = "LEADMARK the rest of an answer that began before this file, long enough to keep.";
@@ -907,6 +908,151 @@ fn t23_the_forget_turn_by_position() {
     // The rows that were there keep their positions, so their ids.
     let before = units_of(&a);
     assert_eq!(archive::unit_id(&a.scope, &a.id, &before[1]), archive::unit_id(&a.scope, &a.id, &units[2]));
+}
+
+// ------------------------------------------------- wave2-c6-review, finding 2 (ruling)
+
+#[test]
+fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
+    let p = policy();
+    let mid = "MIDMARK I am looking for what you told me about the offer, one moment please.";
+
+    // Prompt, reply, withheld, forget call, in one file: no unit holds the prompt or the
+    // reply, and the mark carries the prompt's key. The exchange before the turn stays.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, Q2),
+        asst(3, A2),
+        user(4, WITHHELD),
+        asst_tool(5, A2B, "axel_forget"),
+        result(6),
+        user(7, Q3),
+        asst(8, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x7.0"]);
+    for marker in ["Q2MARK", "A2MARK", "A2MORE", "Acme"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, false)]);
+    // The same file with another tool: the exchange is there, and the reply after the
+    // placeholder is a unit of its own when it is long enough.
+    let mut plain = a.clone();
+    plain.messages[5] = asst_tool(5, mid, "bash");
+    let units = units_of(&plain);
+    assert_eq!(positions(&units), vec!["x0.0", "x2.0", "c5.0", "x7.0"]);
+    assert!(units[1].body.contains("Q2MARK") && units[1].body.contains("A2MARK"));
+    assert!(archive::forgotten_keys(&plain, &p).is_empty());
+    // `keep_forget_turns` brings the turn back whole.
+    let mut keep = policy();
+    keep.keep_forget_turns = true;
+    assert_eq!(positions(&archive::extract_units(&a, &keep)), vec!["x0.0", "x2.0", "x7.0"]);
+    assert!(archive::forgotten_keys(&a, &keep).is_empty());
+
+    // The same across two files: the first ends with the prompt and its reply, and the
+    // placeholder and the call open the second. The second file's mark has `head`.
+    let first = arch(vec![user(0, Q1), asst(1, A1), user(2, Q2), asst(3, A2)]);
+    assert_eq!(positions(&units_of(&first)), vec!["x0.0", "x2.0"]);
+    assert!(archive::forgotten_keys(&first, &p).is_empty());
+    // As a later part, read whole: no prompt of the turn is in this file, so no key.
+    let mut second = arch(vec![
+        user(0, WITHHELD),
+        asst_tool(1, mid, "axel_forget"),
+        result(2),
+        user(3, Q3),
+        asst(4, A3),
+    ]);
+    second.start = Start::Whole;
+    let units = units_of(&second);
+    assert_eq!(positions(&units), vec!["x3.0"]);
+    assert!(!holds(&units, "MIDMARK"));
+    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(None, true, false)]);
+    // As a successor: the prompt is carried, then the tail, then the placeholder and the
+    // call. The key is the carried prompt's, as this file stores it.
+    let second = arch(vec![
+        user(1, Q2),
+        asst(2, A2),
+        user(3, WITHHELD),
+        asst_tool(4, mid, "axel_forget"),
+        result(5),
+        user(6, Q3),
+        asst(7, A3),
+    ]);
+    assert_eq!(archive::carried_head(&second), Some(1));
+    let units = units_of(&second);
+    assert_eq!(positions(&units), vec!["x6.0"]);
+    assert!(!holds(&units, "MIDMARK") && !holds(&units, "Q2MARK"));
+    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(Some(key_of(Q2)), true, false)]);
+
+    // Two withheld texts in a row before the call: the walk passes both.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, Q2),
+        asst(3, A2),
+        user(4, WITHHELD),
+        asst(5, mid),
+        user(6, WITHHELD),
+        asst_tool(7, A2B, "axel_forget"),
+        user(8, Q3),
+        asst(9, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x8.0"]);
+    for marker in ["Q2MARK", "A2MARK", "MIDMARK", "A2MORE"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, false)]);
+
+    // A withheld text AFTER the call does not clear `tail`: only a human prompt shows that
+    // the turn ended here. What follows the placeholder is still read in this file.
+    let after = "AFTERMARK it is done, and I have nothing more to say about that in this window.";
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, Q2),
+        asst_tool(3, A2, "axel_forget"),
+        user(4, WITHHELD),
+        asst(5, after),
+    ]);
+    assert_eq!(positions(&units_of(&a)), vec!["x0.0", "c5.0"]);
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, true)]);
+    // With a human prompt after it, `tail` is clear.
+    let mut messages = a.messages.clone();
+    messages.push(user(6, Q3));
+    messages.push(asst(7, A3));
+    assert_eq!(
+        archive::forgotten_keys(&arch(messages), &p),
+        vec![mark(Some(key_of(Q2)), false, false)]
+    );
+
+    // Two forget spans in one file give two marks, in file order.
+    let a = arch(vec![
+        user(0, Q2),
+        asst_tool(1, A2, "axel_forget"),
+        user(2, Q1),
+        asst(3, A1),
+        user(4, Q3),
+        asst_tool(5, A3, "memory_forget"),
+    ]);
+    assert_eq!(positions(&units_of(&a)), vec!["x2.0"]);
+    assert_eq!(
+        archive::forgotten_keys(&a, &p),
+        vec![mark(Some(key_of(Q2)), false, false), mark(Some(key_of(Q3)), false, true)]
+    );
+    // A second call behind a placeholder in the same turn: two marks with the one key.
+    let a = arch(vec![
+        user(0, Q2),
+        asst_tool(1, A2, "axel_forget"),
+        user(2, WITHHELD),
+        asst_tool(3, A2B, "axel_forget"),
+    ]);
+    assert!(units_of(&a).is_empty());
+    assert_eq!(
+        archive::forgotten_keys(&a, &p),
+        vec![mark(Some(key_of(Q2)), false, true), mark(Some(key_of(Q2)), false, true)]
+    );
 }
 
 // ----------------------------------------------------------------------------- test 28
