@@ -33,6 +33,10 @@ pub const MAX_TEXT_BYTES: usize = 4096;
 pub const MIN_TURN_CHARS: usize = 60;
 
 const TITLE_WORDS: usize = 12;
+/// The keys of replaced prompts a pending turn keeps at most; later ones are not kept.
+// RULING: v2 final capture round, item 1. R-16 set no bound for this; the oldest keys are
+// kept, the first message's among them, and the time range covers the rest in the log.
+pub const MAX_REPLACED_KEYS: usize = 16;
 
 /// By `session_id`; at most 64, oldest evicted.
 #[derive(Default)]
@@ -49,6 +53,10 @@ struct TurnBuffer {
     turn_key: String,
     cwd: Option<String>,
     started_ms: i64,
+    /// The time of the turn's first message: a prompt that replaced another keeps it.
+    turn_from_ms: i64,
+    /// The keys of the prompts this one replaced in the same turn, oldest first.
+    replaced_keys: Vec<String>,
     last_ms: i64,
     assistant: String,
     suppressed: bool,
@@ -64,6 +72,11 @@ pub struct CompletedTurn {
     pub prompt: String,
     pub turn_key: String,
     pub reply: String,
+    /// The hook time of the turn's prompt. For a marked or withheld turn (stored under no
+    /// id) the time of the turn's first message, of a prompt it replaced when there was
+    /// one: the mark's `from_ms`, and where the log delete starts.
+    // RULING: v2 final capture round, item 1: carried here, not in a new field, so that
+    // every `CompletedTurn` built elsewhere stays as it is.
     pub started_ms: i64,
     pub at_ms: i64,
     pub suppressed: bool,
@@ -184,6 +197,20 @@ impl CaptureState {
         let turn_key = archive::turn_key(&redacted.text);
         let prompt = if withheld { String::new() } else { cut(&redacted.text, MAX_TEXT_BYTES).to_string() };
 
+        // RULING: v2 final capture round, item 1. A prompt that replaces a pending one is
+        // the same turn: the turn keeps the first message's time and the keys of the
+        // prompts it replaced, so that a forget call later in the turn covers them too.
+        let (turn_from_ms, replaced_keys) = match self.pending.get(session_id) {
+            Some(prior) => {
+                let mut keys = prior.replaced_keys.clone();
+                if keys.len() < MAX_REPLACED_KEYS && prior.turn_key != turn_key && !keys.contains(&prior.turn_key) {
+                    keys.push(prior.turn_key.clone());
+                }
+                keys.retain(|k| *k != turn_key);
+                (prior.turn_from_ms, keys)
+            }
+            None => (now_ms, Vec::new()),
+        };
         if !self.pending.contains_key(session_id) && self.pending.len() >= MAX_PENDING {
             self.evict_oldest();
         }
@@ -194,6 +221,8 @@ impl CaptureState {
                 turn_key,
                 cwd: cwd.map(str::to_string),
                 started_ms: now_ms,
+                turn_from_ms,
+                replaced_keys,
                 last_ms: now_ms,
                 assistant: String::new(),
                 suppressed: false,
@@ -261,15 +290,16 @@ impl CaptureState {
             prompt: buf.prompt,
             turn_key: buf.turn_key,
             reply: buf.assistant,
-            started_ms: buf.started_ms,
+            started_ms: if buf.suppressed || buf.withheld { buf.turn_from_ms } else { buf.started_ms },
             at_ms: now_ms,
             suppressed: buf.suppressed,
             withheld: buf.withheld,
         })
     }
 
-    /// `(started_ms, turn_key)` of the pending turn, which it marks; `None` when nothing is
-    /// pending.
+    /// `(from_ms, turn_key)` of the pending turn, which it marks; `None` when nothing is
+    /// pending. `from_ms` is the time of the turn's first message (a prompt this one
+    /// replaced, when there was one).
     pub fn suppress(&mut self, session_id: &str) -> Option<(i64, String)> {
         let buf = self.pending.get_mut(session_id)?;
         buf.suppressed = true;
@@ -278,7 +308,13 @@ impl CaptureState {
         buf.prompt.clear();
         buf.assistant.clear();
         buf.blanked = 0;
-        Some((buf.started_ms, buf.turn_key.clone()))
+        Some((buf.turn_from_ms, buf.turn_key.clone()))
+    }
+
+    /// The keys of the prompts the pending turn's prompt replaced, oldest first.
+    // RULING: v2 final capture round, item 1: `mark_forgotten` writes a keyed mark for each.
+    pub fn replaced_keys(&self, session_id: &str) -> Vec<String> {
+        self.pending.get(session_id).map(|buf| buf.replaced_keys.clone()).unwrap_or_default()
     }
 
     /// A hook of this chat was not forwarded.

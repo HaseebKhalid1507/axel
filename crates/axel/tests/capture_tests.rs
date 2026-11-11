@@ -1726,3 +1726,79 @@ fn small_3_a_forgotten_or_withheld_turn_the_queue_refuses_still_leaves_no_log_ro
     assert_eq!(status.write_errors.load(Ordering::Relaxed), 0);
     assert_eq!(dropped(&status), 0);
 }
+
+// ── v2 final capture round ───────────────────────────────────────────────────
+
+/// `(turn_key, from_ms, to_ms)` of the chat's `call` marks, by key.
+fn call_marks(conn: &Connection, session_id: &str) -> Vec<(String, i64, i64)> {
+    let mut stmt = conn
+        .prepare("SELECT turn_key, from_ms, to_ms FROM forgotten_turns WHERE source = 'call' AND logical = ?1 ORDER BY turn_key")
+        .unwrap();
+    let rows = stmt.query_map([project::logical(session_id)], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?))).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// Item 1 (silverhand 1): the person sends P1, then P2 replaces it in the same turn, and
+/// the forget call comes after. P1's log row goes, and P1's key has a mark of its own,
+/// from P1's time.
+// RULING: v2 final capture round, item 1
+#[test]
+fn final_1_a_prompt_replaced_before_the_forget_call_is_forgotten_too() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, _status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    st.clock = Arc::new(|| 2_500);
+    let earlier = "what did the review say about the archive reader";
+    let first = "the phone number of Bob is five five five one two three four";
+    let second = "actually, forget what I just told you about Bob";
+    let key = |text: &str| archive::turn_key(&screen::redact(text).text);
+    assert!(!screen::core_withholds(first) && !screen::core_withholds(second));
+
+    log_at(&mut ctx, "S", earlier, true, 500);
+    user(&mut st, "S", &cwd, first, 1_000);
+    log_at(&mut ctx, "S", first, true, 1_000);
+    assistant(&mut st, "S", &cwd, "Noted, I will keep the number.", true, 1_500);
+    user(&mut st, "S", &cwd, second, 2_000);
+    log_at(&mut ctx, "S", second, true, 2_000);
+    assert_eq!(st.capture.replaced_keys("S"), [key(first)]);
+    let _ = forget_call(&mut st, "S", &cwd);
+    assert!(st.forget_marks.is_empty(), "a mark was kept");
+    let mut want = vec![(key(first), 1_000, 2_500), (key(second), 1_000, 2_500)];
+    want.sort();
+    assert_eq!(call_marks(ctx_conn(&ctx), "S"), want);
+    assert_eq!(log_times(ctx_conn(&ctx), "S"), [500], "P1's log row survived the call");
+
+    // The turn ends: both marks end with it.
+    assistant(&mut st, "S", &cwd, "Done: the number of Bob is forgotten.", false, 3_000);
+    let turn = next_capture(&jobs).unwrap();
+    assert!(turn.suppressed);
+    assert_eq!((turn.started_ms, turn.at_ms), (1_000, 3_000));
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    let conn = ctx_conn(&ctx);
+    let mut want = vec![(key(first), 1_000, 3_000), (key(second), 1_000, 3_000)];
+    want.sort();
+    assert_eq!(call_marks(conn, "S"), want);
+    assert_eq!(log_times(conn, "S"), [500]);
+    nothing_stored(conn);
+
+    // Pairing alone: the replaced keys are kept once each, never the prompt's own, at most
+    // `MAX_REPLACED_KEYS`; a turn that was not replaced keeps its own time.
+    let mut cap = CaptureState::default();
+    cap.on_user(Some("s"), None, "prompt number zero of the turn", 10);
+    for i in 1..40 {
+        cap.on_user(Some("s"), None, &format!("prompt number {i} of the turn"), 10 + i);
+    }
+    let keys = cap.replaced_keys("s");
+    assert_eq!(keys.len(), capture::MAX_REPLACED_KEYS);
+    assert_eq!(keys[0], key("prompt number zero of the turn"));
+    assert_eq!(keys[1], key("prompt number 1 of the turn"));
+    // A prompt the turn had before is its own prompt again, not a replaced one.
+    cap.on_user(Some("s"), None, "prompt number 3 of the turn", 100);
+    let keys = cap.replaced_keys("s");
+    assert!(!keys.contains(&key("prompt number 3 of the turn")));
+    assert_eq!(keys.iter().collect::<std::collections::HashSet<_>>().len(), keys.len(), "a key twice");
+    assert_eq!(cap.suppress("s").map(|(from, _)| from), Some(10));
+    cap.on_user(Some("t"), None, "a prompt of its own turn", 50);
+    assert!(cap.replaced_keys("t").is_empty());
+    assert_eq!(cap.suppress("t").map(|(from, _)| from), Some(50));
+}

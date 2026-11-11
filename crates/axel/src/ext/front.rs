@@ -270,30 +270,53 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
 /// A mark that is not written now is kept. Returns what became of the try.
 pub(crate) fn mark_forgotten(st: &mut FrontState, session_id: &str) -> MarkEnd {
     let now = (st.clock)();
+    let replaced = st.capture.replaced_keys(session_id);
     let (from_ms, turn_key) = match st.capture.suppress(session_id) {
         Some((started_ms, key)) => (started_ms, Some(key)),
         None => (now, None),
     };
-    let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
-    // RULING: wave4 R-12b item 1. The `Carry` is gone, so nothing else holds this session:
-    // a mark that is not written now is kept, whatever kept it out (the mode is not
-    // `Ready`, there is no connection, the write lock is held).
-    let end = if is_ready(st) && st.conn.is_some() { write_forget_mark(st, &mark) } else { MarkEnd::NotNow };
-    match &end {
-        MarkEnd::Written => {}
-        MarkEnd::Failed(kind) => log_line(&format!("front carry: forget mark dropped: {kind}")),
-        MarkEnd::NotNow => {
-            // RULING: wave3-c12b ruling 7. At most `FORGET_MARKS_KEPT` wait; one more gives
-            // up the oldest, so a brain that stays locked cannot grow the list without end.
-            if st.forget_marks.len() >= FORGET_MARKS_KEPT {
-                st.forget_marks.remove(0);
-                log_line("front carry: forget mark given up (too many waiting)");
+    // RULING: v2 final capture round, item 1. One keyed `call` mark for the turn's prompt
+    // and one for each prompt it replaced, all from the turn's first message. Once one of
+    // them meets a held lock the rest are kept without a try (each would wait as long).
+    let keys = std::iter::once(turn_key).chain(replaced.into_iter().map(Some));
+    let mut end = MarkEnd::Written;
+    for turn_key in keys {
+        let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
+        // RULING: wave4 R-12b item 1. The `Carry` is gone, so nothing else holds this
+        // session: a mark that is not written now is kept, whatever kept it out (the mode
+        // is not `Ready`, there is no connection, the write lock is held).
+        let this = if end != MarkEnd::NotNow && is_ready(st) && st.conn.is_some() {
+            write_forget_mark(st, &mark)
+        } else {
+            MarkEnd::NotNow
+        };
+        match this {
+            MarkEnd::Written => {}
+            MarkEnd::Failed(kind) => {
+                log_line(&format!("front carry: forget mark dropped: {kind}"));
+                if end == MarkEnd::Written {
+                    end = MarkEnd::Failed(kind);
+                }
             }
-            st.forget_marks.push(mark);
-            log_line("front carry: forget mark not written, kept");
+            MarkEnd::NotNow => {
+                keep_mark(st, mark);
+                end = MarkEnd::NotNow;
+            }
         }
     }
     end
+}
+
+/// A mark that could not be written now, kept for a later try.
+fn keep_mark(st: &mut FrontState, mark: ForgetMark) {
+    // RULING: wave3-c12b ruling 7. At most `FORGET_MARKS_KEPT` wait; one more gives up the
+    // oldest, so a brain that stays locked cannot grow the list without end.
+    if st.forget_marks.len() >= FORGET_MARKS_KEPT {
+        st.forget_marks.remove(0);
+        log_line("front carry: forget mark given up (too many waiting)");
+    }
+    st.forget_marks.push(mark);
+    log_line("front carry: forget mark not written, kept");
 }
 
 /// What became of one try to write a mark.
