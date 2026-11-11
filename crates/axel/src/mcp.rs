@@ -360,7 +360,10 @@ fn execute_tool(brain: &mut AxelBrain, name: &str, args: &Value) -> Value {
             let phase_str = args["phase"].as_str().unwrap_or("all");
 
             // Honour ~/.config/axel/sources.toml so MCP and CLI runs agree.
-            let sources = consolidate::load_sources(None);
+            let sources = match consolidate::load_sources(None) {
+                Ok(sources) => sources,
+                Err(e) => return tool_error(&format!("Consolidation failed: {e}")),
+            };
 
             let phases: HashSet<Phase> = match phase_str {
                 "reindex" => [Phase::Reindex].into(),

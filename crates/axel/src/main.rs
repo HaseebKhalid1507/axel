@@ -159,8 +159,9 @@ fn brain_path(cli: &Cli) -> PathBuf {
 
 fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::SourceDir>, Box<dyn std::error::Error>> {
     // Single source of truth lives in `axel::consolidate` so the MCP handler
-    // and CLI agree. Errors degrade to defaults rather than aborting.
-    Ok(axel::consolidate::load_sources(override_path))
+    // and CLI agree. An unreadable config degrades to the defaults; no HOME
+    // when one is needed is an error.
+    Ok(axel::consolidate::load_sources(override_path)?)
 }
 
 fn main() -> ExitCode {

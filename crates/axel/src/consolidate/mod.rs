@@ -15,7 +15,7 @@ use std::time::Instant;
 use chrono::Utc;
 use velocirag::db::ConsolidationLogEntry;
 
-use crate::error::Result;
+use crate::error::{AxelError, Result};
 use crate::search::BrainSearch;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -63,19 +63,35 @@ fn wants(phases: &HashSet<Phase>, p: Phase) -> bool {
     phases.is_empty() || phases.contains(&p)
 }
 
+/// The user's home folder: `$HOME`, when it is set and not empty. Nothing
+/// else is tried; a caller with no home gets an error, not a guessed path.
+fn home_from_env() -> Option<String> {
+    std::env::var("HOME").ok().filter(|home| !home.is_empty())
+}
+
+fn no_home(what: &str) -> AxelError {
+    AxelError::Other(format!("HOME is not set: cannot resolve {what}"))
+}
+
 /// Hardcoded fallback source list. Single source of truth — both the CLI's
 /// `load_sources()` and the MCP `axel_consolidate` handler call this when
 /// `sources.toml` is absent or unparseable.
-pub fn default_sources() -> Vec<SourceDir> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
-    vec![
+///
+/// The folders are under `$HOME`; without it this is an error.
+pub fn default_sources() -> Result<Vec<SourceDir>> {
+    default_sources_in(home_from_env().as_deref())
+}
+
+fn default_sources_in(home: Option<&str>) -> Result<Vec<SourceDir>> {
+    let home = home.ok_or_else(|| no_home("the default source folders"))?;
+    Ok(vec![
         SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
         SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
         SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
         SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
         SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
         SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
-    ]
+    ])
 }
 
 /// Resolve sources from (in priority order):
@@ -83,15 +99,23 @@ pub fn default_sources() -> Vec<SourceDir> {
 ///   2. `$AXEL_SOURCES`
 ///   3. `~/.config/axel/sources.toml`
 ///   4. `default_sources()` fallback
-pub fn load_sources(override_path: Option<&Path>) -> Vec<SourceDir> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/home/haseeb".to_string());
-
+///
+/// `$HOME` is needed for 3, for 4 and for a `~` in a configured path. When
+/// it is needed and not set, this is an error: no path is guessed.
+pub fn load_sources(override_path: Option<&Path>) -> Result<Vec<SourceDir>> {
     let config_path = override_path
         .map(PathBuf::from)
-        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from(format!("{home}/.config/axel/sources.toml")));
+        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from));
+    load_sources_from(config_path, home_from_env().as_deref())
+}
 
-    if config_path.exists() {
+/// [`load_sources`] with the explicit config path (1 or 2) and the home
+/// folder given by the caller.
+fn load_sources_from(config_path: Option<PathBuf>, home: Option<&str>) -> Result<Vec<SourceDir>> {
+    let config_path =
+        config_path.or_else(|| home.map(|home| PathBuf::from(format!("{home}/.config/axel/sources.toml"))));
+
+    if let Some(config_path) = config_path.filter(|path| path.exists()) {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(parsed) = content.parse::<toml::Value>() {
                 if let Some(sources) = parsed.get("source").and_then(|v| v.as_array()) {
@@ -100,7 +124,14 @@ pub fn load_sources(override_path: Option<&Path>) -> Vec<SourceDir> {
                         let name = src.get("name").and_then(|v| v.as_str()).unwrap_or("unknown");
                         let path_str = src.get("path").and_then(|v| v.as_str()).unwrap_or("");
                         let priority_str = src.get("priority").and_then(|v| v.as_str()).unwrap_or("medium");
-                        let expanded = path_str.replace("~", &home);
+                        let expanded = if path_str.contains('~') {
+                            let home = home.ok_or_else(|| {
+                                no_home(&format!("`{path_str}` in {}", config_path.display()))
+                            })?;
+                            path_str.replace('~', home)
+                        } else {
+                            path_str.to_string()
+                        };
                         let priority = match priority_str {
                             "high" => Priority::High,
                             "low" => Priority::Low,
@@ -113,14 +144,54 @@ pub fn load_sources(override_path: Option<&Path>) -> Vec<SourceDir> {
                         });
                     }
                     if !result.is_empty() {
-                        return result;
+                        return Ok(result);
                     }
                 }
             }
         }
     }
 
-    default_sources()
+    default_sources_in(home)
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    // The home folder is passed in: no test changes the process environment.
+
+    #[test]
+    fn without_a_home_the_default_sources_are_an_error_not_a_guessed_path() {
+        let error = default_sources_in(None).unwrap_err().to_string();
+        assert!(error.contains("HOME is not set"), "{error}");
+        let error = load_sources_from(None, None).unwrap_err().to_string();
+        assert!(error.contains("HOME is not set"), "{error}");
+    }
+
+    #[test]
+    fn the_default_sources_are_under_the_given_home() {
+        let sources = default_sources_in(Some("/somewhere/else")).unwrap();
+        assert_eq!(sources.len(), 6);
+        assert!(sources.iter().all(|source| source.path.starts_with("/somewhere/else")));
+    }
+
+    #[test]
+    fn a_config_file_needs_a_home_only_for_a_tilde() {
+        let dir = tempfile::tempdir().unwrap();
+        let absolute = dir.path().join("absolute.toml");
+        std::fs::write(&absolute, "[[source]]\nname = \"notes\"\npath = \"/srv/notes\"\npriority = \"high\"\n").unwrap();
+        let sources = load_sources_from(Some(absolute), None).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].path, PathBuf::from("/srv/notes"));
+        assert_eq!(sources[0].priority, Priority::High);
+
+        let tilde = dir.path().join("tilde.toml");
+        std::fs::write(&tilde, "[[source]]\nname = \"notes\"\npath = \"~/notes\"\n").unwrap();
+        let error = load_sources_from(Some(tilde.clone()), None).unwrap_err().to_string();
+        assert!(error.contains("HOME is not set") && error.contains("~/notes"), "{error}");
+        let sources = load_sources_from(Some(tilde), Some("/somewhere/else")).unwrap();
+        assert_eq!(sources[0].path, PathBuf::from("/somewhere/else/notes"));
+    }
 }
 
 /// Run a consolidation pass.
@@ -268,7 +339,6 @@ use std::time::Duration;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 
-use crate::error::AxelError;
 use crate::project_memory::{MemoryScope, Retention, Sensitivity};
 
 /// Closed opt-in switch for `memory.auto_consolidate`. Deserializing an
