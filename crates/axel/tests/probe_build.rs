@@ -17,6 +17,7 @@
 //! | h | the link scrub `purge_many` runs (`<> '[]'`, filtered in Rust), and the probe table's `instr(supersedes, '"<id>"')`, find an id in the arrays the store writes |
 //! | i | the cost of an exact scan of 25,000 vectors (`#[ignore]`, prints ms) |
 //! | j | the suite runs with `HOME` moved: not a test here, it is the gate itself (`scripts/dirty-home.sh`) |
+//! | k | `VACUUM` / `VACUUM INTO` on an old brain: what residue goes, whether every table's rowids survive (measured and printed) |
 //!
 //! Every file is in a temp directory.
 
@@ -932,4 +933,217 @@ fn i_exact_scan_of_25000_vectors() {
         millis[millis.len() - 1],
         millis.len(),
     );
+}
+
+// ── k ───────────────────────────────────────────────────────────────────
+
+/// One table of the file and what identifies its rows.
+struct TableKeys {
+    name: String,
+    has_rowid: bool,
+    /// One `INTEGER` column is the whole primary key: an alias of the rowid.
+    integer_pk: bool,
+    /// `(rowid, quote(first column))` in rowid order; for a WITHOUT ROWID
+    /// table `(None, quote(first column))` in key order.
+    keys: Vec<(Option<i64>, String)>,
+}
+
+/// Every table in the file, virtual and shadow tables included.
+fn table_keys(conn: &Connection) -> Vec<TableKeys> {
+    let names = ids(conn, "SELECT name FROM sqlite_master WHERE type IN ('table') ORDER BY name", &[], 0);
+    names
+        .into_iter()
+        .map(|name| {
+            let mut info = conn.prepare(&format!("PRAGMA table_info(\"{name}\")")).unwrap();
+            let columns: Vec<(String, String, i64)> = info
+                .query_map([], |r| Ok((r.get(1)?, r.get(2)?, r.get(5)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let pk: Vec<_> = columns.iter().filter(|c| c.2 > 0).collect();
+            let first = &columns[0].0;
+            let by_rowid = conn.prepare(&format!(
+                "SELECT rowid, quote(\"{first}\") FROM \"{name}\" ORDER BY rowid"
+            ));
+            let has_rowid = by_rowid.is_ok();
+            let keys = match by_rowid {
+                Ok(mut stmt) => stmt
+                    .query_map([], |r| Ok((Some(r.get(0)?), r.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap(),
+                Err(_) => conn
+                    .prepare(&format!("SELECT quote(\"{first}\") FROM \"{name}\""))
+                    .unwrap()
+                    .query_map([], |r| Ok((None, r.get(0)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap(),
+            };
+            let integer_pk = has_rowid && pk.len() == 1 && pk[0].1.eq_ignore_ascii_case("INTEGER");
+            TableKeys { name, has_rowid, integer_pk, keys }
+        })
+        .collect()
+}
+
+/// One query per word index on rows that were not deleted: `rowid:id`, in
+/// rank order.
+fn word_queries(conn: &Connection) -> (Vec<String>, Vec<String>) {
+    (
+        ids(
+            conn,
+            "SELECT rowid || ':' || mem_id FROM memories_fts WHERE memories_fts MATCH 'harbours' ORDER BY rank",
+            &[],
+            0,
+        ),
+        ids(
+            conn,
+            "SELECT rowid || ':' || doc_id FROM chunks_fts WHERE chunks_fts MATCH 'harbours' ORDER BY rank",
+            &[],
+            0,
+        ),
+    )
+}
+
+/// `PRAGMA integrity_check`, and FTS5's own check of each word index.
+fn integrity(conn: &Connection) -> (String, String, String) {
+    let fts = |table: &str| match conn
+        .execute(&format!("INSERT INTO {table}({table}) VALUES('integrity-check')"), [])
+    {
+        Ok(_) => "ok".to_string(),
+        Err(e) => e.to_string(),
+    };
+    (
+        ids(conn, "PRAGMA integrity_check", &[], 0).join("; "),
+        fts("memories_fts"),
+        fts("chunks_fts"),
+    )
+}
+
+/// An old brain with the old binary's residue, migration 1's block (and, with
+/// `optimize`, the option and the two `optimize` statements of spec section 1),
+/// then `VACUUM` in place or `VACUUM INTO` a second file. Asserts only that
+/// the fixture is what the probe needs; prints what it measures.
+fn vacuum_probe(optimize: bool, into: bool) {
+    const ROWS: usize = 40;
+    let dir = TempDir::new().unwrap();
+    let (path, db) = legacy_brain(&dir);
+    let conn = db.conn();
+    let pragma: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
+    assert_eq!(pragma, 0, "the old binary's connection has PRAGMA secure_delete off");
+
+    // The marked row and two plain ones, deleted as the old binary deletes:
+    // gaps in every rowid sequence.
+    let doomed = write_rows(&db, ROWS, false, &[(20, MEMORY_MARKER, CHUNK_MARKER)]);
+    purge(conn, &doomed[0], "doomed-0");
+    for i in [5, 30] {
+        let id: String = conn
+            .query_row(
+                "SELECT id FROM memories WHERE content = ?1",
+                [format!("kept row {i} about harbours and lanterns")],
+                |r| r.get(0),
+            )
+            .unwrap();
+        purge(conn, &id, &format!("kept-{i}"));
+    }
+    checkpoint_truncate(conn, &path);
+    let residue = Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER);
+    assert!(residue.in_both(), "the old binary's delete must leave the markers: {residue:?}");
+    for table in ["memories", "documents"] {
+        let n: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0)).unwrap();
+        assert_eq!(n as usize, ROWS - 3, "{table}");
+    }
+
+    conn.execute_batch(SCHEMA_V2_SQL).unwrap();
+    conn.execute(
+        "INSERT INTO memory_ext (mem_id, origin_kind, content_hash, created_ms)
+         SELECT id, 'legacy', 'probe', 1 FROM memories",
+        [],
+    )
+    .unwrap();
+    if optimize {
+        fts_secure_delete_on(conn);
+        conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('optimize')", []).unwrap();
+        conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')", []).unwrap();
+    }
+    checkpoint_truncate(conn, &path);
+    let before = Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER);
+    let keys_before = table_keys(conn);
+    let queries_before = word_queries(conn);
+    assert_eq!(queries_before.0.len(), ROWS - 3);
+    assert_eq!(queries_before.1.len(), ROWS - 3);
+    let size_before = std::fs::metadata(&path).unwrap().len();
+
+    let source_bytes = file_bytes(&path);
+    let target = dir.path().join("into.r8");
+    let started = std::time::Instant::now();
+    if into {
+        conn.execute_batch(&format!("VACUUM INTO '{}'", target.display())).unwrap();
+    } else {
+        conn.execute_batch("VACUUM").unwrap();
+    }
+    let millis = started.elapsed().as_secs_f64() * 1000.0;
+    let source_unchanged = into.then(|| file_bytes(&path) == source_bytes);
+    if !into {
+        checkpoint_truncate(conn, &path);
+    }
+    let checked = if into { target } else { path.clone() };
+    // Read before anything opens the new file.
+    let after = Hits::in_file(&checked, MEMORY_MARKER, CHUNK_MARKER);
+    let size_after = std::fs::metadata(&checked).unwrap().len();
+
+    let opened;
+    let check: &Connection = if into {
+        opened = Connection::open(&checked).unwrap();
+        &opened
+    } else {
+        conn
+    };
+    let keys_after = table_keys(check);
+    let queries_same = word_queries(check) == queries_before;
+    let (integrity_check, fts_memories, fts_chunks) = integrity(check);
+
+    let label = format!(
+        "{} after {}",
+        if into { "VACUUM INTO" } else { "VACUUM" },
+        if optimize { "block + secure-delete + optimize" } else { "block only" }
+    );
+    println!("probe k, {label}:");
+    println!("  markers: old binary's delete {residue:?}, before the vacuum {before:?}, after {after:?}");
+    println!("  size: {size_before} -> {size_after} bytes; vacuum took {millis:.1} ms");
+    println!("  word queries same ids, same order: {queries_same}");
+    println!("  integrity_check: {integrity_check}; fts integrity-check memories_fts: {fts_memories}, chunks_fts: {fts_chunks}");
+    if let Some(unchanged) = source_unchanged {
+        println!("  source file's bytes unchanged: {unchanged}");
+    }
+    for table in &keys_before {
+        let verdict = match keys_after.iter().find(|t| t.name == table.name) {
+            None => "MISSING after".to_string(),
+            Some(t) if t.keys == table.keys => "same".to_string(),
+            Some(t) => {
+                let moved = table.keys.iter().zip(&t.keys).filter(|(a, b)| a != b).count();
+                format!("CHANGED: {} -> {} rows, {moved} pairs differ", table.keys.len(), t.keys.len())
+            }
+        };
+        println!(
+            "  {:<28} rowid {:<5} integer pk {:<5} {:>4} rows  {verdict}",
+            table.name,
+            table.has_rowid,
+            table.integer_pk,
+            table.keys.len()
+        );
+    }
+    for table in keys_after.iter().filter(|t| !keys_before.iter().any(|b| b.name == t.name)) {
+        println!("  {:<28} NEW after the vacuum, {} rows", table.name, table.keys.len());
+    }
+}
+
+#[test]
+fn k_what_vacuum_removes_and_whether_rowids_survive() {
+    fts5_secure_delete_exists();
+    for optimize in [false, true] {
+        for into in [false, true] {
+            vacuum_probe(optimize, into);
+        }
+    }
 }
