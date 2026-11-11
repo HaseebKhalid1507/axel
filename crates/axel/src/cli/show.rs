@@ -384,28 +384,21 @@ fn show_archive(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
     let out = &mut *term.out;
     let mut stmt = conn.prepare(
         "SELECT scope_dir, rel_name, state, skip_reason, cover_ms, rows_indexed, forget_units,
-                keep_forget_turns, unmatched_hidden, session_id
+                keep_forget_turns, unmatched_hidden, session_id, cli_units, cli_unproven
            FROM archive_index WHERE archive_id = ?1 ORDER BY scope_dir, rel_name",
     )?;
-    type ArchiveRow = (String, String, String, Option<String>, Option<i64>, i64, i64, i64, i64, Option<String>);
+    type ArchiveRow = ((String, String, String, Option<String>, Option<i64>), (i64, i64, i64, i64, Option<String>), (i64, i64));
     let rows: Vec<ArchiveRow> = stmt
         .query_map([&archive_id], |r| {
             Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
-                r.get(6)?,
-                r.get(7)?,
-                r.get(8)?,
-                r.get(9)?,
+                (r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?),
+                (r.get(5)?, r.get(6)?, r.get(7)?, r.get(8)?, r.get(9)?),
+                (r.get(10)?, r.get(11)?),
             ))
         })?
         .collect::<rusqlite::Result<_>>()?;
     writeln!(out, "ctx-{}", one(&archive_id))?;
-    for (scope_dir, rel_name, file_state, reason, cover_ms, rows_indexed, forget_units, keep, unmatched, session) in &rows {
+    for ((scope_dir, rel_name, file_state, reason, cover_ms), (rows_indexed, forget_units, keep, unmatched, session), (cli_units, cli_unproven)) in &rows {
         writeln!(out, "  file: {} in {}", one(rel_name), one(scope_dir))?;
         let reason = reason.as_deref().map(|r| format!(" ({})", one(r))).unwrap_or_default();
         writeln!(out, "    state: {}{reason}", one(file_state))?;
@@ -417,6 +410,15 @@ fn show_archive(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
         }
         writeln!(out, "    rows indexed: {rows_indexed}")?;
         writeln!(out, "    turns left out because a forget tool was called: {forget_units}")?;
+        // RULING: v2 c18b review round 3, item 1: what turns deleted with `forget --now` hold
+        // back, taken and hidden without proof.
+        writeln!(out, "    turns left out because they were deleted with forget --now: {cli_units}")?;
+        if *cli_unproven > 0 {
+            writeln!(
+                out,
+                "    turns hidden because they have the prompt of a deleted turn and their text does not prove them that turn: {cli_unproven} (\"axel-v2 restore <id>\" brings one back)"
+            )?;
+        }
         if *keep == 1 {
             writeln!(out, "    the forget rules are off for this file (restore --forget-turns)")?;
         }

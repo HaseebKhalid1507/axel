@@ -12,6 +12,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use axel::brain_v2::{self, OpenOpts, Role, V2Brain};
+use axel::capture::{self, CaptureState};
 use axel::cli::show::Term;
 use axel::cli::{forget, memories, pause, recall, restore, resume, search, show};
 use axel::ext::config::ExtConfig;
@@ -1173,7 +1174,10 @@ impl Indexed {
         put_on(self.db(), self.ctx.signer.as_ref(), row);
     }
     fn file(&self, a: &Arch) {
-        let scope = scope();
+        self.file_in(&scope(), a);
+    }
+    fn file_in(&self, scope: &str, a: &Arch) {
+        let scope = scope.to_string();
         let dir = self.tmp.path().join("base").join("context-archives").join(&scope).join("s000001");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{}.json", a.id)), a.json(&scope)).unwrap();
@@ -1217,11 +1221,13 @@ struct Arch {
     logical: String,
     created_ms: i64,
     items: Vec<Value>,
+    /// The record's `carried`: how many of its first messages are copies (a successor).
+    carried: Option<u32>,
 }
 
 impl Arch {
     fn new(n: u32, session: &str, created_ms: i64) -> Arch {
-        Arch { id: format!("{n:032x}"), logical: project::logical(session), created_ms, items: Vec::new() }
+        Arch { id: format!("{n:032x}"), logical: project::logical(session), created_ms, items: Vec::new(), carried: None }
     }
     fn user(mut self, text: &str) -> Arch {
         self.items.push(json!({"role": "user", "content": text}));
@@ -1261,12 +1267,15 @@ impl Arch {
             .enumerate()
             .map(|(i, message)| json!({"source_index": i, "block_indices": [], "message": message}))
             .collect();
-        json!({
+        let mut record = json!({
             "version": 1, "scope": scope, "logical": self.logical, "id": self.id,
             "digest": format!("{:0>64}", self.id), "created_ms": self.created_ms,
             "body": {"state": "live", "source_message_count": self.items.len(), "messages": messages, "note": ""},
-        })
-        .to_string()
+        });
+        if let Some(n) = self.carried {
+            record["carried"] = json!(n);
+        }
+        record.to_string()
     }
 }
 
@@ -1664,6 +1673,8 @@ fn a_cli_mark_leaves_out_only_the_deleted_turn_of_an_archive_indexed_after_the_p
     assert!(!texts.contains("DELETEDYES"), "the deleted turn came back: {texts}");
     assert!(texts.contains("KEPTYES"), "another turn with the same prompt was left out: {texts}");
     assert_eq!(rows.len(), 2, "{rows:?}");
+    // Round 3, item 1: not left out, and not visible either: its text does not prove it.
+    assert_eq!(hidden_by_with(world.db(), "KEPTYES"), [Some("cli:unproven".to_string())]);
 }
 
 /// v2 c18b review round 2, item 1: a deleted turn over 4096 bytes. Its archived unit's body
@@ -1957,4 +1968,206 @@ fn remember_refuses_a_version_1_brain_as_every_other_command_does() {
     assert!(said.contains("this is a version 1 brain"), "{said}");
     assert_eq!(said, String::from_utf8_lossy(&memories.stderr));
     assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+// ── v2 c18b review round 3: the real capture path ─────────────────────────────
+
+/// The `cwd` of the chats below: a folder of the world's own.
+fn work(world: &Indexed) -> String {
+    let dir = world.tmp.path().join("work");
+    std::fs::create_dir_all(&dir).unwrap();
+    dir.to_string_lossy().into_owned()
+}
+
+/// The directory of a chat whose `cwd` is `work`, as capture files it.
+fn work_scope(world: &Indexed) -> String {
+    project::resolve(Some(&work(world))).unwrap().scope_dir
+}
+
+/// A chat through the real capture path: the pairing (`on_user`, `on_assistant`) and
+/// `capture::write_turn`, as the extension runs them.
+struct Chat {
+    cap: CaptureState,
+    session: &'static str,
+    cwd: String,
+}
+
+impl Chat {
+    fn new(world: &Indexed, session: &'static str) -> Chat {
+        Chat { cap: CaptureState::default(), session, cwd: work(world) }
+    }
+    fn user(&mut self, text: &str, at: i64) {
+        self.cap.on_user(Some(self.session), Some(&self.cwd), text, at);
+    }
+    /// One assistant message; when it ends the turn, the turn is written.
+    fn says(&mut self, world: &Indexed, text: &str, tools: bool, at: i64) {
+        if let Some(turn) = self.cap.on_assistant(Some(self.session), text, tools, at) {
+            let mut cfg = world.ctx.cfg.clone();
+            cfg.capture = true;
+            let written = capture::write_turn(world.db(), world.ctx.signer.as_ref(), &cfg, &turn).unwrap();
+            assert_eq!(written, capture::Written::Stored, "the turn was not stored");
+        }
+    }
+}
+
+/// The one capture row of the brain.
+fn the_capture(world: &Indexed) -> String {
+    world.db().query_row("SELECT mem_id FROM memory_ext WHERE origin_kind = 'capture'", [], |r| r.get(0)).unwrap()
+}
+
+/// Rows that recall can show (not hidden) whose text holds the marker.
+fn visible_with(conn: &Connection, marker: &str) -> i64 {
+    conn.query_row(
+        "SELECT COUNT(*) FROM memories m JOIN memory_ext e ON e.mem_id = m.id
+          WHERE e.hidden_ms IS NULL AND instr(m.content, ?1) > 0",
+        [marker],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// `hidden_by` of the rows whose text holds the marker.
+fn hidden_by_with(conn: &Connection, marker: &str) -> Vec<Option<String>> {
+    let mut stmt = conn
+        .prepare("SELECT e.hidden_by FROM memories m JOIN memory_ext e ON e.mem_id = m.id WHERE instr(m.content, ?1) > 0 ORDER BY e.vid")
+        .unwrap();
+    let rows = stmt.query_map([marker], |r| r.get(0)).unwrap();
+    rows.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Order {
+    /// The archives are indexed after `forget --now`.
+    After,
+    /// They are indexed while the capture is hidden, before `forget --now`.
+    Before,
+}
+
+/// The capture of chat `chat` is hidden 25 hours ago and deleted with `forget --now`; the
+/// archives are indexed before or after. Returns the output of `forget --now`.
+fn delete_the_capture(world: &mut Indexed, archives: &[&Arch], order: Order) -> Ran {
+    let id = the_capture(world);
+    tx(world.db(), || {
+        store::hide(world.db(), &id, "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
+    });
+    let file = |world: &mut Indexed| {
+        for a in archives {
+            world.file_in(&work_scope(world), a);
+        }
+        world.scan();
+        assert!(visible_with(world.db(), "upload queue") > 0, "the archive was not indexed: the test proves nothing");
+    };
+    if order == Order::Before {
+        file(world);
+    }
+    let run = forget_cmd(&world.path(), &[&id], true, false, "y\n");
+    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+    if order == Order::After {
+        file(world);
+    }
+    run
+}
+
+const P_EVENT: &str = "look at the build failure and send a worker to fix it please";
+
+/// A worker's report keeps the archive's span going after the turn's first final reply;
+/// capture ends the turn at that reply.
+fn event_case(order: Order) -> Indexed {
+    let mut world = Indexed::new();
+    let mut chat = Chat::new(&world, "s-event");
+    let at = T0 - 100_000;
+    chat.user(P_EVENT, at);
+    chat.says(&world, "EVENTFIRST I sent a worker to fix the failing build; it will report back", false, at + 1_000);
+    let event = "<event source=\"agent\" type=\"subagent_completion\">the worker fixed the build</event>";
+    chat.user(event, at + 2_000);
+    chat.says(&world, "EVENTSECOND the worker is done and the build is green again", false, at + 3_000);
+    let a = Arch::new(31, "s-event", T0)
+        .turn(P_EVENT, "EVENTFIRST I sent a worker to fix the failing build; it will report back")
+        .user(event)
+        .says("EVENTSECOND the worker is done and the build is green again")
+        .about("upload queue");
+    delete_the_capture(&mut world, &[&a], order);
+    world
+}
+
+/// v2 c18b review round 3, item 1: the archived turn of a deleted capture whose text the
+/// hash misses (a worker's report) is born hidden, `cli:unproven`; counted and shown.
+#[test]
+fn a_deleted_turn_continued_by_a_workers_report_is_born_hidden() {
+    let world = event_case(Order::After);
+    assert_eq!(visible_with(world.db(), "EVENTFIRST"), 0, "the deleted turn came back");
+    assert_eq!(hidden_by_with(world.db(), "EVENTFIRST"), [Some("cli:unproven".to_string())]);
+    let unproven: i64 = world.db().query_row("SELECT cli_unproven FROM archive_index", [], |r| r.get(0)).unwrap();
+    assert_eq!(unproven, 1);
+    let shown = show_cmd(&world.path(), &format!("ctx-{:032x}", 31));
+    assert!(shown.out.contains("turns hidden because they have the prompt of a deleted turn and their text does not prove them that turn: 1"), "{}", shown.out);
+    assert!(shown.out.contains("turns left out because they were deleted with forget --now: 0"), "{}", shown.out);
+    let status = axel_cmd(&world.path(), &["status"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("hidden with the prompt of a turn deleted with forget --now, not proven that turn: 1"), "{status}");
+    // `restore <id>` brings it back.
+    let id: String = world
+        .db()
+        .query_row("SELECT mem_id FROM memory_ext WHERE hidden_by = 'cli:unproven'", [], |r| r.get(0))
+        .unwrap();
+    let back = restore_ids(&world.path(), &[&id]);
+    assert_eq!(back.code, 0, "{}", back.err);
+    assert_eq!(visible_with(world.db(), "EVENTFIRST"), 1);
+}
+
+/// v2 c18b review round 3, item 1: a turn split across two archives (a compaction in the
+/// middle of it). The first file's part and the next file's leading `Continued` unit,
+/// whose carried head holds the prompt, are born hidden.
+fn split_case(order: Order) -> Indexed {
+    const P: &str = "migrate the ledger tables to the new schema and tell me when it is done";
+    let mut world = Indexed::new();
+    let mut chat = Chat::new(&world, "s-split");
+    let at = T0 - 100_000;
+    chat.user(P, at);
+    chat.says(&world, "SPLITFIRST I will start with the ledger tables and move them one at a time", true, at + 1_000);
+    chat.says(&world, "SPLITSECOND the ledger tables are on the new schema now, every one of them", false, T0 + 50_000);
+    let call = json!({"role": "assistant", "content": [
+        {"type": "text", "text": "SPLITFIRST I will start with the ledger tables and move them one at a time"},
+        {"type": "tool_use", "id": "toolu_02", "name": "bash", "input": {"command": "migrate"}},
+    ]});
+    let result = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "ok"}]});
+    let mut a = Arch::new(41, "s-split", T0).about("upload queue").user(P);
+    a.items.push(call.clone());
+    let mut b = Arch::new(42, "s-split", T0 + 100_000).user(P);
+    b.items.push(call);
+    b.items.push(result);
+    let mut b = b.says("SPLITSECOND the ledger tables are on the new schema now, every one of them");
+    b.carried = Some(2);
+    delete_the_capture(&mut world, &[&a, &b], order);
+    world
+}
+
+#[test]
+fn a_deleted_turn_split_across_two_archives_is_born_hidden_in_both() {
+    let world = split_case(Order::After);
+    assert_eq!(visible_with(world.db(), "SPLITFIRST"), 0, "the first half came back");
+    assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "the second half came back");
+    assert_eq!(hidden_by_with(world.db(), "SPLITSECOND"), [Some("cli:unproven".to_string())]);
+}
+
+/// A prompt that ends in a line break and a reply over 4096 bytes.
+fn newline_case(order: Order) -> Indexed {
+    const P: &str = "write out the whole rollout checklist for the payments service";
+    let long: String = (0..700).map(|i| format!("NLSTEP{i}")).collect::<Vec<_>>().join(" ");
+    assert!(long.len() > 5000);
+    let mut world = Indexed::new();
+    let mut chat = Chat::new(&world, "s-newline");
+    let at = T0 - 100_000;
+    chat.user(&format!("{P}\n"), at);
+    chat.says(&world, &long, false, at + 1_000);
+    let a = Arch::new(51, "s-newline", T0).turn(&format!("{P}\n"), &long).about("upload queue");
+    delete_the_capture(&mut world, &[&a], order);
+    world
+}
+
+#[test]
+fn a_long_deleted_turn_whose_prompt_ends_in_a_line_break_never_comes_back() {
+    let world = newline_case(Order::After);
+    assert_eq!(visible_with(world.db(), "NLSTEP1 "), 0, "the deleted turn came back");
 }

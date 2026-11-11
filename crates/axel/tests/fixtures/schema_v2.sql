@@ -57,6 +57,7 @@ CREATE TABLE IF NOT EXISTS archive_index(
   rows_indexed INTEGER NOT NULL DEFAULT 0,
   forget_units INTEGER NOT NULL DEFAULT 0,      -- units left out because a forget tool was called (R3-5)
   cli_units    INTEGER NOT NULL DEFAULT 0,      -- units left out because forget --now deleted their turn (a cli mark); not in forget_units
+  cli_unproven INTEGER NOT NULL DEFAULT 0,      -- units with the key of such a turn, near it, whose text does not prove it: hidden as 'cli:unproven'
   keep_forget_turns INTEGER NOT NULL DEFAULT 0, -- 1: set by 'restore --forget-turns'; the forget rules are off for this file
   unmatched_hidden INTEGER NOT NULL DEFAULT 0,  -- hidden captures of its window that no unit matched (ruling 3)
   indexer_version INTEGER NOT NULL DEFAULT 1,

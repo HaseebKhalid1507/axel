@@ -1017,7 +1017,7 @@ pub fn forgotten_keys(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<ForgetMark
 /// The key of the nearest human prompt before the leading span: the last one of the
 /// carried head, as this file stores it. `None` when the file has no carried head, the head
 /// has no prompt, or a withheld prompt is nearer.
-fn carried_prompt_key(a: &LiveArchive) -> Option<String> {
+pub fn carried_prompt_key(a: &LiveArchive) -> Option<String> {
     let head = carried_head(a)?;
     let mut key = None;
     for message in a.messages[..=head].iter().filter(|m| m.role == Role::User) {

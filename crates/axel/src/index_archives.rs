@@ -408,6 +408,7 @@ struct RowOut<'a> {
     rows_indexed: i64,
     forget_units: i64,
     cli_units: i64,
+    cli_unproven: i64,
     unmatched_hidden: i64,
     first_seen_ms: i64,
     indexed_ms: Option<i64>,
@@ -432,6 +433,7 @@ impl<'a> RowOut<'a> {
             rows_indexed: 0,
             forget_units: 0,
             cli_units: 0,
+            cli_unproven: 0,
             unmatched_hidden: 0,
             first_seen_ms,
             indexed_ms: None,
@@ -449,9 +451,10 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
         "INSERT INTO archive_index(scope_dir, rel_name, archive_id, logical, digest, state, skip_reason,
                                    file_size, created_ms, time_source, cover_ms, session_id, win_no, part_no,
                                    source_message_count, message_count, rows_indexed, forget_units,
-                                   indexer_version, first_seen_ms, indexed_ms, unmatched_hidden, cli_units)
+                                   indexer_version, first_seen_ms, indexed_ms, unmatched_hidden, cli_units,
+                                   cli_unproven)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                 ?22, ?23)
+                 ?22, ?23, ?24)
          ON CONFLICT(scope_dir, rel_name) DO UPDATE SET
             archive_id = excluded.archive_id,
             logical = COALESCE(excluded.logical, archive_index.logical),
@@ -470,6 +473,7 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
             rows_indexed = excluded.rows_indexed,
             forget_units = excluded.forget_units,
             cli_units = excluded.cli_units,
+            cli_unproven = excluded.cli_unproven,
             unmatched_hidden = CASE WHEN excluded.state = 'indexed' THEN excluded.unmatched_hidden
                                     ELSE archive_index.unmatched_hidden END,
             indexer_version = excluded.indexer_version,
@@ -498,6 +502,7 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
             row.indexed_ms,
             row.unmatched_hidden,
             row.cli_units,
+            row.cli_unproven,
         ],
     )?;
     Ok(())
@@ -797,6 +802,7 @@ fn index_archive(
         // left out.
         let mut out = vec![false; units.len()];
         let mut by_cli = vec![false; units.len()];
+        let mut unproven = vec![false; units.len()];
         if takes_marks {
             for mark in own {
                 conn.execute(
@@ -828,6 +834,7 @@ fn index_archive(
             // in `forget_units`, and a kept archive is not read again for it at every scan.
             let (cli, rest): (Vec<Forgot>, Vec<Forgot>) = marks.into_iter().partition(|m| m.source == "cli");
             by_cli = left_out(&units, &cli, &place);
+            unproven = not_proven(&units, &cli, &place, archive::carried_prompt_key(a).as_deref());
             out = left_out(&units, &rest, &place);
             for (left, by_cli) in out.iter_mut().zip(&by_cli) {
                 *left |= *by_cli;
@@ -869,7 +876,7 @@ fn index_archive(
             tags.push(format!("session:{session}"));
         }
         let mut rows_indexed = 0i64;
-        for (unit, left) in units.iter().zip(&out) {
+        for (at_unit, (unit, left)) in units.iter().zip(&out).enumerate() {
             if *left {
                 continue;
             }
@@ -904,7 +911,12 @@ fn index_archive(
                 // RULING: wave4 R-13 round 3, item 2. A carried hide wins over a twin mark:
                 // what a person or a model hid stays theirs, and no re-judging of twins and
                 // no restore of a capture can clear it.
-                hidden: carried.get(&pos).cloned().or_else(|| twin_of(unit)),
+                // RULING: v2 c18b review round 3, item 1. A unit with the key of a deleted
+                // turn that its text does not prove that turn is born hidden: a miss of the
+                // hash never brings deleted text back into recall.
+                hidden: carried.get(&pos).cloned().or_else(|| twin_of(unit)).or_else(|| {
+                    unproven[at_unit].then(|| (now, UNPROVEN.to_string()))
+                }),
             };
             match store::insert_row(conn, ctx.signer.as_ref(), &new)? {
                 Inserted::New { .. } | Inserted::Exists => rows_indexed += 1,
@@ -987,6 +999,7 @@ fn index_archive(
             rows_indexed,
             forget_units: forget_spans + out.iter().zip(&by_cli).filter(|(left, cli)| **left && !**cli).count() as i64,
             cli_units: by_cli.iter().filter(|cli| **cli).count() as i64,
+            cli_unproven: unproven.iter().zip(&out).filter(|(u, left)| **u && !**left).count() as i64,
             unmatched_hidden,
             indexed_ms: Some(now),
             ..base
@@ -2228,6 +2241,32 @@ fn left_out(units: &[Unit], marks: &[Forgot], place: &Place) -> Vec<bool> {
                 *left = true;
             }
         }
+    }
+    out
+}
+
+/// `hidden_by` of a row with the key of a turn deleted with `forget --now`, near it, whose
+/// text does not prove it that turn.
+pub const UNPROVEN: &str = "cli:unproven";
+
+/// Which units of an archive the `cli` marks near it hold back without proof: a unit with a
+/// mark's key whose text is not that turn's (`left_out` takes the proven ones), and the
+/// leading `Continued` unit when the prompt of the carried head (`carried_key`) is a
+/// mark's key: the rest of a turn whose window was split.
+// RULING: v2 c18b review round 3, item 1 (fail closed). The hash is exact one way only: it
+// never takes a turn that was not deleted, but the archive's text of the deleted turn can
+// differ from the capture's (a worker's report kept the span going, a harness note, a
+// window split). Such a unit is not left out (it may be another turn) and not visible (it
+// may be the deleted one): it is born hidden, `cli:unproven`.
+fn not_proven(units: &[Unit], marks: &[Forgot], place: &Place, carried_key: Option<&str>) -> Vec<bool> {
+    let near = |m: &Forgot| m.source == "cli" && m.to_ms > place.stretch.0 && m.from_ms <= place.stretch.1;
+    let marked = |key: &str| marks.iter().any(|m| near(m) && m.turn_key == key);
+    let mut out: Vec<bool> = units
+        .iter()
+        .map(|unit| unit.turn_key.as_deref().filter(|k| !k.is_empty()).is_some_and(marked))
+        .collect();
+    if let (Some(at), Some(key)) = (leading_continued(units), carried_key.filter(|k| !k.is_empty())) {
+        out[at] |= marked(key);
     }
     out
 }

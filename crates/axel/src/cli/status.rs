@@ -742,13 +742,14 @@ fn brain_report(
     // Hidden and superseded (R-1, R3-6a): over all time, and of them the last 30 days.
     let hidden_by = {
         let mut m = Map::new();
-        for k in ["model", "cli", "pause", "twin"] {
+        for k in ["model", "cli", "pause", "twin", "unproven"] {
             m.insert(k.to_string(), json!(0));
         }
         for (k, v) in grouped(
             conn,
             "SELECT CASE WHEN substr(hidden_by, 1, 6) = 'model:' THEN 'model'
                          WHEN substr(hidden_by, 1, 5) = 'twin:' THEN 'twin'
+                         WHEN hidden_by = 'cli:unproven' THEN 'unproven'
                          WHEN hidden_by IN ('cli', 'pause') THEN hidden_by
                          ELSE 'other' END, COUNT(*)
                FROM memory_ext WHERE hidden_ms IS NOT NULL GROUP BY 1",
@@ -1152,6 +1153,13 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
         "hidden rows: model {}, cli {}, pause {}, twin {}",
         h["model"], h["cli"], h["pause"], h["twin"]
     ));
+    // RULING: v2 c18b review round 3, item 1: one count.
+    if h["unproven"].as_i64().unwrap_or(0) > 0 {
+        l.push(format!(
+            "hidden with the prompt of a turn deleted with forget --now, not proven that turn: {} (axel-v2 restore <id> brings one back)",
+            h["unproven"]
+        ));
+    }
     let (hm, sm) = (j["hidden_by_model"].as_i64().unwrap_or(0), j["superseded_by_model"].as_i64().unwrap_or(0));
     if hm > 0 || sm > 0 {
         let recent = j["hidden_by_model_30d"].as_i64().unwrap_or(0) + j["superseded_by_model_30d"].as_i64().unwrap_or(0);
