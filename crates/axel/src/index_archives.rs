@@ -779,7 +779,10 @@ fn index_archive(
                 logical: Some(&a.logical),
                 links: RecordLinks::default(),
                 turn_key: unit.turn_key.clone(),
-                hidden: twin_of(unit).or_else(|| carried.get(&pos).cloned()),
+                // RULING: wave4 R-13 round 3, item 2. A carried hide wins over a twin mark:
+                // what a person or a model hid stays theirs, and no re-judging of twins and
+                // no restore of a capture can clear it.
+                hidden: carried.get(&pos).cloned().or_else(|| twin_of(unit)),
             };
             match store::insert_row(conn, ctx.signer.as_ref(), &new)? {
                 Inserted::New { .. } | Inserted::Exists => rows_indexed += 1,

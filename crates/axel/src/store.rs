@@ -471,11 +471,15 @@ fn clear_shadow(conn: &Connection, id: &str) -> Result<()> {
 /// rows of the chat's newest archive with the same `turn_key` are hidden with it as
 /// `twin:<id>`. Returns the number of rows hidden (0: no such row, or hidden already).
 // SPEC: 3202 gives the statement without `AND hidden_ms IS NULL`. A second hide of a hidden
-// row would overwrite who hid it and when (a `twin:` mark among them), and restore could
-// no longer bring back what the first hide hid: it changes nothing here.
+// row would overwrite who hid it and when, and restore could no longer bring back what the
+// first hide hid: it changes nothing here.
 // RULING: wave3-c11 ruling 1: the one exception is a `pause` mark. A hide by anyone but a
 // pause takes it over (`hidden_by` and `hidden_ms` become the new hide's), so `resume`,
 // which restores only rows still marked `pause`, leaves the row hidden.
+// RULING: wave4 R-13 round 3, item 2 (changes ruling 1 of wave 3 for twins): a hide by a
+// person or a model takes over a `twin:` mark the same way. The hide is then theirs: the
+// re-judging of twins, the restore of the capture and a resume touch only rows still
+// marked `twin:`, so none of them brings the row back. A pause takes over no twin.
 pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
     if hidden_by.trim().is_empty() {
         return Err(AxelError::Memory("hide: empty hidden_by".into()));
@@ -489,7 +493,9 @@ pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
         let now = now_ms();
         let mut hidden = conn.execute(
             "UPDATE memory_ext SET hidden_ms = ?1, hidden_by = ?2
-              WHERE mem_id = ?3 AND (hidden_ms IS NULL OR (hidden_by = 'pause' AND ?2 <> 'pause'))",
+              WHERE mem_id = ?3
+                AND (hidden_ms IS NULL
+                     OR (?2 <> 'pause' AND (hidden_by = 'pause' OR substr(COALESCE(hidden_by, ''), 1, 5) = 'twin:')))",
             params![now, hidden_by, id],
         )?;
         if hidden == 0 {

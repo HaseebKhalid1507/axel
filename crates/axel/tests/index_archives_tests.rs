@@ -2714,6 +2714,43 @@ fn a_replaced_file_keeps_the_hide_of_the_row_at_the_same_position() {
     assert_eq!(run.errors(), 0);
 }
 
+/// Guards what the owner would lose: a row he hid, in a file that was replaced, came back
+/// as the twin of a hidden capture, and the twin mark is what a re-judging or a restore
+/// clears.
+#[test]
+fn a_hide_carried_over_a_replace_wins_over_a_twin_and_outlives_rejudging_and_restore() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let last = |text: &str| Arch::new(8, "s-keephide").at(T0 + 8 * W).turn(HIDDEN_PROMPT, &reply(text)).about("upload queue");
+    let old = last("OLDHIDDENTEXT");
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&old), &[0]);
+    let first = rows(run.db(), &dir, &old)[0].0.clone();
+    assert_eq!(tx(run.db(), || store::hide(run.db(), &first, "cli").unwrap()), 1);
+    // A hidden capture of the same prompt, far back: inside the stretch of the newest file.
+    capture_keyed(&run, "mem_cap_far", &dir, "s-keephide", T0 + W / 2, Some("cli"), &key_of(HIDDEN_PROMPT));
+
+    // The file is replaced, with the same turn at the same position.
+    let mut new = last("NEWHIDDENTEXTLONGER");
+    new.digest = format!("{:064x}", 88);
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&new), &[0]);
+    let held = |run: &Run| hidden_by(run.db(), &dir, &new);
+    let kept = [("x0.0".to_string(), Some("cli".to_string())), ("x2.0".to_string(), None)];
+    assert_eq!(held(&run), kept, "the owner's hide became a twin mark");
+
+    // Files between: the capture falls out of the stretch and twins are judged again.
+    let between: Vec<Arch> = [2u32, 4, 6]
+        .iter()
+        .map(|n| Arch::new(*n, "s-keephide").at(T0 + i64::from(*n) * W).about(&format!("matter {n}")))
+        .collect();
+    index_in_order(&env, &mut run, &dir, &between, &[0, 1, 2]);
+    assert_eq!(held(&run), kept, "the re-judging cleared the owner's hide");
+    // The capture is restored.
+    assert_eq!(tx(run.db(), || store::restore(run.db(), "mem_cap_far").unwrap()), 1);
+    assert_eq!(held(&run), kept, "the restore of the capture cleared the owner's hide");
+    assert_eq!(run.errors(), 0);
+}
+
 #[test]
 fn the_front_thread_is_told_to_remove_the_vectors_of_purged_rows() {
     let env = Env::new();

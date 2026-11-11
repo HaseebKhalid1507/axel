@@ -1594,6 +1594,48 @@ fn hide_refuses_a_twin_mark_as_who_hides() {
     assert_eq!(tx(conn, || store::hide(conn, "mem_row", "cli").unwrap()), 1);
 }
 
+/// Guards what the owner would lose: he hides a row that a hidden capture already hid as
+/// its twin, and the restore of that capture would show it again.
+#[test]
+fn a_persons_or_a_models_hide_takes_over_a_twin_mark_and_outlives_the_twin() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &capture_row("mem_cap", TURN_KEY));
+    let long_ago = now_ms() - 3 * DAY_MS;
+    let twin_of = |id: &str, archive_id: &'static str| {
+        let mut twin = archive_row(id, archive_id, TURN_KEY);
+        twin.hidden = Some((long_ago, "twin:mem_cap".to_string()));
+        twin
+    };
+    put(&brain, &twin_of("mem_arch_cli", "aaaa0000aaaa0000aaaa0000aaaa0000"));
+    put(&brain, &twin_of("mem_arch_model", "bbbb0000bbbb0000bbbb0000bbbb0000"));
+    put(&brain, &twin_of("mem_arch_pause", "cccc0000cccc0000cccc0000cccc0000"));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_cap", "cli").unwrap()), 1);
+
+    // The owner hides one twin, a model another: each hide is recorded as theirs.
+    let before = now_ms();
+    assert_eq!(tx(conn, || store::hide(conn, "mem_arch_cli", "cli").unwrap()), 1, "the owner's hide was dropped");
+    assert_eq!(tx(conn, || store::hide(conn, "mem_arch_model", "model:session-s").unwrap()), 1);
+    let (ms, by) = mark_of(conn, "mem_arch_cli");
+    assert_eq!(by.as_deref(), Some("cli"));
+    assert!(ms.unwrap() >= before, "hidden_ms is the new hide's");
+    assert_eq!(hidden_by(conn, "mem_arch_model").as_deref(), Some("model:session-s"));
+    // A pause takes over no twin, and a second hide is a second hide like any other.
+    assert_eq!(tx(conn, || store::hide(conn, "mem_arch_pause", "pause").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_arch_pause"), (Some(long_ago), Some("twin:mem_cap".to_string())));
+    let taken = mark_of(conn, "mem_arch_cli");
+    assert_eq!(tx(conn, || store::hide(conn, "mem_arch_cli", "model:session-s").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_arch_cli"), taken);
+
+    // The capture is restored: its twin mark is cleared, and the two hides stay.
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap").unwrap()), 1);
+    assert!(is_returned(conn, "mem_arch_pause"), "the row still marked as the twin is back");
+    assert_eq!(mark_of(conn, "mem_arch_cli"), taken, "the row the owner hid came back with the capture");
+    assert_eq!(hidden_by(conn, "mem_arch_model").as_deref(), Some("model:session-s"));
+    assert!(!is_returned(conn, "mem_arch_cli") && !is_returned(conn, "mem_arch_model"));
+}
+
 #[test]
 fn insert_row_refuses_a_row_hidden_as_its_own_twin() {
     let dir = TempDir::new().unwrap();
