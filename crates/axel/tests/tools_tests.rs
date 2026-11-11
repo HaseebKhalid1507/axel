@@ -1812,3 +1812,53 @@ fn r1_an_old_row_whose_title_is_not_text_does_not_fail_recall_in_any_project() {
     let found = lab.search(&s, "curlew roost saltmarsh");
     assert!(!found.contains("mem_blobtitle000001") && !found.contains("mem_badutf8title001"), "{found}");
 }
+
+// RULING: v2 c18a review, item 2: saying a text again finds the row that is recalled now,
+// or a hidden one; a superseded or expired row, and a row that is not a saved memory, are
+// not the answer: a new row is stored.
+#[test]
+fn r2_remember_of_a_superseded_expired_or_note_file_text_stores_a_new_row() {
+    let mut lab = Lab::new();
+    let (a, dir_a) = (lab.a.clone(), lab.dir_a.clone());
+    let s = lab.chat(&a, "S");
+
+    // Superseded: X, then Y replaces X, then X again.
+    let x = "the service listens on port 8080 behind the proxy";
+    let first = lab.remember(&s, x);
+    let second = saved_id(&lab.ok(
+        "remember",
+        json!({ "content": "the service listens on port 8081 behind the proxy", "supersedes": [format!("m:{first}")] }),
+        &s,
+    ));
+    let again = lab.remember(&s, x);
+    assert_ne!(again, first, "the superseded row was handed back");
+    assert_ne!(again, second);
+    let recalled = lab.recall(&s);
+    assert!(recalled.contains(&again), "{recalled}");
+    assert!(!recalled.contains(&first), "{recalled}");
+
+    // Expired: a reminder saved again after its time ran out.
+    let z = "remind the owner to renew the harbour permit this week";
+    let reminder = saved_id(&lab.ok("remember", json!({ "content": z, "ttl_hours": 1 }), &s));
+    lab.conn()
+        .execute("UPDATE memories SET expires_at = '2000-01-01T00:00:00+00:00' WHERE id = ?1", [&reminder])
+        .unwrap();
+    let renewed = lab.remember(&s, z);
+    assert_ne!(renewed, reminder, "the expired row was handed back");
+    assert!(lab.recall(&s).contains(&renewed));
+
+    // A note file's row with the same text and kind: its id is never handed back.
+    let n = "the tide table for the estuary is pinned in the shed";
+    lab.put(&row("mem_notefilesame0001", "note", &dir_a, "note_file", n));
+    let saved = lab.remember(&s, n);
+    assert_ne!(saved, "mem_notefilesame0001");
+    assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memory_ext WHERE mem_id = ?1 AND origin_kind = 'tool'", &saved), 1);
+
+    // A row that is recalled now is still the answer, and a hidden one stays hidden.
+    let rows = count(lab.conn(), "SELECT COUNT(*) FROM memories");
+    assert_eq!(lab.remember(&s, n), saved);
+    lab.ok("forget", json!({ "id": format!("m:{saved}") }), &s);
+    let answer = lab.ok("remember", json!({ "content": n }), &s);
+    assert!(answer.starts_with("This was hidden on ") && answer.contains(&saved), "{answer}");
+    assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows);
+}

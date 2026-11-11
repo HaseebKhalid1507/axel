@@ -439,14 +439,22 @@ fn remember(st: &FrontState, input: &Value, caller: &Caller) -> Result<String> {
 
     let saved = write(st, |conn| {
         let read = sql(st, true);
-        // The same text, kind and project: that row is the answer, and a hidden one stays
-        // hidden (R-9g). A hidden one is looked at first.
+        // The same text, kind and project, saved by a model, the command line or the old
+        // binary: a hidden row stays hidden (R-9g) and is the answer; a row that is recalled
+        // now is the answer. A superseded, invalidated, expired or secret one is not: a new
+        // row is stored. A hidden one is looked at first.
+        // RULING: v2 c18a review, item 2.
         let same: Option<(String, Option<i64>)> = conn
             .query_row(
                 "SELECT m.id, e.hidden_ms FROM memory_ext e JOIN memories m ON m.id = e.mem_id
-                  WHERE e.content_hash = ?1 AND m.category = ?2 AND m.project_key = ?3
+                  WHERE e.content_hash = :hash AND m.category = :class AND m.project_key = :key
+                    AND e.origin_kind IN ('tool', 'cli', 'legacy')
+                    AND (e.hidden_ms IS NOT NULL
+                         OR (m.superseded_by IS NULL AND m.invalidated_at IS NULL
+                             AND (m.expires_at IS NULL OR m.expires_at > :now)
+                             AND m.sensitivity = 'normal' AND m.retention = 'standard'))
                   ORDER BY e.hidden_ms IS NULL, e.vid LIMIT 1",
-                params![content_hash, class, project_key],
+                named_params! { ":hash": content_hash, ":class": class, ":key": project_key, ":now": expiry_text(now) },
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()
