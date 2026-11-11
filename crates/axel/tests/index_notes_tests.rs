@@ -1076,6 +1076,48 @@ fn a_rewritten_note_keeps_who_replaced_it_and_the_links_other_rows_hold_to_it() 
     assert_eq!(links_of(&w, "mem-linker"), before[2], "the links another row holds to the note were dropped");
 }
 
+/// The `hidden` mark of the document `doc_id`.
+fn doc_hidden(w: &World, doc_id: &str) -> Option<String> {
+    w.text("SELECT hidden FROM documents WHERE doc_id = ?1", doc_id)
+}
+
+/// A row the note replaced has a hidden shadow document: the rewrite's purge clears it and
+/// the put-back brings it back. A row whose id is that of a file document: the file
+/// document is left as it was.
+// RULING: v2 final small round, item 5
+#[test]
+fn a_rewritten_note_gives_back_the_shadow_mark_of_a_row_it_replaced_and_leaves_a_file_document_alone() {
+    let mut w = three_mirrored();
+    w.put_tool_row("mem-older", "an older memory that the second note replaced");
+    w.put_tool_row("mem-filed", "another memory the second note replaced, its id a file's");
+    let conn = w.conn();
+    conn.execute_batch(
+        r#"INSERT INTO documents(doc_id, content, metadata, embedding) VALUES ('mem-older', 'shadow', '{"type":"memory"}', x'00');
+           INSERT INTO documents(doc_id, content, metadata, embedding, hidden) VALUES ('mem-filed', 'a file', '{"type":"file"}', x'00', 'missing_source');"#,
+    )
+    .unwrap();
+    brain_v2::begin_write(conn).unwrap();
+    assert_eq!(store::supersede(conn, "mem-older", N2).unwrap(), 1);
+    assert_eq!(store::supersede(conn, "mem-filed", N2).unwrap(), 1);
+    conn.execute_batch("COMMIT").unwrap();
+    assert_eq!(doc_hidden(&w, "mem-older").as_deref(), Some("memory_hidden"));
+    assert_eq!(doc_hidden(&w, "mem-filed").as_deref(), Some("missing_source"));
+    let file_before = w.text(
+        "SELECT quote(content) || quote(metadata) || quote(hidden) FROM documents WHERE doc_id = ?1",
+        "mem-filed",
+    );
+
+    w.write(KEY, &format!("{}{}{}", n1(), rec(N2, 1_700_000_000_100, "the second note is about delta"), n3()));
+    assert_eq!(w.pass().rewritten, 1);
+    assert_eq!(w.text("SELECT superseded_by FROM memories WHERE id = ?1", "mem-older").as_deref(), Some(N2));
+    assert_eq!(doc_hidden(&w, "mem-older").as_deref(), Some("memory_hidden"), "the shadow was shown again");
+    let file_after = w.text(
+        "SELECT quote(content) || quote(metadata) || quote(hidden) FROM documents WHERE doc_id = ?1",
+        "mem-filed",
+    );
+    assert_eq!(file_after, file_before, "a file document was touched");
+}
+
 /// Guards what the owner would lose: a note rewritten with a time no row can hold.
 #[test]
 fn a_note_rewritten_with_a_time_no_row_can_hold_keeps_its_old_row() {

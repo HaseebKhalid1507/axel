@@ -567,6 +567,13 @@ struct LinkRow {
     shadow: Option<Option<String>>,
 }
 
+/// A memory's shadow document, as `store` tells it from a file document with the same id.
+// RULING: v2 final small round, item 5: the shadow's `hidden` is read and put back only on
+// the memory's own shadow document; a file document whose id equals a memory id is never
+// touched. The text is `store`'s (its constant is private there).
+const SHADOW_IS_MEMORY: &str =
+    "CASE WHEN json_valid(metadata) THEN json_extract(metadata, '$.type') END = 'memory'";
+
 /// The other rows that name `id` in a link array, or are replaced by it.
 fn links_to(conn: &Connection, id: &str) -> Result<Vec<LinkRow>> {
     let names = |column: &str| {
@@ -596,7 +603,9 @@ fn links_to(conn: &Connection, id: &str) -> Result<Vec<LinkRow>> {
     };
     for row in &mut rows {
         row.shadow = conn
-            .query_row("SELECT hidden FROM documents WHERE doc_id = ?1", [&row.id], |r| r.get(0))
+            .query_row(&format!("SELECT hidden FROM documents WHERE doc_id = ?1 AND {SHADOW_IS_MEMORY}"), [&row.id], |r| {
+                r.get(0)
+            })
             .optional()?;
     }
     Ok(rows)
@@ -626,7 +635,10 @@ fn put_back(conn: &Connection, id: &str, kept: &Kept) -> Result<()> {
             params![row.supersedes, row.contradicts, row.confirmed_by, row.superseded_by, row.invalidated_at, row.id],
         )?;
         if let Some(hidden) = &row.shadow {
-            conn.execute("UPDATE documents SET hidden = ?1 WHERE doc_id = ?2", params![hidden, row.id])?;
+            conn.execute(
+                &format!("UPDATE documents SET hidden = ?1 WHERE doc_id = ?2 AND {SHADOW_IS_MEMORY}"),
+                params![hidden, row.id],
+            )?;
         }
     }
     Ok(())
