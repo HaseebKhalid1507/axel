@@ -449,7 +449,10 @@ fn t03_every_hook_kind_and_an_unknown_one_answer_continue() {
     assert_eq!(row["reason"], "None");
     assert!(row["written_ms"].as_i64().unwrap() >= row["started_ms"].as_i64().unwrap());
     assert!(row["started_ms"].as_i64().unwrap() > 0);
-    assert_eq!(row["scan"], "pending");
+    // The scan is real since commit 13a: the row says how far it is when the row is written,
+    // which may be before the first tick (`pending`) or after it (`running`, `done`).
+    let scan = row["scan"].as_str().expect("scan is a string");
+    assert!(matches!(scan, "pending" | "running" | "done"), "scan = {scan}");
     assert_eq!(row["forum"]["declared"], true);
     assert_eq!(row["forum"]["core_owns"], false);
     assert_eq!(row["embed_stopped"], false);

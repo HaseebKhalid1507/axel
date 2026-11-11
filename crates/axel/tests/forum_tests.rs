@@ -1000,12 +1000,11 @@ fn test_9_through_serve_a_call_without_a_usable_caller_is_refused() {
     assert_eq!(rows("forum_posts"), 1);
 }
 
-/// Test 9, "a `caller` that is not an object", the one case that does not hold yet: the rpc
-/// thread (`ext/server.rs`, not this commit's file) parses `caller` with serde, which takes
-/// a JSON array of two or three strings as an `Author`, field by position. The handler is
-/// given a well-formed author and cannot tell. Un-ignore when `on_tool` takes an object only.
+/// Test 9, "a `caller` that is not an object": serde takes a JSON array of two or three
+/// strings as an `Author`, field by position, and the handler would be given a well-formed
+/// author and could not tell. So the rpc thread (`ext/server.rs`, `on_tool`) reads `caller`
+/// only when it is a JSON object.
 #[test]
-#[ignore = "needs ext/server.rs to refuse a caller that is not a JSON object (see the report of commit 17)"]
 fn test_9_through_serve_a_caller_that_is_an_array_is_refused() {
     let tmp = TempDir::new().unwrap();
     std::fs::create_dir_all(tmp.path().join("base")).unwrap();

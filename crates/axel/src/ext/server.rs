@@ -990,7 +990,13 @@ impl<W: Write> Pump<W> {
         let caller = Caller {
             session_id: str_field(params, "session_id"),
             cwd: str_field(params, "cwd"),
-            author: params.get("caller").cloned().and_then(|c| serde_json::from_value(c).ok()),
+            // Only a JSON object is a caller: serde would also take an array of strings as
+            // an `Author`, field by position, and the forum would then post under it.
+            author: params
+                .get("caller")
+                .filter(|c| c.is_object())
+                .cloned()
+                .and_then(|c| serde_json::from_value(c).ok()),
         };
         let forget = name == "forget" || name == "axel_forget";
         let session_id = caller.session_id.clone();
