@@ -81,10 +81,24 @@ pub fn shown(conn: &Connection, hidden: &HashSet<String>, doc_id: &str) -> Resul
     Ok(!gone)
 }
 
+/// The count and the sum of the row ids of `documents`: a row deleted or added changes it.
+fn documents_now(conn: &Connection) -> Result<(i64, f64)> {
+    Ok(conn.query_row("SELECT COUNT(*), TOTAL(id) FROM documents", [], |r| Ok((r.get(0)?, r.get(1)?)))?)
+}
+
 /// The search for three times `limit`, the hidden hits dropped, at most `limit` kept.
 pub fn visible_hits(search: &mut BrainSearch, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    let before = documents_now(search.db().conn())?;
     let response = search.search(query, limit.saturating_mul(3))?;
     let conn = search.db().conn();
+    // RULING: v2 c18b review, item 9. The first search of a process reads every vector and
+    // then writes `<brain>.r8.hnsw`; a `forget --now` that commits and removes that file in
+    // between would find it written back with the deleted shadow's vector. When the
+    // documents changed while this search ran, the file it may have written goes, and the
+    // next search builds it again.
+    if documents_now(conn)? != before {
+        let _ = std::fs::remove_file(search.db().path().with_extension("r8.hnsw"));
+    }
     let hidden = hidden_ids(conn)?;
     let mut kept = Vec::new();
     for hit in response.results {

@@ -512,6 +512,20 @@ fn t10_after_forget_now_the_text_is_in_no_table_and_in_neither_file() {
     }
     assert!(hnsw.exists(), "the test needs the cache file");
     assert!(in_tables(w.db(), MARKER) > 0);
+    // The old search's access log holds the query that found a hit (v2 c18b review, item 9).
+    for (doc_id, query) in [("mem_secret_plan", MARKER), ("graph:mem_secret_plan", MARKER), ("mem_other", "another decision")] {
+        w.db()
+            .execute("INSERT INTO document_access(doc_id, access_type, query) VALUES (?1, 'search_hit', ?2)", [doc_id, query])
+            .unwrap();
+    }
+    w.db()
+        .execute("INSERT INTO co_retrieval(doc_id_a, doc_id_b, query) VALUES ('mem_other', 'mem_secret_plan', ?1)", [MARKER])
+        .unwrap();
+    let logged = |w: &World| {
+        count(w.db(), &format!("SELECT COUNT(*) FROM document_access WHERE query LIKE '%{MARKER}%'"))
+            + count(w.db(), &format!("SELECT COUNT(*) FROM co_retrieval WHERE query LIKE '%{MARKER}%'"))
+    };
+    assert_eq!(logged(&w), 3);
     assert!(in_file(&wal, MARKER) > 0, "the log does not hold the text: the test proves nothing");
 
     let run = forget_cmd(&w.path, &["mem_secret_plan"], true, false, "yes\n");
@@ -523,6 +537,8 @@ fn t10_after_forget_now_the_text_is_in_no_table_and_in_neither_file() {
     assert_eq!(count(w.db(), "SELECT COUNT(*) FROM context_data WHERE key = 'purge_pending'"), 0);
     assert!(w.has("mem_other"));
     assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_secret_plan'"), 1);
+    assert_eq!(logged(&w), 0, "a search log row that names the deleted row stayed");
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM document_access WHERE doc_id = 'mem_other'"), 1);
 }
 
 /// A terminal whose stdout closes once the `[y/N]` question is on it, like a pipe whose
@@ -767,6 +783,20 @@ fn a_wrong_or_ambiguous_id_changes_nothing_and_exits_non_zero() {
     let now = forget_cmd(&w.path, &["mem_ab0"], true, false, "y\n");
     assert_eq!(now.code, 1);
     assert_eq!(state(&w), before);
+    // v2 c18b review, item 9: `--now` takes whole ids only, even a start one row has.
+    let short = forget_cmd(&w.path, &["mem_ab01"], true, false, "y\n");
+    assert_eq!(short.code, 1, "{}", short.out);
+    assert!(short.err.contains("--now needs the whole id"), "{}", short.err);
+    assert_eq!(state(&w), before);
+    // A row with no memory_ext row is refused, not reported as hidden.
+    w.put(&r("mem_bare", "legacy", "a row that was never adopted"));
+    w.db().execute("DELETE FROM memory_ext WHERE mem_id = 'mem_bare'", []).unwrap();
+    for now in [false, true] {
+        let bare = forget_cmd(&w.path, &["mem_bare"], now, false, "y\n");
+        assert_eq!(bare.code, 1, "{}", bare.out);
+        assert!(bare.err.contains("m:mem_bare: not adopted") && !bare.out.contains("Hidden"), "{}{}", bare.out, bare.err);
+    }
+    assert!(w.has("mem_bare"));
     for refused in [restore_ids(&w.path, &["mem_ab0"]), show_cmd(&w.path, "mem_ab0")] {
         assert_eq!(refused.code, 1);
         assert!(refused.err.contains("m:mem_ab02bbbbbbbbbbbb"), "{}", refused.err);
@@ -1568,6 +1598,32 @@ fn remember_says_the_brain_is_busy_when_the_write_lock_is_held() {
     assert!(!done.status.success());
     assert!(String::from_utf8_lossy(&done.stderr).contains("the brain is busy"), "{}", String::from_utf8_lossy(&done.stderr));
     assert!(cli_rows(w.db()).is_empty());
+    // v2 c18b review, item 9: busy has an exit code of its own, said in --help.
+    assert_eq!(done.status.code(), Some(75));
+    let help = std::process::Command::new(env!("CARGO_BIN_EXE_axel")).arg("--help").output().unwrap();
+    assert!(String::from_utf8_lossy(&help.stdout).contains("75 the brain is busy"));
+}
+
+/// v2 c18b review, item 9: the tool's same-text rule. The same text again is the row that
+/// has it; when that row is hidden, `remember` refuses and stores nothing (R-9g).
+#[test]
+fn remember_of_a_text_saved_before_returns_that_row_and_refuses_when_it_is_hidden() {
+    let w = World::new();
+    let text = "the harbour office closes at four on the last Friday of each month";
+    assert!(axel_cmd(&w.path, &["remember", text]).status.success());
+    let id = cli_rows(w.db())[0].0.clone();
+    let again = axel_cmd(&w.path, &["remember", &format!("  {text} ")]);
+    assert!(again.status.success());
+    assert!(String::from_utf8_lossy(&again.stdout).contains(&format!("Remembered already: m:{id}")));
+    assert_eq!(cli_rows(w.db()).len(), 1);
+
+    w.hide(&id, "cli", HOUR_MS);
+    let hidden = axel_cmd(&w.path, &["remember", text]);
+    assert_eq!(hidden.status.code(), Some(1));
+    let said = String::from_utf8_lossy(&hidden.stderr);
+    assert!(said.contains("stays hidden") && said.contains(&format!("axel-v2 restore {id}")), "{said}");
+    assert_eq!(cli_rows(w.db()).len(), 1, "hidden text was saved again");
+    assert_eq!(w.hidden_by(&id).as_deref(), Some("cli"));
 }
 
 #[test]

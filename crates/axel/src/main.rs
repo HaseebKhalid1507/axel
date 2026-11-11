@@ -21,7 +21,14 @@ use axel_memkoshi::storage::MemoryStorage;
 ///
 /// Search, memory, and session awareness in one .r8 file.
 #[derive(Parser)]
-#[command(name = "axel", version, about, long_about = None)]
+#[command(
+    name = "axel",
+    version,
+    about,
+    long_about = None,
+    after_help = "Exit codes: 0 done; 1 refused, not found, or an error (nothing was changed when it says so); \
+                  2 a usage error; 75 the brain is busy (another command or the extension is writing): try again."
+)]
 struct Cli {
     /// Path to .r8 brain file (overrides AXEL_BRAIN env var)
     #[arg(long, global = true, env = "AXEL_BRAIN")]
@@ -182,7 +189,12 @@ fn main() -> ExitCode {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e}");
-            ExitCode::FAILURE
+            // RULING: v2 c18b review, item 9: a script can tell "try again" from "wrong".
+            if e.to_string().contains(axel::cli::show::BUSY) {
+                ExitCode::from(BUSY_EXIT)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }
@@ -629,6 +641,19 @@ fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Er
 /// The words of a remembered text that make its title, as the tool's `remember` takes.
 const REMEMBER_TITLE_WORDS: usize = 12;
 
+/// The exit code of a command that could not get the brain's write lock in time
+/// (`EX_TEMPFAIL`): nothing was changed and the same command may be run again.
+const BUSY_EXIT: u8 = 75;
+
+/// What `remember` found for a text it was given.
+enum Same {
+    /// A row with the same text is hidden: `(id, hidden_ms)`.
+    Hidden(String, i64),
+    /// A visible row with the same text, kind and place: its id.
+    Visible(String),
+    New(axel::store::Inserted),
+}
+
 fn cmd_remember(
     cli: &Cli,
     content_parts: &[String],
@@ -695,9 +720,67 @@ fn cmd_remember(
         turn_key: None,
         hidden: None,
     };
-    let inserted = show::write(&conn, || store::insert_row(&conn, signer.as_ref(), &row))?;
-    if !matches!(inserted, Inserted::New { .. }) {
-        return Err("the memory could not be saved; nothing was stored; try again".into());
+    // RULING: v2 c18b review, item 9. The same-text rule of the tool: a saved row (origin
+    // `tool`, `cli` or `legacy`) with the same text as stored is the answer when it is
+    // visible, not superseded, not invalidated and not expired, with the same kind, for
+    // every project; one that is hidden makes `remember` refuse (R-9g), whatever its kind
+    // and project, so that hidden text is not saved again, visible.
+    let content_hash = {
+        use sha2::{Digest, Sha256};
+        hex::encode(Sha256::digest(axel::archive::normalise(&axel::screen::redact(&content).text).as_bytes()))
+    };
+    let now_rfc = chrono::Utc::now();
+    let same = show::write(&conn, || {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, e.hidden_ms, m.superseded_by, m.invalidated_at, m.expires_at, m.category, m.project_key
+               FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+              WHERE e.content_hash = ?1 AND e.origin_kind IN ('tool', 'cli', 'legacy')
+              ORDER BY e.hidden_ms IS NULL, e.vid",
+        )?;
+        type Found = (String, Option<i64>, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>);
+        let found: Vec<Found> = stmt
+            .query_map([&content_hash], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?, r.get(6)?))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        for (id, hidden_ms, ..) in &found {
+            if let Some(ms) = hidden_ms {
+                return Ok(Same::Hidden(id.clone(), *ms));
+            }
+        }
+        for (id, _, superseded_by, invalidated_at, expires_at, kind, project) in &found {
+            let expired = expires_at.as_deref().is_some_and(|t| {
+                chrono::DateTime::parse_from_rfc3339(t).map_or(true, |t| t <= now_rfc)
+            });
+            if superseded_by.is_none()
+                && invalidated_at.is_none()
+                && !expired
+                && kind.as_deref() == Some(category.as_str())
+                && project.as_deref() == Some(GLOBAL_KEY)
+            {
+                return Ok(Same::Visible(id.clone()));
+            }
+        }
+        Ok(Same::New(store::insert_row(&conn, signer.as_ref(), &row)?))
+    })?;
+    match same {
+        Same::Hidden(id, ms) => {
+            eprintln!(
+                "This text was hidden on {} (m:{}) and stays hidden; \"axel-v2 restore {}\" brings it back. Nothing was stored.",
+                show::day(ms),
+                show::one(&id),
+                show::one(&id)
+            );
+            return Ok(ExitCode::FAILURE);
+        }
+        Same::Visible(id) => {
+            println!("✓ Remembered already: m:{} has this text; nothing new was stored.", show::one(&id));
+            return Ok(ExitCode::SUCCESS);
+        }
+        Same::New(Inserted::New { .. }) => {}
+        Same::New(_) => {
+            return Err("the memory could not be saved: the new id it drew is taken; nothing was stored; run the command again".into());
+        }
     }
     println!("✓ Remembered: {} ({})", show::one(&title), mem.id);
     println!("  category: {} | topic: {} | every project", category.as_str(), show::one(topic));

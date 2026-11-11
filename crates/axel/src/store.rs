@@ -414,6 +414,29 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
             conn.execute("DELETE FROM documents WHERE doc_id IN (SELECT doc_id FROM temp.purge_docs)", [])?;
         }
 
+        // 5b. The old search's access log: each row holds the query that found a hit, by the
+        // hit's id (the graph layer's as `graph:<id>`).
+        // RULING: v2 c18b review, item 9: the rows that name a purged id go with it.
+        for (table, columns) in [("document_access", &["doc_id"][..]), ("co_retrieval", &["doc_id_a", "doc_id_b"][..])] {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1)",
+                [table],
+                |r| r.get(0),
+            )?;
+            if !present {
+                continue;
+            }
+            for column in columns {
+                conn.execute(
+                    &format!(
+                        "DELETE FROM {table} WHERE {column} IN (SELECT id FROM temp.purge_ids)
+                            OR {column} IN (SELECT 'graph:' || id FROM temp.purge_ids)"
+                    ),
+                    [],
+                )?;
+            }
+        }
+
         // 6. Graph nodes: `nodes.content` can hold text.
         conn.execute(
             "DELETE FROM edges WHERE source_id IN (SELECT id FROM temp.purge_ids)

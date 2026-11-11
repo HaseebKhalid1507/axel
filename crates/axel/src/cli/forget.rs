@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cli::show::{self, find_all, now_ms, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
+use crate::cli::show::{self, bare, find_all, now_ms, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
 use crate::{index_archives, screen, store};
@@ -84,6 +84,26 @@ pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Res
                 return Ok(FAILED);
             }
         }
+    }
+    // RULING: v2 c18b review, item 9. A row with no `memory_ext` row cannot be hidden (the
+    // hide is written there): it is refused, not reported as hidden. And `--now` deletes
+    // for good only rows named by their whole id.
+    let mut refused = false;
+    for row in rows.iter().filter(|r| r.origin == "unknown") {
+        writeln!(term.err, "m:{}: not adopted (the brain has no memory_ext row for it); it cannot be hidden or deleted here", one(&row.id))?;
+        refused = true;
+    }
+    if args.now {
+        for given in &args.ids {
+            if !ids.iter().any(|id| id == bare(given)) {
+                writeln!(term.err, "{}: --now needs the whole id of the row (\"axel-v2 show {}\" gives it)", one(given), one(given))?;
+                refused = true;
+            }
+        }
+    }
+    if refused {
+        writeln!(term.err, "Nothing was changed.")?;
+        return Ok(FAILED);
     }
     // As the tool does: a row that mirrors a Synaps file is forgotten in Synaps. A hidden
     // one (the archived form of a hidden turn) is taken by `--now`.
