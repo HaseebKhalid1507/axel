@@ -2338,10 +2338,47 @@ fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: 
             };
         }
 
-        // The rest of what somebody saved, by primary key.
+        // The rest of what somebody saved, by primary key. A key in both brains whose row
+        // differs keeps the new brain's row, and the source's is listed: never taken or
+        // dropped silently (wave5-c19-review finding 7). The handoff was settled above.
         let mut saved = Map::new();
+        let mut saved_changed = Map::new();
         for table in SAVED_TABLES {
             let Some(columns) = lists.get(table) else { continue };
+            let keys = key_columns(&conn, "src", table)?;
+            let on = keys.iter().map(|k| format!("s.{k} = m.{k}", k = q(k))).collect::<Vec<_>>().join(" AND ");
+            let differs = columns
+                .iter()
+                .filter(|c| !keys.contains(c))
+                .map(|c| format!("s.{c} IS NOT m.{c}", c = q(c)))
+                .collect::<Vec<_>>()
+                .join(" OR ");
+            let mut changed_keys = Vec::new();
+            if !differs.is_empty() {
+                let sel = keys.iter().map(|k| format!("s.{}", q(k))).collect::<Vec<_>>().join(", ");
+                let mut stmt = conn.prepare(&format!(
+                    "SELECT {sel} FROM src.{t} s JOIN main.{t} m ON {on} WHERE {differs} ORDER BY {sel}",
+                    t = q(table)
+                ))?;
+                let mut rows = stmt.query([])?;
+                while let Some(r) = rows.next()? {
+                    let key: Vec<String> =
+                        (0..keys.len()).map(|i| r.get_ref(i).map(|v| Cell::of(v).show())).collect::<rusqlite::Result<_>>()?;
+                    changed_keys.push(key.join("/"));
+                }
+            }
+            if !changed_keys.is_empty() {
+                eprintln!("{table}: {} row(s) changed in the source, the new brain's kept", changed_keys.len());
+            }
+            saved_changed.insert(
+                table.to_string(),
+                json!({
+                    "key": keys,
+                    "count": changed_keys.len(),
+                    "keys": changed_keys.iter().take(LIST_MAX).collect::<Vec<_>>(),
+                    "truncated": changed_keys.len() > LIST_MAX,
+                }),
+            );
             let cols = joined(columns);
             let n = conn.execute(
                 &format!("INSERT OR IGNORE INTO main.{t}({cols}) SELECT {cols} FROM src.{t}", t = q(table)),
@@ -2397,6 +2434,7 @@ fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: 
         rep.insert("forgotten_in_source_still_in_new_brain".into(), id_list(&forgotten_there));
         rep.insert("handoff".into(), json!(handoff));
         rep.insert("saved_rows".into(), Value::Object(saved));
+        rep.insert("saved_changed_in_source".into(), Value::Object(saved_changed));
         rep.insert("not_carried".into(), Value::Object(not_carried));
         rep.insert("watch".into(), watch.clone());
         Ok(())

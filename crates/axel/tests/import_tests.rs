@@ -1634,3 +1634,42 @@ fn f4_a_file_that_appears_after_the_move_is_kept_with_exit_4() {
     assert_eq!(out.report["destination_made"], false);
     assert!(temporaries(fx.new.parent().unwrap()).is_empty());
 }
+
+/// Finding 7: a saved row whose key is in both brains and whose values the old plugin
+/// changed since the import keeps the new brain's values and is listed, table by table.
+#[test]
+fn f7_catch_up_lists_saved_rows_changed_in_the_source() {
+    let fx = fx();
+    make_axel(&fx.old);
+    assert_eq!(fx.init(&fx.old).code, 0);
+    change_axel(&fx.old, |conn| {
+        conn.execute_batch(
+            "UPDATE context_data SET value = 'light' WHERE key = 'theme';
+             UPDATE staged_memories SET title = 'staged one, renamed' WHERE id = 'stg-1';
+             UPDATE patterns SET confidence = 0.9 WHERE name = 'morning';",
+        )
+        .unwrap();
+    });
+    let out = fx.catch_up();
+    show("catch-up, saved rows changed in the source", &out);
+    assert_eq!(out.code, 0, "{}", out.report);
+    let changed = &out.report["saved_changed_in_source"];
+    assert_eq!(changed["context_data"]["key"], json!(["key", "layer"]));
+    assert_eq!(changed["context_data"]["keys"], json!(["theme/prefs"]));
+    assert_eq!(changed["staged_memories"]["keys"], json!(["stg-1"]));
+    assert_eq!(changed["patterns"]["count"], 1);
+    assert_eq!(out.report["saved_rows"], json!({ "context_data": 0, "staged_memories": 0, "patterns": 0 }));
+    // Never overwritten.
+    let new = Connection::open(&fx.new).unwrap();
+    assert_eq!(text(&new, "SELECT value FROM context_data WHERE key = 'theme'"), "dark");
+    assert_eq!(text(&new, "SELECT title FROM staged_memories WHERE id = 'stg-1'"), "staged one");
+    // A catch-up with nothing changed lists nothing.
+    let other = self::fx();
+    make_axel(&other.old);
+    assert_eq!(other.init(&other.old).code, 0);
+    let out = other.catch_up();
+    assert_eq!(out.code, 0, "{}", out.report);
+    for table in ["context_data", "staged_memories", "patterns"] {
+        assert_eq!(out.report["saved_changed_in_source"][table]["count"], 0, "{}", out.report);
+    }
+}
