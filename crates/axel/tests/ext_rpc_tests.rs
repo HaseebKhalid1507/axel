@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use axel::ext::config::{base_config_value, default_brain, EmbedderKind, ExtConfig, ForumMode};
 use axel::ext::rpc::{
     parse_request, write_frame, write_response, FrameError, FrameReader, MessageError, Response,
-    MAX_BODY, METHOD_NOT_FOUND,
+    INTERNAL_ERROR, MAX_BODY, MAX_OUT, METHOD_NOT_FOUND,
 };
 use serde_json::{json, Value};
 
@@ -183,6 +183,51 @@ fn oversized_and_cut_short() {
     let mut r = FrameReader::new(BufReader::new(stream));
     assert_eq!(r.next_frame(), Some(Err(FrameError::Truncated)));
     assert_eq!(r.next_frame(), None);
+}
+
+/// The body of a response, read back from one written frame.
+fn written_body(out: Vec<u8>) -> Vec<u8> {
+    let got = all(reader(out));
+    assert_eq!(got.len(), 1);
+    got.into_iter().next().unwrap().unwrap()
+}
+
+/// RULING: wave2-c12a review finding 5: nothing over the host's 4 MiB leaves this side.
+#[test]
+fn responses_over_the_hosts_limit_become_an_error() {
+    assert_eq!(MAX_OUT, 4 * 1024 * 1024);
+    let id = json!("evt-9");
+    let empty = Response::result(id.clone(), json!("")).to_bytes().len();
+    let sized = |n: usize| Response::result(id.clone(), json!("a".repeat(n - empty)));
+
+    // Exactly the limit: written as it is.
+    let at = sized(MAX_OUT);
+    assert_eq!(at.to_bytes().len(), MAX_OUT);
+    let mut out = Vec::new();
+    write_response(&mut out, &at).unwrap();
+    assert_eq!(written_body(out), at.to_bytes());
+
+    // One byte over: the error response with the same id, itself under the limit.
+    let mut out = Vec::new();
+    write_response(&mut out, &sized(MAX_OUT + 1)).unwrap();
+    let body = written_body(out);
+    assert!(body.len() <= MAX_OUT);
+    let v: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(v["id"], id);
+    assert_eq!(v["error"]["code"], json!(INTERNAL_ERROR));
+    assert_eq!(INTERNAL_ERROR, -32603);
+    assert_eq!(v["error"]["message"], json!("response too large"));
+    assert_eq!(v["error"]["data"]["size"], json!(MAX_OUT + 1));
+    assert!(v.get("result").is_none());
+}
+
+#[test]
+fn write_frame_over_the_limit_writes_nothing() {
+    let mut out = Vec::new();
+    assert!(write_frame(&mut out, &vec![b' '; MAX_OUT + 1]).is_err());
+    assert!(out.is_empty());
+    write_frame(&mut out, &vec![b' '; MAX_OUT]).unwrap();
+    assert_eq!(out.len(), format!("Content-Length: {MAX_OUT}\r\n\r\n").len() + MAX_OUT);
 }
 
 // ---- section 9, test 3 ----

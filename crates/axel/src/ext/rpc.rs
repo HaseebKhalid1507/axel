@@ -14,6 +14,13 @@ use serde_json::Value;
 
 /// A body over this size is read and discarded (section 7, "Bad frame").
 pub const MAX_BODY: usize = 64 * 1024 * 1024;
+/// The largest body this side writes. RULING: wave2-c12a review finding 5: the host's
+/// reader refuses a larger one (`MAX_RESPONSE_SIZE = 4 * 1024 * 1024` in
+/// `CORE/crates/agent-engine/src/extensions/runtime/process.rs`, near line 1050) and then
+/// drops the whole connection.
+pub const MAX_OUT: usize = 4 * 1024 * 1024;
+/// JSON-RPC "internal error": the answer to a request whose response would be over `MAX_OUT`.
+pub const INTERNAL_ERROR: i64 = -32603;
 /// The size of the pieces an oversized body is discarded in.
 pub const DISCARD_CHUNK: usize = 64 * 1024;
 /// A header line keeps at most this many bytes (its tail); the rest is not a header.
@@ -188,8 +195,15 @@ fn is_header(line: &[u8]) -> bool {
     }
 }
 
-/// One frame: the header, the blank line, the body, then a flush.
+/// One frame: the header, the blank line, the body, then a flush. A body over `MAX_OUT` is
+/// an error and nothing is written (RULING: wave2-c12a review finding 5).
 pub fn write_frame(w: &mut impl Write, body: &[u8]) -> io::Result<()> {
+    if body.len() > MAX_OUT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("frame body of {} bytes is over {MAX_OUT}", body.len()),
+        ));
+    }
     w.write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())?;
     w.write_all(body)?;
     w.flush()
@@ -236,6 +250,8 @@ pub fn parse_request(body: &[u8]) -> Result<Request, MessageError> {
 pub struct RpcError {
     pub code: i64,
     pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 /// An answer to a request with an `id`. Serialised with the keys in the old order:
@@ -260,7 +276,7 @@ impl Response {
             jsonrpc: "2.0",
             id,
             result: None,
-            error: Some(RpcError { code, message: message.into() }),
+            error: Some(RpcError { code, message: message.into(), data: None }),
         }
     }
 
@@ -275,7 +291,18 @@ impl Response {
     }
 }
 
-/// Writes one response as one frame.
+/// Writes one response as one frame. A body over `MAX_OUT` is replaced by an error response
+/// with the same `id`: code `-32603`, `response too large`, the size in `data` (RULING:
+/// wave2-c12a review finding 5). Should even that be over (an `id` of megabytes),
+/// `write_frame` refuses it and nothing is written.
 pub fn write_response(w: &mut impl Write, response: &Response) -> io::Result<()> {
-    write_frame(w, &response.to_bytes())
+    let body = response.to_bytes();
+    if body.len() <= MAX_OUT {
+        return write_frame(w, &body);
+    }
+    let mut too_large = Response::error(response.id.clone(), INTERNAL_ERROR, "response too large");
+    if let Some(e) = too_large.error.as_mut() {
+        e.data = Some(serde_json::json!({ "size": body.len(), "max": MAX_OUT }));
+    }
+    write_frame(w, &too_large.to_bytes())
 }
