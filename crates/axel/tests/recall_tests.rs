@@ -1301,6 +1301,116 @@ fn t12b_the_log_keeps_the_newest_thousand_rows_and_drops_a_row_inside_a_forget_c
     assert!(ctx.conn.as_ref().unwrap().is_autocommit());
 }
 
+#[test]
+fn t12c_the_log_keeps_no_text_of_a_worker_a_host_message_or_a_chat_filed_elsewhere() {
+    let mut h = Hook::new(json!({ "recall_on_events": "on" }));
+    let scope = h.scope_dir.clone();
+    let mut new = row("mem_deploy", "staging deploy note", "the staging server deploy uses the blue pipeline");
+    new.project_key = &scope;
+    h.put(&new);
+    let mut global = row("mem_global", "global deploy fact", "the staging server deploy is described for every project");
+    global.project_key = GLOBAL_KEY;
+    h.put(&global);
+    let question = "which pipeline does the staging server deploy use";
+    let no_text = |trace: &RecallTrace| {
+        assert_eq!((trace.query_preview.as_deref(), trace.query_tokens.len()), (None, 0), "{trace:?}");
+        assert!(!recall::detail_json(trace).contains("pipeline"));
+    };
+
+    // A chat's prompt, for comparison: its start and its words are kept.
+    assert!(matches!(h.before("s-chat", question), HookOut::Inject(_)));
+    let kept = h.trace();
+    assert_eq!(kept.query_preview.as_deref(), Some(question));
+    assert!(kept.query_tokens.contains(&"pipeline".to_string()));
+
+    // A worker: no session id (and an empty one). It is answered; the log keeps no text.
+    for session in [None, Some(String::new())] {
+        let mut ev = h.event("before_message", "unused", Some(question));
+        ev.session_id = session;
+        assert!(matches!(recall::on_before_message(&mut h.st, &ev, true), HookOut::Inject(_)));
+        let trace = h.trace();
+        assert_eq!(trace.outcome, "injected");
+        assert_eq!(trace.query_hash, recall::query_hash(question));
+        no_text(&trace);
+    }
+
+    // A host message that is recalled for (`recall_on_events`), with white space before it.
+    for event in ["<event kind=\"timer\">which pipeline does the staging server deploy use</event>", "  \n<event kind=\"timer\">which pipeline does the staging server deploy use</event>"] {
+        assert!(matches!(h.before("s-chat", event), HookOut::Inject(_)), "{event}");
+        let trace = h.trace();
+        assert_eq!(trace.outcome, "injected");
+        no_text(&trace);
+    }
+
+    // A chat whose rows are filed under another project.
+    let logical = project::logical("s-moved");
+    let mut filed = row("mem_filed", "moved chat turn", "User: unrelated zebra\nAssistant: unrelated giraffe");
+    filed.project_key = B;
+    filed.class = "episodic_turn";
+    filed.origin_kind = "archive";
+    filed.origin_ref = ARCHIVE_1;
+    filed.session_id = Some("s-moved");
+    filed.logical = Some(&logical);
+    h.put(&filed);
+    assert!(matches!(h.before("s-moved", question), HookOut::Inject(_)));
+    no_text(&h.trace());
+
+    // A hook with no project: capture stores nothing of it.
+    let mut ev = h.event("before_message", "s-nowhere", Some(question));
+    ev.cwd = None;
+    assert!(matches!(recall::on_before_message(&mut h.st, &ev, true), HookOut::Inject(_)));
+    no_text(&h.trace());
+}
+
+#[test]
+fn t12d_the_row_of_a_turn_that_ends_withheld_is_removed_by_chat_and_hash() {
+    let mut h = Hook::new(json!({}));
+    let (boot_indexer, _) = boot(None);
+    let (mut ctx, _jobs, _vecs) = indexer_start::open_ctx(h.ext.clone(), boot_indexer);
+    let scope = h.scope_dir.clone();
+    let mut new = row("mem_deploy", "staging deploy note", "the staging server deploy uses the blue pipeline");
+    new.project_key = &scope;
+    h.put(&new);
+
+    // The hash of a prompt is the one its log row carries, and the turn key capture makes.
+    let value = format!("{}{}", "abcd1234", "efgh5678");
+    let first = format!("please look up the deploy token={value} for the staging server");
+    let second = "which pipeline does the staging server deploy use";
+    assert_eq!(recall::query_hash(&first), archive::turn_key(&screen::redact(&first).text));
+    assert_ne!(recall::query_hash(&first), archive::turn_key(&first));
+    for (session, prompt) in [("s-one", first.as_str()), ("s-one", second), ("s-two", first.as_str())] {
+        assert!(matches!(h.before(session, prompt), HookOut::Inject(_)));
+        let trace = h.trace();
+        assert_eq!(trace.query_hash, recall::query_hash(prompt));
+        assert!(trace.query_preview.is_some());
+        recall::write_log(&mut ctx, &trace).unwrap();
+    }
+    let conn = ctx.conn.as_ref().unwrap();
+    let left = |conn: &Connection| -> Vec<(String, String)> {
+        let mut stmt = conn.prepare("SELECT session_id, query_hash FROM recall_log ORDER BY id").unwrap();
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+        rows.map(Result::unwrap).collect()
+    };
+    assert_eq!(left(conn).len(), 3);
+
+    // On a bare connection: one row, of that chat and that prompt only; committed.
+    assert_eq!(recall::drop_logged_turn(conn, "s-one", &recall::query_hash(&first)).unwrap(), 1);
+    assert!(conn.is_autocommit());
+    let want = vec![("s-one".to_string(), recall::query_hash(second)), ("s-two".to_string(), recall::query_hash(&first))];
+    assert_eq!(left(conn), want);
+    assert_eq!(left(&h.brain.conn), want, "another connection sees it: it is committed");
+    // Again: nothing to remove, no error.
+    assert_eq!(recall::drop_logged_turn(conn, "s-one", &recall::query_hash(&first)).unwrap(), 0);
+    assert_eq!(recall::drop_logged_turn(conn, "s-three", &recall::query_hash(second)).unwrap(), 0);
+
+    // Inside the caller's transaction it is part of it: rolled back with it, and not committed by it.
+    brain_v2::begin_write(conn).unwrap();
+    assert_eq!(recall::drop_logged_turn(conn, "s-two", &recall::query_hash(&first)).unwrap(), 1);
+    assert!(!conn.is_autocommit(), "the caller's transaction is still open");
+    conn.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(left(conn), want);
+}
+
 // ── The hook and the project of a chat ──────────────────────────────────────
 
 #[test]

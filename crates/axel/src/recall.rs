@@ -299,6 +299,23 @@ const STOP_WORDS: [&str; 60] = [
 
 // ── The query ───────────────────────────────────────────────────────────────
 
+/// The `query_hash` of the `recall_log` row of a prompt: the turn key of the redacted text.
+///
+/// For capture (R-16): give it the prompt exactly as the `before_message` hook carried it
+/// (`HookEvent.message`: whole, not redacted, not cut). It is the same value as
+/// `archive::turn_key(&screen::redact(prompt).text)`, which is the `turn_key` capture
+/// already makes of that text, so capture may pass that key to [`drop_logged_turn`] as it is.
+pub fn query_hash(prompt: &str) -> String {
+    archive::turn_key(&screen::redact(prompt).text)
+}
+
+/// A message the host wrote, not the person (capture's rule: white space before the mark
+/// is skipped). No text of one is ever stored, so none is logged.
+fn host_message(text: &str) -> bool {
+    let head = text.trim_start();
+    head.starts_with("<event ") || head.starts_with("[Context continuation") || head.starts_with("[Host context advisory")
+}
+
 /// The query tokens of a text that has ALREADY passed `screen::redact`: lowercase
 /// alphanumeric runs of 3 or more chars, minus the stop list, de-duplicated, at most 12,
 /// longest first (equal lengths in the order they were written).
@@ -966,6 +983,7 @@ pub fn recall(
         session_id: view.own_session.clone(),
         logical: view.own_session.as_deref().map(project::logical),
         scope_dir: project.map(str::to_string),
+        // Equal to `query_hash(req.query)`: `query` is the redacted text.
         query_hash: archive::turn_key(query),
         thresholds: TraceThresholds { min_sem: cfg.min_sem, min_lex: cfg.min_lex },
         ..RecallTrace::default()
@@ -1336,11 +1354,22 @@ pub fn on_before_message(st: &mut FrontState, ev: &HookEvent, recall_allowed: bo
         });
     } else {
         // A chat whose rows are filed under another project gets global material only.
+        let mut elsewhere = false;
         if let (Some(session), Some(logical), Some(p)) = (session_id, logical.as_deref(), view.project.clone()) {
             if filed_elsewhere(st, session, logical, &p.scope_dir, now) {
                 view.project = None;
+                elsewhere = true;
             }
         }
+        // RULING: wave 4 ruling R-15 item 2: the log decides at the prompt what capture
+        // decides at the end of the turn, by capture's own rules. A hook with no session id
+        // (a worker), a host message, a chat filed elsewhere and a hook with no project are
+        // never captured, so the log keeps no text of them. A turn that ends withheld is
+        // known only later: capture then calls `drop_logged_turn`.
+        let never_captured = session_id.is_none_or(str::is_empty)
+            || host_message(prompt)
+            || elsewhere
+            || view.project.is_none();
         let mut cfg = RecallConfig::from_ext(&st.cfg, now);
         cfg.model_loaded = st.status.model_loaded.load(Ordering::Relaxed);
         let req = RecallRequest {
@@ -1384,7 +1413,12 @@ pub fn on_before_message(st: &mut FrontState, ev: &HookEvent, recall_allowed: bo
             }
             // The log never holds text the brain would not hold anyway: the prompt's start
             // and its words are kept only when this turn would be captured.
-            if st.cfg.log_queries && st.cfg.capture && !learning_paused && !screen::core_withholds(prompt) {
+            if st.cfg.log_queries
+                && st.cfg.capture
+                && !learning_paused
+                && !never_captured
+                && !screen::core_withholds(prompt)
+            {
                 found.trace.query_preview = Some(first_chars(text, PREVIEW_CHARS).to_string());
                 found.trace.query_tokens = tokens(text);
             }
@@ -1473,6 +1507,32 @@ fn in_write<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T>
         let _ = conn.execute_batch("ROLLBACK");
     }
     done
+}
+
+/// Removes the `recall_log` rows of one prompt of one chat; returns how many (0 when the
+/// row was never written, was trimmed, or was dropped by a forget call).
+///
+/// For capture (R-16), on the indexer thread, when a turn ends withheld (its reply, or the
+/// turn as a whole, is something core would not store): the row was written at the
+/// prompt, before that could be known, and may hold the prompt's first 120 characters and
+/// up to 12 of its words. `session_id` is the hook's; `query_hash` is [`query_hash`] of
+/// the prompt as the hook carried it (equal to the turn key capture makes of it). The
+/// log job of a prompt is queued before the job of its turn's end, so the row is there.
+///
+/// On a bare connection it opens its own write transaction and commits it; inside a
+/// transaction of the caller it is one `DELETE` of that transaction.
+pub fn drop_logged_turn(conn: &Connection, session_id: &str, query_hash: &str) -> Result<usize> {
+    let delete = || -> Result<usize> {
+        Ok(conn.execute(
+            "DELETE FROM recall_log WHERE session_id = ?1 AND query_hash = ?2",
+            params![session_id, query_hash],
+        )?)
+    };
+    if conn.is_autocommit() {
+        in_write(conn, delete)
+    } else {
+        delete()
+    }
 }
 
 /// `Job::LogRecall` (called by `indexer::dispatch`): one `recall_log` row, in its own
