@@ -742,20 +742,88 @@ mod tests {
         assert!(!missing.exists());
     }
 
+    /// The sentences of the ONNX test, embedded in one call.
+    const ONNX_SENTENCES: [&str; 3] =
+        ["a cat sat on the mat", "a kitten rested on the rug", "quarterly tax filing"];
+
+    /// The first eight floats of the vector of `ONNX_SENTENCES[0]`, embedded
+    /// in one call with the other two. Measured on the build machine with
+    /// the graph `onnx/model.onnx` of 90,405,214 bytes, at 2 and at 24
+    /// threads (bit-identical). A folder that holds only another export of
+    /// the model (a flat `model.onnx` of another size) may not match.
+    const ONNX_PINNED: [f32; 8] = [
+        0.1233721,
+        -0.020183532,
+        -0.0290672,
+        0.0504292,
+        -0.06355779,
+        0.026167523,
+        0.04465598,
+        0.022190386,
+    ];
+
     #[test]
-    #[ignore = "needs the ONNX model: set AXEL_TEST_MODEL_DIR and run with --ignored"]
+    #[ignore = "needs the ONNX model in AXEL_TEST_MODEL_DIR or in the models folder: run with --ignored"]
     fn from_model_dir_loads_the_model_and_embeds() {
         let dir = std::env::var_os("AXEL_TEST_MODEL_DIR")
             .map(PathBuf::from)
-            .expect("set AXEL_TEST_MODEL_DIR");
+            .unwrap_or_else(|| {
+                crate::download::models_cache_dir().join(crate::download::EMBEDDER_MODEL.local_dir)
+            });
+        let graph = crate::download::model_files_in(&dir)
+            .unwrap_or_else(|| panic!("no model in {}: set AXEL_TEST_MODEL_DIR", dir.display()));
+        let cpus = num_cpus();
+        eprintln!(
+            "model graph: {} ({} bytes); threads compared: 2 and {cpus}",
+            graph.display(),
+            std::fs::metadata(&graph).unwrap().len()
+        );
+
+        // `from_model_dir` is what v2 calls, with 2 threads. The lazy path
+        // (`Embedder::new`) loads with `num_cpus()` threads, and the vectors
+        // stored in today's brains were made that way.
         let mut embedder = Embedder::from_model_dir(&dir, 2, true).unwrap();
+        let mut all_cpus = Embedder::from_model_dir(&dir, cpus, true).unwrap();
+        // Neither writes a disk cache: nothing is left behind by this test.
+        assert!(embedder.cache_dir.is_none() && all_cpus.cache_dir.is_none());
 
         assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
-        let vectors = embedder
-            .embed(&["a cat sat on the mat", "a kitten rested on the rug", "quarterly tax filing"])
-            .unwrap();
+        let vectors = embedder.embed(&ONNX_SENTENCES).unwrap();
+        let vectors_all_cpus = all_cpus.embed(&ONNX_SENTENCES).unwrap();
+        eprintln!("pinned sentence, first eight floats: {:?}", &vectors[0][..8]);
+
+        assert_eq!(vectors.len(), 3);
+        assert!(vectors.iter().all(|vector| vector.len() == EMBEDDING_DIM));
         assert!((norm(&vectors[0]) - 1.0).abs() < 1e-4);
         // Real semantics: no shared content words, still the closer pair.
         assert!(cosine(&vectors[0], &vectors[1]) > cosine(&vectors[0], &vectors[2]));
+
+        // The thread count must not change a single bit: a query vector made
+        // with 2 threads is compared with stored vectors made with all CPUs.
+        let mut differing = 0usize;
+        let mut largest = 0.0f32;
+        for (two, all) in vectors.iter().flatten().zip(vectors_all_cpus.iter().flatten()) {
+            if two.to_bits() != all.to_bits() {
+                differing += 1;
+                largest = largest.max((two - all).abs());
+            }
+        }
+        eprintln!("2 threads against {cpus}: {differing} floats differ, largest difference {largest:e}");
+        assert_eq!(
+            differing, 0,
+            "2 threads and {cpus} threads differ in {differing} of {} floats, by at most {largest:e}",
+            3 * EMBEDDING_DIM
+        );
+
+        // The pinned floats guard the ONNX output from here on. The
+        // tolerance is for other CPUs only: ONNX Runtime picks its kernels
+        // by instruction set, and the last bits may differ between machines.
+        // On one machine the output does not vary.
+        for (index, (got, pinned)) in vectors[0].iter().zip(ONNX_PINNED).enumerate() {
+            assert!(
+                (got - pinned).abs() < 1e-4,
+                "float {index} of the pinned sentence is {got}, pinned {pinned}"
+            );
+        }
     }
 }
