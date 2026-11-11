@@ -44,15 +44,39 @@ pub enum Role {
     Cli,
 }
 
-/// Clears the `writing` flag when dropped (R-6). It does not end the transaction: the
-/// caller commits or rolls back.
+/// The front's write. The caller commits. When the guard is dropped it rolls back a
+/// transaction that is still open, then clears the `writing` flag (R-6).
+// RULING: wave2-c4-review finding 2: the spec's guard only clears the flag. An early return
+// between `begin_write_front` and `COMMIT` would leave the front connection holding the
+// write lock, so the guard holds the connection too and ends what the caller did not.
 pub struct WriteGuard<'a> {
+    conn: &'a Connection,
     writing: &'a AtomicBool,
+    /// `begin_write` succeeded: the open transaction is this guard's. A transaction that
+    /// was already open when `begin_write` refused is the caller's and is left alone.
+    began: bool,
 }
 
 impl Drop for WriteGuard<'_> {
     fn drop(&mut self) {
+        if self.began && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
         self.writing.store(false, Ordering::SeqCst);
+    }
+}
+
+/// `COMMIT`; when it fails the transaction is rolled back, so the connection is never left
+/// holding the write lock.
+fn commit(conn: &Connection) -> Result<()> {
+    match conn.execute_batch("COMMIT") {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            Err(AxelError::Db(e))
+        }
     }
 }
 
@@ -309,7 +333,7 @@ fn migrate_step(conn: &Connection, n: i32) -> Result<()> {
         Ok(true)
     })();
     match run {
-        Ok(true) => Ok(conn.execute_batch("COMMIT")?),
+        Ok(true) => commit(conn),
         Ok(false) => Ok(conn.execute_batch("ROLLBACK")?),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
@@ -399,12 +423,13 @@ pub fn begin_write(conn: &Connection) -> Result<()> {
     }
 }
 
-/// Sets the flag, then `begin_write`; the guard clears the flag when dropped (R-6), also
-/// when `begin_write` fails.
-pub fn begin_write_front<'a>(conn: &Connection, writing: &'a AtomicBool) -> Result<WriteGuard<'a>> {
+/// Sets the flag, then `begin_write`. The guard clears the flag when dropped (R-6), also
+/// when `begin_write` fails, and rolls back a transaction the caller did not commit.
+pub fn begin_write_front<'a>(conn: &'a Connection, writing: &'a AtomicBool) -> Result<WriteGuard<'a>> {
     writing.store(true, Ordering::SeqCst);
-    let guard = WriteGuard { writing };
+    let mut guard = WriteGuard { conn, writing, began: false };
     begin_write(conn)?;
+    guard.began = true;
     Ok(guard)
 }
 
@@ -469,11 +494,10 @@ pub fn adopt_orphans(conn: &Connection, origin: &str) -> Result<usize> {
         return Ok(0);
     }
     begin_write(conn)?;
+    // RULING: wave2-c4-review finding 2: any error after the `BEGIN`, a failed `COMMIT`
+    // included, rolls back: this is the indexer's long-lived connection.
     match adopt_in_transaction(conn, origin) {
-        Ok(n) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(n)
-        }
+        Ok(n) => commit(conn).map(|()| n),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)

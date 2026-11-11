@@ -656,6 +656,15 @@ fn t18_the_indexer_stands_aside_for_the_front() {
             rounds
         });
 
+        // A failed assertion below must stop the indexer too, or the scope never ends.
+        struct StopOnDrop<'a>(&'a AtomicBool);
+        impl Drop for StopOnDrop<'_> {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+        let _stop = StopOnDrop(&stop);
+
         let front = brain_v2::connect(&path, Role::Front).unwrap();
         // Let the indexer get going first.
         std::thread::sleep(Duration::from_millis(50));
@@ -675,12 +684,13 @@ fn t18_the_indexer_stands_aside_for_the_front() {
         // The closure returned an error: the guard still clears the flag.
         let failed: Result<(), AxelError> = (|| {
             let _guard = brain_v2::begin_write_front(&front, &writing)?;
-            let result = front.execute("INSERT INTO no_such_table VALUES (1)", []).map(|_| ());
-            front.execute_batch("ROLLBACK")?;
-            Ok(result?)
+            front.execute("INSERT INTO no_such_table VALUES (1)", [])?;
+            front.execute_batch("COMMIT")?;
+            Ok(())
         })();
         assert!(failed.is_err());
         assert!(!writing.load(Ordering::SeqCst), "the flag after a failed write");
+        assert!(front.is_autocommit(), "the guard ends the transaction of a failed write");
 
         stop.store(true, Ordering::SeqCst);
         let rounds = indexer.join().unwrap();
@@ -698,6 +708,99 @@ fn t18_the_indexer_stands_aside_for_the_front() {
     let start = Instant::now();
     brain_v2::stand_aside(&writing);
     assert!(start.elapsed() < Duration::from_millis(100));
+}
+
+// ── Review finding 2: nobody leaves a transaction open ───────────────────
+
+#[test]
+fn f2_the_guard_rolls_back_what_the_caller_did_not_commit() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("brain.r8");
+    drop(brain_v2::open_v2(&path, &opts(false)).unwrap());
+    let front = brain_v2::connect(&path, Role::Front).unwrap();
+    let other = brain_v2::connect(&path, Role::Cli).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    let writing = AtomicBool::new(false);
+    let put = "INSERT INTO context_data(key, value, layer) VALUES (?1, 'x', 'axel')";
+    let rows = "SELECT COUNT(*) FROM context_data WHERE key = ?1";
+
+    // An early return between `begin_write_front` and `COMMIT`.
+    let early: Result<(), AxelError> = (|| {
+        let _guard = brain_v2::begin_write_front(&front, &writing)?;
+        front.execute(put, ["early"])?;
+        assert_eq!(count_id(&front, rows, "early"), 1, "the write is in the open transaction");
+        Err(AxelError::Other("the caller gave up".to_string()))
+    })();
+    assert!(early.is_err());
+    assert!(front.is_autocommit(), "the guard left the transaction open");
+    assert!(!writing.load(Ordering::SeqCst));
+    assert_eq!(count_id(&front, rows, "early"), 0);
+    assert_eq!(count_id(&other, rows, "early"), 0, "the write is not in the file");
+    // The front holds no lock: a connection that does not wait takes the write lock.
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+
+    // A second write on the same connection, committed by the caller: nothing is undone.
+    let guard = brain_v2::begin_write_front(&front, &writing).unwrap();
+    front.execute(put, ["second"]).unwrap();
+    front.execute_batch("COMMIT").unwrap();
+    drop(guard);
+    assert!(front.is_autocommit());
+    assert!(!writing.load(Ordering::SeqCst));
+    assert_eq!(count_id(&other, rows, "second"), 1);
+
+    // A transaction that was already open when `begin_write` refused is the caller's.
+    front.execute_batch("BEGIN").unwrap();
+    front.execute(put, ["outer"]).unwrap();
+    assert!(brain_v2::begin_write_front(&front, &writing).is_err());
+    assert!(!writing.load(Ordering::SeqCst));
+    assert!(!front.is_autocommit(), "the guard rolled back a transaction that was not its own");
+    front.execute_batch("COMMIT").unwrap();
+    assert_eq!(count_id(&other, rows, "outer"), 1);
+}
+
+#[test]
+fn f2_adopt_orphans_rolls_back_when_its_commit_fails() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("brain.r8");
+    let brain = brain_v2::open_v2(&path, &opts(false)).unwrap();
+    let memory = Memory::new(MemoryCategory::Events, "test", "orphan", "a heron waited by the lock");
+    project_memory::store_scoped(&brain.conn, &memory, &scope()).unwrap();
+    drop(brain);
+
+    // The injected failure: adopting a row breaks a deferred foreign key, which SQLite
+    // reports at `COMMIT` and which leaves the transaction open.
+    let conn = brain_v2::connect(&path, Role::Indexer).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE test_parent(id TEXT PRIMARY KEY);
+         CREATE TABLE test_child(p TEXT REFERENCES test_parent(id) DEFERRABLE INITIALLY DEFERRED);
+         CREATE TRIGGER test_break_commit AFTER INSERT ON memory_ext
+         BEGIN INSERT INTO test_child(p) VALUES ('nobody'); END;",
+    )
+    .unwrap();
+    let err = brain_v2::adopt_orphans(&conn, "cli").unwrap_err();
+    assert!(err.to_string().contains("FOREIGN KEY"), "{err}");
+    assert!(conn.is_autocommit(), "adopt_orphans left its transaction open");
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM memory_ext"), 0);
+    let other = Connection::open(&path).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+
+    // The same connection writes again once the cause is gone.
+    conn.execute_batch("DROP TRIGGER test_break_commit").unwrap();
+    assert_eq!(brain_v2::adopt_orphans(&conn, "cli").unwrap(), 1);
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM memory_ext"), 1);
+
+    // An error before the `COMMIT` rolls back too.
+    let second = Memory::new(MemoryCategory::Events, "test", "orphan two", "a coot dived under the gate");
+    project_memory::store_scoped(&conn, &second, &scope()).unwrap();
+    conn.execute_batch(
+        "CREATE TRIGGER test_break_insert BEFORE INSERT ON memory_ext
+         BEGIN SELECT RAISE(ABORT, 'injected failure'); END;",
+    )
+    .unwrap();
+    let err = brain_v2::adopt_orphans(&conn, "cli").unwrap_err();
+    assert!(err.to_string().contains("injected failure"), "{err}");
+    assert!(conn.is_autocommit());
+    other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
 }
 
 // ── 19 ──────────────────────────────────────────────────────────────────
