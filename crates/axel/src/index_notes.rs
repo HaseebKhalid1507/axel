@@ -6,6 +6,7 @@
 //! not be read. Only a file that was read, and says so, removes a row.
 
 use std::collections::HashSet;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::atomic::Ordering;
@@ -14,7 +15,8 @@ use chrono::DateTime;
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::Result;
-use crate::ext::types::{IndexerCtx, Mode};
+use crate::ext::server::log_line;
+use crate::ext::types::{Clock, IndexerCtx, Mode};
 use crate::notes::{self, NoteRecord, NoteSensitivity, NotesError, NotesFile};
 use crate::project_memory::{RecordLinks, Sensitivity};
 use crate::store::{self, Inserted, NewRow};
@@ -41,6 +43,9 @@ pub struct PassReport {
     pub files_changed: usize,
     /// `note_files` rows whose file is gone, removed with their rows.
     pub files_gone: usize,
+    /// Files whose work ended in an error or a panic: rolled back, counted, tried again at
+    /// the next pass. The pass went on with the next file.
+    pub files_failed: usize,
     pub inserted: usize,
     pub purged: usize,
     /// Notes whose record changed under the same id: the old row purged, the new one
@@ -90,8 +95,12 @@ pub fn pass_counted(ctx: &mut IndexerCtx) -> Result<PassReport> {
             return Ok(report);
         }
         let Some(conn) = ctx.conn.as_ref() else { return Ok(report) };
-        let now = (ctx.clock)();
-        one_file(conn, ctx.signer.as_ref(), &dir, name, now, &mut report)?;
+        let got = catch_unwind(AssertUnwindSafe(|| {
+            one_file(conn, ctx.signer.as_ref(), &dir, name, &ctx.clock, &mut report)
+        }));
+        if isolated(ctx, name, got)?.is_none() {
+            report.files_failed += 1;
+        }
     }
 
     // Step 4: a notes file that is gone, only when the folder was listed without error.
@@ -100,10 +109,57 @@ pub fn pass_counted(ctx: &mut IndexerCtx) -> Result<PassReport> {
             return Ok(report);
         }
         let Some(conn) = ctx.conn.as_ref() else { return Ok(report) };
-        gone_files(conn, &dir, &names, &mut report)?;
+        let got = catch_unwind(AssertUnwindSafe(|| gone_files(conn, &dir, &names)));
+        let Some(gone) = isolated(ctx, "the files that are gone", got)? else {
+            report.files_failed += 1;
+            return Ok(report);
+        };
+        for (name, path_text) in &gone {
+            if !ready(ctx) {
+                return Ok(report);
+            }
+            let got = catch_unwind(AssertUnwindSafe(|| gone_file(conn, name, path_text)));
+            match isolated(ctx, name, got)? {
+                Some(purged) => {
+                    report.purged += purged;
+                    report.files_gone += 1;
+                }
+                None => report.files_failed += 1,
+            }
+        }
         report.listed = true;
     }
     Ok(report)
+}
+
+/// What the work of one file gave, taken the way the archive scan takes it
+/// (`index_archives::one_file`). A panic or an `Err` is rolled back, counted and logged,
+/// and the pass goes on with the next file (`None`): one file that fails at every pass
+/// must not keep a forget in another file from landing. Only an error that says the brain
+/// is damaged or was changed is returned, and the pass ends there.
+// RULING: wave 4, R-14 item 3.
+fn isolated<T>(ctx: &IndexerCtx, name: &str, got: std::thread::Result<Result<T>>) -> Result<Option<T>> {
+    if !matches!(got, Ok(Ok(_))) {
+        if let Some(conn) = ctx.conn.as_ref() {
+            rollback(conn);
+        }
+    }
+    match got {
+        Ok(Ok(value)) => Ok(Some(value)),
+        // `guarded` counts the error the pass returns.
+        Ok(Err(e)) if brain_v2::degrade_on(&e, &ctx.status, &ctx.mode) => Err(e),
+        Ok(Err(e)) => {
+            ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
+            log_line(&format!("notes pass: {name}: {e}"));
+            Ok(None)
+        }
+        Err(_) => {
+            ctx.status.panics.fetch_add(1, Ordering::Relaxed);
+            // The panic's own message and source line go to stderr.
+            log_line(&format!("notes pass: panic in {name}"));
+            Ok(None)
+        }
+    }
 }
 
 /// `Job::Forgotten` with `kind = "note"` (called by `indexer::dispatch`): the row with that
@@ -186,7 +242,7 @@ fn one_file(
     signer: Option<&axel_memkoshi::security::MemorySigner>,
     dir: &Path,
     name: &str,
-    now: i64,
+    clock: &Clock,
     report: &mut PassReport,
 ) -> Result<()> {
     let Some(key) = key_of(name) else { return Ok(()) };
@@ -232,7 +288,7 @@ fn one_file(
                      VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, ?6)
                      ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns,
                             ok = 0, reason = excluded.reason, scanned_ms = excluded.scanned_ms",
-                    params![path_text, key, seen.0, seen.1, reason, now],
+                    params![path_text, key, seen.0, seen.1, reason, clock()],
                 )?;
                 conn.execute_batch("COMMIT")?;
                 Ok(())
@@ -242,13 +298,10 @@ fn one_file(
         }
     };
 
+    // After an `Err` or a panic in here the caller rolls back ([`isolated`]).
     brain_v2::begin_write(conn)?;
-    let done = mirror(conn, signer, &path_text, name, key, &file, stored.as_ref(), now)
-        .and_then(|done| {
-            conn.execute_batch("COMMIT")?;
-            Ok(done)
-        })
-        .inspect_err(|_| rollback(conn))?;
+    let done = mirror(conn, signer, &path_text, name, key, &file, stored.as_ref(), clock())?;
+    conn.execute_batch("COMMIT")?;
     report.files_read += 1;
     report.inserted += done.inserted;
     report.purged += done.purged;
@@ -491,13 +544,16 @@ fn new_row<'a>(note: &NoteRecord, scope_dir: &'a str, name: &'a str) -> NewRow<'
     }
 }
 
-/// Step 4. `names` are the file names the listing gave, whatever kind of entry they are.
-fn gone_files(conn: &Connection, dir: &Path, names: &[String], report: &mut PassReport) -> Result<()> {
+/// Step 4, the list: the `note_files` rows of this folder whose file the listing did not
+/// give, as (file name, stored path). `names` are the file names the listing gave, whatever
+/// kind of entry they are.
+fn gone_files(conn: &Connection, dir: &Path, names: &[String]) -> Result<Vec<(String, String)>> {
     let known: Vec<String> = {
         let mut stmt = conn.prepare("SELECT path FROM note_files ORDER BY path")?;
         let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
         rows.collect::<rusqlite::Result<_>>()?
     };
+    let mut gone = Vec::new();
     for path_text in known {
         let path = Path::new(&path_text);
         // SPEC: 2382-2385 "each `note_files` row whose path was not listed": a row whose
@@ -509,18 +565,21 @@ fn gone_files(conn: &Connection, dir: &Path, names: &[String], report: &mut Pass
         if key_of(name).is_none() || names.iter().any(|n| n == name) {
             continue;
         }
-        brain_v2::begin_write(conn)?;
-        let work = || -> Result<usize> {
-            let purged = store::purge_many(conn, &rows_of(conn, name)?, false, true)?;
-            if purged > 0 {
-                index_archives::mark_purged(conn)?;
-            }
-            conn.execute("DELETE FROM note_files WHERE path = ?1", [&path_text])?;
-            conn.execute_batch("COMMIT")?;
-            Ok(purged)
-        };
-        report.purged += work().inspect_err(|_| rollback(conn))?;
-        report.files_gone += 1;
+        gone.push((name.to_string(), path_text.clone()));
     }
-    Ok(())
+    Ok(gone)
+}
+
+/// Step 4, one file that is gone: its rows are purged without a tombstone and its
+/// `note_files` row is deleted, in one transaction. Returns the rows purged. After an `Err`
+/// or a panic the caller rolls back ([`isolated`]).
+fn gone_file(conn: &Connection, name: &str, path_text: &str) -> Result<usize> {
+    brain_v2::begin_write(conn)?;
+    let purged = store::purge_many(conn, &rows_of(conn, name)?, false, true)?;
+    if purged > 0 {
+        index_archives::mark_purged(conn)?;
+    }
+    conn.execute("DELETE FROM note_files WHERE path = ?1", [path_text])?;
+    conn.execute_batch("COMMIT")?;
+    Ok(purged)
 }

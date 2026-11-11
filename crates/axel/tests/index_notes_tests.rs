@@ -1033,3 +1033,104 @@ fn a_change_of_tags_or_of_expiry_rewrites_the_row_too() {
     assert_eq!((report.files_read, report.rewritten), (1, 0));
     assert_eq!(w.notes(), ids(&[N1, N3, N2]));
 }
+
+// ── Wave 4, R-14 items 3 and 5: one file that fails ─────────────────────────
+
+/// A rollback half way, and the pass goes on: the first file's transaction purges a row
+/// and then fails on an insert. None of it is committed, the file's `note_files` row is as
+/// it was, the next file is mirrored in the same pass, and the pass returns no error.
+#[test]
+fn a_file_whose_transaction_fails_half_way_is_rolled_back_and_the_next_file_is_still_read() {
+    let mut w = three_mirrored();
+    let (size, mtime) = (w.nf_int(KEY, "size"), w.nf_int(KEY, "mtime_ns"));
+    w.conn()
+        .execute_batch(
+            "CREATE TRIGGER test_abort BEFORE INSERT ON memory_ext WHEN NEW.mem_id = 'mem-boom'
+             BEGIN SELECT RAISE(ABORT, 'test: this note is refused'); END;",
+        )
+        .unwrap();
+    // The purge of note 2 comes first in the transaction, then the insert that fails.
+    let failing = format!("{}{}{}{}{}", n1(), n2(), n3(), tomb(N2), rec("mem-boom", 9, "the note that fails"));
+    w.write(KEY, &failing);
+    w.write(KEY_B, &rec_of(KEY_B, "mem-next", 9, "a note of the next file"));
+
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.files_read, report.purged, report.inserted), (1, 1, 0, 1));
+    assert!(report.listed, "the step for files that are gone still ran");
+    assert_eq!(w.notes(), ids(&["mem-next", N1, N3, N2]), "half a transaction was committed");
+    assert_eq!(w.content(N2).unwrap(), "the second note is about beta");
+    assert_eq!(fts(&w, "beta"), 1);
+    assert_eq!(w.purge_pending(), 0);
+    assert_eq!((w.nf_int(KEY, "size"), w.nf_int(KEY, "mtime_ns")), (size, mtime), "the file is read again");
+    assert_eq!(w.nf_int(KEY_B, "ok"), Some(1));
+    assert_eq!(w.ctx.status.write_errors.load(Ordering::Relaxed), 1);
+    assert_eq!(w.ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+
+    // It fails again at the next pass and is counted again; nothing else is touched.
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.files_unchanged), (1, 1));
+    assert_eq!(w.notes(), ids(&["mem-next", N1, N3, N2]));
+
+    // Once it can be written, the forget lands.
+    w.conn().execute_batch("DROP TRIGGER test_abort").unwrap();
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.purged, report.inserted), (0, 1, 1));
+    assert_eq!(w.notes(), ids(&["mem-boom", "mem-next", N1, N3]));
+    assert_eq!(w.purge_pending(), 1);
+}
+
+/// A panic inside one file's transaction (here: the clock, which is read inside it) is
+/// caught, rolled back and counted, and the next file is read.
+#[test]
+fn a_panic_in_one_file_is_rolled_back_and_counted_and_the_pass_goes_on() {
+    let mut w = three_mirrored();
+    let armed = Arc::new(AtomicBool::new(true));
+    let flag = armed.clone();
+    w.ctx.clock = Arc::new(move || {
+        if flag.swap(false, Ordering::SeqCst) {
+            panic!("test: the clock panics once");
+        }
+        chrono::Utc::now().timestamp_millis()
+    });
+    w.write(KEY, &format!("{}{}{}{}", n1(), n2(), n3(), tomb(N2)));
+    w.write(KEY_B, &rec_of(KEY_B, "mem-next", 9, "a note of the next file"));
+
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.files_read, report.purged, report.inserted), (1, 1, 0, 1));
+    assert_eq!(w.ctx.status.panics.load(Ordering::Relaxed), 1);
+    assert_eq!(w.ctx.status.write_errors.load(Ordering::Relaxed), 0);
+    assert_eq!(w.notes(), ids(&["mem-next", N1, N3, N2]));
+    assert!(!armed.load(Ordering::SeqCst));
+
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.purged), (0, 1));
+    assert_eq!(w.notes(), ids(&["mem-next", N1, N3]));
+}
+
+/// The step for files that are gone is isolated file by file too.
+#[test]
+fn a_gone_file_whose_purge_fails_does_not_stop_the_next_gone_file() {
+    let mut w = three_mirrored();
+    w.write(KEY_B, &rec_of(KEY_B, "mem-next", 9, "a note of the next file"));
+    w.pass();
+    w.conn()
+        .execute_batch(&format!(
+            "CREATE TRIGGER test_abort BEFORE DELETE ON note_files WHEN OLD.project_key = '{KEY}'
+             BEGIN SELECT RAISE(ABORT, 'test: this row stays'); END;"
+        ))
+        .unwrap();
+    fs::remove_file(w.file(KEY)).unwrap();
+    fs::remove_file(w.file(KEY_B)).unwrap();
+
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.files_gone, report.purged), (1, 1, 1));
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]), "the failed file's purge was rolled back whole");
+    assert_eq!(w.nf_rows(), 1);
+    assert_eq!(w.ctx.status.write_errors.load(Ordering::Relaxed), 1);
+
+    w.conn().execute_batch("DROP TRIGGER test_abort").unwrap();
+    let report = w.pass();
+    assert_eq!((report.files_failed, report.files_gone, report.purged), (0, 1, 3));
+    assert_eq!(w.notes(), ids(&[]));
+    assert_eq!(w.nf_rows(), 0);
+}
