@@ -1008,6 +1008,64 @@ fn a_note_made_secret_under_the_same_id_leaves_the_word_index() {
     assert_eq!(w.purge_pending(), 1);
 }
 
+/// All a row's link columns, quoted.
+fn links_of(w: &World, id: &str) -> Option<String> {
+    w.text(
+        "SELECT (SELECT quote(supersedes) || quote(contradicts) || quote(confirmed_by) || quote(superseded_by)
+                        || quote(invalidated_at) FROM memories WHERE id = ?1)",
+        id,
+    )
+}
+
+/// Guards what the owner would see: a note he had replaced is shown again once he edits it,
+/// and the links other memories hold to it are gone.
+#[test]
+fn a_rewritten_note_keeps_who_replaced_it_and_the_links_other_rows_hold_to_it() {
+    let mut w = three_mirrored();
+    w.put_tool_row("mem-newer", "a newer memory that replaces the second note");
+    w.put_tool_row("mem-older", "an older memory that the second note replaced");
+    w.put_tool_row("mem-linker", "a memory that names the second note in its links");
+    let conn = w.conn();
+    brain_v2::begin_write(conn).unwrap();
+    assert_eq!(store::supersede(conn, N2, "mem-newer").unwrap(), 1);
+    assert_eq!(store::supersede(conn, "mem-older", N2).unwrap(), 1);
+    conn.execute(
+        &format!(
+            r#"UPDATE memories SET supersedes = '["{N2}"]', contradicts = '["{N2}","{N1}"]', confirmed_by = '["{N1}","{N2}"]'
+                WHERE id = 'mem-linker'"#
+        ),
+        [],
+    )
+    .unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    let before: Vec<Option<String>> = [N2, "mem-older", "mem-linker"].iter().map(|id| links_of(&w, id)).collect();
+    assert!(before[0].as_deref().is_some_and(|l| l.contains("'mem-newer'")));
+
+    w.write(KEY, &format!("{}{}{}", n1(), rec(N2, 1_700_000_000_100, "the second note is about delta"), n3()));
+    assert_eq!(w.pass().rewritten, 1);
+    assert_eq!(w.content(N2).unwrap(), "the second note is about delta");
+    assert_eq!(links_of(&w, N2), before[0], "the rewritten note lost who replaced it");
+    assert_eq!(links_of(&w, "mem-older"), before[1], "the row the note replaced is shown again");
+    assert_eq!(links_of(&w, "mem-linker"), before[2], "the links another row holds to the note were dropped");
+}
+
+/// Guards what the owner would lose: a note rewritten with a time no row can hold.
+#[test]
+fn a_note_rewritten_with_a_time_no_row_can_hold_keeps_its_old_row() {
+    let mut w = three_mirrored();
+    let two = w.saved(N2);
+    let far = format!(
+        "{{\"namespace\":\"project-{KEY}\",\"timestamp_ms\":18446744073709551615,\"content\":\"the second note is about omega\",\"tags\":[],\"id\":\"{N2}\",\"project\":\"{KEY}\"}}\n"
+    );
+    w.write(KEY, &format!("{}{far}{}", n1(), n3()));
+    let report = w.pass();
+    assert_eq!((report.rewritten, report.purged, report.inserted), (0, 0, 0));
+    assert_eq!(w.saved(N2), two, "the old row of a record that is refused was purged");
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
+    assert_eq!(w.nf_text(KEY, "reason").unwrap(), "ids_skipped: 1");
+    assert_eq!(w.purge_pending(), 0);
+}
+
 #[test]
 fn a_change_of_tags_or_of_expiry_rewrites_the_row_too() {
     let mut w = three_mirrored();

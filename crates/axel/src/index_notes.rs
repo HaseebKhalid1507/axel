@@ -359,6 +359,8 @@ struct Existing {
     vid: Option<i64>,
     hidden_ms: Option<i64>,
     hidden_by: Option<String>,
+    superseded_by: Option<String>,
+    invalidated_at: Option<String>,
     title: String,
     content: String,
     sensitivity: String,
@@ -370,7 +372,8 @@ fn existing_row(conn: &Connection, id: &str) -> Result<Option<Existing>> {
     Ok(conn
         .query_row(
             "SELECT e.origin_kind, e.origin_ref, e.hidden_ms, e.hidden_by,
-                    m.title, m.content, m.sensitivity, m.tags, m.expires_at, e.vid
+                    m.title, m.content, m.sensitivity, m.tags, m.expires_at, e.vid,
+                    m.superseded_by, m.invalidated_at
                FROM memories m LEFT JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
             [id],
             |r| {
@@ -380,6 +383,8 @@ fn existing_row(conn: &Connection, id: &str) -> Result<Option<Existing>> {
                     vid: r.get(9)?,
                     hidden_ms: r.get(2)?,
                     hidden_by: r.get(3)?,
+                    superseded_by: r.get(10)?,
+                    invalidated_at: r.get(11)?,
                     title: r.get(4)?,
                     content: r.get(5)?,
                     sensitivity: r.get(6)?,
@@ -453,8 +458,18 @@ fn mirror(
             ids_skipped += 1;
             continue;
         }
+        // SPEC: 2346 "`created_ms` = `timestamp_ms`": a time the row writer cannot store
+        // (the reader saturates core's u64 at i64::MAX) would fail the whole transaction
+        // at every pass, and with it every forget in this file. Such a record is skipped
+        // and counted with the skipped ids.
+        // RULING: wave 4, archives/notes round 3, item 5: checked before anything is
+        // purged, so the row of a note rewritten with such a time stays as it was.
+        if DateTime::from_timestamp_millis(note.timestamp_ms).is_none() {
+            ids_skipped += 1;
+            continue;
+        }
         let mut row = new_row(note, &scope_dir, name);
-        let mut rewrote = false;
+        let mut kept: Option<Kept> = None;
         if let Some(old) = existing_row(conn, &note.id)? {
             // A row of another origin or of another notes file is not mirrored and not
             // touched.
@@ -469,22 +484,22 @@ fn mirror(
             // edited the note, or made it secret). The old row is forgotten, with its word
             // rows and its vector, and the new one is written in this transaction. A hide
             // someone set on the row is carried over: an edit never unhides.
+            // RULING: wave 4, archives/notes round 3, item 5: the id is the same, so what
+            // was said of it is kept: who replaced it and when, and the links other rows
+            // hold to it, which the purge takes away.
+            let links = links_to(conn, &note.id)?;
             store::purge_many(conn, std::slice::from_ref(&note.id), false, true)?;
             rewritten += 1;
-            rewrote = true;
             removed.extend(old.vid);
             row.hidden = old.hidden_ms.map(|ms| (ms, old.hidden_by.unwrap_or_default()));
+            kept = Some(Kept { superseded_by: old.superseded_by, invalidated_at: old.invalidated_at, links });
         }
-        // SPEC: 2346 "`created_ms` = `timestamp_ms`": a time the row writer cannot store
-        // (the reader saturates core's u64 at i64::MAX) would fail the whole transaction
-        // at every pass, and with it every forget in this file. Such a record is skipped
-        // and counted with the skipped ids.
-        if DateTime::from_timestamp_millis(note.timestamp_ms).is_none() {
-            ids_skipped += 1;
-            continue;
+        let inserted_now = store::insert_row(conn, signer, &row)?;
+        if let (Inserted::New { .. }, Some(kept)) = (inserted_now, &kept) {
+            put_back(conn, &note.id, kept)?;
         }
-        match store::insert_row(conn, signer, &row)? {
-            Inserted::New { .. } if rewrote => {}
+        match inserted_now {
+            Inserted::New { .. } if kept.is_some() => {}
             Inserted::New { .. } => inserted += 1,
             // SPEC: 2356-2361 names `Exists` only. An id with a `memory_tombstones` row (an
             // id Axel itself forgot for good) is not mirrored either, and is counted.
@@ -523,6 +538,84 @@ fn mirror(
         params![scope_dir, key, now],
     )?;
     Ok(Mirrored { inserted, purged, rewritten, removed })
+}
+
+/// What a rewritten note keeps of its old row.
+struct Kept {
+    superseded_by: Option<String>,
+    invalidated_at: Option<String>,
+    links: Vec<LinkRow>,
+}
+
+/// Another row that names a note, as it was before the note's purge: its id, its three
+/// link arrays, `superseded_by`, `invalidated_at`, and the mark on its shadow document.
+struct LinkRow {
+    id: String,
+    supersedes: Option<String>,
+    contradicts: Option<String>,
+    confirmed_by: Option<String>,
+    superseded_by: Option<String>,
+    invalidated_at: Option<String>,
+    shadow: Option<Option<String>>,
+}
+
+/// The other rows that name `id` in a link array, or are replaced by it.
+fn links_to(conn: &Connection, id: &str) -> Result<Vec<LinkRow>> {
+    let names = |column: &str| {
+        format!("(json_valid({column}) AND EXISTS (SELECT 1 FROM json_each({column}) WHERE value = ?1))")
+    };
+    let sql = format!(
+        "SELECT id, supersedes, contradicts, confirmed_by, superseded_by, invalidated_at FROM memories
+          WHERE id <> ?1 AND (superseded_by = ?1 OR {} OR {} OR {})",
+        names("supersedes"),
+        names("contradicts"),
+        names("confirmed_by")
+    );
+    let mut rows: Vec<LinkRow> = {
+        let mut stmt = conn.prepare(&sql)?;
+        let got = stmt.query_map([id], |r| {
+            Ok(LinkRow {
+                id: r.get(0)?,
+                supersedes: r.get(1)?,
+                contradicts: r.get(2)?,
+                confirmed_by: r.get(3)?,
+                superseded_by: r.get(4)?,
+                invalidated_at: r.get(5)?,
+                shadow: None,
+            })
+        })?;
+        got.collect::<rusqlite::Result<_>>()?
+    };
+    for row in &mut rows {
+        row.shadow = conn
+            .query_row("SELECT hidden FROM documents WHERE doc_id = ?1", [&row.id], |r| r.get(0))
+            .optional()?;
+    }
+    Ok(rows)
+}
+
+/// After the new row of a rewritten note is in: its `superseded_by` and `invalidated_at`,
+/// and the other rows' links to it, exactly as they were. None of these columns is in a
+/// row's signature (id, category, title, content).
+fn put_back(conn: &Connection, id: &str, kept: &Kept) -> Result<()> {
+    if kept.superseded_by.is_some() || kept.invalidated_at.is_some() {
+        conn.execute(
+            "UPDATE memories SET superseded_by = ?1, invalidated_at = ?2 WHERE id = ?3",
+            params![kept.superseded_by, kept.invalidated_at, id],
+        )?;
+    }
+    for row in &kept.links {
+        conn.execute(
+            "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3, superseded_by = ?4,
+                    invalidated_at = ?5
+              WHERE id = ?6",
+            params![row.supersedes, row.contradicts, row.confirmed_by, row.superseded_by, row.invalidated_at, row.id],
+        )?;
+        if let Some(hidden) = &row.shadow {
+            conn.execute("UPDATE documents SET hidden = ?1 WHERE doc_id = ?2", params![hidden, row.id])?;
+        }
+    }
+    Ok(())
 }
 
 /// The ids this file has mirrored: `origin_kind = 'note_file'`, `origin_ref` = its name.
