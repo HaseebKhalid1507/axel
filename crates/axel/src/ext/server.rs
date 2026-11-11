@@ -492,10 +492,12 @@ fn frame_error_kind(e: &FrameError) -> &'static str {
     }
 }
 
+const BEFORE_MESSAGE_LABEL: &str = "hook.handle before_message";
+
 /// What the log calls a forwarded hook: a name this binary knows, never the host's string.
 fn hook_label(kind: &str) -> &'static str {
     match kind {
-        "before_message" => "hook.handle before_message",
+        "before_message" => BEFORE_MESSAGE_LABEL,
         "on_message_complete" => "hook.handle on_message_complete",
         "on_session_start" => "hook.handle on_session_start",
         "on_session_end" => "hook.handle on_session_end",
@@ -855,7 +857,11 @@ impl<W: Write> Pump<W> {
             }
             Got::NotForwarded => {
                 self.answer(id, continue_result());
-                self.missed(before_message);
+                // RULING: wave3-c12b ruling 3. Recall is not what is slow when the call the
+                // front thread is inside is a tool or another hook: such a miss is counted,
+                // and does not count toward the breaker.
+                let behind_recall = self.busy.as_ref().is_some_and(|b| b.method == BEFORE_MESSAGE_LABEL);
+                self.missed(before_message && behind_recall);
                 self.skipped(session_id);
                 None
             }
@@ -866,13 +872,14 @@ impl<W: Write> Pump<W> {
         }
     }
 
-    /// A hook the pump answered itself. Three `before_message` in a row open the breaker.
+    /// A hook the pump answered itself. Three `before_message` in a row that recall made
+    /// late (`for_breaker`) open the breaker.
     // SPEC: 4963 counts in `hook_misses` hooks answered "at a deadline, or the breaker
     // open", and 509 says a call is still forwarded while the breaker is open. Such a call
     // is forwarded with `recall: false` and counted only if the pump has to answer it.
-    fn missed(&mut self, before_message: bool) {
+    fn missed(&mut self, for_breaker: bool) {
         self.status.hook_misses.fetch_add(1, Ordering::Relaxed);
-        if !before_message {
+        if !for_breaker {
             return;
         }
         self.misses += 1;

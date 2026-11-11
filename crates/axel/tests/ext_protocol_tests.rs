@@ -496,7 +496,7 @@ fn t04_a_stuck_front_thread_costs_one_budget_then_nothing_and_opens_the_breaker(
     };
     assert_eq!(tool["result"]["is_error"], true, "{tool}");
     assert_eq!(tool["result"]["content"], BUSY_TEXT);
-    assert!(took < Duration::from_millis(2100), "{took:?}");
+    assert!(took < Duration::from_millis(100), "the tool was forwarded: {took:?}");
 
     // Notify-only events never wait for the front thread.
     let (event, took) = host.timed("hook.handle", hook_params("on_context_archived", "s1"));
@@ -1230,4 +1230,44 @@ fn r2_a_front_thread_that_never_hands_over_the_queue_degrades_the_process_which_
     assert_serves_without_a_front_thread(&mut host, &dirs);
     assert!(read_log(&dirs).contains("front thread did not start in time"));
     assert_eq!(host.close(), ServeEnd::InputClosed);
+}
+
+// ── Wave 3 ruling 3: a late tool does not open the breaker ──────────────────
+
+#[test]
+fn r3_hooks_answered_behind_a_late_tool_are_counted_and_do_not_open_the_breaker() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks { front_sleep_ms: 2400, ..TestHooks::default() });
+
+    // The tool is forwarded and is late at its 2 s.
+    let start = Instant::now();
+    let tool = host.tool("search");
+    assert_eq!(tool["result"]["content"], BUSY_TEXT, "{tool}");
+    assert!(start.elapsed() >= Duration::from_millis(1900), "{:?}", start.elapsed());
+
+    // Three messages while the front thread is still inside it.
+    for n in 1..=3 {
+        let (answer, took) = host.timed("hook.handle", hook_params("before_message", "s1"));
+        assert_eq!(answer["result"], continues());
+        assert!(took < Duration::from_millis(100), "message {n} was forwarded: {took:?}");
+    }
+    assert!(start.elapsed() < Duration::from_millis(2400), "the tool had returned: {:?}", start.elapsed());
+    assert_eq!(host.status.hook_misses.load(Ordering::Relaxed), 3);
+    assert!(!host.status.breaker_open.load(Ordering::Relaxed), "a late tool opened the breaker");
+    assert_eq!(host.status.breaker_trips.load(Ordering::Relaxed), 0);
+
+    // The tool returns; the next message is forwarded (it waits its budget for a front
+    // thread that sleeps again), and the breaker, which is what switches recall off, is
+    // still closed when it goes.
+    wait_for_log(&dirs, "front late in tool.call");
+    let (answer, took) = host.timed("hook.handle", hook_params("before_message", "s1"));
+    assert_eq!(answer["result"], continues());
+    assert!(took >= Duration::from_millis(140), "not forwarded: {took:?}");
+    assert!(!host.status.breaker_open.load(Ordering::Relaxed));
+    assert_eq!(host.status.breaker_trips.load(Ordering::Relaxed), 0);
+    assert_eq!(host.status.hook_misses.load(Ordering::Relaxed), 4);
+
+    host.send(&json!({"jsonrpc": "2.0", "id": 902, "method": "shutdown"}));
+    assert_eq!(host.read()["id"], 902);
+    assert_eq!(host.end.recv_timeout(Duration::from_secs(5)).unwrap(), ServeEnd::Shutdown);
 }
