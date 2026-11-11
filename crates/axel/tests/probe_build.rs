@@ -14,7 +14,7 @@
 //! | e | the `kv` guard triggers stop `INSERT OR REPLACE … '2'`, and let `'3'` through |
 //! | f | on the store's own connection: its `INSERT OR REPLACE` fires neither delete trigger; a plain delete is stopped by the guard unless `axel_purge` has its row |
 //! | g | `json_set` and `json_extract` exist in the bundled SQLite |
-//! | h | the link scrub `purge_many` runs (`<> '[]'`, filtered in Rust), and the probe table's `instr(supersedes, '"<id>"')`, find an id in the arrays the store writes |
+//! | h | the link scrub of `purge_many` as the spec writes it (`SELECT … <> '[]'` with `superseded_by`, the filter in Rust, the `UPDATE`) finds and clears every link to a purged id, the reverse edge among them |
 //! | i | the cost of an exact scan of 25,000 vectors (`#[ignore]`, prints ms) |
 //! | j | the suite runs with `HOME` moved: not a test here, it is the gate itself (`scripts/dirty-home.sh`) |
 //! | k | `VACUUM` / `VACUUM INTO` on an old brain: what residue goes, whether every table's rowids survive (measured and printed) |
@@ -802,69 +802,99 @@ fn h_link_scrub_finds_an_id_in_the_arrays_the_store_writes() {
         .unwrap();
     assert_eq!(empty, ("[]".into(), "[]".into(), "[]".into()), "an empty link is the text []");
 
-    // The spec has two forms. The one purge_many runs (section 2.7, step 2):
-    // one read over the purge set, filtered in Rust to the rows whose arrays
-    // name an id of the set.
+    // The scrub of purge_many (spec section 2.7, step 2), its two statements
+    // as written there: one read over the purge set; in Rust a row is kept
+    // when its superseded_by is in the set or one of its arrays holds an id
+    // of the set; each kept row is rewritten with its arrays without the set.
     conn.execute_batch("CREATE TEMP TABLE purge_ids(id TEXT PRIMARY KEY)").unwrap();
-    let scrub = |id: &str| -> (Vec<String>, Vec<String>) {
+    // Returns the ids read and the ids kept (and rewritten).
+    let scrub = |purged: &str| -> (Vec<String>, Vec<String>) {
         conn.execute("DELETE FROM purge_ids", []).unwrap();
-        conn.execute("INSERT INTO purge_ids(id) VALUES (?1)", [id]).unwrap();
+        conn.execute("INSERT INTO purge_ids(id) VALUES (?1)", [purged]).unwrap();
+        let set = [purged.to_string()];
         let mut stmt = conn
             .prepare(
-                "SELECT id, supersedes, contradicts, confirmed_by FROM memories
-   WHERE superseded_by IN purge_ids OR supersedes <> '[]' OR contradicts <> '[]' OR
-   confirmed_by <> '[]'",
+                "SELECT id, superseded_by, supersedes, contradicts, confirmed_by FROM memories
+    WHERE superseded_by IN purge_ids OR supersedes <> '[]' OR contradicts <> '[]'
+       OR confirmed_by <> '[]';",
             )
             .unwrap();
         let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, String>(0)?, [r.get::<_, String>(1)?, r.get(2)?, r.get(3)?])))
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    [r.get::<_, String>(2)?, r.get(3)?, r.get(4)?],
+                ))
+            })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap();
-        let read = sorted(rows.iter().map(|(id, _)| id.clone()).collect());
-        let naming = sorted(
-            rows.into_iter()
-                .filter(|(_, arrays)| {
-                    arrays.iter().any(|a| {
-                        serde_json::from_str::<Vec<String>>(a).unwrap().iter().any(|x| x == id)
-                    })
+        let read = sorted(rows.iter().map(|(id, ..)| id.clone()).collect());
+        let mut kept = Vec::new();
+        for (id, superseded_by, arrays) in rows {
+            let arrays: Vec<Vec<String>> =
+                arrays.iter().map(|a| serde_json::from_str(a).unwrap()).collect();
+            let names_the_set = superseded_by.as_ref().is_some_and(|s| set.contains(s))
+                || arrays.iter().flatten().any(|x| set.contains(x));
+            if !names_the_set {
+                continue;
+            }
+            let without: Vec<String> = arrays
+                .iter()
+                .map(|a| {
+                    let rest: Vec<&String> = a.iter().filter(|x| !set.contains(x)).collect();
+                    serde_json::to_string(&rest).unwrap()
                 })
-                .map(|(id, _)| id)
-                .collect(),
-        );
-        (read, naming)
+                .collect();
+            let changed = conn
+                .execute(
+                    "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3,
+          superseded_by = CASE WHEN superseded_by IN purge_ids THEN NULL ELSE superseded_by END
+    WHERE id = ?4;",
+                    params![without[0], without[1], without[2], id],
+                )
+                .unwrap();
+            assert_eq!(changed, 1);
+            kept.push(id);
+        }
+        (read, sorted(kept))
     };
-    let (read, naming) = scrub(&old);
-    assert_eq!(read, vec![newer.id.clone()], "rows with only empty arrays are not read");
-    assert_eq!(naming, vec![newer.id.clone()]);
-    // The reverse edge: the read returns the row by superseded_by, but its
-    // select list has no superseded_by, so the filter on arrays drops it.
-    let (read, naming) = scrub(&newer.id);
-    assert!(read.contains(&old), "superseded_by IN purge_ids reads the reverse edge");
-    assert!(naming.is_empty(), "the arrays of the superseded row name nothing");
-    let (read, naming) = scrub(&unrelated);
-    assert_eq!(read, vec![newer.id.clone()]);
-    assert!(naming.is_empty());
-    // A shorter id that is a prefix of a stored one is not named.
-    assert!(scrub(&old[..old.len() - 1]).1.is_empty());
+    let links_of = |id: &str| -> (Option<String>, String, String, String) {
+        conn.query_row(
+            "SELECT superseded_by, supersedes, contradicts, confirmed_by FROM memories WHERE id = ?1",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    let none = || "[]".to_string();
+    assert_eq!(links_of(&old), (Some(newer.id.clone()), none(), none(), none()), "the reverse edge the store keeps");
 
-    // The form the probe table names (spec section 9, row h): instr over the
-    // arrays, ?2 = the id in double quotes.
-    let naming = |id: &str| {
-        sorted(ids(
-            conn,
-            "SELECT id FROM memories WHERE superseded_by = :id OR instr(supersedes, :quoted)
-                 OR instr(contradicts, :quoted) OR instr(confirmed_by, :quoted)",
-            named_params! { ":id": id, ":quoted": format!("\"{id}\"") },
-            0,
-        ))
-    };
-    assert_eq!(naming(&old), vec![newer.id.clone()]);
-    assert_eq!(naming(&newer.id), vec![old.clone()], "the reverse edge the store keeps");
-    assert!(naming(&unrelated).is_empty());
-    // The quotes are what make it exact: a shorter id that is a prefix of a
-    // stored one is not found.
-    assert!(naming(&old[..old.len() - 1]).is_empty());
+    // A row that nobody names, and a shorter id that is a prefix of a stored
+    // one: read (the newer row has a non-empty array), not kept, nothing written.
+    for purged in [unrelated.as_str(), &old[..old.len() - 1]] {
+        let (read, kept) = scrub(purged);
+        assert_eq!(read, vec![newer.id.clone()], "rows with only empty arrays are not read");
+        assert!(kept.is_empty(), "{purged}");
+    }
+    assert_eq!(links_of(&newer.id), (None, format!("[\"{old}\"]"), none(), none()));
+
+    // The case 4.1's filter dropped: the newer row is purged. The old row is
+    // reached only through superseded_by IN purge_ids; the filter keeps it and
+    // the UPDATE clears its superseded_by.
+    let (read, kept) = scrub(&newer.id);
+    assert!(read.contains(&old), "superseded_by IN purge_ids reads the reverse edge");
+    assert_eq!(kept, vec![old.clone()], "the filter keeps the row whose superseded_by is in the set");
+    assert_eq!(links_of(&old), (None, none(), none(), none()), "superseded_by no longer points at the purged row");
+    assert_eq!(links_of(&newer.id), (None, format!("[\"{old}\"]"), none(), none()), "the newer row is untouched");
+
+    // The forward edge: the old row is purged; the newer row's array names it.
+    let (read, kept) = scrub(&old);
+    assert_eq!(read, vec![newer.id.clone()]);
+    assert_eq!(kept, vec![newer.id.clone()]);
+    assert_eq!(links_of(&newer.id), (None, none(), none(), none()), "the id is gone from supersedes");
+    assert_eq!(links_of(&unrelated), (None, none(), none(), none()));
 }
 
 // ── i ───────────────────────────────────────────────────────────────────
