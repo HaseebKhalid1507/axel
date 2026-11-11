@@ -882,6 +882,8 @@ fn exact_scan(data: &[f32], query: &[f32], k: usize) -> Vec<(usize, f32)> {
 }
 
 #[test]
+// Release run on the build machine (bbuild, 5dc78ff): median 5.37 ms, best 5.07 ms,
+// worst 6.79 ms over 9 runs. The debug profile measured 89 ms median.
 #[ignore = "timing probe: run once with --ignored --nocapture"]
 fn i_exact_scan_of_25000_vectors() {
     const ROWS: usize = 25_000;
