@@ -10,6 +10,7 @@
 //! `write_turn` runs on the indexer thread and owns its transaction.
 
 use std::collections::HashMap;
+use std::sync::atomic::Ordering;
 
 use axel_memkoshi::security::MemorySigner;
 use rusqlite::{params, Connection, OptionalExtension};
@@ -27,8 +28,6 @@ use crate::{archive, brain_v2, project, screen};
 pub const MAX_PENDING: usize = 64;
 /// A prompt, and the whole reply of a turn, are cut here (bytes, on a char boundary).
 pub const MAX_TEXT_BYTES: usize = 4096;
-/// A buffer whose last hook is older than this is dropped (R17).
-pub const STALE_MS: i64 = 10 * 60 * 1000;
 /// A turn whose prompt plus reply is shorter is not stored.
 pub const MIN_TURN_CHARS: usize = 60;
 
@@ -38,6 +37,8 @@ const TITLE_WORDS: usize = 12;
 #[derive(Default)]
 pub struct CaptureState {
     pending: HashMap<String, TurnBuffer>,
+    /// Turns let go since `take_dropped` was last called.
+    dropped: u64,
 }
 
 struct TurnBuffer {
@@ -97,12 +98,30 @@ impl CaptureState {
         self.pending.contains_key(session_id)
     }
 
+    /// How many turns were let go since this was last called: a buffer evicted, a buffer
+    /// cleared (`drop_session`, `on_session_end`, a host event). A turn that would not have
+    /// been stored anyway, marked by a forget call or withheld by core's rule, is not one.
+    // RULING: wave4 R-16 item 1. Pairing has no `Status`; the three `on_*_event` functions
+    // move this count to `Status.turns_dropped`.
+    pub fn take_dropped(&mut self) -> u64 {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Removes the chat's buffer and counts the turn that goes with it.
+    fn let_go(&mut self, session_id: &str) {
+        if let Some(buf) = self.pending.remove(session_id) {
+            if !buf.suppressed && !buf.withheld {
+                self.dropped += 1;
+            }
+        }
+    }
+
     pub fn on_user(&mut self, session_id: Option<&str>, cwd: Option<&str>, text: &str, now_ms: i64) {
         let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
             return;
         };
         if host_message(text) {
-            self.pending.remove(session_id);
+            self.let_go(session_id);
             return;
         }
         // Core's test is on the text as given, the whole of it. The key is of the whole
@@ -140,7 +159,7 @@ impl CaptureState {
             .min_by(|a, b| (a.1.last_ms, a.0).cmp(&(b.1.last_ms, b.0)))
             .map(|(session_id, _)| session_id.clone());
         if let Some(session_id) = oldest {
-            self.pending.remove(&session_id);
+            self.let_go(&session_id);
         }
     }
 
@@ -153,10 +172,9 @@ impl CaptureState {
     ) -> Option<CompletedTurn> {
         let session_id = session_id?;
         let buf = self.pending.get_mut(session_id)?;
-        if now_ms - buf.last_ms > STALE_MS {
-            self.pending.remove(session_id);
-            return None;
-        }
+        // RULING: wave4 R-16 item 1. No buffer is too old to pair: a turn may run for as
+        // long as its workers do. A new prompt replaces the buffer; a lost hook drops it
+        // (`drop_session`).
         buf.last_ms = now_ms;
         // A marked turn keeps no text (`suppress`), a withheld one neither.
         if !buf.suppressed {
@@ -208,11 +226,11 @@ impl CaptureState {
 
     /// A hook of this chat was not forwarded.
     pub fn drop_session(&mut self, session_id: &str) {
-        self.pending.remove(session_id);
+        self.let_go(session_id);
     }
 
     pub fn on_session_end(&mut self, session_id: &str) {
-        self.pending.remove(session_id);
+        self.let_go(session_id);
     }
 }
 
@@ -361,27 +379,40 @@ pub fn write_turn(
     })
 }
 
+/// Moves what pairing let go to `Status.turns_dropped`. With capture off no turn is
+/// stored, so none is missing.
+fn count_dropped(st: &mut FrontState) {
+    let dropped = st.capture.take_dropped();
+    if dropped > 0 && st.cfg.capture {
+        st.status.turns_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+}
+
 /// After recall has been answered (called by `ext::hooks::handle`). No SQL.
 pub fn on_user_event(st: &mut FrontState, ev: &HookEvent) {
-    let Some(session_id) = ev.session_id.as_deref() else {
-        return;
-    };
-    // SPEC: 3357 names `st.clock`; the time of a hook is `ev.received_ms`, which the rpc
-    // thread read from that clock when the hook arrived. It is not later than anything
-    // written for this turn, which is what a forget's `from_ms` needs.
-    match ev.message.as_deref() {
-        Some(text) => st.capture.on_user(Some(session_id), ev.cwd.as_deref(), text, ev.received_ms),
-        // A prompt hook with no text: whatever was pending is not this message's turn.
-        None => st.capture.drop_session(session_id),
+    if let Some(session_id) = ev.session_id.as_deref() {
+        // SPEC: 3357 names `st.clock`; the time of a hook is `ev.received_ms`, which the rpc
+        // thread read from that clock when the hook arrived. It is not later than anything
+        // written for this turn, which is what a forget's `from_ms` needs.
+        match ev.message.as_deref() {
+            Some(text) => st.capture.on_user(Some(session_id), ev.cwd.as_deref(), text, ev.received_ms),
+            // A prompt hook with no text: whatever was pending is not this message's turn.
+            None => st.capture.drop_session(session_id),
+        }
     }
+    count_dropped(st);
 }
 
 /// `on_message_complete` (called by `ext::hooks::handle`). No SQL: the turn goes to the
 /// indexer as a job.
 pub fn on_assistant_event(st: &mut FrontState, ev: &HookEvent) {
-    let Some(session_id) = ev.session_id.as_deref() else {
-        return;
-    };
+    if let Some(session_id) = ev.session_id.as_deref() {
+        pair_reply(st, session_id, ev);
+    }
+    count_dropped(st);
+}
+
+fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
     // SPEC: 3340 says the hook carries `data.has_tool_use`. Without it nobody knows
     // whether the turn has ended: the turn is not captured live.
     let Some(has_tool_use) = ev.data.get("has_tool_use").and_then(serde_json::Value::as_bool) else {
@@ -392,12 +423,17 @@ pub fn on_assistant_event(st: &mut FrontState, ev: &HookEvent) {
     let Some(turn) = st.capture.on_assistant(Some(session_id), text, has_tool_use, ev.received_ms) else {
         return;
     };
+    let storable = st.cfg.capture && !turn.suppressed && !turn.withheld;
     // `write_turn` is given no `Status`: the count is made here, where the turn ends.
     if turn.withheld && !turn.suppressed && st.cfg.capture {
-        st.status.turns_withheld.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        st.status.turns_withheld.fetch_add(1, Ordering::Relaxed);
     }
-    // A full queue drops the turn (counted there); it arrives with its archive.
-    front::send_job(st, Job::Capture(turn));
+    // A full queue drops the turn (the job is counted there, the turn here); it arrives
+    // with its archive.
+    let sent = front::send_job(st, Job::Capture(turn));
+    if !sent && storable {
+        st.status.turns_dropped.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// `on_session_end` (called by `ext::hooks::handle`).
@@ -405,6 +441,7 @@ pub fn on_session_end_event(st: &mut FrontState, ev: &HookEvent) {
     if let Some(session_id) = ev.session_id.as_deref() {
         st.capture.on_session_end(session_id);
     }
+    count_dropped(st);
 }
 
 #[cfg(test)]

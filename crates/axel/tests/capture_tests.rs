@@ -262,16 +262,15 @@ fn t01_pairing() {
     assert_eq!(cap.pending_len(), 64);
     assert!(cap.is_pending("chat2"));
 
-    // A buffer 11 minutes old is dropped, and the next assistant message gives nothing.
+    // R-16 item 1: no buffer is too old. A reply fifteen minutes after the prompt (a worker
+    // ran inside the turn) is paired with it.
     let mut cap = CaptureState::default();
-    cap.on_user(Some("s"), None, "an old prompt", 0);
-    assert_eq!(cap.on_assistant(Some("s"), "eleven minutes later", false, 11 * 60_000), None);
-    assert_eq!(cap.pending_len(), 0);
-    assert_eq!(cap.on_assistant(Some("s"), "and again", false, 11 * 60_000 + 1), None);
-    // Ten minutes is not more than ten minutes; the time runs from the last hook.
-    cap.on_user(Some("s"), None, "a slow prompt", 0);
-    assert_eq!(cap.on_assistant(Some("s"), "one", true, 10 * 60_000), None);
-    assert!(cap.on_assistant(Some("s"), "two", false, 20 * 60_000).is_some());
+    cap.on_user(Some("s"), None, "a prompt with a long worker run", 0);
+    assert_eq!(cap.on_assistant(Some("s"), "the worker is started", true, 1_000), None);
+    let turn = cap.on_assistant(Some("s"), "fifteen minutes later", false, 15 * 60_000).unwrap();
+    assert_eq!(turn.prompt, "a prompt with a long worker run");
+    assert_eq!(turn.reply, "the worker is started\nfifteen minutes later");
+    assert_eq!(cap.take_dropped(), 0);
 
     // `on_session_end` drops what is pending.
     cap.on_user(Some("s"), None, "a prompt", 0);
@@ -1064,4 +1063,93 @@ fn the_row_is_filed_by_directory_hash_not_by_path() {
         brain.conn.query_row("SELECT project_key FROM memories WHERE id = ?1", [id_of(&turn)], |r| r.get(0)).unwrap();
     assert_eq!(filed, scope_dir(&cwd), "a folder inside the project is the project");
     assert_eq!(filed.len(), 64);
+}
+
+// ── R-16: what the review of wave 4 changed ─────────────────────────────────
+
+fn dropped(status: &Status) -> u64 {
+    status.turns_dropped.load(Ordering::Relaxed)
+}
+
+/// Item 1: every turn the buffer lets go is counted, each once; a turn that is replaced,
+/// marked or withheld is not one; with capture off nothing is counted.
+#[test]
+fn r16_1_every_dropped_turn_is_counted() {
+    let lab = Lab::new();
+    let (_ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+
+    // A turn that is paired and sent is not dropped, however long it took.
+    user(&mut st, "S", &cwd, PROMPT, 0);
+    assistant(&mut st, "S", &cwd, "starting a worker", true, 1_000);
+    assistant(&mut st, "S", &cwd, REPLY, false, 15 * 60_000);
+    assert!(next_capture(&jobs).is_some(), "a reply fifteen minutes later is still paired");
+    assert_eq!(dropped(&status), 0);
+
+    // No `has_tool_use`: dropped, counted. With nothing pending there is nothing to count.
+    let bare = |at| hook("on_message_complete", Some("S"), Some(&cwd), Some(REPLY), json!({}), at);
+    user(&mut st, "S", &cwd, PROMPT, 1);
+    capture::on_assistant_event(&mut st, &bare(2));
+    assert_eq!(dropped(&status), 1);
+    capture::on_assistant_event(&mut st, &bare(3));
+    assert_eq!(dropped(&status), 1);
+
+    // A host event clears the buffer.
+    user(&mut st, "S", &cwd, PROMPT, 4);
+    user(&mut st, "S", &cwd, "<event id=\"1\">a worker reported</event>", 5);
+    assert_eq!(dropped(&status), 2);
+
+    // The session ends in the middle of a turn.
+    user(&mut st, "S", &cwd, PROMPT, 6);
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("S"), Some(&cwd), None, json!({}), 7));
+    assert_eq!(dropped(&status), 3);
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("S"), Some(&cwd), None, json!({}), 8));
+    assert_eq!(dropped(&status), 3);
+
+    // A lost hook (`drop_session` is the front thread's call): counted at the next hook.
+    user(&mut st, "S", &cwd, PROMPT, 9);
+    st.capture.drop_session("S");
+    user(&mut st, "T", &cwd, PROMPT, 10);
+    assert_eq!(dropped(&status), 4);
+    assistant(&mut st, "T", &cwd, REPLY, false, 11);
+    assert!(next_capture(&jobs).is_some());
+
+    // Eviction: 65 chats pending, the oldest goes, once.
+    for i in 0..65 {
+        user(&mut st, &format!("chat{i}"), &cwd, PROMPT, 100 + i);
+    }
+    assert_eq!(st.capture.pending_len(), 64);
+    assert!(!st.capture.is_pending("chat0"));
+    assert_eq!(dropped(&status), 5);
+
+    // Not dropped: a prompt that replaces the pending one (the turn goes on), a turn a
+    // forget call marked, a turn core's rule withholds.
+    user(&mut st, "chat1", &cwd, "a second prompt for the same turn", 200);
+    user(&mut st, "chat2", &cwd, "forget what I said about the offer from Acme", 201);
+    assert!(st.capture.suppress("chat2").is_some());
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("chat2"), Some(&cwd), None, json!({}), 202));
+    user(&mut st, "chat3", &cwd, "my password is hunter2", 203);
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("chat3"), Some(&cwd), None, json!({}), 204));
+    assert_eq!(dropped(&status), 5);
+
+    // Capture off: no turn is stored, so none is missing.
+    let off = Lab::new();
+    let (_ctx, mut st, _jobs, status, _kept) = threads(&off, "off");
+    user(&mut st, "S", &cwd, PROMPT, 1);
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("S"), Some(&cwd), None, json!({}), 2));
+    assert_eq!(dropped(&status), 0);
+}
+
+/// Item 1: a turn whose job finds the queue full is a dropped turn too.
+#[test]
+fn r16_1_a_turn_the_queue_refuses_is_counted() {
+    let lab = Lab::new();
+    let (_ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    while st.jobs.try_send(Job::Tick).is_ok() {}
+    user(&mut st, "S", &cwd, PROMPT, 1);
+    assistant(&mut st, "S", &cwd, REPLY, false, 2);
+    assert!(next_capture(&jobs).is_none());
+    assert_eq!(dropped(&status), 1);
+    assert_eq!(status.jobs_dropped.load(Ordering::Relaxed), 1);
 }
