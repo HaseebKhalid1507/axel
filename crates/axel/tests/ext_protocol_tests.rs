@@ -2550,3 +2550,24 @@ fn every_degraded_reason_has_its_own_place_in_status() {
         assert_eq!(DegradedReason::from_u8(v as u8), DegradedReason::None, "{v} names a reason past COUNT");
     }
 }
+
+/// v2 c18b review round 5, item 2: a v2 brain of the pre-round-3 shape degrades the
+/// extension with the refusal's own words, not "not ready"; the file is unchanged.
+#[test]
+fn a_brain_of_an_older_shape_degrades_with_its_reason() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        conn.execute_batch("ALTER TABLE archive_index DROP COLUMN cli_unproven; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let before = sha256(&dirs.brain());
+    let mut host = Host::start(Some(Embedder::hashing()), TestHooks::default());
+    host.call("initialize", json!({"config": dirs.config("hash")}));
+    let text = host.wait_degraded();
+    assert!(text.starts_with("Axel is unavailable: BrainOldShape (the brain was made by an older build of axel-v2"), "{text}");
+    assert!(text.contains("Move it aside and make it again"), "{text}");
+    assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::BrainOldShape);
+    assert_eq!(wait_status_file(&dirs, "degraded", Duration::from_secs(5))["reason"], "BrainOldShape");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert_eq!(sha256(&dirs.brain()), before, "the brain was written");
+}

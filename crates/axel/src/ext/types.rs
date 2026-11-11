@@ -149,11 +149,13 @@ pub enum DegradedReason {
     IndexerStopped = 8,
     /// The front thread died or hung before the first `Ready` (wave 3, 12b ruling 2).
     FrontStopped = 9,
+    /// A v2 brain of a shape before round 3 (`brain_v2::check_shape`; v2 c18b round 5).
+    BrainOldShape = 10,
 }
 
 impl DegradedReason {
     /// How many reasons there are: `Status.reason_at` has one place for each.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 11;
 
     /// Every reason, in the order of its value (checked when the crate compiles, below).
     pub const ALL: [DegradedReason; Self::COUNT] = [
@@ -167,6 +169,7 @@ impl DegradedReason {
         Self::OtherBase,
         Self::IndexerStopped,
         Self::FrontStopped,
+        Self::BrainOldShape,
     ];
 
     /// A value that names no reason reads as `None`.
@@ -181,6 +184,7 @@ impl DegradedReason {
             7 => Self::OtherBase,
             8 => Self::IndexerStopped,
             9 => Self::FrontStopped,
+            10 => Self::BrainOldShape,
             _ => Self::None,
         }
     }
@@ -199,6 +203,7 @@ impl DegradedReason {
             Self::OtherBase => "OtherBase",
             Self::IndexerStopped => "IndexerStopped",
             Self::FrontStopped => "FrontStopped",
+            Self::BrainOldShape => "BrainOldShape",
         }
     }
 }
@@ -225,7 +230,8 @@ const fn _every_reason_is_in_all(r: DegradedReason) {
         | DegradedReason::BrainNotReady
         | DegradedReason::OtherBase
         | DegradedReason::IndexerStopped
-        | DegradedReason::FrontStopped => {}
+        | DegradedReason::FrontStopped
+        | DegradedReason::BrainOldShape => {}
     }
 }
 

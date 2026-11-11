@@ -127,6 +127,7 @@ fn reason_of(e: &AxelError) -> DegradedReason {
         AxelError::BrainDamaged(_) => DegradedReason::BrainDamaged,
         AxelError::BrainChanged => DegradedReason::BrainChanged,
         AxelError::OtherBase(_) => DegradedReason::OtherBase,
+        e if brain_v2::is_old_shape(e) => DegradedReason::BrainOldShape,
         AxelError::Db(e)
             if matches!(
                 e.sqlite_error_code(),

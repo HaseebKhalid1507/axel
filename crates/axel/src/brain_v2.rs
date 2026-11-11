@@ -321,6 +321,15 @@ fn connect_raw(path: &Path, role: Role, check: bool, record: bool) -> Result<Con
     Ok(conn)
 }
 
+/// What `check_shape` says of a brain it refuses; the extension's degraded line and
+/// `status` say it too (round 5, item 2).
+pub const OLD_SHAPE: &str = "was made by an older build of axel-v2 and lacks tables this build writes; it is not changed. Move it aside and make it again (\"axel-v2 init\", or \"axel-v2 migrate init --from-axel <axel.r8>\")";
+
+/// Whether `e` is the refusal of `check_shape`.
+pub fn is_old_shape(e: &AxelError) -> bool {
+    matches!(e, AxelError::Other(m) if m.contains(OLD_SHAPE))
+}
+
 /// The unique key of `forgotten_turns` that every upsert of a mark names.
 const MARK_KEY: &str = "logical,source,from_ms,turn_key,archive_id,text_hash";
 
@@ -348,10 +357,7 @@ fn check_shape(conn: &Connection, path: &Path) -> Result<()> {
     if columns == 2 && keys.iter().any(|k| k.as_deref() == Some(MARK_KEY)) {
         return Ok(());
     }
-    Err(AxelError::Other(format!(
-        "the brain at {} was made by an older build of axel-v2 and lacks tables this build writes; it is not changed. Move it aside and make it again (\"axel-v2 init\", or \"axel-v2 migrate init --from-axel <axel.r8>\").",
-        path.display()
-    )))
+    Err(AxelError::Other(format!("the brain at {} {OLD_SHAPE}.", path.display())))
 }
 
 /// Pragmas only; never creates, never migrates.

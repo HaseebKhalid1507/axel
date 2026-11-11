@@ -72,6 +72,12 @@ pub const BUSY_TEXT: &str = "Axel is busy; the outcome of this call is unknown; 
 
 /// `ToolError::Unavailable(reason)` as the host is sent it.
 pub fn unavailable_text(reason: &str) -> String {
+    if reason == "BrainOldShape" {
+        return format!(
+            "Axel is unavailable: BrainOldShape (the brain {}). Synaps itself is not affected.",
+            crate::brain_v2::OLD_SHAPE
+        );
+    }
     format!("Axel is unavailable: {reason}. Synaps itself is not affected.")
 }
 

@@ -461,6 +461,7 @@ fn hint(reason: &str) -> Option<&'static str> {
         "BrainDamaged" => "the file is kept as it is; restore it from a backup of the brain",
         "BrainTooNew" => "this brain was written by a newer axel-v2; install that one",
         "OtherBase" => "this brain records another Synaps base",
+        "BrainOldShape" => crate::brain_v2::OLD_SHAPE,
         "V1Brain" => "this is a version 1 brain; \"axel-v2 migrate init --from-axel <it>\" makes a v2 copy",
         "NoBrain" | "BrainNotReady" => "retried every 60 s",
         _ => return None,
