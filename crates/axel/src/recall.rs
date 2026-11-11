@@ -303,9 +303,14 @@ const FILED_SESSIONS: usize = 256;
 // SPEC: 3136-3140, 3160: a note file is stored whole and nothing bounds what recall reads
 // of one. The words and the passage are looked for in the first 64 KiB of a body, so that
 // a few very large files cannot take the budget.
-// RULING: wave 4 ruling R-15 item 1: the candidate queries read no more than the first
-// 65,536 characters of a body (`substr` in `MEM_COLUMNS` and `DOC_COLUMNS`), so a row of any
-// size costs a bounded read.
+// RULING: wave 4 ruling R-15 item 1: the candidate queries keep no more than the first
+// 65,536 characters of a body (`substr` in `MEM_COLUMNS` and `DOC_COLUMNS`).
+// RULING: v2 capture/recall review, item 3: what is READ is bounded by the number of rows,
+// not by their size. The word generators rank on the index alone and then read the rows
+// best first: a body is read for the 48 (24) rows taken, and for a better-ranked row that
+// turned out not to be in the caller's view. SQLite loads a body whole before `substr`
+// cuts it, so each of those rows costs its whole size once; the rows below the cut cost
+// nothing.
 const BODY_SCAN_BYTES: usize = 64 * 1024;
 /// SQLite asks "is the deadline past" once in this many steps of its virtual machine.
 const PROGRESS_STEPS: std::os::raw::c_int = 1_000;
@@ -512,23 +517,42 @@ struct Scope<'a> {
     now: String,
 }
 
+/// The word index's matches, best first, by `rowid` alone: `bm25` reads the index and the
+/// sizes it keeps, and no column of a row is read, so no body is.
+const MEM_RANK: &str =
+    "SELECT rowid FROM memories_fts WHERE memories_fts MATCH :expr ORDER BY bm25(memories_fts), rowid";
+const DOC_RANK: &str = "SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH 'content : (' || :expr || ')'
+     ORDER BY bm25(chunks_fts), rowid";
+
 /// Generator a: memory, by words.
+// RULING: v2 capture/recall review, item 3 (finding 2). The rank is made first and alone
+// (`MEM_RANK`), then the rows are read best first, one at a time, until `MEM_WORDS_LIMIT`
+// of them are in the caller's view. The view cannot go into the rank: the memory id is in
+// the word index's row with the body, and `project_key` and `expires_at` come after
+// `content` in `memories`. A `LIMIT` before the view would let rows of other projects take
+// the places; this gives what `ORDER BY bm25 LIMIT 48` over the visible rows gave.
 fn mem_by_words(conn: &Connection, expr: &str, scope: &Scope) -> rusqlite::Result<Vec<MemRow>> {
     let sql = format!(
         "SELECT {MEM_COLUMNS}
      FROM memories_fts f JOIN memories m ON m.id = f.mem_id
                          JOIN memory_ext e ON e.mem_id = m.id
-     WHERE memories_fts MATCH :expr
-       AND {MEM_VISIBLE}
-     ORDER BY bm25(memories_fts) LIMIT {MEM_WORDS_LIMIT}"
+     WHERE f.rowid = :rowid
+       AND {MEM_VISIBLE}"
     );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let mut rows = stmt.query(named_params! {
-        ":expr": expr, ":scope_dir": scope.dir, ":global": scope.global, ":now": scope.now,
-    })?;
-    let mut out = Vec::new();
-    while let Some(r) = rows.next()? {
-        out.extend(mem_row(r));
+    let mut rank = conn.prepare_cached(MEM_RANK)?;
+    let mut read = conn.prepare_cached(&sql)?;
+    let mut ranked = rank.query(named_params! { ":expr": expr })?;
+    let (mut out, mut found) = (Vec::new(), 0);
+    while found < MEM_WORDS_LIMIT {
+        let Some(hit) = ranked.next()? else { break };
+        let rowid: i64 = hit.get(0)?;
+        let mut rows = read.query(named_params! {
+            ":rowid": rowid, ":scope_dir": scope.dir, ":global": scope.global, ":now": scope.now,
+        })?;
+        if let Some(r) = rows.next()? {
+            found += 1;
+            out.extend(mem_row(r));
+        }
     }
     Ok(out)
 }
@@ -552,19 +576,26 @@ fn mem_by_vid(conn: &Connection, vid: i64, scope: &Scope) -> rusqlite::Result<Op
     })
 }
 
-/// Generator c: note files, by words.
+/// Generator c: note files, by words. As generator a: the rank alone first (`DOC_RANK`),
+/// then the rows best first until `DOC_WORDS_LIMIT` of them are not hidden.
 fn docs_by_words(conn: &Connection, expr: &str) -> rusqlite::Result<Vec<DocRow>> {
     let sql = format!(
         "SELECT {DOC_COLUMNS}
      FROM chunks_fts f JOIN documents d ON d.doc_id = f.doc_id
-     WHERE chunks_fts MATCH 'content : (' || :expr || ')' AND d.hidden IS NULL
-     ORDER BY bm25(chunks_fts) LIMIT {DOC_WORDS_LIMIT}"
+     WHERE f.rowid = :rowid AND d.hidden IS NULL"
     );
-    let mut stmt = conn.prepare_cached(&sql)?;
-    let mut rows = stmt.query(named_params! { ":expr": expr })?;
-    let mut out = Vec::new();
-    while let Some(r) = rows.next()? {
-        out.extend(doc_row(r));
+    let mut rank = conn.prepare_cached(DOC_RANK)?;
+    let mut read = conn.prepare_cached(&sql)?;
+    let mut ranked = rank.query(named_params! { ":expr": expr })?;
+    let (mut out, mut found) = (Vec::new(), 0);
+    while found < DOC_WORDS_LIMIT {
+        let Some(hit) = ranked.next()? else { break };
+        let rowid: i64 = hit.get(0)?;
+        let mut rows = read.query(named_params! { ":rowid": rowid })?;
+        if let Some(r) = rows.next()? {
+            found += 1;
+            out.extend(doc_row(r));
+        }
     }
     Ok(out)
 }
