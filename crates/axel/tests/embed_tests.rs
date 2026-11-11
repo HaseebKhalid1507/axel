@@ -1,6 +1,6 @@
 //! Commit 9: the embed thread (`EmbedService`). Hash embedder only; every wait is bounded.
 
-use std::sync::mpsc::{sync_channel, Receiver, TryRecvError};
+use std::sync::mpsc::{sync_channel, Receiver};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -121,36 +121,29 @@ fn panic_embed_ends_the_thread_only() {
 
 #[test]
 fn a_query_is_served_while_a_bulk_batch_of_64_is_queued() {
-    let (svc, jobs_rx) = start(TestHooks::default());
-    let texts = big_texts(64, 1024 * 1024);
-    let items: Vec<(VecKey, String)> = texts.iter().enumerate().map(|(i, t)| (VecKey::Mem(i as i64), t.clone())).collect();
-    let t0 = Instant::now();
-    svc.submit_bulk(items);
-    // Let the thread take the bulk and start on it, so the query arrives behind it.
-    thread::sleep(Duration::from_millis(20));
+    // The indexer's queue is full (a dummy job in a queue of one), so no bulk can be handed
+    // over until the test takes the dummy out: the query is answered while the bulk of 64 is
+    // still the thread's, on any machine (review answer 3).
+    let (svc, jobs_rx) = start_latched();
+    svc.submit_bulk(rows(0, 4));
+    svc.submit_bulk(rows(4, 64));
 
-    let t1 = Instant::now();
-    let q = svc.embed_query("retry limit", secs(30)).expect("the query is answered");
-    let query_took = t1.elapsed();
+    let q = svc.embed_query("retry limit", secs(5)).expect("the query is answered");
     assert_eq!(q, hashed("retry limit"));
-    // Had the query waited its turn, the bulk's `Job::Embedded` would be on the queue already:
-    // the thread sends it before it turns to the next request.
-    assert!(
-        matches!(jobs_rx.try_recv(), Err(TryRecvError::Empty)),
-        "the query was served only after the whole bulk"
-    );
+    assert_eq!(svc.backlog(), 68, "a bulk was handed over before the latch opened");
 
-    match jobs_rx.recv_timeout(Duration::from_secs(60)) {
+    // Then the queue gives, in order: the dummy, the bulk of 4, the bulk of 64.
+    assert!(matches!(jobs_rx.recv_timeout(Duration::from_secs(5)), Ok(Job::Tick)));
+    let first = embedded(&jobs_rx);
+    assert_eq!(first.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (0..4).map(VecKey::Mem).collect::<Vec<_>>());
+    match jobs_rx.recv_timeout(Duration::from_secs(5)) {
         Ok(Job::Embedded { model, vectors }) => {
-            // The query waits for one batch of 4 at most; the bulk takes 16 of them.
-            let bulk_took = t0.elapsed();
-            assert!(bulk_took > Duration::from_millis(100), "the bulk was too quick to test: {bulk_took:?}");
-            assert!(query_took * 4 < bulk_took, "query {query_took:?}, bulk {bulk_took:?}");
             assert_eq!(model, Embedder::hashing().model_id());
             assert_eq!(vectors.len(), 64);
             for (i, (key, v)) in vectors.iter().enumerate() {
-                assert_eq!(*key, VecKey::Mem(i as i64));
-                assert_eq!(*v, hashed(&texts[i]));
+                let n = i as i64 + 4;
+                assert_eq!(*key, VecKey::Mem(n));
+                assert_eq!(*v, hashed(&format!("row number {n} of the bulk")));
             }
         }
         other => panic!("expected Job::Embedded, got {other:?}"),
