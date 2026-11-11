@@ -1,7 +1,7 @@
 //! The migrations ledger, `open_v2`, `require_v2`, `connect`, `begin_write`,
 //! `begin_write_front`, `stand_aside`, `signer`, adoption and the word-index fill.
 
-use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::{Duration, Instant};
@@ -231,12 +231,26 @@ pub fn open_source(path: &Path) -> Result<Connection> {
     for suffix in ["-wal", "-journal"] {
         let mut side = resolved.clone().into_os_string();
         side.push(suffix);
-        if std::fs::metadata(&side).map(|m| m.len() > 0).unwrap_or(false) {
-            return Err(AxelError::Other(format!(
-                "{} has a non-empty {} beside it; checkpoint it or give a copy without one",
-                path.display(),
-                suffix
-            )));
+        // RULING: wave2-c4-review finding 8: only "not found" says there is no log. Any
+        // other answer (no permission, a link that loops, something that is not a file) is
+        // a log this cannot rule out, and the source is refused.
+        match std::fs::metadata(&side) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Ok(m) if m.is_file() && m.len() == 0 => {}
+            Ok(_) => {
+                return Err(AxelError::Other(format!(
+                    "{} has a non-empty {} beside it; checkpoint it or give a copy without one",
+                    path.display(),
+                    suffix
+                )))
+            }
+            Err(e) => {
+                return Err(AxelError::Other(format!(
+                    "{}: cannot look at the {} beside it: {e}",
+                    path.display(),
+                    suffix
+                )))
+            }
         }
     }
     let conn = Connection::open_with_flags(
@@ -303,9 +317,8 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
             }
         }
-        let brain = Brain::create_or_join(path, opts.agent, opts.model, opts.dim)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        brain
+        // The file is 0600 before the signing key is written (finding 7, in `r8.rs`).
+        Brain::create_or_join(path, opts.agent, opts.model, opts.dim)?
     } else {
         Brain::open(path)?
     };
@@ -332,9 +345,14 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     }
 
     // 6. The ledger.
+    // RULING: wave2-c4-review finding 8: a migration commits with `synchronous = FULL`, so
+    // a power cut after `open_v2` returned cannot undo it. The connection is the indexer's
+    // afterwards and goes back to `NORMAL`.
+    conn.execute_batch("PRAGMA synchronous=FULL")?;
     for n in (user_version(&conn)? + 1)..=LATEST {
         migrate_step(&conn, n)?;
     }
+    conn.execute_batch("PRAGMA synchronous=NORMAL")?;
     let now = user_version(&conn)?;
     if now != LATEST {
         return Err(too_new(now));

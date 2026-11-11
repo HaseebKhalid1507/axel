@@ -176,8 +176,17 @@ fn t01_open_v2_on_a_missing_path_creates_a_v2_brain() {
             "table {table}"
         );
     }
+    // Finding 7: the file is made 0600 before the signing key is written. A test cannot look
+    // at the file between the two without a switch in the code, so this is the mode after
+    // `open_v2`, on the main file and on the side files, which take the main file's mode.
     let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
     assert_eq!(mode, 0o600, "file mode {mode:o}");
+    for suffix in side_files(&path) {
+        let side = format!("{}{suffix}", path.display());
+        let mode = std::fs::metadata(&side).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{suffix} mode {mode:o}");
+    }
+    assert_eq!(count(conn, "PRAGMA synchronous"), 1, "NORMAL again after the migration");
     let dir_mode = std::fs::metadata(path.parent().unwrap()).unwrap().permissions().mode() & 0o777;
     assert_eq!(dir_mode, 0o700, "directory mode {dir_mode:o}");
 
@@ -965,6 +974,83 @@ fn f5_an_unreadable_memory_is_skipped_and_counted_and_the_rest_are_adopted() {
 
     // A later open reports all three.
     assert_eq!(brain_v2::open_v2(&path, &opts(false)).unwrap().unreadable_memories, 3);
+}
+
+// ── Review findings 7 and 8 ──────────────────────────────────────────────
+
+/// A source file in SQLite's default journal mode: one table, one row, no side file.
+fn plain_source(dir: &Path, name: &str) -> PathBuf {
+    let path = dir.join(name);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute_batch("CREATE TABLE notes(body TEXT); INSERT INTO notes(body) VALUES ('kept');").unwrap();
+    drop(conn);
+    assert!(side_files(&path).is_empty());
+    path
+}
+
+#[test]
+fn f8_open_source_refuses_a_log_it_cannot_rule_out() {
+    let dir = TempDir::new().unwrap();
+    let side = |path: &Path, suffix: &str| PathBuf::from(format!("{}{suffix}", path.display()));
+    let refused = |path: &Path, what: &str| match brain_v2::open_source(path) {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("{what}: the source was opened"),
+    };
+
+    // No side file, and an empty one: read.
+    let clean = plain_source(dir.path(), "clean.db");
+    assert_eq!(count(&brain_v2::open_source(&clean).unwrap(), "SELECT COUNT(*) FROM notes"), 1);
+    std::fs::write(side(&clean, "-wal"), b"").unwrap();
+    assert_eq!(count(&brain_v2::open_source(&clean).unwrap(), "SELECT COUNT(*) FROM notes"), 1);
+
+    // A `-wal` whose `stat` fails with something other than "not found": a link to itself.
+    let looped = plain_source(dir.path(), "looped.db");
+    let wal = side(&looped, "-wal");
+    std::os::unix::fs::symlink(&wal, &wal).unwrap();
+    let error = std::fs::metadata(&wal).unwrap_err();
+    assert_ne!(error.kind(), std::io::ErrorKind::NotFound, "{error}");
+    let message = refused(&looped, "a -wal that cannot be looked at");
+    assert!(message.contains("cannot look at the -wal"), "{message}");
+
+    // A `-journal` that is a directory, and one with bytes in it.
+    let foldered = plain_source(dir.path(), "foldered.db");
+    std::fs::create_dir(side(&foldered, "-journal")).unwrap();
+    let message = refused(&foldered, "a -journal that is a directory");
+    assert!(message.contains("-journal"), "{message}");
+    let hot = plain_source(dir.path(), "hot.db");
+    std::fs::write(side(&hot, "-journal"), b"not empty").unwrap();
+    let message = refused(&hot, "a non-empty -journal");
+    assert!(message.contains("non-empty -journal"), "{message}");
+}
+
+#[test]
+fn f8_touch_keeps_the_version_the_file_has() {
+    let dir = TempDir::new().unwrap();
+    let (path, _, _) = legacy_file(&dir);
+    // A handle that read version 1, and an upgrade behind its back.
+    let mut handle = Brain::open(&path).unwrap();
+    assert_eq!(handle.meta().schema_version, 1);
+    let brain = brain_v2::open_v2(&path, &opts(true)).unwrap();
+    let stored = "SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'";
+    assert_eq!(count(&brain.conn, stored), 2);
+    let key_before: String = brain
+        .conn
+        .query_row("SELECT json_extract(value, '$.signing_key') FROM brain_meta WHERE key = 'meta'", [], |r| r.get(0))
+        .unwrap();
+
+    handle.touch().unwrap();
+    assert_eq!(count(&brain.conn, stored), 2, "touch wrote version 1 back into a version 2 brain");
+    assert_eq!(handle.meta().schema_version, 2);
+    assert_eq!(handle.meta().memory_count, 2);
+    assert_eq!(handle.meta().document_count, 3);
+    assert_eq!(count(&brain.conn, "SELECT json_extract(value, '$.memory_count') FROM brain_meta WHERE key = 'meta'"), 2);
+    let key_after: String = brain
+        .conn
+        .query_row("SELECT json_extract(value, '$.signing_key') FROM brain_meta WHERE key = 'meta'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(key_after, key_before);
+    drop(handle);
+    assert!(brain_v2::require_v2(&path).is_ok());
 }
 
 // ── Review finding 2: nobody leaves a transaction open ───────────────────

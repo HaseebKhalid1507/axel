@@ -122,6 +122,16 @@ impl Brain {
         model: &str,
         dim: usize,
     ) -> Result<Self> {
+        // RULING: wave2-c4-review finding 7: the file is 0600 before the signing key is
+        // written. It is created empty with that mode here, and a file that was already
+        // there is set to it, before SQLite opens it; `-wal` and `-shm` take the mode of the
+        // main file. Not the umask: it belongs to the whole process, and changing it around
+        // the create would change the mode of a file another thread makes at that moment.
+        {
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+            std::fs::OpenOptions::new().append(true).create(true).mode(0o600).open(path)?;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        }
         let conn = Connection::open(path)?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         // Two connections that switch an empty file to WAL at the same moment: one of them
@@ -281,14 +291,16 @@ impl Brain {
             }
         })?;
 
-        self.meta.document_count = doc_count;
-        self.meta.memory_count = mem_count;
-        self.meta.last_modified = Utc::now().to_rfc3339();
-
+        // RULING: wave2-c4-review finding 8: only the three fields are written, into the
+        // value that is stored now. Writing the whole value from this handle would put back
+        // what the handle read when it was opened: `schema_version` 1 on a brain that was
+        // upgraded to version 2 since.
         self.conn.execute(
-            "UPDATE brain_meta SET value = ?1 WHERE key = 'meta'",
-            params![serde_json::to_string(&self.meta)?],
+            "UPDATE brain_meta SET value = json_set(value, '$.document_count', ?1,
+                 '$.memory_count', ?2, '$.last_modified', ?3) WHERE key = 'meta'",
+            params![doc_count, mem_count, Utc::now().to_rfc3339()],
         )?;
+        self.meta = Self::load_meta(&self.conn)?;
 
         Ok(())
     }
