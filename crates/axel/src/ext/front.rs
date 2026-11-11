@@ -262,8 +262,31 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
     // RULING: v2 final capture round, item 2: and a marked or withheld one is sent.
     capture::after_let_go(st);
     // A chat in which core's `memory_forget` was called: the turn is not to be learned.
-    for session_id in &carry.forgot {
-        let _ = mark_forgotten(st, session_id);
+    mark_carried(st, &carry.forgot);
+}
+
+/// `mark_forgotten` for each chat of `Carry.forgot`.
+// RULING: v2 c18a review round 2, item 1. Without a wait for the lock, as
+// `retry_forget_marks`: a mark not written now is kept, and the call this carry came with
+// starts with nothing in front of it.
+fn mark_carried(st: &mut FrontState, forgot: &[String]) {
+    if forgot.is_empty() {
+        return;
+    }
+    let tried = match WaitBack::shorten(&mut *st, |_| Duration::ZERO) {
+        Ok(mut st) => {
+            for session_id in forgot {
+                let _ = mark_forgotten(&mut st, session_id);
+            }
+            true
+        }
+        Err(_) => false,
+    };
+    // The wait could not be read: the marks are kept untried.
+    if !tried {
+        for session_id in forgot {
+            let _ = mark(st, session_id, false);
+        }
     }
 }
 
@@ -310,6 +333,11 @@ impl<S: Deref<Target = FrontState>> Drop for WaitBack<S> {
 /// `forget` tool (`tools_core::mark_turn`): `capture.suppress`, then `write_forget_mark`.
 /// A mark that is not written now is kept. Returns what became of the try.
 pub(crate) fn mark_forgotten(st: &mut FrontState, session_id: &str) -> MarkEnd {
+    mark(st, session_id, true)
+}
+
+/// `mark_forgotten`; with `try_now` false every mark is kept without a try.
+fn mark(st: &mut FrontState, session_id: &str, try_now: bool) -> MarkEnd {
     let now = (st.clock)();
     let replaced = st.capture.replaced_keys(session_id);
     let (from_ms, turn_key) = match st.capture.suppress(session_id) {
@@ -320,7 +348,7 @@ pub(crate) fn mark_forgotten(st: &mut FrontState, session_id: &str) -> MarkEnd {
     // and one for each prompt it replaced, all from the turn's first message. Once one of
     // them meets a held lock the rest are kept without a try (each would wait as long).
     let keys = std::iter::once(turn_key).chain(replaced.into_iter().map(Some));
-    let mut end = MarkEnd::Written;
+    let mut end = if try_now { MarkEnd::Written } else { MarkEnd::NotNow };
     for turn_key in keys {
         let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
         // RULING: wave4 R-12b item 1. The `Carry` is gone, so nothing else holds this

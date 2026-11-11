@@ -19,10 +19,10 @@ use axel::capture::{self, CompletedTurn, Written};
 use axel::ext::config::ExtConfig;
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{serve, BUSY_TEXT};
-use axel::ext::front::{WaitBack};
+use axel::ext::front::{FrontAnswer, FrontCall, FrontWork, WaitBack};
 use axel::ext::tools_core::{self, NOT_AGAIN, WORKER_REFUSAL};
 use axel::ext::tools_forum::NO_CALLER;
-use axel::ext::types::{Boot, Caller, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status, TestHooks, ToolError};
+use axel::ext::types::{Boot, Caller, Carry, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status, TestHooks, ToolError};
 use axel::ext::{front, tools};
 use axel::forum::Author;
 use axel::project_memory::{RecordLinks, Sensitivity};
@@ -2002,6 +2002,43 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
 /// The front connection's wait for the write lock, in ms.
 fn wait_of(st: &FrontState) -> i64 {
     st.conn.as_ref().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap()
+}
+
+/// One call as the rpc thread forwards it, with its `Carry`.
+fn forward(lab: &mut Lab, carry: Carry, name: &str, input: Value, caller: &Caller) -> FrontAnswer {
+    let work = FrontWork::Tool { name: name.to_string(), input, caller: caller.clone() };
+    front::handle(&mut lab.st, FrontCall { seq: 1, carry, work })
+}
+
+// RULING: v2 c18a review round 2, item 1: the carried marks are tried with no wait, so the
+// forget that brings them is answered within the rpc thread's 2 s (`TOOL_WAIT_MS`), and the
+// carried mark is kept.
+#[test]
+fn rr1_a_forget_that_brings_a_carried_mark_under_a_held_lock_is_answered_within_the_rpc_wait() {
+    let mut lab = Lab::new();
+    let t = lab.chat(&lab.a.clone(), "T");
+    let id = lab.remember(&t, "the grey wagtail feeds along the mill race at dawn");
+    assert_eq!(wait_of(&lab.st), 1_500, "the production wait");
+    let (held_tx, held_rx) = mpsc::channel();
+    let brain = lab.ext.brain.clone();
+    let holder = std::thread::spawn(move || {
+        let conn = Connection::open(&brain).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        held_tx.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(3_500));
+        conn.execute_batch("ROLLBACK").unwrap();
+    });
+    held_rx.recv().unwrap();
+    let carry = Carry { skipped: Vec::new(), forgot: vec!["S".to_string()] };
+    let start = Instant::now();
+    let answer = forward(&mut lab, carry, "forget", json!({ "id": format!("m:{id}") }), &t);
+    let took = start.elapsed();
+    holder.join().unwrap();
+    assert!(matches!(answer, FrontAnswer::Tool(Err(ToolError::Busy))), "after {took:?}");
+    assert!(took < Duration::from_millis(2_000), "{took:?}: past TOOL_WAIT_MS");
+    assert!(lab.st.forget_marks.iter().any(|m| m.session_id == "S"), "the carried mark was not kept");
+    assert_eq!(wait_of(&lab.st), 1_500, "the wait was not put back");
+    assert_eq!(hidden_by(lab.conn(), &id), None);
 }
 
 // RULING: v2 c18a review round 2, item 2: a hidden row of any origin keeps R-9g's answer.
