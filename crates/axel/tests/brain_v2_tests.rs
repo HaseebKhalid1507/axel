@@ -1744,3 +1744,26 @@ fn a_v2_brain_of_the_pre_round_3_shape_is_refused_unchanged() {
         assert_eq!(std::fs::read(&path).unwrap(), before, "{name}: the file was changed");
     }
 }
+
+/// v2 c18b review round 5, item 3: the mark key is the set of its columns; one declared in
+/// another order is the same conflict target and is accepted.
+#[test]
+fn the_mark_key_in_another_column_order_is_accepted() {
+    let dir = TempDir::new().unwrap();
+    let path = dir.path().join("brain.r8");
+    drop(brain_v2::open_v2(&path, &opts(false)).unwrap());
+    {
+        let raw = Connection::open(&path).unwrap();
+        let create: String =
+            raw.query_row("SELECT sql FROM sqlite_master WHERE name = 'forgotten_turns'", [], |r| r.get(0)).unwrap();
+        let turned = create.replace(
+            "UNIQUE (logical, source, from_ms, turn_key, archive_id, text_hash)",
+            "UNIQUE (text_hash, archive_id, turn_key, from_ms, source, logical)",
+        );
+        assert_ne!(turned, create, "the key was not found: the test proves nothing");
+        raw.execute_batch(&format!("PRAGMA foreign_keys=OFF; DROP TABLE forgotten_turns; {turned}; PRAGMA wal_checkpoint(TRUNCATE);"))
+            .unwrap();
+    }
+    assert!(brain_v2::connect(&path, Role::Cli).is_ok());
+    assert!(brain_v2::open_v2(&path, &opts(false)).is_ok());
+}

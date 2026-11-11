@@ -330,14 +330,17 @@ pub fn is_old_shape(e: &AxelError) -> bool {
     matches!(e, AxelError::Other(m) if m.contains(OLD_SHAPE))
 }
 
-/// The unique key of `forgotten_turns` that every upsert of a mark names.
-const MARK_KEY: &str = "logical,source,from_ms,turn_key,archive_id,text_hash";
+/// The unique key of `forgotten_turns` that every upsert of a mark names (its conflict
+/// target, which matches a key of these columns in any order).
+const MARK_KEY: [&str; 6] = ["logical", "source", "from_ms", "turn_key", "archive_id", "text_hash"];
 
 /// A version-1 v2 brain made before the round-3 shape: `forgotten_turns` without
 /// `text_hash` in its unique key, or `archive_index` without `cli_units` and
 /// `cli_unproven`. Its first mark would fail ("does not match any UNIQUE constraint").
 // RULING: v2 c18b review round 4, item 6. No version bump: no v2 brain is in use yet; one
 // made by an older build is refused, unchanged, and made again.
+// RULING: v2 c18b review round 5, item 3: the columns of each unique index are read row by
+// row and compared as sorted sets; nothing leans on the order of an aggregate.
 fn check_shape(conn: &Connection, path: &Path) -> Result<()> {
     let columns: i64 = conn
         .query_row(
@@ -346,15 +349,20 @@ fn check_shape(conn: &Connection, path: &Path) -> Result<()> {
             |r| r.get(0),
         )
         .map_err(damaged)?;
-    let mut keys = conn
-        .prepare(
-            "SELECT (SELECT group_concat(name, ',') FROM (SELECT name FROM pragma_index_info(l.name) ORDER BY seqno))
-               FROM pragma_index_list('forgotten_turns') l WHERE l.\"unique\" = 1",
-        )
-        .map_err(damaged)?;
-    let keys: Vec<Option<String>> =
-        keys.query_map([], |r| r.get(0)).map_err(damaged)?.collect::<rusqlite::Result<_>>().map_err(damaged)?;
-    if columns == 2 && keys.iter().any(|k| k.as_deref() == Some(MARK_KEY)) {
+    let mut want: Vec<&str> = MARK_KEY.to_vec();
+    want.sort_unstable();
+    let mut list = conn.prepare("SELECT name FROM pragma_index_list('forgotten_turns') WHERE \"unique\" = 1").map_err(damaged)?;
+    let indexes: Vec<String> =
+        list.query_map([], |r| r.get(0)).map_err(damaged)?.collect::<rusqlite::Result<_>>().map_err(damaged)?;
+    let mut info = conn.prepare("SELECT name FROM pragma_index_info(?1)").map_err(damaged)?;
+    let mut keyed = false;
+    for index in &indexes {
+        let mut names: Vec<Option<String>> =
+            info.query_map([index], |r| r.get(0)).map_err(damaged)?.collect::<rusqlite::Result<_>>().map_err(damaged)?;
+        names.sort_unstable();
+        keyed |= names.iter().map(Option::as_deref).eq(want.iter().map(|w| Some(*w)));
+    }
+    if columns == 2 && keyed {
         return Ok(());
     }
     Err(AxelError::Other(format!("the brain at {} {OLD_SHAPE}.", path.display())))
