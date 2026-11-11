@@ -1,0 +1,12 @@
+{"tombstone":"mem-gone","timestamp_ms":1700000000500}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000000,"content":"first text of one","tags":["a","b"],"id":"mem-one","project":"p1111111111111111","provenance":{"source":"model","session":"s-1"},"sensitivity":"normal","retention":"standard"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000100,"content":"two is sensitive","tags":[],"id":"mem-two","project":"p1111111111111111","sensitivity":"sensitive"}
+
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000200,"content":"three expires","tags":null,"meta":null,"id":"mem-three","project":"p1111111111111111","provenance":{"source":"user","session":null},"retention":{"max_age_days":30}}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000300,"content":"forgotten before it was written","id":"mem-gone","project":"p1111111111111111"}
+{"namespace":"project-p2222222222222222","timestamp_ms":1700000000400,"content":"another project","id":"mem-foreign","project":"p2222222222222222"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000450,"content":"legacy line without id","project":"p1111111111111111"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000460,"content":"bad tags","tags":"one","id":"mem-badtags","project":"p1111111111111111"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000600,"content":"SECRET-BODY-SENTINEL","tags":["creds"],"id":"mem-secret","project":"p1111111111111111","sensitivity":"secret"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000700,"content":"later text of one","tags":["a"],"id":"mem-one","project":"p1111111111111111","sensitivity":"normal"}
+{"namespace":"project-p1111111111111111","timestamp_ms":1700000000800,"content":"torn appe
