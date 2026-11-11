@@ -1564,7 +1564,8 @@ fn posts_against_the_indexer(polite: bool) -> (usize, usize, Duration) {
 fn test_17_posts_are_not_starved_by_the_indexer() {
     let (created, busy, slowest) = posts_against_the_indexer(true);
     assert_eq!((created, busy), (20, 0));
-    assert!(slowest < Duration::from_millis(1_500), "a post took {slowest:?}");
+    // Ruling R-17.1: without `stand_aside` one call was seen to wait 931 ms; with it, 1.4 ms.
+    assert!(slowest < Duration::from_millis(100), "a post waited {slowest:?} for the indexer");
 }
 
 /// The other half: with the flag ignored at least one `busy` is expected. Printed, not
