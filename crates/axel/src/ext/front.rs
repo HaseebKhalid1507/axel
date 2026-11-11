@@ -13,6 +13,7 @@ use serde_json::Value;
 use crate::brain_v2::{self, Role};
 use crate::capture::CaptureState;
 use crate::embed::EmbedService;
+use crate::error::AxelError;
 use crate::ext::config::ExtConfig;
 use crate::ext::server::{self, degrade, log_line, JOB_QUEUE};
 use crate::ext::types::{
@@ -24,7 +25,7 @@ use crate::recall::View;
 use crate::vindex::{ExactIndex, VecDelta};
 use crate::{index_archives, project};
 
-/// Forget marks kept for a later try (wave 3, 12b ruling 7).
+/// Forget marks kept for a later try (wave 3, 12b ruling 7; wave 4, R-12b item 1).
 const FORGET_MARKS_KEPT: usize = 256;
 /// How long the loop waits for a call before it looks after its own state.
 const IDLE: Duration = Duration::from_millis(250);
@@ -176,14 +177,15 @@ pub fn run(mut st: FrontState, calls: Receiver<FrontCall>, replies: Sender<Front
                     }
                 };
                 if replies.send(FrontReply { seq, answer }).is_err() {
-                    return;
+                    break;
                 }
                 retry_forget_marks(&mut st);
             }
             Err(RecvTimeoutError::Timeout) => idle(&mut st),
-            Err(RecvTimeoutError::Disconnected) => return,
+            Err(RecvTimeoutError::Disconnected) => break,
         }
     }
+    last_try_forget_marks(&mut st);
 }
 
 fn is_ready(st: &FrontState) -> bool {
@@ -251,29 +253,66 @@ fn mark_forgotten(st: &mut FrontState, session_id: &str) {
         Some((started_ms, key)) => (started_ms, Some(key)),
         None => (now, None),
     };
-    if !is_ready(st) || st.conn.is_none() {
-        return;
-    }
     let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
-    if write_forget_mark(st, &mark) {
-        return;
+    // RULING: wave4 R-12b item 1. The `Carry` is gone, so nothing else holds this session:
+    // a mark that is not written now is kept, whatever kept it out (the mode is not
+    // `Ready`, there is no connection, the write lock is held).
+    let end = if is_ready(st) && st.conn.is_some() { write_forget_mark(st, &mark) } else { MarkEnd::NotNow };
+    match end {
+        MarkEnd::Written => {}
+        MarkEnd::Failed(kind) => log_line(&format!("front carry: forget mark dropped: {kind}")),
+        MarkEnd::NotNow => {
+            // RULING: wave3-c12b ruling 7. At most `FORGET_MARKS_KEPT` wait; one more gives
+            // up the oldest, so a brain that stays locked cannot grow the list without end.
+            if st.forget_marks.len() >= FORGET_MARKS_KEPT {
+                st.forget_marks.remove(0);
+                log_line("front carry: forget mark given up (too many waiting)");
+            }
+            st.forget_marks.push(mark);
+            log_line("front carry: forget mark not written, kept");
+        }
     }
-    // RULING: wave3-c12b ruling 7. The `Carry` is gone, so nothing else holds this session:
-    // the mark is kept and tried again. At most `FORGET_MARKS_KEPT` wait; one more gives up
-    // the oldest, so a brain that stays locked cannot grow the list without end.
-    if st.forget_marks.len() >= FORGET_MARKS_KEPT {
-        st.forget_marks.remove(0);
-        log_line("front carry: forget mark given up (too many waiting)");
-    }
-    st.forget_marks.push(mark);
-    log_line("front carry: forget mark not written, kept");
 }
 
-/// True when the mark is in the brain.
-fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> bool {
-    let Some(conn) = st.conn.as_ref() else { return false };
+/// What became of one try to write a mark.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkEnd {
+    /// The mark is in the brain.
+    Written,
+    /// The write lock was not free, or there is no connection: the mark is tried again.
+    NotNow,
+    /// Any other error, by its kind (never its text): the mark is dropped.
+    Failed(&'static str),
+}
+
+/// The write lock is held by somebody else.
+fn is_busy(e: &AxelError) -> bool {
+    matches!(
+        e,
+        AxelError::Db(e) if matches!(
+            e.sqlite_error_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+        )
+    )
+}
+
+fn error_kind(e: &AxelError) -> &'static str {
+    match e {
+        AxelError::BrainChanged => "BrainChanged",
+        AxelError::BrainDamaged(_) => "BrainDamaged",
+        AxelError::Db(_) => "Db",
+        _ => "Other",
+    }
+}
+
+fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> MarkEnd {
+    let Some(conn) = st.conn.as_ref() else { return MarkEnd::NotNow };
     let logical = project::logical(&mark.session_id);
-    let Ok(guard) = brain_v2::begin_write_front(conn, &st.writing) else { return false };
+    let guard = match brain_v2::begin_write_front(conn, &st.writing) {
+        Ok(guard) => guard,
+        Err(e) if is_busy(&e) => return MarkEnd::NotNow,
+        Err(e) => return MarkEnd::Failed(error_kind(&e)),
+    };
     let marked = index_archives::mark_forgotten_turn(
         conn,
         &logical,
@@ -284,21 +323,46 @@ fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> bool {
         mark.turn_key.as_deref(),
     );
     let ended = match marked {
-        Ok(_) => conn.execute_batch("COMMIT").is_ok(),
-        Err(_) => false,
+        Ok(_) => conn.execute_batch("COMMIT").map_err(AxelError::from),
+        Err(e) => Err(e),
     };
-    if !ended {
+    if ended.is_err() {
         let _ = conn.execute_batch("ROLLBACK");
     }
     drop(guard);
-    ended
+    match ended {
+        Ok(()) => MarkEnd::Written,
+        Err(e) if is_busy(&e) => MarkEnd::NotNow,
+        Err(e) => MarkEnd::Failed(error_kind(&e)),
+    }
 }
 
-/// After each call's answer has been sent, and between calls: the kept marks, oldest
-/// first, until one cannot be written. The lock is asked for without waiting, so a brain
-/// that is still locked costs this thread nothing.
+/// The kept marks, oldest first, each given to `write` once. A mark that cannot be written
+/// now stops the round and stays, with every mark behind it; a mark that failed for another
+/// reason is dropped with a log line, and the round goes on. Returns how many were written.
+/// Public for its test: `write` is `write_forget_mark` everywhere else.
+// RULING: wave4 R-12b item 1. A mark that can never be written does not keep the ones
+// behind it out.
+pub fn retry_marks(st: &mut FrontState, write: impl Fn(&FrontState, &ForgetMark) -> MarkEnd) -> usize {
+    let mut written = 0;
+    while let Some(mark) = st.forget_marks.first().cloned() {
+        match write(st, &mark) {
+            MarkEnd::NotNow => break,
+            MarkEnd::Written => written += 1,
+            MarkEnd::Failed(kind) => log_line(&format!("front carry: forget mark dropped: {kind}")),
+        }
+        st.forget_marks.remove(0);
+    }
+    if written > 0 {
+        log_line(&format!("front carry: forget marks written late: {written}"));
+    }
+    written
+}
+
+/// After each call's answer has been sent, and between calls. The lock is asked for without
+/// waiting, so a brain that is still locked costs this thread nothing.
 fn retry_forget_marks(st: &mut FrontState) {
-    if st.forget_marks.is_empty() || !is_ready(st) {
+    if st.forget_marks.is_empty() || !is_ready(st) || !connect(st) {
         return;
     }
     let Some(conn) = st.conn.as_ref() else { return };
@@ -306,16 +370,24 @@ fn retry_forget_marks(st: &mut FrontState) {
     if conn.busy_timeout(Duration::ZERO).is_err() {
         return;
     }
-    let mut written = 0;
-    while let Some(mark) = st.forget_marks.first().cloned() {
-        if !write_forget_mark(st, &mark) {
-            break;
-        }
-        st.forget_marks.remove(0);
-        written += 1;
+    retry_marks(st, write_forget_mark);
+    if let Some(conn) = st.conn.as_ref() {
+        let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
     }
-    let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
-    if written > 0 {
-        log_line(&format!("front carry: forget marks written late: {written}"));
+}
+
+/// Before the loop returns: the kept marks once more, this time waiting for the lock as any
+/// write of this thread does. What is still not written is lost with the process, and the
+/// log says how many.
+// RULING: wave4 R-12b item 1. The list lives in memory only.
+fn last_try_forget_marks(st: &mut FrontState) {
+    if st.forget_marks.is_empty() {
+        return;
+    }
+    if is_ready(st) && connect(st) {
+        retry_marks(st, write_forget_mark);
+    }
+    if !st.forget_marks.is_empty() {
+        log_line(&format!("front carry: forget marks lost at the end: {}", st.forget_marks.len()));
     }
 }

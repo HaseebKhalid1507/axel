@@ -12,10 +12,12 @@ use std::time::{Duration, Instant};
 
 use axel::brain_v2::{self, OpenOpts};
 use axel::ext::config::ExtConfig;
-use axel::ext::front;
+use axel::ext::front::{self, FrontAnswer, FrontCall, FrontReply, FrontWork, MarkEnd};
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{self, degrade, recover, serve, BUSY_TEXT};
-use axel::ext::types::{Boot, Caller, DegradedReason, Job, Mode, ServeEnd, Status, TestHooks};
+use axel::ext::types::{
+    Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, Job, Mode, ServeEnd, Status, TestHooks,
+};
 use axel::error::AxelError;
 use axel::ext::types::IndexerCtx;
 use axel::indexer;
@@ -1682,4 +1684,88 @@ fn r12_on_recovery_the_mode_is_never_degraded_with_no_reason() {
     watcher.join().unwrap();
     assert_eq!(seen_without_reason.load(Ordering::Relaxed), 0, "Degraded was visible with its reason cleared");
     assert_eq!(mode.load(Ordering::SeqCst), Mode::Ready as u8);
+}
+
+// ── Wave 4, R-12b item 1: a forget mark is kept whatever kept it out ────────
+
+fn forget_mark(session: &str) -> ForgetMark {
+    ForgetMark { session_id: session.to_string(), from_ms: 1_000, to_ms: 2_000, turn_key: None }
+}
+
+/// `front::run` on its own thread, logging to the test's folder.
+fn front_on_a_thread(st: FrontState) -> (Sender<FrontCall>, Receiver<FrontReply>, std::thread::JoinHandle<()>) {
+    let (calls, calls_rx) = mpsc::channel();
+    let (replies_tx, replies) = mpsc::channel();
+    let log = server::Log::new(&st.cfg.data_dir, 1 << 20);
+    let thread = std::thread::spawn(move || {
+        server::set_thread_log(Some(log));
+        front::run(st, calls_rx, replies_tx);
+    });
+    (calls, replies, thread)
+}
+
+#[test]
+fn w4_1_a_forget_mark_that_arrives_before_the_brain_is_open_is_written_once_it_is() {
+    let dirs = Dirs::new();
+    // No brain yet: the mode is `Starting` and the front thread has no connection.
+    let (b, _) = boot(None, TestHooks::default());
+    let (st, _jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    assert!(st.conn.is_none());
+    let mode = st.mode.clone();
+    let (calls, replies, thread) = front_on_a_thread(st);
+
+    let carry = Carry { skipped: Vec::new(), forgot: vec!["session-S".to_string()] };
+    let work = FrontWork::Tool { name: "search".to_string(), input: json!({}), caller: Caller::default() };
+    calls.send(FrontCall { seq: 1, carry, work }).unwrap();
+    let reply = replies.recv_timeout(Duration::from_secs(10)).expect("no reply");
+    assert!(matches!(reply.answer, FrontAnswer::Tool(Err(_))));
+    let log = wait_for_log(&dirs, "front carry: forget mark not written, kept");
+    assert!(!log.contains("written late"), "{log}");
+
+    // The brain appears and the process is ready: the idle turn writes the mark.
+    drop(make_brain(&dirs.brain()));
+    mode.store(Mode::Ready as u8, Ordering::SeqCst);
+    let log = wait_for_log(&dirs, "front carry: forget marks written late: 1");
+    assert!(!log.contains("session-S"), "{log}");
+    drop(calls);
+    thread.join().unwrap();
+    assert!(!read_log(&dirs).contains("lost at the end"));
+}
+
+#[test]
+fn w4_1_a_forget_mark_that_fails_is_dropped_and_does_not_block_the_ones_behind_it() {
+    let dirs = Dirs::new();
+    drop(make_brain(&dirs.brain()));
+    let (b, _) = boot(None, TestHooks::default());
+    let (mut st, _jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    let tried = std::cell::RefCell::new(Vec::new());
+    let write = |_: &FrontState, mark: &ForgetMark| {
+        tried.borrow_mut().push(mark.session_id.clone());
+        match mark.session_id.as_str() {
+            "b" => MarkEnd::Failed("Db"),
+            "d" => MarkEnd::NotNow,
+            _ => MarkEnd::Written,
+        }
+    };
+    st.forget_marks = ["a", "b", "c", "d", "e"].map(forget_mark).to_vec();
+    assert_eq!(front::retry_marks(&mut st, write), 2);
+    assert_eq!(*tried.borrow(), ["a", "b", "c", "d"], "each mark is tried once, up to the one that must wait");
+    assert_eq!(st.forget_marks, ["d", "e"].map(forget_mark).to_vec());
+}
+
+#[test]
+fn w4_1_the_kept_forget_marks_are_tried_once_more_before_the_front_thread_ends() {
+    let dirs = Dirs::new();
+    drop(make_brain(&dirs.brain()));
+    let (b, _) = boot(None, TestHooks::default());
+    let (mut st, _jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    assert_eq!(st.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    st.forget_marks = vec![forget_mark("session-S"), forget_mark("session-T")];
+    // The rpc thread is gone before the loop's first turn: no idle turn, no call.
+    let (calls, _replies, thread) = front_on_a_thread(st);
+    drop(calls);
+    thread.join().unwrap();
+    let log = read_log(&dirs);
+    assert!(log.contains("front carry: forget marks written late: 2"), "{log}");
+    assert!(!log.contains("lost at the end"), "{log}");
 }
