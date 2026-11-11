@@ -262,6 +262,65 @@ struct Later {
     cover_ms: i64,
 }
 
+/// Where a file stands in its chat's order when it is not indexed: what its row would say
+/// had it been.
+// RULING: v2 archives round 4. A file that fails (a panic, a refusal, an error that is not
+// a panic) keeps its place in its chat's order: the window of the file after it ends at
+// its seal, and a mark of the file before it stops at it, as at any neighbour that is not
+// indexed. Nothing of it is taken or shown: `edges_of` gives nothing for it.
+struct Held {
+    archive_id: String,
+    logical: String,
+    session_id: Option<String>,
+    created_ms: i64,
+    time_source: &'static str,
+    cover_ms: i64,
+    win_no: Option<i64>,
+    part_no: Option<i64>,
+}
+
+impl Held {
+    /// The place the scan knows from the record's own time.
+    fn of_later(l: &Later) -> Held {
+        Held {
+            archive_id: l.archive_id.clone(),
+            logical: l.logical.clone(),
+            session_id: None,
+            created_ms: l.cover_ms,
+            time_source: "archive",
+            cover_ms: l.cover_ms,
+            win_no: None,
+            part_no: None,
+        }
+    }
+
+    /// The place `index_archive` would give a live record read with what an event said;
+    /// none for a file whose time is from `mtime` or is no time.
+    fn of_live(a: &LiveArchive, seen: &Seen, row: Option<&Known>, at: &FileAt, now: i64) -> Option<Held> {
+        let first_seen_ms = row.map_or(now, |r| r.first_seen_ms);
+        let (created_ms, time_source, cover_ms) = times(a, seen, row, &at.path(), first_seen_ms);
+        if time_source == "mtime" || chrono::DateTime::<chrono::Utc>::from_timestamp_millis(created_ms).is_none() {
+            return None;
+        }
+        Some(Held {
+            archive_id: a.id.clone(),
+            logical: a.logical.clone(),
+            session_id: seen.session_id.or_else(|| row.and_then(|r| r.session_id.as_deref())).map(str::to_string),
+            created_ms,
+            time_source,
+            cover_ms,
+            win_no: seen.window,
+            part_no: seen.part,
+        })
+    }
+}
+
+/// The `skip_reason`s the indexer writes itself. Any other is the reader's refusal of a
+/// file (`write_refused`).
+// RULING: v2 archives round 4. `error` is new: a file whose indexing failed with an error
+// that is not a panic.
+const OWN_REASONS: [&str; 5] = ["paused", "forgotten_elsewhere", "panic", "error", "created_ms is not a time"];
+
 /// The `archive_index` row of one file, as far as this file reads it.
 struct Known {
     archive_id: String,
@@ -506,7 +565,9 @@ fn times(a: &LiveArchive, seen: &Seen, row: Option<&Known>, path: &Path, first_s
     }
     if let Some(r) = row {
         match (r.created_ms, r.time_source.as_deref(), r.cover_ms) {
-            (Some(ms), Some("observed"), Some(cover)) => return (ms, "observed", cover),
+            // RULING: v2 archives round 4. The cover time, which an `observed` row writes
+            // as its `created_ms` too: a refused file's row holds the file's time there.
+            (Some(_), Some("observed"), Some(cover)) => return (cover, "observed", cover),
             (Some(ms), Some("mtime"), Some(cover)) => return (ms, "mtime", cover),
             _ => {}
         }
@@ -1013,9 +1074,11 @@ fn settle(
 /// The `skipped` row of a file that can be read and is refused, with the reader's reason.
 // RULING: wave4 R-13 item 2. Such a file is read again when its size or its time changes.
 // `archive_index` has no column for a file's time and the schema is not this commit's, so
-// the row holds it the way the row of a record that gives no time does: `created_ms` is
-// the `lstat` modification time, `time_source` is `mtime`, and `cover_ms` is null (which
-// is what tells this row from the row of an archive timed by `mtime`).
+// the row holds the `lstat` modification time in `created_ms`; its reason, one that is not
+// in `OWN_REASONS`, is what tells it from another `skipped` row (`read_again`).
+// RULING: v2 archives round 4. A row that has a place in its chat's order (a file indexed
+// before and refused now) keeps it: its `time_source` and `cover_ms` stay. A row with none
+// says `mtime`, with a null `cover_ms`, as before.
 fn write_refused(
     conn: &Connection,
     at: &FileAt,
@@ -1025,17 +1088,22 @@ fn write_refused(
 ) -> Result<()> {
     let archive_id = at.name_id.or(row.map(|r| r.archive_id.as_str())).unwrap_or("");
     let file_ms = mtime_ms(&at.path());
+    let placed = row.is_some_and(|r| {
+        r.cover_ms.is_some() && matches!(r.time_source.as_deref(), Some("archive" | "observed"))
+    });
     let skipped = RowOut {
         skip_reason: Some(&reason.0),
         created_ms: file_ms,
-        time_source: file_ms.map(|_| "mtime"),
+        time_source: if placed { None } else { file_ms.map(|_| "mtime") },
         ..RowOut::new(archive_id, "skipped", first_seen_ms)
     };
     upsert_row(conn, at, &skipped)?;
-    conn.execute(
-        "UPDATE archive_index SET cover_ms = NULL WHERE scope_dir = ?1 AND rel_name = ?2",
-        params![at.scope_dir, at.rel_name],
-    )?;
+    if !placed {
+        conn.execute(
+            "UPDATE archive_index SET cover_ms = NULL WHERE scope_dir = ?1 AND rel_name = ?2",
+            params![at.scope_dir, at.rel_name],
+        )?;
+    }
     Ok(())
 }
 
@@ -1138,15 +1206,13 @@ pub fn on_job(ctx: &mut IndexerCtx, job: &Job) -> Result<()> {
         later: &[],
     };
 
-    match known(conn, &scope_dir, &entry.rel_name)? {
-        None => {
-            let got = at.read(Some(archive_id));
-            // A slot file's id is inside it: one that is not this archive is the scan's.
-            if entry.id_from_name.is_none() && got.is_err() {
-                return Ok(());
-            }
-            settle(ctx, &at, None, got, &seen)
-        }
+    let row = known(conn, &scope_dir, &entry.rel_name)?;
+    // RULING: v2 archives round 4. A file whose indexing failed with an error is read again
+    // as a file with no row is.
+    let failed = row.as_ref().is_some_and(|r| r.state == "skipped" && r.skip_reason.as_deref() == Some("error"));
+    match row {
+        None => event_file(ctx, &at, None, &seen, archive_id),
+        Some(row) if failed => event_file(ctx, &at, Some(&row), &seen, archive_id),
         // The scan got there first: the job writes what the event said, and reads the file
         // again only where the event changes how it is read: the event says `Whole`, the
         // record has no `carried`, and the first `source_index` is above 0. Ids are
@@ -1178,6 +1244,43 @@ pub fn on_job(ctx: &mut IndexerCtx, job: &Job) -> Result<()> {
         // Indexed with what an event said, skipped, or forgotten: the same event twice
         // indexes once, and what a skipped file becomes is the scan's to decide.
         Some(_) => Ok(()),
+    }
+}
+
+/// A file an event names that is not indexed yet: read and settled.
+// RULING: v2 archives round 4. When indexing it fails (a panic, an error that is not a
+// panic), its `skipped` row keeps its place: the chat and the time `index_archive` would
+// have given it, from the record's head and what the event said (the session id, the
+// arrival time for a record with no time of its own). A file the reader refuses has no
+// head to read, and no place.
+fn event_file(ctx: &IndexerCtx, at: &FileAt, row: Option<&Known>, seen: &Seen, archive_id: &str) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    let got = at.read(Some(archive_id));
+    // A slot file's id is inside it: one that is not this archive is the scan's.
+    if at.name_id.is_none() && got.is_err() {
+        return Ok(());
+    }
+    let held = match &got {
+        Ok(ArchiveFile::Live(a)) => Held::of_live(a, seen, row, at, (ctx.clock)()),
+        _ => None,
+    };
+    let out = catch_unwind(AssertUnwindSafe(|| settle(ctx, at, row, got, seen)));
+    if !matches!(out, Ok(Ok(()))) && !conn.is_autocommit() {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    match out {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => {
+            if !brain_v2::degrade_on(&e, &ctx.status, &ctx.mode) {
+                let _ = write_failed(conn, at, "error", || held);
+            }
+            Err(e)
+        }
+        // `guarded` counts the panic.
+        Err(payload) => {
+            let _ = write_failed(conn, at, "panic", || held);
+            std::panic::resume_unwind(payload)
+        }
     }
 }
 
@@ -1505,23 +1608,34 @@ fn between_files(ctx: &mut IndexerCtx) -> Result<bool> {
 }
 
 /// One file, inside `catch_unwind`. A panic marks the file `skipped`, `panic`; an `Err` is
-/// rolled back and counted; either way the scan goes on, unless the error says the brain
-/// is damaged or was changed, and then the scan returns it at once.
+/// rolled back, marks it `skipped`, `error`, and is counted; either way the scan goes on,
+/// unless the error says the brain is damaged or was changed, and then the scan returns it
+/// at once.
 fn one_file(ctx: &mut IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry, later: &[Later]) -> Result<()> {
     let got = catch_unwind(AssertUnwindSafe(|| scan_file(ctx, dir, scope_dir, entry, later)));
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
     if !matches!(got, Ok(Ok(()))) && !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
     }
+    // RULING: v2 archives round 4. The failed file keeps its place: the record's own time
+    // and chat, read from its head once more as the sorted pass reads them (`seal_time`),
+    // so that a file that is the one new file of its scan has it too.
+    let at = FileAt::of(dir, scope_dir, entry);
+    let held = || seal_time(dir, scope_dir, entry).2.as_ref().map(Held::of_later);
     let failed = match got {
         Ok(Ok(())) => return Ok(()),
-        Ok(Err(e)) => Err(e),
+        Ok(Err(e)) => {
+            if !brain_v2::degrade_on(&e, &ctx.status, &ctx.mode) {
+                let _ = write_failed(conn, &at, "error", held);
+            }
+            Err(e)
+        }
         Err(_) => {
             ctx.status.panics.fetch_add(1, Ordering::Relaxed);
             // SPEC: 2273 says the scan "logs the location": the file, by its directory and
             // name. The panic's own message and source line go to stderr.
             log_line(&format!("archive scan: panic in {scope_dir}/{}", entry.rel_name));
-            mark_panic(conn, dir, scope_dir, entry)
+            write_failed(conn, &at, "panic", held)
         }
     };
     match failed {
@@ -1536,22 +1650,42 @@ fn one_file(ctx: &mut IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEn
     }
 }
 
-/// `skipped`, `panic`, with the binary's `INDEXER_VERSION`: its own small transaction.
+/// `skipped` with `reason` (`panic` or `error`) and the binary's `INDEXER_VERSION`, in its
+/// own small transaction, with the file's place when it is known. A row that is not
+/// `skipped` is left as it is.
 // SPEC: 2272-2274 do not say what becomes of a file that is `indexed` and panics when it
 // is read again. Its row is left as it is (its rows are still what the index holds) and
 // the next scan tries it again.
-fn mark_panic(conn: &Connection, dir: &Path, scope_dir: &str, entry: &ArchiveEntry) -> Result<()> {
-    let row = known(conn, scope_dir, &entry.rel_name)?;
+// RULING: v2 archives round 4. An error that is not a panic writes a row too, `error`, and
+// it is tried again at every scan (`read_again`); the place is what keeps the file after it
+// from taking its window. A place the row has already stays when none is known now.
+fn write_failed(conn: &Connection, at: &FileAt, reason: &str, held: impl FnOnce() -> Option<Held>) -> Result<()> {
+    let row = known(conn, at.scope_dir, at.rel_name)?;
     if row.as_ref().is_some_and(|r| r.state != "skipped") {
         return Ok(());
     }
-    let at = FileAt::of(dir, scope_dir, entry);
+    let held = held();
+    let held = held.as_ref();
     let now = chrono::Utc::now().timestamp_millis();
     let first_seen_ms = row.as_ref().map_or(now, |r| r.first_seen_ms);
-    let archive_id = at.name_id.or(row.as_ref().map(|r| r.archive_id.as_str())).unwrap_or("");
+    let archive_id = at
+        .name_id
+        .or(held.map(|h| h.archive_id.as_str()))
+        .or(row.as_ref().map(|r| r.archive_id.as_str()))
+        .unwrap_or("");
     in_write(conn, || {
-        let skipped = RowOut { skip_reason: Some("panic"), ..RowOut::new(archive_id, "skipped", first_seen_ms) };
-        upsert_row(conn, &at, &skipped)
+        let skipped = RowOut {
+            skip_reason: Some(reason),
+            logical: held.map(|h| h.logical.as_str()),
+            session_id: held.and_then(|h| h.session_id.as_deref()),
+            created_ms: held.map(|h| h.created_ms),
+            time_source: held.map(|h| h.time_source),
+            cover_ms: held.map(|h| h.cover_ms),
+            win_no: held.and_then(|h| h.win_no),
+            part_no: held.and_then(|h| h.part_no),
+            ..RowOut::new(archive_id, "skipped", first_seen_ms)
+        };
+        upsert_row(conn, at, &skipped)
     })
 }
 
@@ -1614,14 +1748,17 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
 }
 
 /// Is a `skipped` file read again: its size changed, it is a refused file (see
-/// `write_refused`) whose time is another now, or it panicked under an older indexer.
+/// `write_refused`) whose time is another now, its indexing failed with an error, or it
+/// panicked under an older indexer.
+// RULING: v2 archives round 4. A refused file is known by its reason, not by a null
+// `cover_ms`: it keeps its place and is still read again when its time changes. A file
+// whose indexing failed with an error is tried again at every scan, as a file with no row.
 fn read_again(row: &Known, at: &FileAt) -> bool {
+    let reason = row.skip_reason.as_deref();
     let changed = row.file_size != Some(at.size);
-    let touched = row.time_source.as_deref() == Some("mtime")
-        && row.cover_ms.is_none()
-        && row.created_ms.is_some()
-        && mtime_ms(&at.path()) != row.created_ms;
-    changed || touched || (row.skip_reason.as_deref() == Some("panic") && INDEXER_VERSION > row.indexer_version)
+    let refused = reason.is_some_and(|r| !OWN_REASONS.contains(&r));
+    let touched = refused && row.created_ms.is_some() && mtime_ms(&at.path()) != row.created_ms;
+    changed || touched || reason == Some("error") || (reason == Some("panic") && INDEXER_VERSION > row.indexer_version)
 }
 
 /// Known `indexed` files that are gone. One whose archive is live in another project

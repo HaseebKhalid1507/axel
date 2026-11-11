@@ -575,7 +575,8 @@ fn t07_t34e_an_error_rolls_the_archive_back_and_the_next_scan_completes_it() {
     assert!(conn.is_autocommit(), "the failed transaction is still open");
     assert!(rows(conn, &dir, &torn).is_empty(), "half an archive was committed");
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 1, "only the next archive's row");
-    assert_eq!(state(conn, &dir, &rel(&torn.id)), None);
+    // RULING: v2 archives round 4. An error writes a `skipped` row with the file's place.
+    assert_eq!(state(conn, &dir, &rel(&torn.id)), Some(("skipped".to_string(), Some("error".to_string()))));
     assert_eq!(positions(conn, &dir, &next), ["x0.0"], "the scan stopped at the error");
     assert_eq!(state_of(conn, &dir, &next), "indexed");
     assert_eq!(run.errors(), 1);
@@ -2974,26 +2975,247 @@ fn a_record_whose_created_ms_is_no_time_stands_as_no_files_neighbour() {
     assert_eq!(run.errors(), 0);
 }
 
+// ── Round 4: a file that fails keeps its place among its chat's files ────────
+
+/// Makes the indexing of archive `a` fail with an error that is not a panic: its row is
+/// refused when it would say `indexed`.
+fn refuse_indexed_row(conn: &Connection, a: &Arch) {
+    conn.execute_batch(&format!(
+        "CREATE TRIGGER test_refuse_row BEFORE INSERT ON archive_index
+          WHEN NEW.archive_id = '{}' AND NEW.state = 'indexed'
+          BEGIN SELECT RAISE(ABORT, 'test: this archive is refused'); END;",
+        a.id
+    ))
+    .unwrap();
+}
+
+/// A run in which the indexing of `a` fails: with a panic, or with an error.
+fn failing(env: &Env, a: &Arch, kind: &str) -> Run {
+    let hooks = match kind {
+        "panic" => TestHooks { panic_archive_id: Some(a.id.clone()), ..TestHooks::default() },
+        _ => TestHooks::default(),
+    };
+    let run = env.run_with(hooks, None);
+    if kind == "error" {
+        refuse_indexed_row(run.db(), a);
+    }
+    run
+}
+
+/// After `failing`: a run in which `a` indexes. A `panic` row is read again only by a
+/// binary with a higher `INDEXER_VERSION`; this one says the row is older.
+fn mended(env: &Env, run: Run, a: &Arch, kind: &str) -> Run {
+    if kind == "panic" {
+        tx(run.db(), || {
+            run.db()
+                .execute(
+                    "UPDATE archive_index SET indexer_version = ?1 WHERE archive_id = ?2",
+                    params![index_archives::INDEXER_VERSION - 1, a.id],
+                )
+                .unwrap()
+        });
+        drop(run);
+        env.run()
+    } else {
+        run.db().execute_batch("DROP TRIGGER test_refuse_row").unwrap();
+        run
+    }
+}
+
+/// `(skip_reason, logical, session_id, cover_ms, time_source)` of a file's row.
+type Spot = (Option<String>, Option<String>, Option<String>, Option<i64>, Option<String>);
+
+fn spot(conn: &Connection, scope: &str, a: &Arch) -> Spot {
+    conn.query_row(
+        "SELECT skip_reason, logical, session_id, cover_ms, time_source FROM archive_index
+          WHERE scope_dir = ?1 AND rel_name = ?2",
+        params![scope, rel(&a.id)],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+    )
+    .unwrap()
+}
+
+/// Guards what the owner would lose: B's mark took D's turn with the same prompt, across
+/// C that failed, and C indexed later repaired nothing.
 #[test]
-fn a_file_that_panics_in_the_sorted_pass_is_no_later_file_for_the_files_after_it() {
-    // C panics. D, after it, is judged with C absent, as the brain will hold it: B's mark
-    // reaches D's same-key turn, which is left out and counted. (B, before C, was judged
-    // with C between; its own step 3b did not reach D, and D took the mark itself.)
+fn a_file_that_fails_in_the_sorted_pass_stops_the_mark_before_it_and_indexed_later_gives_seal_order() {
+    let dir = scope(KEY);
+    let expect = sealed_in_order();
+    for kind in ["panic", "error"] {
+        let env = Env::new();
+        let files = four_windows();
+        let c = &files[2];
+        let mut run = failing(&env, c, kind);
+        for a in &files {
+            env.put_live(&dir, a);
+        }
+        run.scan();
+        let conn = run.db();
+        assert_eq!(state_of(conn, &dir, c), "skipped");
+        assert_eq!(
+            spot(conn, &dir, c),
+            (Some(kind.to_string()), Some(c.logical.clone()), None, c.created_ms, Some("archive".to_string())),
+            "{kind}: the file that failed has no place"
+        );
+        assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
+        assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+        assert_eq!(positions(conn, &dir, &files[3]), ["x0.0"], "{kind}: B's mark took D's turn past the file that failed");
+        assert_eq!(forget_units(conn, &dir, &files[3]), 0);
+        assert_eq!((run.panics(), run.errors()), if kind == "panic" { (1, 0) } else { (0, 1) });
+
+        let mut run = mended(&env, run, c, kind);
+        run.scan();
+        assert_eq!(state_of(run.db(), &dir, c), "indexed", "{kind}: the file that failed was not read again");
+        assert_eq!(shape(run.db(), &dir, &files), expect, "{kind}: indexed later, not as in seal order");
+    }
+}
+
+/// Three windows of one chat, each with one exchange, and a capture inside the window of
+/// each of the last two.
+fn bounded_chat(session: &str) -> Vec<Arch> {
+    (1..=3u32)
+        .map(|n| Arch::new(n, session).at(T0 + i64::from(n) * W).about(&format!("matter {n} of {session}")))
+        .collect()
+}
+
+fn capture_ids(conn: &Connection) -> Vec<String> {
+    let mut stmt = conn.prepare("SELECT mem_id FROM memory_ext WHERE origin_kind = 'capture' ORDER BY mem_id").unwrap();
+    let got = stmt.query_map([], |r| r.get(0)).unwrap();
+    got.collect::<rusqlite::Result<_>>().unwrap()
+}
+
+/// Guards what the owner would lose: turns of the window of a file that failed, which are
+/// only in that file, deleted as stand-ins by the file after it.
+#[test]
+fn a_file_that_fails_alone_in_its_scan_bounds_the_window_of_the_file_after_it() {
+    for kind in ["panic", "error"] {
+        let env = Env::new();
+        let dir = scope(KEY);
+        let files = bounded_chat("s-bound");
+        let (b, c, d) = (&files[0], &files[1], &files[2]);
+        let mut run = failing(&env, c, kind);
+        capture(&run, "mem_cap_in_c", &dir, "s-bound", T0 + 2 * W - 100_000, None);
+        capture(&run, "mem_cap_in_d", &dir, "s-bound", T0 + 3 * W - 100_000, None);
+        // One new file per scan: no sorted pass knows C's place.
+        for a in [b, c] {
+            env.put_live(&dir, a);
+            run.scan();
+        }
+        assert_eq!(spot(run.db(), &dir, c).3, c.created_ms, "{kind}: the file that failed has no place");
+        env.put_live(&dir, d);
+        run.scan();
+        assert_eq!(positions(run.db(), &dir, d), ["x0.0"]);
+        assert_eq!(capture_ids(run.db()), ["mem_cap_in_c"], "{kind}: D took the window of the file that failed");
+
+        let mut run = mended(&env, run, c, kind);
+        run.scan();
+        assert_eq!(positions(run.db(), &dir, c), ["x0.0"]);
+        assert!(capture_ids(run.db()).is_empty(), "{kind}: C indexed later left its stand-in");
+    }
+}
+
+#[test]
+fn a_file_that_fails_on_the_live_path_keeps_the_place_the_event_gives_it() {
+    for kind in ["panic", "error"] {
+        let env = Env::new();
+        let dir = scope(KEY);
+        let files = bounded_chat("s-livebound");
+        let (b, c, d) = (&files[0], &files[1], &files[2]);
+        let mut run = failing(&env, c, kind);
+        capture(&run, "mem_cap_in_c", &dir, "s-livebound", T0 + 2 * W - 100_000, None);
+        for a in [b, c, d] {
+            let path = env.put_live(&dir, a);
+            run.job(archived(a, KEY, Some(&path), Some("s-livebound"), None, None));
+        }
+        let conn = run.db();
+        assert_eq!(
+            spot(conn, &dir, c),
+            (
+                Some(kind.to_string()),
+                Some(c.logical.clone()),
+                Some("s-livebound".to_string()),
+                c.created_ms,
+                Some("archive".to_string())
+            ),
+            "{kind}: the file that failed on the live path has no place"
+        );
+        assert_eq!(positions(conn, &dir, d), ["x0.0"]);
+        assert_eq!(capture_ids(conn), ["mem_cap_in_c"], "{kind}: D took the window of the file that failed");
+        assert_eq!((run.panics(), run.errors()), if kind == "panic" { (1, 0) } else { (0, 1) });
+        if kind == "error" {
+            // The same event again: a file whose indexing failed with an error is read
+            // again, as one with no row.
+            run.db().execute_batch("DROP TRIGGER test_refuse_row").unwrap();
+            run.job(archived(c, KEY, Some(&env.archives().join(&dir).join(rel(&c.id))), Some("s-livebound"), None, None));
+            assert_eq!(positions(run.db(), &dir, c), ["x0.0"], "the event did not read the file again");
+            assert!(capture_ids(run.db()).is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_refused_file_timed_by_its_event_is_read_again_with_the_events_time() {
     let env = Env::new();
     let dir = scope(KEY);
-    let files = four_windows();
-    let mut run = env.run_with(TestHooks { panic_archive_id: Some(files[2].id.clone()), ..TestHooks::default() }, None);
+    let mut run = env.run();
+    let mut c = Arch::new(1, "s-refobserved").about("upload queue");
+    c.created_ms = None;
+    let path = env.put_live(&dir, &c);
+    run.job(archived(&c, KEY, Some(&path), Some("s-refobserved"), None, None));
+    let at = |run: &Run| count(run.db(), "SELECT MAX(created_ms) FROM memory_ext WHERE origin_kind = 'archive'");
+    assert_eq!(at(&run), NOW - 1_000);
+    std::fs::write(&path, "x".repeat(c.json(&dir).len() + 40)).unwrap();
+    set_mtime(&path, T0);
+    run.scan();
+    assert_eq!(spot(run.db(), &dir, &c).3, Some(NOW - 1_000), "a refused file gave up its place");
+    let c = c.about("retry limit");
+    env.put_live(&dir, &c);
+    run.scan();
+    assert_eq!(positions(run.db(), &dir, &c), ["x0.0", "x2.0"]);
+    assert_eq!(at(&run), NOW - 1_000, "the rows of a file read again took the file's time");
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_refused_file_keeps_its_place_and_is_read_again_when_its_size_or_its_time_changes() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let files = bounded_chat("s-refplace");
+    let c = &files[1];
     for a in &files {
         env.put_live(&dir, a);
     }
     run.scan();
-    let conn = run.db();
-    assert_eq!(state(conn, &dir, &rel(&files[2].id)).and_then(|s| s.1).as_deref(), Some("panic"));
-    assert_eq!(run.panics(), 1);
-    assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
-    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
-    assert!(rows(conn, &dir, &files[3]).is_empty(), "D was judged with the file that panicked between");
-    assert_eq!(forget_units(conn, &dir, &files[3]), 1);
+    let live = c.json(&dir);
+    // C is refused now: it loses its rows and keeps its place.
+    let path = env.put(&dir, SHELF, &c.id, &"x".repeat(live.len() + 40));
+    run.scan();
+    let placed = |run: &Run| {
+        let s = spot(run.db(), &dir, c);
+        (s.1, s.3, s.4)
+    };
+    let place = (Some(c.logical.clone()), c.created_ms, Some("archive".to_string()));
+    assert_eq!(spot(run.db(), &dir, c).0.as_deref(), Some("not valid JSON"));
+    assert_eq!(placed(&run), place, "a refused file gave up its place");
+    // Another size: read again, and refused for another reason.
+    std::fs::write(&path, r#"{"version": 2}"#).unwrap();
+    run.scan();
+    assert_eq!(spot(run.db(), &dir, c).0.as_deref(), Some("version 2 is not 1"), "another size, and it was not read again");
+    assert_eq!(placed(&run), place);
+    // The same size, another time: read again.
+    let seen_ms = count(run.db(), &format!("SELECT created_ms FROM archive_index WHERE rel_name = '{}'", rel(&c.id)));
+    std::fs::write(&path, r#"{"version": 3}"#).unwrap();
+    set_mtime(&path, seen_ms);
+    run.scan();
+    assert_eq!(spot(run.db(), &dir, c).0.as_deref(), Some("version 2 is not 1"), "the same size and time, and it was read");
+    set_mtime(&path, seen_ms + 7_000);
+    run.scan();
+    assert_eq!(spot(run.db(), &dir, c).0.as_deref(), Some("version 3 is not 1"), "another time, and it was not read again");
+    assert_eq!(placed(&run), place);
+    env.put_live(&dir, c);
+    run.scan();
+    assert_eq!(positions(run.db(), &dir, c), ["x0.0"]);
     assert_eq!(run.errors(), 0);
 }
 
