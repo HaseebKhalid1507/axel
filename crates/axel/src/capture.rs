@@ -298,6 +298,9 @@ pub fn turn_id(session_id: &str, started_ms: i64, prompt: &str) -> String {
 
 /// One transaction of this file: `begin_write`, the work, `COMMIT`. After any error the
 /// transaction is rolled back and never committed.
+// RULING: wave4 R-16 item 5. `begin_write`, not `begin_write_front`: `write_turn` runs on the
+// indexer thread. The rule that a write goes through `begin_write_front` is the front
+// thread's, and nothing in this file writes from there.
 fn in_transaction<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
     // An error here leaves nothing of ours open: `begin_write` rolls its own `BEGIN` back,
     // and a transaction that was open before the call is the caller's.

@@ -867,6 +867,10 @@ fn t08_after_the_server_has_started_the_process_is_offline() {
 
 // ── 9. A pause hides ────────────────────────────────────────────────────────
 
+// NOTE (wave4 R-16 item 5): the spec's test 9 says the chat's rows are "in no search". Here
+// that is read from `hidden_ms`, because the search tool is commit 18a's. When 18a is
+// merged this test is to ask the search itself, before the pause, during it and after
+// the resume.
 #[test]
 fn t09_a_pause_hides_the_chats_captures_and_resume_brings_them_back() {
     let lab = Lab::new();
