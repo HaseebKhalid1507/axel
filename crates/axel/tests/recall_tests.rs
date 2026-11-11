@@ -1927,3 +1927,57 @@ fn review_6_the_hook_takes_the_host_harness_note_for_a_host_message() {
     assert!(matches!(h.before("s1", words), HookOut::Inject(_)));
     assert_eq!(h.trace().outcome, "injected");
 }
+
+/// Item 8 (review of the archives round, finding 1): a forget with no pending turn writes a
+/// keyless `call` mark at once; the log job of the turn before it arrives after the mark and
+/// writes nothing. A late job of an earlier turn, with a newer row of its chat after it, is
+/// written; so is a row after the mark, and another chat's.
+#[test]
+fn review_8_a_log_job_that_arrives_after_a_keyless_forget_mark_writes_nothing() {
+    let dir = TempDir::new().unwrap();
+    let ext = ext_cfg(&dir, json!({}));
+    let brain = open_brain(&ext);
+    let (boot_indexer, _) = boot(None);
+    let (mut ctx, _jobs, _vecs) = indexer_start::open_ctx(ext, boot_indexer);
+    let conn = &brain.conn;
+    let mark = |session: &str, from_ms: i64| {
+        tx(conn, || {
+            conn.execute(
+                "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, added_ms)
+                 VALUES (?1, ?2, 'call', '', ?3, ?3, ?3)",
+                params![project::logical(session), session, from_ms],
+            )
+            .unwrap()
+        });
+    };
+    let trace = |session: &str, said: &str, ts_ms: i64| RecallTrace {
+        ts_ms,
+        session_id: Some(session.to_string()),
+        logical: Some(project::logical(session)),
+        query_preview: Some(said.to_string()),
+        query_hash: recall::query_hash(said),
+        outcome: "nothing_relevant".to_string(),
+        ..RecallTrace::default()
+    };
+    let rows = |session: &str| -> Vec<i64> {
+        let mut stmt = conn.prepare("SELECT ts_ms FROM recall_log WHERE session_id = ?1 ORDER BY ts_ms").unwrap();
+        stmt.query_map([session], |r| r.get(0)).unwrap().map(Result::unwrap).collect()
+    };
+
+    // The mark first (the call, at NOW + 100), then the log job of the turn's prompt (NOW).
+    mark("s-late", NOW + 100);
+    recall::write_log(&mut ctx, &trace("s-late", "forget what I said about the jetty survey", NOW)).unwrap();
+    assert_eq!(rows("s-late"), Vec::<i64>::new(), "the turn's row was written after its mark");
+    // Another chat at the same time, and this chat after the mark: written.
+    recall::write_log(&mut ctx, &trace("s-else", "forget what I said about the jetty survey", NOW)).unwrap();
+    recall::write_log(&mut ctx, &trace("s-late", "what does the jetty survey say now", NOW + 200)).unwrap();
+    assert_eq!(rows("s-else"), [NOW]);
+    assert_eq!(rows("s-late"), [NOW + 200]);
+
+    // An earlier turn whose chat already has a newer row before the mark: its row is written.
+    recall::write_log(&mut ctx, &trace("s-old", "forget the second question", NOW + 50)).unwrap();
+    mark("s-old", NOW + 100);
+    recall::write_log(&mut ctx, &trace("s-old", "what did the jetty survey find", NOW + 10)).unwrap();
+    assert_eq!(rows("s-old"), [NOW + 10, NOW + 50]);
+    assert!(ctx.conn.as_ref().unwrap().is_autocommit());
+}

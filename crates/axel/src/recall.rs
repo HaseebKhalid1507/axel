@@ -1613,6 +1613,12 @@ pub fn detail_json(trace: &RecallTrace) -> String {
 }
 
 /// Inside the caller's transaction. False: the row falls inside a forget call and is dropped.
+// RULING: v2 capture/recall review, item 8 (review of the archives round, finding 1). A
+// forget with no pending turn writes a keyless `call` mark from the front thread at once;
+// the log job of the turn's prompt comes later, from the indexer's queue, after the mark
+// has deleted what was there. Such a row is refused too: a keyless mark of the chat starts
+// at or after it, and no newer row of the chat lies between it and the mark's start (that
+// row would be of the turn the mark is about).
 fn insert_log_row(conn: &Connection, trace: &RecallTrace) -> Result<bool> {
     // A turn in which a forget tool was called leaves no trace: a log job that arrives
     // after the call's mark is not written at all (section 4, "the live call").
@@ -1620,7 +1626,14 @@ fn insert_log_row(conn: &Connection, trace: &RecallTrace) -> Result<bool> {
         let inside: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM forgotten_turns
                             WHERE source = 'call' AND (logical = ?1 OR session_id = ?2)
-                              AND from_ms <= ?3 AND to_ms >= ?3)",
+                              AND from_ms <= ?3 AND to_ms >= ?3)
+                 OR EXISTS(SELECT 1 FROM forgotten_turns f
+                            WHERE f.source = 'call' AND f.turn_key = ''
+                              AND (f.logical = ?1 OR f.session_id = ?2)
+                              AND f.from_ms >= ?3
+                              AND NOT EXISTS(SELECT 1 FROM recall_log r
+                                              WHERE (r.logical = ?1 OR r.session_id = ?2)
+                                                AND r.ts_ms > ?3 AND r.ts_ms <= f.from_ms))",
             params![trace.logical, trace.session_id, trace.ts_ms],
             |r| r.get(0),
         )?;
