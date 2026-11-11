@@ -26,9 +26,9 @@ use axel::embed::EmbedService;
 use axel::ext::config::{EmbedderKind, ExtConfig, ForumMode};
 use axel::ext::types::{
     BrainArg, Caller, DegradedReason, FrontState, HookEvent, HookOut, IndexerCtx, Job, Mode,
-    Status, TestHooks, ToolError,
+    Status, TestHooks,
 };
-use axel::ext::{front, hooks, tools, tools_core};
+use axel::ext::{front, hooks, tools};
 use axel::recall::{self, RecallTrace};
 use axel::vindex::{ExactIndex, VecDelta, VecKey, VecScope};
 use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project};
@@ -248,19 +248,6 @@ fn the_hook_dispatch_answers_continue_for_every_kind() {
 }
 
 #[test]
-fn the_tool_dispatch_declares_nothing_and_knows_no_name() {
-    assert!(tools::declarations(false).is_empty());
-    assert!(tools_core::tools().is_empty());
-
-    let (mut st, _jobs_rx) = front_state(TestHooks::default());
-    let caller = Caller::default();
-    for name in ["search", "remember", "recall", "forget", "forum_post", "forum_read", "forum_forget"] {
-        let got = tools::call(&mut st, name, &json!({}), &caller);
-        assert!(matches!(got, Err(ToolError::Invalid(_))), "{name}: {got:?}");
-    }
-}
-
-#[test]
 fn the_tool_dispatch_panics_on_the_test_switch() {
     let (mut st, _jobs_rx) =
         front_state(TestHooks { panic_tool: Some("search".to_string()), ..TestHooks::default() });
@@ -269,10 +256,6 @@ fn the_tool_dispatch_panics_on_the_test_switch() {
         tools::call(&mut st, "search", &json!({}), &caller)
     }));
     assert!(got.is_err());
-    assert!(matches!(
-        tools::call(&mut st, "recall", &json!({}), &caller),
-        Err(ToolError::Invalid(_))
-    ));
 }
 
 #[test]
