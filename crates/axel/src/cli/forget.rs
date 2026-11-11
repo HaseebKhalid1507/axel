@@ -51,7 +51,14 @@ pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
         env: std::env::var_os("SYNAPS_BASE_DIR").filter(|v| !v.is_empty()).map(PathBuf::from),
         home: dirs::home_dir().map(|home| home.join(".synaps-cli")),
     };
-    show::on_std(|term| run_with(args, &brain.path, &bases, term))
+    // As `show::on_std`, except that a stdout that cannot be flushed at the end (a closed
+    // pipe) does not turn a purge that is done into an error (v2 c18b review, item 5).
+    let (stdout, stderr, stdin) = (std::io::stdout(), std::io::stderr(), std::io::stdin());
+    let (mut out, mut err, mut input) = (stdout.lock(), stderr.lock(), stdin.lock());
+    let mut term = Term { out: &mut out, err: &mut err, input: &mut input };
+    let code = run_with(args, &brain.path, &bases, &mut term)?;
+    let _ = term.out.flush();
+    Ok(ExitCode::from(code))
 }
 
 pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Result<u8> {
@@ -310,19 +317,38 @@ fn forget_now(
 
     // 4. One transaction: the purge, the forget marks, the purge mark.
     let purged = write(conn, || purge(conn, &ripe, &twins))?;
-    if purged.shadows > 0 {
+    // RULING: v2 c18b review, item 5. The rows are gone once that COMMIT holds: nothing
+    // after it can turn the result into an error (a retry would only find "not found").
+    // The "Deleted" line comes first; every later write, the cache file and the checkpoint
+    // can fail without changing the answer, which is exit 0.
+    let _ = after_purge(conn, path, &purged, term);
+    Ok(OK)
+}
+
+/// What is said and done after the purge's COMMIT. Its error is ignored by the caller.
+fn after_purge(conn: &Connection, path: &Path, purged: &Purged, term: &mut Term) -> Result<()> {
+    writeln!(term.out, "Deleted {} memories for good.", purged.deleted)?;
+    let _ = term.out.flush();
+    let hnsw_failed = if purged.shadows > 0 {
         // The old search's vector cache is keyed by `documents` rows; the next `search`
         // builds it again.
         let hnsw = path.with_extension("r8.hnsw");
-        if let Err(e) = std::fs::remove_file(&hnsw) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                writeln!(term.err, "could not remove {}: {e}; delete it by hand", hnsw.display())?;
-            }
+        match std::fs::remove_file(&hnsw) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some(format!("{}: {e}", hnsw.display())),
+            _ => None,
         }
+    } else {
+        None
+    };
+    let log_clear = checkpoint(conn, path).unwrap_or(false);
+    if let Some(failed) = hnsw_failed {
+        let _ = writeln!(term.err, "could not remove {failed}; delete it by hand");
     }
-    let log_clear = checkpoint(conn, path)?;
+    let _ = said_after(purged, log_clear, term);
+    Ok(())
+}
 
-    writeln!(term.out, "Deleted {} memories for good.", purged.deleted)?;
+fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) -> Result<()> {
     for id in &purged.changed {
         writeln!(term.out, "  m:{}: changed since it was listed; left as it is.", one(id))?;
     }
@@ -363,7 +389,7 @@ fn forget_now(
             "The brain's log file still holds the deleted text: it was in use. The running extension clears it when it is next idle."
         )?;
     }
-    Ok(OK)
+    Ok(())
 }
 
 fn print_row(out: &mut dyn Write, row: &RowInfo, now: i64) -> Result<()> {

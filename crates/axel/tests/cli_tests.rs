@@ -524,6 +524,44 @@ fn t10_after_forget_now_the_text_is_in_no_table_and_in_neither_file() {
     assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_secret_plan'"), 1);
 }
 
+/// A terminal whose stdout closes once the `[y/N]` question is on it, like a pipe whose
+/// reader has gone.
+struct Closing {
+    seen: Vec<u8>,
+}
+
+impl std::io::Write for Closing {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if self.seen.ends_with(b"[y/N] ") {
+            return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "closed"));
+        }
+        self.seen.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// v2 c18b review, item 5: nothing after the purge's COMMIT turns the result into an error.
+#[test]
+fn after_the_purge_is_committed_a_failed_write_is_not_an_error() {
+    let w = World::new();
+    w.put(&r("mem_done", "tool", "a decision hidden yesterday"));
+    w.hide("mem_done", "cli", 25 * HOUR_MS);
+    let args = forget::Args { ids: strings(&["mem_done"]), now: true, hidden: false };
+    let mut out = Closing { seen: Vec::new() };
+    let mut err = Closing { seen: b"[y/N] ".to_vec() };
+    let mut input = Cursor::new(b"y\n".to_vec());
+    let code = {
+        let mut term = Term { out: &mut out, err: &mut err, input: &mut input };
+        forget::run_with(&args, &w.path, &forget::Bases::default(), &mut term)
+    };
+    assert_eq!(code.unwrap_or_else(|e| panic!("the purge is done and the answer is an error: {e}")), 0);
+    assert!(String::from_utf8_lossy(&out.seen).contains("Delete 1 memories for good? [y/N] "));
+    assert!(!w.has("mem_done"));
+}
+
 #[test]
 fn t10_a_deleted_replacement_says_the_row_it_replaced_is_recalled_again() {
     let w = World::new();
