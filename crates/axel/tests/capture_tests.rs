@@ -1487,3 +1487,50 @@ fn review_1_a_message_in_the_middle_of_a_withheld_turn_keeps_it_withheld() {
     assert_eq!(log_times(conn, "T"), [2_000], "another chat's row");
     assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
 }
+
+/// Item 2 (finding 6): every turn that capture, on, does not store takes the log rows of its
+/// time with it: too short, no project, paused, filed elsewhere, tombstoned. The chat's
+/// earlier row stays, and so does another chat's row of the same time.
+#[test]
+fn review_2_a_turn_that_is_not_stored_takes_its_log_rows() {
+    let lab = Lab::new();
+    let brain = lab.open();
+    let cfg = lab.cfg();
+    let conn = &brain.conn;
+    let (a, b) = (lab.project("alpha"), lab.project("beta"));
+    let at = 1_700_000_000_000;
+
+    // The chats, and what keeps each turn out.
+    let short = pair("short", &a, "so?", "yes.", at);
+    let nowhere_turn = CompletedTurn { cwd: None, ..pair("nowhere", &a, PROMPT, REPLY, at) };
+    let paused = pair("paused", &a, PROMPT, REPLY, at);
+    tx(conn, || store::set_pause(conn, &project::logical("paused"), Some("paused"), "learning", "model").unwrap());
+    let moved = pair("moved", &b, PROMPT, REPLY, at);
+    archive_row(conn, &scope_dir(&a), &"a".repeat(32), "moved");
+    let gone = pair("gone", &a, PROMPT, REPLY, at);
+    tx(conn, || {
+        conn.execute(
+            "INSERT INTO memory_tombstones(id, project_key, deleted_at) VALUES (?1, ?2, '2026-01-01T00:00:00Z')",
+            params![id_of(&gone), scope_dir(&a)],
+        )
+        .unwrap()
+    });
+
+    for turn in [&short, &nowhere_turn, &paused, &moved, &gone] {
+        let chat = turn.session_id.as_str();
+        log_row(conn, chat, "an earlier question of this chat about the reader", at - 5_000);
+        log_row(conn, chat, PROMPT, at);
+        log_row(conn, chat, "a second message in the middle of the turn", at + 500);
+        log_row(conn, &format!("{chat}-other"), PROMPT, at);
+        assert_eq!(write(&brain, &cfg, turn), Written::Skipped, "{chat}");
+        assert_eq!(log_times(conn, chat), [at - 5_000], "{chat}: a log row of the turn survived");
+        assert_eq!(log_times(conn, &format!("{chat}-other")), [at], "{chat}: another chat's row");
+    }
+    nothing_stored(conn);
+
+    // A turn that is stored keeps its rows.
+    let kept = pair("kept", &a, PROMPT, REPLY, at);
+    log_row(conn, "kept", PROMPT, at);
+    assert_eq!(write(&brain, &cfg, &kept), Written::Stored);
+    assert_eq!(log_times(conn, "kept"), [at]);
+}
