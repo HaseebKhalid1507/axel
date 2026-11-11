@@ -32,9 +32,10 @@ const SECRET_TITLE: &str = "Secret note";
 pub struct PassReport {
     /// Files that were read and whose transaction committed.
     pub files_read: usize,
-    /// Files whose `(size, mtime_ns)` equals their `note_files` row.
+    /// Files whose `(size, mtime_ns)` equals their `note_files` row, which says `ok = 1`.
     pub files_unchanged: usize,
-    /// Files the reader refused (`TooLarge`, `Io`): `ok = 0`, the mirror as it was.
+    /// Files the reader refused (`TooLarge`, `Io`): `ok = 0`, the mirror as it was. Such a
+    /// file is read again at every pass until it can be read.
     pub files_refused: usize,
     /// Files that changed under the read: nothing written.
     pub files_changed: usize,
@@ -158,13 +159,21 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 struct Stored {
     size: i64,
     mtime_ns: i64,
+    ok: bool,
+    reason: Option<String>,
     bad_lines: Option<String>,
 }
 
 fn stored_row(conn: &Connection, path: &str) -> Result<Option<Stored>> {
     Ok(conn
-        .query_row("SELECT size, mtime_ns, bad_lines FROM note_files WHERE path = ?1", [path], |r| {
-            Ok(Stored { size: r.get(0)?, mtime_ns: r.get(1)?, bad_lines: r.get(2)? })
+        .query_row("SELECT size, mtime_ns, ok, reason, bad_lines FROM note_files WHERE path = ?1", [path], |r| {
+            Ok(Stored {
+                size: r.get(0)?,
+                mtime_ns: r.get(1)?,
+                ok: r.get::<_, i64>(2)? == 1,
+                reason: r.get(3)?,
+                bad_lines: r.get(4)?,
+            })
         })
         .optional()?)
 }
@@ -189,7 +198,11 @@ fn one_file(
     }
     let seen = (i64::try_from(meta.len()).unwrap_or(i64::MAX), mtime_ns(&meta));
     let stored = stored_row(conn, &path_text)?;
-    if stored.as_ref().is_some_and(|s| (s.size, s.mtime_ns) == seen) {
+    // RULING: wave 4, R-14 item 1: only a file that was read is skipped as unchanged. A file
+    // that was refused (`ok = 0`) is tried again at every pass: a failed open says nothing
+    // about what the file holds, and a tombstone line may be waiting in it.
+    let same = stored.as_ref().is_some_and(|s| (s.size, s.mtime_ns) == seen);
+    if same && stored.as_ref().is_some_and(|s| s.ok) {
         report.files_unchanged += 1;
         return Ok(());
     }
@@ -202,7 +215,13 @@ fn one_file(
         }
         Err(refused) => {
             // `ok = 0` with the reason and the size and time seen; the mirror, the live
-            // count and the bad-line set stay exactly as they were.
+            // count and the bad-line set stay exactly as they were. A file that stays
+            // refused for the same reason writes nothing.
+            let reason = refused.to_string();
+            report.files_refused += 1;
+            if same && stored.as_ref().is_some_and(|s| !s.ok && s.reason.as_deref() == Some(reason.as_str())) {
+                return Ok(());
+            }
             brain_v2::begin_write(conn)?;
             let work = || -> Result<()> {
                 conn.execute(
@@ -210,13 +229,12 @@ fn one_file(
                      VALUES (?1, ?2, ?3, ?4, 0, ?5, 0, ?6)
                      ON CONFLICT(path) DO UPDATE SET size = excluded.size, mtime_ns = excluded.mtime_ns,
                             ok = 0, reason = excluded.reason, scanned_ms = excluded.scanned_ms",
-                    params![path_text, key, seen.0, seen.1, refused.to_string(), now],
+                    params![path_text, key, seen.0, seen.1, reason, now],
                 )?;
                 conn.execute_batch("COMMIT")?;
                 Ok(())
             };
             work().inspect_err(|_| rollback(conn))?;
-            report.files_refused += 1;
             return Ok(());
         }
     };

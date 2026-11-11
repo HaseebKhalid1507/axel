@@ -706,9 +706,13 @@ fn t21_e_a_file_above_64_mib_is_refused_and_the_mirror_is_unchanged() {
     assert_eq!(w.nf_int(KEY, "live_count"), Some(3));
     assert_eq!(w.purge_pending(), 0);
 
-    // Tried again only when the size or the time changes.
+    // A refused file is tried again at every pass (wave 4, R-14 item 1), and a file that
+    // stays refused for the same reason writes nothing.
+    let scanned = w.nf_int(KEY, "scanned_ms");
+    std::thread::sleep(Duration::from_millis(5));
     let report = w.pass();
-    assert_eq!((report.files_unchanged, report.files_refused), (1, 0));
+    assert_eq!((report.files_unchanged, report.files_refused), (0, 1));
+    assert_eq!(w.nf_int(KEY, "scanned_ms"), scanned, "the refusal row was written again");
     assert_eq!(w.notes(), ids(&[N1, N3, N2]));
 
     // A readable file again: read, and `ok` is 1.
@@ -794,25 +798,51 @@ fn a_bad_line_that_goes_away_is_a_change_of_the_set_too() {
     assert_eq!(w.notes(), ids(&[N1, N2]));
 }
 
-/// An I/O failure never drops rows. Skipped where the test's user reads every file
-/// whatever its mode (root).
+/// An I/O failure never drops rows, and never hides the file from the next pass (wave 4,
+/// R-14 item 1): a tombstone appended just before the failed read lands as soon as the file
+/// can be read, with its size and time unchanged. Where the test's user reads every file
+/// whatever its mode (root), the row a failed read leaves is written by hand.
 #[test]
-fn a_file_that_cannot_be_opened_keeps_its_rows() {
+fn a_file_that_could_not_be_opened_is_read_again_and_its_tombstone_lands() {
     use std::os::unix::fs::PermissionsExt;
     let mut w = three_mirrored();
     std::thread::sleep(Duration::from_millis(25));
-    fs::write(w.file(KEY), n1()).unwrap();
+    fs::write(w.file(KEY), format!("{}{}{}{}", n1(), n2(), n3(), tomb(N2))).unwrap();
     fs::set_permissions(w.file(KEY), fs::Permissions::from_mode(0o000)).unwrap();
-    if fs::File::open(w.file(KEY)).is_ok() {
-        return;
+    if fs::File::open(w.file(KEY)).is_err() {
+        let report = w.pass();
+        assert_eq!((report.files_refused, report.files_unchanged, report.purged), (1, 0, 0));
+        assert_eq!(w.nf_int(KEY, "ok"), Some(0));
+        assert!(w.nf_text(KEY, "reason").is_some());
+        assert_eq!(w.nf_int(KEY, "live_count"), Some(3), "the mirror's count is as it was");
+        // Still refused: tried again, nothing written.
+        let scanned = w.nf_int(KEY, "scanned_ms");
+        std::thread::sleep(Duration::from_millis(5));
+        let report = w.pass();
+        assert_eq!((report.files_refused, report.files_unchanged), (1, 0));
+        assert_eq!(w.nf_int(KEY, "scanned_ms"), scanned, "a file that stays refused writes every pass");
+    } else {
+        use std::os::unix::fs::MetadataExt;
+        let meta = fs::metadata(w.file(KEY)).unwrap();
+        let path = w.file(KEY).to_string_lossy().into_owned();
+        let mtime_ns = meta.mtime() * 1_000_000_000 + meta.mtime_nsec();
+        w.conn()
+            .execute(
+                "UPDATE note_files SET ok = 0, reason = 'cannot open', size = ?1, mtime_ns = ?2 WHERE path = ?3",
+                rusqlite::params![meta.len() as i64, mtime_ns, path],
+            )
+            .unwrap();
     }
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]), "an I/O failure never drops rows");
+
+    // Readable again. A change of mode does not change the file's size or time.
+    fs::set_permissions(w.file(KEY), fs::Permissions::from_mode(0o644)).unwrap();
     let report = w.pass();
-    assert_eq!((report.files_refused, report.purged), (1, 0));
-    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
-    assert_eq!(w.nf_int(KEY, "ok"), Some(0));
-    assert!(w.nf_text(KEY, "reason").is_some());
+    assert_eq!((report.files_read, report.files_unchanged, report.purged), (1, 0, 1));
+    assert_eq!(w.notes(), ids(&[N1, N3]), "the note the owner forgot is gone");
+    assert_eq!(w.nf_int(KEY, "ok"), Some(1));
+    assert_eq!(w.nf_text(KEY, "reason"), None);
     assert_eq!(w.pass().files_unchanged, 1);
-    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
 }
 
 #[test]
