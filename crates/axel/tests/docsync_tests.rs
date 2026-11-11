@@ -10,6 +10,7 @@ use std::time::{Duration, Instant, SystemTime};
 
 use axel::brain_v2::{self, OpenOpts};
 use axel::docsync::{self, SyncReport};
+use axel::embed::EmbedService;
 use axel::ext::config::ExtConfig;
 use axel::ext::types::{Boot, IndexerCtx, Job, Mode, Status, TestHooks};
 use axel::indexer_start;
@@ -107,6 +108,15 @@ impl World {
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .ok()
+    }
+    /// From here on, an `embed_wait` call ends the embed thread (`embed_called` says so).
+    fn trap_embed(&mut self) {
+        let test = Arc::new(TestHooks { panic_embed: true, ..TestHooks::default() });
+        self.ctx.embed = EmbedService::start(Some(Embedder::hashing()), self.ctx.jobs.clone(), test);
+    }
+    fn embed_called(&self) -> bool {
+        std::thread::sleep(Duration::from_millis(300));
+        self.ctx.embed.stopped()
     }
     fn doc_ids(&self) -> Vec<String> {
         let mut stmt = self.conn().prepare("SELECT doc_id FROM documents ORDER BY doc_id").unwrap();
@@ -446,7 +456,8 @@ fn t22_the_sync_stops_when_the_mode_is_not_ready() {
     let a = w.file("notes/a.md", BODY);
     w.sync();
     std::fs::remove_file(&a).unwrap();
-    w.file("notes/b.md", BODY);
+    // Another text: the same one would take over the row of `a` (R-22.2).
+    w.file("notes/b.md", &format!("{BODY} Another text."));
 
     w.ctx.mode.store(Mode::Starting as u8, Ordering::SeqCst);
     assert_eq!(w.sync(), SyncReport::default());
@@ -537,4 +548,100 @@ fn r22_1_a_file_over_two_mib_is_skipped_and_keeps_its_row() {
     w.file("notes/huge.md", &big);
     let report = w.sync();
     assert_eq!((report.skipped, report.waiting), (1, 0));
+}
+
+/// R-22.2: a file whose time changed and whose text did not gets its time only: no
+/// `embed_wait`, no slot, no vector sent.
+#[test]
+fn r22_2_a_touched_file_is_not_embedded_again() {
+    let mut w = world();
+    let a = w.file("notes/a.md", BODY);
+    w.sync();
+    let (id, ..) = w.row("notes::a").unwrap();
+    w.deltas();
+    w.trap_embed();
+    touch_ahead(&a, 5);
+    let report = w.sync();
+    assert_eq!((report.retimed, report.indexed, report.waiting), (1, 0, 0));
+    let (id2, content, hidden, mtime, _) = w.row("notes::a").unwrap();
+    assert_eq!((id2, content.as_str(), hidden), (id, BODY, None));
+    assert!(mtime.unwrap() > now_ms());
+    assert!(w.deltas().is_empty());
+    assert_eq!(w.sync(), SyncReport::default());
+    assert!(!w.embed_called(), "embed_wait was called");
+}
+
+/// R-22.2: a renamed folder: one tick, every row visible again under its new path with its
+/// old row id, its stored vector sent, no `embed_wait`.
+#[test]
+fn r22_2_a_renamed_folder_keeps_its_rows() {
+    let mut w = world();
+    let texts = ["first", "second", "third"];
+    for (i, t) in texts.iter().enumerate() {
+        w.file(&format!("notes/old/n{i}.md"), &format!("{BODY} The {t} note."));
+    }
+    assert_eq!(w.sync().indexed, 3);
+    let ids: Vec<i64> = (0..3).map(|i| w.row(&format!("notes::old::n{i}")).unwrap().0).collect();
+    w.deltas();
+    w.trap_embed();
+
+    std::fs::rename(w.path("notes/old"), w.path("notes/new")).unwrap();
+    let report = w.sync();
+    assert_eq!((report.hidden, report.moved, report.indexed, report.waiting), (3, 3, 0, 0));
+    assert_eq!(w.count(), 3);
+    for (i, t) in texts.iter().enumerate() {
+        let (id, content, hidden, mtime, _) = w.row(&format!("notes::new::n{i}")).expect("the row moved");
+        assert_eq!((id, hidden), (ids[i], None));
+        assert!(content.ends_with(&format!("The {t} note.")));
+        let p = w.path(&format!("notes/new/n{i}.md"));
+        let path: String = w.conn().query_row("SELECT file_path FROM documents WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert_eq!(path, canon(&p));
+        let file_ms = std::fs::metadata(&p).unwrap().modified().unwrap().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_millis() as i64;
+        assert_eq!(mtime, Some(file_ms));
+        let meta: String = w.conn().query_row("SELECT metadata FROM documents WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(!meta.contains("missing_since"), "{meta}");
+        let fts: String = w
+            .conn()
+            .query_row("SELECT doc_id FROM chunks_fts WHERE content = ?1", [&content], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, format!("notes::new::n{i}"));
+    }
+    let deltas = w.deltas();
+    let mut sent = upserted(&deltas);
+    sent.sort();
+    assert_eq!(sent, ids);
+    assert_eq!(w.sync(), SyncReport::default());
+    assert!(!w.embed_called(), "embed_wait was called");
+}
+
+/// R-22.2: of two hidden rows with the text, the one hidden last is taken; a row hidden for
+/// another reason is never taken.
+#[test]
+fn r22_2_the_row_hidden_last_is_taken_and_no_other_mark() {
+    let mut w = world();
+    let b = w.file("notes/b.md", BODY);
+    w.sync();
+    let a = w.file("notes/a.md", BODY);
+    w.sync();
+    let (id_a, ..) = w.row("notes::a").unwrap();
+    let (id_b, ..) = w.row("notes::b").unwrap();
+    assert!(id_a > id_b);
+    std::fs::remove_file(&a).unwrap();
+    assert_eq!(w.sync().hidden, 1);
+    std::thread::sleep(Duration::from_millis(20));
+    std::fs::remove_file(&b).unwrap();
+    assert_eq!(w.sync().hidden, 1);
+
+    w.file("notes/c.md", BODY);
+    assert_eq!(w.sync().moved, 1);
+    assert_eq!(w.row("notes::c").unwrap().0, id_b, "the row hidden last");
+    assert_eq!(w.row("notes::a").unwrap().2.as_deref(), Some("missing_source"));
+
+    // Hidden by someone else: not taken; the new file gets its own row.
+    w.conn().execute("UPDATE documents SET hidden = 'memory_hidden' WHERE id = ?1", [id_a]).unwrap();
+    w.file("notes/d.md", BODY);
+    let report = w.sync();
+    assert_eq!((report.moved, report.indexed), (0, 1));
+    assert_ne!(w.row("notes::d").unwrap().0, id_a);
+    assert_eq!(w.row("notes::a").unwrap().2.as_deref(), Some("memory_hidden"));
 }
