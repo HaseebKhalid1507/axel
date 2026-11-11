@@ -1435,6 +1435,13 @@ fn a_kept_archive_that_leaves_out_a_deleted_turn_is_read_again_once() {
     assert_eq!(left_counts(world.db(), &a), (1, 1));
     let kept = restore_turns(&world.path(), &format!("ctx-{}", a.id));
     assert_eq!(kept.code, 0, "{}", kept.err);
+    // Round 2, item 3: what stays out is said, apart from what comes back.
+    assert_eq!(
+        kept.out.lines().next().unwrap_or_default(),
+        format!("this brings back the turns of ctx-{} a forget tool left out, the forgotten one among them; the turns deleted with forget --now stay out", a.id)
+    );
+    assert!(kept.out.contains(&format!("ctx-{}: 1 turns left out will be indexed", a.id)), "{}", kept.out);
+    assert!(kept.out.contains(&format!("1 turns of ctx-{} deleted with \"axel-v2 forget --now\" stay out", a.id)), "{}", kept.out);
 
     let mut reads = Vec::new();
     for _ in 0..3 {
@@ -1447,6 +1454,40 @@ fn a_kept_archive_that_leaves_out_a_deleted_turn_is_read_again_once() {
     assert_eq!(left_counts(world.db(), &a), (0, 1));
     let texts = world.rows(&a).into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n");
     assert!(texts.contains("TOOLFORGET") && !texts.contains("DOCTORANSWER"), "{texts}");
+}
+
+/// v2 c18b review round 2, item 3: an archive that leaves out only a turn deleted with
+/// `forget --now` is not named as a neighbour that "still leaves turns out", and
+/// `restore --forget-turns` of it says the turn stays out and changes nothing.
+#[test]
+fn restore_forget_turns_does_not_offer_what_a_cli_mark_leaves_out() {
+    const GONE: &str = "please tell me again what the doctor said on Tuesday afternoon";
+    let mut world = Indexed::new();
+    let a = Arch::new(24, "s-hint", T0)
+        .about("retry limit")
+        .forget_call("forget the thing about the landlord from this morning please", "TOOLFORGET")
+        .about("upload queue");
+    world.file(&a);
+    world.scan();
+    deleted_capture(&mut world, "mem_cap_hint", "s-hint", GONE, &reply("DOCTORANSWER"), T0 + 500_000);
+    let b = Arch::new(25, "s-hint", T0 + 1_000_000).turn(GONE, &reply("DOCTORANSWER")).about("lunch order");
+    world.file(&b);
+    world.scan();
+    assert_eq!(left_counts(world.db(), &a), (1, 0));
+    assert_eq!(left_counts(world.db(), &b), (0, 1), "the deleted turn is not left out of b: the test proves nothing");
+
+    let run = restore_turns(&world.path(), &format!("ctx-{}", a.id));
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(!run.out.contains(&format!("ctx-{}:", b.id)), "{}", run.out);
+    assert!(run.out.contains("No neighbouring archive of this chat leaves turns out."), "{}", run.out);
+
+    let before = dump(world.db(), "SELECT * FROM archive_index ORDER BY rel_name");
+    let of_b = restore_turns(&world.path(), &format!("ctx-{}", b.id));
+    assert_eq!(of_b.code, 0, "{}", of_b.err);
+    assert!(of_b.out.contains("leaves out no turn because a forget tool was called; nothing changed."), "{}", of_b.out);
+    assert!(of_b.out.contains(&format!("1 turns of ctx-{} deleted with \"axel-v2 forget --now\" stay out", b.id)), "{}", of_b.out);
+    assert!(!of_b.out.contains("the forgotten one among them"), "{}", of_b.out);
+    assert_eq!(dump(world.db(), "SELECT * FROM archive_index ORDER BY rel_name"), before);
 }
 
 /// v2 c18b review round 2, item 1: a `cli` mark takes only the deleted turn. An archive of

@@ -232,16 +232,38 @@ fn forget_turns(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
         return Ok(FAILED);
     };
     let id = one(&archive_id);
-    let units: i64 = conn.query_row(
-        "SELECT COALESCE(SUM(forget_units), 0) FROM archive_index WHERE archive_id = ?1",
+    let (units, deleted): (i64, i64) = conn.query_row(
+        "SELECT COALESCE(SUM(forget_units), 0), COALESCE(SUM(cli_units), 0) FROM archive_index WHERE archive_id = ?1",
         [&archive_id],
-        |r| r.get(0),
+        |r| Ok((r.get(0)?, r.get(1)?)),
     )?;
+    // RULING: v2 c18b review round 2, item 3. The turns a `cli` mark leaves out (a turn
+    // deleted with `forget --now`) are counted apart and stay out: a kept archive obeys the
+    // mark. What is said counts them as staying out, never as coming back.
+    let staying = if deleted > 0 {
+        format!(
+            "{deleted} turns of ctx-{id} deleted with \"axel-v2 forget --now\" stay out: no command brings them back."
+        )
+    } else {
+        String::new()
+    };
     if units == 0 {
-        writeln!(term.out, "ctx-{id} leaves no turn out; nothing changed.")?;
+        if deleted > 0 {
+            writeln!(term.out, "ctx-{id} leaves out no turn because a forget tool was called; nothing changed.")?;
+            writeln!(term.out, "{staying}")?;
+        } else {
+            writeln!(term.out, "ctx-{id} leaves no turn out; nothing changed.")?;
+        }
         return Ok(OK);
     }
-    writeln!(term.out, "this brings back every turn of ctx-{id}, {FORGET_TURNS_WARNING}")?;
+    if deleted > 0 {
+        writeln!(
+            term.out,
+            "this brings back the turns of ctx-{id} a forget tool left out, {FORGET_TURNS_WARNING}; the turns deleted with forget --now stay out"
+        )?;
+    } else {
+        writeln!(term.out, "this brings back every turn of ctx-{id}, {FORGET_TURNS_WARNING}")?;
+    }
     write(conn, || {
         conn.execute("UPDATE archive_index SET keep_forget_turns = 1 WHERE archive_id = ?1", [&archive_id])?;
         conn.execute("DELETE FROM forgotten_turns WHERE archive_id = ?1", [&archive_id])?;
@@ -252,9 +274,13 @@ fn forget_turns(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
         "ctx-{id}: {units} turns left out will be indexed by the next scan of the running extension. \
          What comes back is not left out again by a later forget."
     )?;
+    if deleted > 0 {
+        writeln!(term.out, "{staying}")?;
+    }
 
     // A mark reaches one window each way: the archives of the chat near this one that
-    // still leave turns out.
+    // still leave turns out. `forget_units` does not count what a `cli` mark leaves out
+    // (round 2, items 2 and 3): an archive that leaves out only such turns is not named.
     let mut near: Vec<(String, i64)> = Vec::new();
     let files: Vec<(String, Option<String>, Option<String>, i64)> = {
         let mut stmt = conn.prepare(
