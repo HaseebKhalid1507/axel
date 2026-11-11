@@ -1,6 +1,13 @@
-//! `redact`, `show`, `core_withholds`. Commit 8 writes this file.
+//! What text may be stored or shown: `redact` blanks credential-shaped tokens, `show` and
+//! `show_block` make stored text harmless for a model or a terminal, and `core_withholds`
+//! is the copy of the rule Synaps core uses to withhold a string from its archives.
+//!
+//! Pure. A shape test, not a secret detector, in both directions (spec section 8).
 
 use std::borrow::Cow;
+use std::sync::OnceLock;
+
+const BLANK: &str = "(redacted)";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hit {
@@ -17,32 +24,830 @@ pub struct Redacted<'a> {
     pub hits: Vec<Hit>,
 }
 
-/// Blanks credential-shaped tokens; the rest is untouched. The stub returns its input
-/// unchanged.
+/// Blanks credential-shaped tokens with `(redacted)`; the rest is untouched.
 pub fn redact(text: &str) -> Redacted<'_> {
-    Redacted { text: Cow::Borrowed(text), blanked: 0, hits: Vec::new() }
+    let view = View::new(text);
+    let spans = scan(view.as_str(), false);
+    if spans.is_empty() {
+        return Redacted { text: Cow::Borrowed(text), blanked: 0, hits: Vec::new() };
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut at = 0;
+    let mut hits = Vec::with_capacity(spans.len());
+    for span in spans {
+        let (start, end) = view.original(span.start, span.end);
+        out.push_str(&text[at..start]);
+        out.push_str(BLANK);
+        at = end;
+        hits.push(span.hit);
+    }
+    out.push_str(&text[at..]);
+    Redacted { text: Cow::Owned(out), blanked: hits.len(), hits }
 }
 
 /// The first hit of the four certain rules (the forum's test).
 pub fn certain_hit(text: &str) -> Option<Hit> {
-    let _ = text;
+    let view = View::new(text);
+    scan(view.as_str(), true).into_iter().next().map(|span| span.hit)
+}
+
+/// Redact, then make it one harmless line.
+pub fn show(text: &str, max_chars: usize) -> String {
+    cut(clean_line(&redact(text).text), max_chars)
+}
+
+/// The same, keeping line breaks: command-line output.
+// SPEC: 4202: "the same five steps line by line" does not say whether `max_chars` bounds a
+// line or the block. It bounds the whole block here, so the output is never longer than asked.
+pub fn show_block(text: &str, max_chars: usize) -> String {
+    let redacted = redact(text);
+    let lines: Vec<String> = redacted.text.split('\n').map(clean_line).collect();
+    cut(lines.join("\n"), max_chars)
+}
+
+/// The copy of core's withholding rule: true when the ASCII-lowercase form of `text`
+/// contains one of the words of `core_withheld.txt`. Core stores such a string as
+/// `[archive: withheld]`, whole. A copy that cannot be read withholds everything.
+pub fn core_withholds(text: &str) -> bool {
+    let rule = core_rule();
+    if !rule.ok {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    rule.words.iter().any(|needle| lower.contains(needle.as_str()))
+}
+
+/// The words of the copy, in core's order.
+pub fn core_rule_words() -> &'static [String] {
+    &core_rule().words
+}
+
+/// The core commit the copy was taken at (the file's first line).
+pub fn core_rule_commit() -> &'static str {
+    core_rule().commit
+}
+
+struct CoreRule {
+    commit: &'static str,
+    words: Vec<String>,
+    ok: bool,
+}
+
+fn core_rule() -> &'static CoreRule {
+    static RULE: OnceLock<CoreRule> = OnceLock::new();
+    RULE.get_or_init(|| {
+        let mut lines = include_str!("core_withheld.txt").lines();
+        let commit = lines.next().and_then(|l| l.strip_prefix("# core ")).map(str::trim).unwrap_or("");
+        let mut words = Vec::new();
+        let mut ok = !commit.is_empty();
+        for line in lines.map(str::trim).filter(|l| !l.is_empty()) {
+            match serde_json::from_str::<String>(line) {
+                Ok(word) if !word.is_empty() => words.push(word),
+                _ => ok = false,
+            }
+        }
+        ok &= !words.is_empty();
+        CoreRule { commit, words, ok }
+    })
+}
+
+// ---------------------------------------------------------------------------------------
+// Characters
+// ---------------------------------------------------------------------------------------
+
+/// Removed by `show` and skipped by the scanner: format characters (general category Cf),
+/// variation selectors, private-use and unassigned-plane characters.
+const INVISIBLE: &[(u32, u32)] = &[
+    (0x00AD, 0x00AD),
+    (0x0600, 0x0605),
+    (0x061C, 0x061C),
+    (0x06DD, 0x06DD),
+    (0x070F, 0x070F),
+    (0x0890, 0x0891),
+    (0x08E2, 0x08E2),
+    (0x180E, 0x180E),
+    (0x200B, 0x200F),
+    (0x202A, 0x202E),
+    (0x2060, 0x2064),
+    (0x2066, 0x206F),
+    (0xE000, 0xF8FF),
+    (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF),
+    (0xFFF9, 0xFFFB),
+    (0x110BD, 0x110BD),
+    (0x110CD, 0x110CD),
+    (0x13430, 0x1343F),
+    (0x1BCA0, 0x1BCA3),
+    (0x1D173, 0x1D17A),
+    (0xE0001, 0xE0001),
+    (0xE0020, 0xE007F),
+    (0xE0100, 0xE01EF),
+    (0xF0000, 0x10FFFF),
+];
+
+/// Line break, carriage return, tab and the line and paragraph separators become a space.
+fn becomes_space(c: char) -> bool {
+    matches!(c, '\n' | '\r' | '\t' | '\u{2028}' | '\u{2029}')
+}
+
+/// Characters `show` drops without a trace. The scanner drops the same ones before it
+/// matches, so `redact` sees a token exactly as `show` would otherwise reveal it (R-9a).
+fn removed(c: char) -> bool {
+    if becomes_space(c) {
+        return false;
+    }
+    if c.is_ascii() {
+        return c.is_ascii_control();
+    }
+    let n = c as u32;
+    c.is_control() || INVISIBLE.iter().any(|&(lo, hi)| lo <= n && n <= hi)
+}
+
+fn bracket(c: char) -> char {
+    match c {
+        '[' | '\u{FF3B}' | '\u{3010}' | '\u{3014}' | '\u{3016}' | '\u{3018}' | '\u{301A}' | '\u{27E6}' => '(',
+        ']' | '\u{FF3D}' | '\u{3011}' | '\u{3015}' | '\u{3017}' | '\u{3019}' | '\u{301B}' | '\u{27E7}' => ')',
+        '<' | '\u{FF1C}' | '\u{3008}' | '\u{300A}' | '\u{27E8}' => '\u{2039}',
+        '>' | '\u{FF1E}' | '\u{3009}' | '\u{300B}' | '\u{27E9}' => '\u{203A}',
+        other => other,
+    }
+}
+
+/// Steps 2 to 4 of `show` on text that holds no line break the caller wants kept.
+fn clean_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut gap = false;
+    for c in text.chars() {
+        if removed(c) {
+            continue;
+        }
+        if becomes_space(c) || c.is_whitespace() {
+            gap = true;
+            continue;
+        }
+        if gap && !out.is_empty() {
+            out.push(' ');
+        }
+        gap = false;
+        out.push(bracket(c));
+    }
+    out
+}
+
+/// Step 5: at most `max_chars` characters, the last one `…` when something was cut.
+fn cut(text: String, max_chars: usize) -> String {
+    let Some((at, _)) = text.char_indices().nth(max_chars) else {
+        return text;
+    };
+    if max_chars == 0 {
+        return String::new();
+    }
+    let keep = text[..at].char_indices().next_back().map_or(0, |(i, _)| i);
+    let mut out = text[..keep].to_string();
+    out.push('…');
+    out
+}
+
+// ---------------------------------------------------------------------------------------
+// The scanner's view: the text without the characters `removed` names
+// ---------------------------------------------------------------------------------------
+
+struct View<'a> {
+    text: Cow<'a, str>,
+    /// For each byte of an owned view, its offset in the original. Empty: the view is the text.
+    map: Vec<usize>,
+}
+
+impl<'a> View<'a> {
+    fn new(text: &'a str) -> Self {
+        if !text.chars().any(removed) {
+            return View { text: Cow::Borrowed(text), map: Vec::new() };
+        }
+        let mut kept = String::with_capacity(text.len());
+        let mut map = Vec::with_capacity(text.len());
+        for (at, c) in text.char_indices() {
+            if !removed(c) {
+                kept.push(c);
+                map.extend(at..at + c.len_utf8());
+            }
+        }
+        View { text: Cow::Owned(kept), map }
+    }
+
+    fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// A span of the view (never empty) as a span of the original. It includes the removed
+    /// characters inside it, and none before or after.
+    fn original(&self, start: usize, end: usize) -> (usize, usize) {
+        if self.map.is_empty() {
+            (start, end)
+        } else {
+            (self.map[start], self.map[end - 1] + 1)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------------------
+// The scanner: one pass over the bytes, no regular expressions
+// ---------------------------------------------------------------------------------------
+
+struct Span {
+    start: usize,
+    end: usize,
+    hit: Hit,
+}
+
+const PREFIXES: [&str; 17] = [
+    "sk-", "sk_live_", "sk_test_", "rk_live_", "pk_live_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+    "github_pat_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "xoxs-", "ya29.",
+];
+
+const NAMES: [&str; 9] = [
+    "password", "passwd", "secret", "token", "api_key", "apikey", "api-key", "access_key", "authorization",
+];
+
+/// `[A-Za-z0-9_-]`
+fn is_word(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// `[A-Za-z0-9+=_-]`
+fn is_long(b: u8) -> bool {
+    is_word(b) || b == b'+' || b == b'='
+}
+
+/// `[A-Za-z0-9._~+/=-]`
+fn is_bearer(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"._~+/=-".contains(&b)
+}
+
+fn is_upper_digit(b: u8) -> bool {
+    b.is_ascii_uppercase() || b.is_ascii_digit()
+}
+
+fn run_end(b: &[u8], from: usize, class: fn(u8) -> bool) -> usize {
+    let mut i = from;
+    while i < b.len() && class(b[i]) {
+        i += 1;
+    }
+    i
+}
+
+fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+fn skip_blank(b: &[u8], mut i: usize) -> usize {
+    while i < b.len() && (b[i] == b' ' || b[i] == b'\t') {
+        i += 1;
+    }
+    i
+}
+
+/// What the scanner remembers so that a hostile megabyte costs one pass, not one pass per
+/// candidate: the ends of the `is_word` runs it has measured, and the last place where a
+/// value turned out to read as code.
+#[derive(Default)]
+struct Memo {
+    runs: [(usize, usize); 4],
+    code: Option<(usize, usize)>,
+}
+
+impl Memo {
+    /// The end of the `is_word` run that holds `from` (`from` itself when there is none).
+    fn word_end(&mut self, slot: usize, b: &[u8], from: usize) -> usize {
+        let (start, end) = self.runs[slot];
+        if start <= from && from < end {
+            return end;
+        }
+        let end = run_end(b, from, is_word);
+        self.runs[slot] = (from, end);
+        end
+    }
+}
+
+fn hit(rule: &'static str, name: Option<&str>) -> Hit {
+    Hit { rule, name: name.map(str::to_string) }
+}
+
+/// All spans to blank, in order and not overlapping. With `certain`, only the four certain
+/// rules are tried and the scan stops at the first hit.
+fn scan(s: &str, certain: bool) -> Vec<Span> {
+    let b = s.as_bytes();
+    let mut spans = Vec::new();
+    let mut memo = Memo::default();
+    let mut url: Option<(usize, usize)> = None;
+    let mut long_done = 0;
+    let mut i = 0;
+    while i < b.len() {
+        if let Some((start, end)) = url {
+            if i >= start {
+                url = None;
+            }
+            if i == start {
+                spans.push(Span { start, end, hit: hit("url_password", None) });
+                if certain {
+                    return spans;
+                }
+                i = end;
+                continue;
+            }
+        }
+        // The character before a match is not a letter or a digit.
+        // SPEC: 4137: "a letter or a digit" is read as ASCII. A key glued to a letter of a
+        // script written without spaces is blanked, not kept.
+        let anchored = i == 0 || !b[i - 1].is_ascii_alphanumeric();
+        // SPEC: 4144: a private key block is matched wherever its dashes start: it is never
+        // "inside a word", and one glued to a letter is still a key.
+        let mut found = key_block(b, i);
+        if found.is_none() && anchored {
+            found = prefix(b, i, &mut memo).or_else(|| jwt(b, i, &mut memo));
+        }
+        if found.is_none() && b[i] == b':' {
+            if let Some(password) = url_password(b, i) {
+                url = Some(password);
+            }
+        }
+        if found.is_none() && !certain {
+            found = named_value(s, i, &mut memo);
+            if found.is_none() && anchored {
+                found = bearer(b, i);
+            }
+            if found.is_none() && i >= long_done && is_long(b[i]) {
+                long_done = run_end(b, i, is_long);
+                found = long_token(b, i, long_done);
+            }
+        }
+        match found {
+            Some(span) => {
+                i = span.end;
+                spans.push(span);
+                if certain {
+                    return spans;
+                }
+            }
+            None => i += 1,
+        }
+    }
+    spans
+}
+
+/// From `-----BEGIN ` + anything + `PRIVATE KEY-----` to the matching `-----END … KEY-----`,
+/// or to the end of the text.
+// SPEC: 4144: "anything" is at most 80 bytes of the same line, and the tail of the END line
+// likewise; an END line that does not close ends the block at the end of the text.
+fn key_block(b: &[u8], i: usize) -> Option<Span> {
+    const LABEL: usize = 80;
+    if !b[i..].starts_with(b"-----BEGIN ") {
+        return None;
+    }
+    let label = i + 11;
+    let same_line = |from: usize| {
+        let limit = (from + LABEL + 16).min(b.len());
+        from + b[from..limit].iter().position(|&c| c == b'\n').unwrap_or(limit - from)
+    };
+    let head = label + find(&b[label..same_line(label)], b"PRIVATE KEY-----")? + 16;
+    let end = find(&b[head..], b"-----END ")
+        .map(|at| head + at + 9)
+        .and_then(|tail| find(&b[tail..same_line(tail)], b"KEY-----").map(|at| tail + at + 8))
+        .unwrap_or(b.len());
+    Some(Span { start: i, end, hit: hit("key_block", None) })
+}
+
+fn prefix(b: &[u8], i: usize, memo: &mut Memo) -> Option<Span> {
+    if !matches!(b[i], b's' | b'r' | b'p' | b'g' | b'x' | b'y' | b'A') {
+        return None;
+    }
+    let rest = &b[i..];
+    for p in PREFIXES {
+        if rest.starts_with(p.as_bytes()) {
+            let from = i + p.len();
+            let end = memo.word_end(0, b, from);
+            if end - from >= 16 {
+                return Some(Span { start: i, end, hit: hit("prefix", Some(p)) });
+            }
+        }
+    }
+    for p in ["AKIA", "ASIA"] {
+        // Exactly 16: a seventeenth character of the class is another shape.
+        if rest.starts_with(p.as_bytes())
+            && rest.len() >= 20
+            && rest[4..20].iter().all(|&c| is_upper_digit(c))
+            && !rest.get(20).is_some_and(|&c| is_upper_digit(c))
+        {
+            return Some(Span { start: i, end: i + 20, hit: hit("prefix", Some(p)) });
+        }
+    }
+    if rest.starts_with(b"AIza") {
+        // SPEC: 4142: "followed by 35": with more than 35 the whole run is blanked, so that
+        // no tail of a key is left standing.
+        let end = memo.word_end(0, b, i + 4);
+        if end - (i + 4) >= 35 {
+            return Some(Span { start: i, end, hit: hit("prefix", Some("AIza")) });
+        }
+    }
     None
 }
 
-/// Redact, then make it one harmless line. The stub returns its input unchanged.
-pub fn show(text: &str, max_chars: usize) -> String {
-    let _ = max_chars;
-    text.to_string()
+/// `eyJ`, then three runs of at least 8 of `[A-Za-z0-9_-]` separated by two dots.
+fn jwt(b: &[u8], i: usize, memo: &mut Memo) -> Option<Span> {
+    if !b[i..].starts_with(b"eyJ") {
+        return None;
+    }
+    let mut from = i + 3;
+    for slot in 1..=3 {
+        let end = memo.word_end(slot, b, from);
+        if end - from < 8 {
+            return None;
+        }
+        if slot == 3 {
+            return Some(Span { start: i, end, hit: hit("jwt", Some("eyJ")) });
+        }
+        if b.get(end) != Some(&b'.') {
+            return None;
+        }
+        from = end + 1;
+    }
+    None
 }
 
-/// The same, keeping line breaks: command-line output. The stub returns its input unchanged.
-pub fn show_block(text: &str, max_chars: usize) -> String {
-    let _ = max_chars;
-    text.to_string()
+/// At the `:` of `<scheme>://<user>:<password>@`: the span of the password.
+fn url_password(b: &[u8], i: usize) -> Option<(usize, usize)> {
+    if !b[i..].starts_with(b"://") || i == 0 {
+        return None;
+    }
+    let scheme = b[i - 1];
+    if !(scheme.is_ascii_alphanumeric() || b"+.-".contains(&scheme)) {
+        return None;
+    }
+    let from = i + 3;
+    let stop = |c: &u8| c.is_ascii_whitespace() || b"/?#\"'`<>".contains(c);
+    let authority = &b[from..from + b[from..].iter().position(stop).unwrap_or(b.len() - from)];
+    let at = authority.iter().rposition(|&c| c == b'@')?;
+    let colon = authority[..at].iter().position(|&c| c == b':')?;
+    let (start, end) = (from + colon + 1, from + at);
+    (end > start && &b[start..end] != BLANK.as_bytes()).then_some((start, end))
 }
 
-/// The copy of core's withholding rule. The stub returns `false`.
-pub fn core_withholds(text: &str) -> bool {
-    let _ = text;
-    false
+/// A name that ends with one of `NAMES`, then `=` or `:`, optional spaces, an optional quote
+/// and an optional `Bearer `, then a value of at least 8 characters with no space. Not when
+/// the value reads as code.
+// SPEC: 4146: three things the row does not say. Spaces may stand before the `=` or `:`
+// (its own example `next_token = self.lexer…` has them). One quote may close the name
+// (`"api_key": "…"`), so that JSON is covered. A value that opened with a quote ends at
+// that quote. The Hit's name is the matched ending, in lowercase, not the whole name: the
+// text before it is free text and could itself be a token.
+fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
+    let b = s.as_bytes();
+    if !matches!(b[i] | 0x20, b'p' | b's' | b't' | b'a') {
+        return None;
+    }
+    let name = NAMES
+        .into_iter()
+        .find(|n| b.len() - i >= n.len() && b[i..i + n.len()].eq_ignore_ascii_case(n.as_bytes()))?;
+    let is_quote = |at: usize| matches!(b.get(at), Some(b'"' | b'\''));
+    let mut j = i + name.len();
+    if is_quote(j) {
+        j += 1;
+    }
+    j = skip_blank(b, j);
+    if !matches!(b.get(j), Some(b'=' | b':')) {
+        return None;
+    }
+    j = skip_blank(b, j + 1);
+    let mut quote = None;
+    if is_quote(j) {
+        quote = Some(b[j] as char);
+        j += 1;
+    }
+    if b.len() - j >= 7 && b[j..j + 7].eq_ignore_ascii_case(b"bearer ") {
+        j += 7;
+    }
+    let start = j;
+    if quote.is_none() && memo.code.is_some_and(|(from, at)| from <= start && start < at) {
+        return None;
+    }
+    let (mut end, mut chars, mut digit, mut colon) = (b.len(), 0usize, false, false);
+    for (off, c) in s[start..].char_indices() {
+        if c.is_whitespace() || quote == Some(c) {
+            end = start + off;
+            break;
+        }
+        if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>') || (c == ':' && colon) {
+            memo.code = Some((start, start + off));
+            return None;
+        }
+        colon = c == ':';
+        digit |= c.is_ascii_digit();
+        chars += 1;
+    }
+    if chars < 8 || (!digit && chars < 16) {
+        return None;
+    }
+    Some(Span { start, end, hit: hit("named_value", Some(name)) })
+}
+
+/// `Bearer ` followed by at least 20 of `[A-Za-z0-9._~+/=-]`: the value.
+fn bearer(b: &[u8], i: usize) -> Option<Span> {
+    if b.len() - i < 7 || !b[i..i + 7].eq_ignore_ascii_case(b"bearer ") {
+        return None;
+    }
+    let start = i + 7;
+    let end = run_end(b, start, is_bearer);
+    (end - start >= 20).then(|| Span { start, end, hit: hit("named_value", Some("bearer")) })
+}
+
+/// A run of at least 32 of `[A-Za-z0-9+=_-]` with at least 3 lowercase letters, 3 uppercase
+/// letters and 3 digits.
+fn long_token(b: &[u8], start: usize, end: usize) -> Option<Span> {
+    if end - start < 32 {
+        return None;
+    }
+    let count = |class: fn(&u8) -> bool| b[start..end].iter().filter(|c| class(c)).count();
+    (count(u8::is_ascii_lowercase) >= 3 && count(u8::is_ascii_uppercase) >= 3 && count(u8::is_ascii_digit) >= 3)
+        .then(|| Span { start, end, hit: hit("long_token", None) })
+}
+
+// ---------------------------------------------------------------------------------------
+// Tests (spec section 8: 1 to 3, 11, 13, 14)
+// ---------------------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Tokens are joined from parts, so no key-shaped literal is in the repository.
+    fn mk(parts: &[&str]) -> String {
+        parts.concat()
+    }
+
+    const LOW_A: &str = "abcdefghij0123456789";
+    const LOW_B: &str = "klmnopqrst9876543210";
+
+    // Test 1.
+    #[test]
+    fn redact_keeps_code_prose_hashes_and_paths_whole() {
+        let cases: [(&str, String); 12] = [
+            ("lexer call", "next_token = self.lexer.next_token()?;".into()),
+            ("string new", "password: String::new()".into()),
+            ("environ", "api_key=os.environ[\"X\"]".into()),
+            ("already redacted", "secret: [REDACTED]".into()),
+            ("required", "password: required".into()),
+            ("task-list", "the task-list for disk-usage".into()),
+            ("secretary", "my secretary Nakia asked".into()),
+            ("policy", "the password policy needs authorization from ops".into()),
+            ("git hash", format!("commit {} landed", "9f2c1a7e04".repeat(4))),
+            ("project dir", format!("dir {} here", "0a1b2c3d4e5f6789".repeat(4))),
+            ("path", "/home/u/Projects/SynapsCLI/crates/agent-engine/src/tools/memory.rs".into()),
+            ("archive id", "ctx-9f2c1a7e04b35d6688c1f0a2b7d94e13".into()),
+        ];
+        for (case, text) in &cases {
+            let r = redact(text);
+            assert!(r.text == *text, "case {case}: the text was changed");
+            assert!(matches!(r.text, Cow::Borrowed(_)), "case {case}: the text was copied");
+            assert!(r.blanked == 0 && r.hits.is_empty(), "case {case}: {} hits", r.hits.len());
+        }
+    }
+
+    // Test 2.
+    #[test]
+    fn redact_blanks_each_shape_and_keeps_the_rest() {
+        let b64 = mk(&["aGVsbG8gd29ybGQgdGhpcyBp", "cyBhIHRlc3QgMTIzNDU="]);
+        assert_eq!(b64.chars().count(), 44, "the base64 case is 44 characters");
+        // (case, the text between "before " and " after", what is left of it, rule, name)
+        let cases: Vec<(&str, String, &str, &str, Option<&str>)> = vec![
+            ("sk-", mk(&["sk", "-", LOW_A, LOW_B]), BLANK, "prefix", Some("sk-")),
+            ("sk_live_", mk(&["sk_", "live_", LOW_A, "abcd"]), BLANK, "prefix", Some("sk_live_")),
+            ("gho_", mk(&["gho", "_", LOW_A, LOW_B]), BLANK, "prefix", Some("gho_")),
+            ("glpat-", mk(&["glpat", "-", LOW_A]), BLANK, "prefix", Some("glpat-")),
+            ("xoxp-", mk(&["xoxp", "-", "1234-5678-", LOW_A]), BLANK, "prefix", Some("xoxp-")),
+            ("AIza", mk(&["AI", "za", "SyA-", LOW_A, "_", "ABCDEFGHIJ"]), BLANK, "prefix", Some("AIza")),
+            ("AKIA", mk(&["AKIA", "ABCDEFGH", "12345678"]), BLANK, "prefix", Some("AKIA")),
+            (
+                "jwt",
+                mk(&["ey", "J0eXAiOiJKV1Qi", ".", "eyJzdWIiOiIxMjM0", ".", "c2lnbmF0dXJlX3g"]),
+                BLANK,
+                "jwt",
+                Some("eyJ"),
+            ),
+            ("token=", mk(&["token=", "abcdef", "123456"]), "token=(redacted)", "named_value", Some("token")),
+            (
+                "url",
+                mk(&["postgres://user:", "hunter", "2xyz", "@host/db"]),
+                "postgres://user:(redacted)@host/db",
+                "url_password",
+                None,
+            ),
+            (
+                "authorization bearer",
+                mk(&["Authorization: Bearer ", "abcdefghijklmno", "pqrstuvwxyz0123"]),
+                "Authorization: Bearer (redacted)",
+                "named_value",
+                Some("authorization"),
+            ),
+            (
+                "pem",
+                mk(&[
+                    "-----BEGIN RSA PRIVATE",
+                    " KEY-----\nMIIEowIBAAKCAQEA\nq1w2e3r4t5y6\n-----END RSA PRIVATE",
+                    " KEY-----",
+                ]),
+                BLANK,
+                "key_block",
+                None,
+            ),
+            ("base64", b64, BLANK, "long_token", None),
+        ];
+        for (case, token, left, rule, name) in &cases {
+            let text = format!("words before {token} words after");
+            let r = redact(&text);
+            assert!(r.text == format!("words before {left} words after"), "case {case}: wrong text");
+            assert!(r.blanked == 1 && r.hits.len() == 1, "case {case}: blanked {}", r.blanked);
+            assert!(r.hits[0].rule == *rule, "case {case}: rule {}", r.hits[0].rule);
+            assert!(r.hits[0].name.as_deref() == *name, "case {case}: wrong name");
+            let again = redact(&r.text);
+            assert!(again.blanked == 0, "case {case}: a second pass blanked {}", again.blanked);
+        }
+    }
+
+    #[test]
+    fn redact_edges_of_the_shapes() {
+        let bearer = mk(&["Bearer ", LOW_A, ".", LOW_B]);
+        let open_pem = mk(&["-----BEGIN OPENSSH PRIVATE", " KEY-----\nb3BlbnNzaC1rZXk\nmore"]);
+        let json = mk(&["{\"api_key\": \"", "abcd1234", "efgh", "\"}"]);
+        let in_word = mk(&["task", "-", LOW_A, LOW_B]);
+        let akia17 = mk(&["AKIA", "ABCDEFGH", "123456789"]);
+        let two = format!("a {} b {} c", mk(&["ghp", "_", LOW_A]), mk(&["xoxb", "-", LOW_B]));
+        // (case, text, expected text, blanked)
+        let cases: Vec<(&str, String, String, usize)> = vec![
+            ("bare bearer", format!("sent {bearer} ok"), "sent Bearer (redacted) ok".into(), 1),
+            ("pem with no end", format!("key: {open_pem}"), "key: (redacted)".into(), 1),
+            ("json", json, "{\"api_key\": \"(redacted)\"}".into(), 1),
+            ("prefix inside a word", in_word.clone(), in_word, 0),
+            ("AKIA and 17", akia17.clone(), akia17, 0),
+            ("url without password", "https://example.com:8080/a@b".into(), "https://example.com:8080/a@b".into(), 0),
+            ("ssh url", "ssh://git@host:22/repo".into(), "ssh://git@host:22/repo".into(), 0),
+            ("two tokens", two, "a (redacted) b (redacted) c".into(), 2),
+            ("short value", "token=abc123".into(), "token=abc123".into(), 0),
+            ("empty", String::new(), String::new(), 0),
+        ];
+        for (case, text, expected, blanked) in &cases {
+            let r = redact(text);
+            assert!(r.text == *expected, "case {case}: wrong text");
+            assert!(r.blanked == *blanked && r.hits.len() == *blanked, "case {case}: blanked {}", r.blanked);
+        }
+    }
+
+    // Test 3.
+    #[test]
+    fn show_makes_one_harmless_line() {
+        assert_eq!(show("one\ntwo\r\n\tthree  four\u{2028}five", 200), "one two three four five");
+
+        let invisible = "a\u{202E}b\u{200B}c\u{2060}d\u{00AD}e\u{061C}f\u{2028}g\u{E0041}h";
+        assert_eq!(show(invisible, 200), "abcdef gh");
+
+        let event = show("<event id=\"1\">", 200);
+        assert!(!event.contains('<') && !event.contains('>'), "event: {event}");
+        assert_eq!(event, "\u{2039}event id=\"1\"\u{203A}");
+
+        let markers = [
+            ("plain", "[End extension context]", "(End extension context)"),
+            ("two spaces", "[End  extension context]", "(End extension context)"),
+            ("line break", "[End\nextension context]", "(End extension context)"),
+            ("fullwidth", "\u{FF3B}End Axel recall\u{FF3D}", "(End Axel recall)"),
+        ];
+        for (case, text, expected) in markers {
+            let shown = show(text, 200);
+            assert!(!shown.contains(['[', ']', '\u{FF3B}', '\u{FF3D}']), "case {case}: {shown}");
+            assert_eq!(shown, expected, "case {case}");
+        }
+
+        let every = "[\u{FF3B}\u{3010}\u{3014}\u{3016}\u{3018}\u{301A}\u{27E6}]\u{FF3D}\u{3011}\u{3015}\u{3017}\u{3019}\u{301B}\u{27E7}<\u{FF1C}\u{3008}\u{300A}\u{27E8}>\u{FF1E}\u{3009}\u{300B}\u{27E9}";
+        assert_eq!(show(every, 200), format!("{}{}{}{}", "(".repeat(8), ")".repeat(8), "‹".repeat(5), "›".repeat(5)));
+
+        let long = "é√ words ".repeat(111) + "é";
+        assert_eq!(long.chars().count(), 1000);
+        let shown = show(&long, 100);
+        assert_eq!(shown.chars().count(), 100);
+        assert!(shown.ends_with('…'));
+        assert!(long.starts_with(shown.trim_end_matches('…')));
+        assert_eq!(show(&long, 1000), long);
+        assert_eq!(show("abc", 0), "");
+        assert_eq!(show("abcd", 3), "ab…");
+
+        let token = mk(&["sk", "-", LOW_A, LOW_B]);
+        assert_eq!(show(&format!("key\n{token}\nend"), 200), "key (redacted) end");
+    }
+
+    // Test 11.
+    #[test]
+    fn invisible_characters_do_not_hide_a_key() {
+        for (case, invisible) in [("zero-width space", '\u{200B}'), ("soft hyphen", '\u{00AD}')] {
+            let token = format!("{}{LOW_A}{invisible}{LOW_B}", mk(&["sk", "-"]));
+            let text = format!("words before {token} words after");
+            let r = redact(&text);
+            assert!(r.text == "words before (redacted) words after", "case {case}: wrong text");
+            assert!(r.blanked == 1 && r.hits.len() == 1, "case {case}: blanked {}", r.blanked);
+            assert!(r.hits[0].rule == "prefix", "case {case}: rule {}", r.hits[0].rule);
+            assert!(r.hits[0].name.as_deref() == Some("sk-"), "case {case}: wrong name");
+            for h in &r.hits {
+                let name = h.name.as_deref().unwrap_or("");
+                assert!(!name.contains(LOW_A) && !name.contains(LOW_B), "case {case}: a Hit holds the value");
+                assert!(name.len() <= 16, "case {case}: a Hit's name is {} bytes", name.len());
+            }
+            assert!(certain_hit(&text) == Some(hit("prefix", Some("sk-"))), "case {case}: certain_hit");
+        }
+        // Outside a match nothing is removed by `redact`.
+        let kept = "soft\u{00AD}hyphen and zero\u{200B}width";
+        assert!(matches!(redact(kept).text, Cow::Borrowed(t) if t == kept));
+    }
+
+    // Test 13.
+    #[test]
+    fn show_block_keeps_lines_and_nothing_else() {
+        let token = mk(&["sk", "-", LOW_A, LOW_B]);
+        let text = format!("line one\r\nline \u{1b}[2Ktwo {token}\n\u{202E}line three");
+        let shown = show_block(&text, 500);
+        let lines: Vec<&str> = shown.split('\n').collect();
+        assert_eq!(lines, ["line one", "line (2Ktwo (redacted)", "line three"]);
+        assert!(!shown.contains(['\r', '\u{1b}', '\u{202E}', '[']));
+        assert!(!shown.contains(LOW_A) && !shown.contains(LOW_B), "the token is still there");
+
+        assert_eq!(show_block("a\n\nb", 500), "a\n\nb");
+        assert_eq!(show_block("abc\ndef", 5), "abc\n…");
+
+        assert!(certain_hit("password: String::new()").is_none(), "case string new");
+        assert!(certain_hit("token=abcdefgh1234").is_none(), "case token=");
+        let jwt = mk(&["ey", "J0eXAiOiJKV1Qi", ".", "eyJzdWIiOiIxMjM0", ".", "c2lnbmF0dXJlX3g"]);
+        let found = certain_hit(&format!("token={jwt}")).expect("case jwt: no hit");
+        assert_eq!(found.rule, "jwt");
+        let url = mk(&["see https://bob:", "pw", "@example.com/x"]);
+        assert_eq!(certain_hit(&url).map(|h| h.rule), Some("url_password"));
+    }
+
+    // Test 14, and the strings core's own tests withhold with this rule
+    // (context_archive.rs at babe8511: "password=bad", "password=synthetic-credential",
+    // "the password is example-only"). Core has no direct test of `credential_like`.
+    #[test]
+    fn core_withholds_is_cores_rule() {
+        for text in ["my Password is hunter2", "the task-list", "my secretary", "Bearer x"] {
+            assert!(core_withholds(text), "case {text:?} is withheld by core");
+        }
+        for text in ["hello there", "bearer", "", "pass word", "s k-", "api key"] {
+            assert!(!core_withholds(text), "case {text:?} is not withheld by core");
+        }
+        for text in ["password=bad", "password=synthetic-credential", "the password is example-only"] {
+            assert!(core_withholds(text), "core's case {text:?}");
+        }
+        // The case rule is ASCII lowercase, the match is a substring, one case per word.
+        let one_each = [
+            "PASSWORD", "Passwd", "API_KEY", "ApiKey", "api-KEY", "ACCESS_TOKEN", "Refresh_Token", "SECRET",
+            "Authorization", "BEARER x", "PRIVATE KEY", "disk-usage", "GHP_", "GitHub_PAT_", "XOXB-", "Nakia",
+            "EYJH",
+        ];
+        for (text, word) in one_each.iter().zip(core_rule_words()) {
+            assert!(core_withholds(&format!("x{text}y")), "case {text:?} for word {word:?}");
+            assert!(text.to_ascii_lowercase().contains(word.as_str()), "case {text:?} is not word {word:?}");
+        }
+        // ASCII lowercase only: the Kelvin sign is not a "k".
+        assert!(!core_withholds("S\u{212A}-"), "case kelvin");
+
+        let words = core_rule_words();
+        assert_eq!(words.len(), 17);
+        for word in words {
+            assert!(!word.is_empty(), "an empty word");
+            assert!(*word == word.to_lowercase(), "word {word:?} is not lowercase");
+        }
+        assert_eq!(words[9], "bearer ");
+
+        let first = include_str!("core_withheld.txt").lines().next().unwrap();
+        let commit = first.strip_prefix("# core ").expect("the first line names a core commit");
+        assert!(commit.len() >= 7 && commit.bytes().all(|b| b.is_ascii_hexdigit()), "commit {commit:?}");
+        assert_eq!(core_rule_commit(), commit);
+    }
+
+    // The spec gives no size or time bound; this one only catches a scan that is quadratic.
+    #[test]
+    fn redact_is_one_pass_on_a_megabyte() {
+        let fill = |unit: &str, tail: &str| unit.repeat((1 << 20) / unit.len()) + tail;
+        let cases = [
+            ("prose", fill("the quick brown fox jumps over the lazy dog. ", ""), 0),
+            ("names before code", fill("token=", "("), 0),
+            ("jwt heads", fill("eyJaaaaaaaa-", ""), 0),
+            ("jwt heads, two runs", fill("eyJaaaaaaaa-", ".bbbbbbbb"), 0),
+            ("key block heads", fill("-----BEGIN ", ""), 0),
+            ("url heads", fill("a://b:", ""), 0),
+            ("prefix heads", fill("sk-a ", ""), 0),
+            ("one long name chain", fill("token=", ""), 1),
+        ];
+        for (case, text, blanked) in &cases {
+            let started = std::time::Instant::now();
+            let r = redact(text);
+            let took = started.elapsed();
+            assert!(r.blanked == *blanked, "case {case}: blanked {}", r.blanked);
+            assert!(took.as_secs() < 5, "case {case}: {took:?} for {} bytes", text.len());
+        }
+    }
 }
