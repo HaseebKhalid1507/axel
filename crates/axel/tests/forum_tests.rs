@@ -1920,7 +1920,7 @@ fn emoji_selectors_and_the_joiner_pass_in_a_post() {
     let heart = "\u{2764}\u{FE0F}";
     let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
     let rainbow_flag = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}";
-    let body = format!("{warning} the build is red\n{check} fixed {heart}\n{family} {rainbow_flag} text\u{FE0E}style");
+    let body = format!("{warning} the build is red\n{check} fixed {heart}\n{family} {rainbow_flag} \u{2603}\u{FE0E} text style");
     let title = format!("{warning} Status {check}");
     // A request key is ASCII letters, digits and `._-` by core's rule, so it holds no emoji.
     let key = "status-1";
@@ -1944,6 +1944,42 @@ fn emoji_selectors_and_the_joiner_pass_in_a_post() {
         let text = fx.invalid("forum_post", json!({"request_key": "k", "title": "T", "body": format!("{warning}{c}")}), &me);
         assert_eq!(text, forum_store::invisible_text("body"));
     }
+}
+
+/// Wave 5 review, finding 5: a selector passes only directly after a non-ASCII base, the
+/// joiner only between two bases, U+FE00 to U+FE0D never. A run of selectors is a hidden
+/// payload.
+#[test]
+fn selectors_and_joiners_outside_an_emoji_are_refused() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let me = chat(&cwd, "s-smuggle", &who("a", "ga", None));
+    let before = fx.count("forum_posts");
+    for bad in [
+        "text\u{FE0E}style",
+        "a\u{FE0F}",
+        "\u{2764}\u{FE0F}\u{FE0F}",
+        "\u{2764}\u{FE0E}\u{FE0F}",
+        "\u{FE0F}",
+        "\u{200D}\u{1F469}",
+        "\u{1F468}\u{200D}",
+        "\u{1F468}\u{200D}\u{200D}\u{1F469}",
+        "\u{1F468}\u{200D}x",
+        "x\u{200D}\u{1F469}",
+        "\u{2764}\u{FE01}",
+        "\u{2764}\u{FE00}",
+        "\u{2764}\u{FE0D}",
+        "\u{1F600}\u{FE00}\u{FE01}\u{FE02}\u{FE03}",
+    ] {
+        for (field, input) in [
+            ("body", json!({"request_key": "k", "title": "T", "body": format!("ok {bad} ok")})),
+            ("title", json!({"request_key": "k", "title": format!("T {bad}"), "body": "fine"})),
+        ] {
+            let text = fx.invalid("forum_post", input, &me);
+            assert_eq!(text, forum_store::invisible_text(field), "{bad:?}");
+        }
+    }
+    assert_eq!(fx.count("forum_posts"), before, "nothing was written");
 }
 
 /// R-17.5, second ruling: a joiner or a variation selector inside a credential does not

@@ -181,13 +181,11 @@ fn credential(hit: &screen::Hit) -> AxelError {
 /// whitespace, which `show` turns into a gap, is not such a character.
 // SPEC: ruling R-17.5 names "what `screen::show` removes"; `screen` keeps that test private
 // (`removed`), so it is asked through `show`, once per distinct non-ASCII character.
-// RULING: R-17.5, second ruling: the variation selectors and the zero-width joiner pass,
-// because emoji are made of them. The credential check does not depend on this one: `screen`
-// drops these characters before it matches, so a token split by one is still refused.
+// RULING: R-17.5, second ruling, narrowed by the wave 5 review (finding 5): the emoji
+// selectors and the zero-width joiner pass only where an emoji puts them (`emoji_part_ok`).
+// The credential check does not depend on this one: `screen` drops these characters before
+// it matches, so a token split by one is still refused.
 fn invisible(c: char) -> bool {
-    if emoji_part(c) {
-        return false;
-    }
     !c.is_ascii() && !c.is_whitespace() && screen::show(c.encode_utf8(&mut [0; 4]), 1).is_empty()
 }
 
@@ -196,11 +194,49 @@ fn emoji_part(c: char) -> bool {
     matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{200D}')
 }
 
-/// The first of `body`, `title`, `request_key` that holds an invisible character.
+/// A character an emoji selector or joiner may stand beside: not ASCII, not a selector or
+/// the joiner.
+fn emoji_base(c: Option<char>) -> bool {
+    c.is_some_and(|c| !c.is_ascii() && !emoji_part(c))
+}
+
+/// Whether the selector or joiner at `i` of `chars` stands where an emoji puts it.
+/// U+FE0E and U+FE0F: directly after a base. U+200D: between two bases, where the one before
+/// may carry its one U+FE0E/FE0F (`🏳️‍🌈`). U+FE00 to U+FE0D: never. So a run of selectors, a
+/// selector after ASCII and a leading or trailing joiner are refused.
+fn emoji_part_ok(chars: &[char], i: usize) -> bool {
+    let at = |j: Option<usize>| j.and_then(|j| chars.get(j).copied());
+    let before = at(i.checked_sub(1));
+    match chars[i] {
+        '\u{FE0E}' | '\u{FE0F}' => emoji_base(before),
+        '\u{200D}' => {
+            let left = emoji_base(before)
+                || (matches!(before, Some('\u{FE0E}' | '\u{FE0F}')) && emoji_base(at(i.checked_sub(2))));
+            left && emoji_base(at(Some(i + 1)))
+        }
+        _ => false,
+    }
+}
+
+/// The first of `body`, `title`, `request_key` that holds an invisible character. `None` for a
+/// post that holds a credential: the credential rule answers it (`post` checks that first),
+/// whoever asks this first.
+// RULING: wave 5 review, finding 5: a selector or joiner inside a token is now refused here,
+// and the tool asks this before `post`; the credential answer is the one the post gets.
 pub fn invisible_field(post: &Post) -> Option<&'static str> {
+    if [&post.body, &post.title, &post.request_key].into_iter().any(|part| screen::certain_hit(part).is_some()) {
+        return None;
+    }
     let mut seen: Vec<(char, bool)> = Vec::new();
     for (field, text) in [("body", &post.body), ("title", &post.title), ("request_key", &post.request_key)] {
-        for c in text.chars().filter(|c| !c.is_ascii()) {
+        let chars: Vec<char> = text.chars().collect();
+        for (i, &c) in chars.iter().enumerate().filter(|(_, c)| !c.is_ascii()) {
+            if emoji_part(c) {
+                if emoji_part_ok(&chars, i) {
+                    continue;
+                }
+                return Some(field);
+            }
             let bad = match seen.iter().find(|(known, _)| *known == c) {
                 Some((_, bad)) => *bad,
                 None => {
