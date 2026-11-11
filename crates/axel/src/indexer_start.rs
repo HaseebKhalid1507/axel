@@ -516,6 +516,18 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
     // `model_matches` is null when no model is running, so there is nothing to compare.
     let recorded = brain_model(conn)?;
     let matches = ctx.embed.model_id().map(|model| model_matches(&recorded, model));
+    // RULING: wave4 R-12b item 8. How long a purge has waited for its log to be truncated:
+    // the age of the mark `index_archives::mark_purged` leaves, which every later purge
+    // writes again. Null when there is no mark; 0 when the mark's time cannot be read.
+    let purge_pending_ms: Option<i64> = conn
+        .query_row(
+            "SELECT CAST((julianday('now') - julianday(updated)) * 86400000 AS INTEGER)
+             FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'",
+            [],
+            |r| r.get::<_, Option<i64>>(0),
+        )
+        .optional()?
+        .map(|age| age.unwrap_or(0).max(0));
     let s = &ctx.status;
     let now = (ctx.clock)();
     let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
@@ -540,6 +552,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "vectors_waiting": n(&s.vectors_waiting),
         "docs_waiting": n(&s.docs_waiting),
         "unreadable_memories": n(&s.unreadable_memories),
+        "purge_pending_ms": purge_pending_ms,
         "breaker_open": s.breaker_open.load(Ordering::Relaxed),
         "breaker_trips": n(&s.breaker_trips),
         "hook_misses": n(&s.hook_misses),

@@ -1998,3 +1998,37 @@ fn w4_7_the_config_keeps_the_home_it_was_read_with() {
     assert_eq!(cfg.sources.as_deref(), Some(home.path().join("notes/sources.toml").as_path()));
     assert_ne!(Some(cfg.home.as_os_str()), std::env::var_os("HOME").as_deref(), "the test's home is not the process's");
 }
+
+// ── Wave 4, R-12b item 8: the status row says how long a purge has waited ───
+
+#[test]
+fn w4_8_the_status_row_gives_the_age_of_the_purge_mark() {
+    let dirs = Dirs::new();
+    let (b, _status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    let row = status_row(&dirs.brain()).unwrap();
+    assert!(row.as_object().unwrap().contains_key("purge_pending_ms"), "{row}");
+    assert_eq!(row["purge_pending_ms"], Value::Null, "{row}");
+
+    // A purge leaves its mark, as `index_archives::mark_purged` writes it.
+    let conn = Connection::open(dirs.brain()).unwrap();
+    axel::index_archives::mark_purged(&conn).unwrap();
+    indexer_start::write_status(&mut ctx).unwrap();
+    let age = status_row(&dirs.brain()).unwrap()["purge_pending_ms"].as_i64().expect("an age in milliseconds");
+    assert!((0..60_000).contains(&age), "{age}");
+
+    // The mark has waited ten minutes.
+    conn.execute(
+        "UPDATE context_data SET updated = datetime('now', '-10 minutes') WHERE key = 'purge_pending' AND layer = 'axel'",
+        [],
+    )
+    .unwrap();
+    indexer_start::write_status(&mut ctx).unwrap();
+    let age = status_row(&dirs.brain()).unwrap()["purge_pending_ms"].as_i64().unwrap();
+    assert!((599_000..660_000).contains(&age), "{age}");
+
+    // The log was truncated and the mark is gone.
+    conn.execute("DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", []).unwrap();
+    indexer_start::write_status(&mut ctx).unwrap();
+    assert_eq!(status_row(&dirs.brain()).unwrap()["purge_pending_ms"], Value::Null);
+}
