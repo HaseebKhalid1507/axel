@@ -347,34 +347,46 @@ impl ExtConfig {
         if self.forum != ForumMode::Auto {
             return None;
         }
-        host_config_files(&self.base)
+        // RULING: wave2-c12a review finding 1 (cap): a base folder with more than
+        // `MAX_PROFILE_ENTRIES` entries cannot be checked whole, so it decides by itself:
+        // its own path is returned ("too many entries to check") and the forum is off.
+        let Some(files) = host_config_files(&self.base) else {
+            return Some(self.base.clone());
+        };
+        files
             .into_iter()
             .find(|f| config_file_value(f, "memory.backend").as_deref() == Some("axel"))
     }
 }
 
-/// At most this many entries of the base folder are looked at for profile folders.
-pub const MAX_PROFILE_ENTRIES: usize = 256;
+/// At most this many entries of the base folder are looked at for profile folders; a base
+/// with more turns the forum off under `auto` (`forum_decided_by` names the base itself).
+pub const MAX_PROFILE_ENTRIES: usize = 4096;
 
 /// `<base>/config`, then `<base>/<dir>/config` for each directory directly under the base
 /// (RULING: wave2-c12a review finding 1). A link is not followed to a directory, nothing
-/// deeper is read, at most `MAX_PROFILE_ENTRIES` entries are looked at and the folders are
-/// sorted by name so the order is stable. A base that cannot be listed gives the main file
-/// alone (missing files read as "no such line").
-fn host_config_files(base: &Path) -> Vec<PathBuf> {
-    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(base) {
-        Ok(entries) => entries
-            .take(MAX_PROFILE_ENTRIES)
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
-            .map(|e| e.path())
-            .collect(),
-        Err(_) => Vec::new(),
-    };
+/// deeper is read, and the folders are sorted by name so the order is stable. A base that
+/// cannot be listed gives the main file alone (missing files read as "no such line").
+/// `None` when the base has more than `MAX_PROFILE_ENTRIES` entries (every entry counts,
+/// folder or not): the list would be partial, and a missed profile is the state that must
+/// not happen.
+fn host_config_files(base: &Path) -> Option<Vec<PathBuf>> {
+    let mut dirs = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(base) {
+        for (n, entry) in entries.enumerate() {
+            if n >= MAX_PROFILE_ENTRIES {
+                return None;
+            }
+            let Ok(entry) = entry else { continue };
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                dirs.push(entry.path());
+            }
+        }
+    }
     dirs.sort();
     let mut files = vec![base.join("config")];
     files.extend(dirs.into_iter().map(|d| d.join("config")));
-    files
+    Some(files)
 }
 
 /// The value of `key` in `<base>/config` (`key = value` lines; `#` begins a comment; the

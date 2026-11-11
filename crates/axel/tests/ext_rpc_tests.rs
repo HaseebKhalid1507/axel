@@ -4,7 +4,9 @@
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use axel::ext::config::{base_config_value, default_brain, EmbedderKind, ExtConfig, ForumMode};
+use axel::ext::config::{
+    base_config_value, default_brain, EmbedderKind, ExtConfig, ForumMode, MAX_PROFILE_ENTRIES,
+};
 use axel::ext::rpc::{
     parse_request, write_frame, write_response, FrameError, FrameReader, MessageError, Response,
     INTERNAL_ERROR, MAX_BODY, MAX_OUT, METHOD_NOT_FOUND,
@@ -381,6 +383,34 @@ fn default_brain_is_the_command_lines_default() {
     );
     assert_eq!(cfg(json!({})).brain, home().join(".local/share/axel/brain.r8"));
     assert_eq!(cfg(json!({ "brain": "" })).brain, home().join(".local/share/axel/brain.r8"));
+}
+
+/// RULING: wave2-c12a review finding 1 (cap): a base folder too large to check whole turns
+/// the forum off under `auto`, and `forum_decided_by` names the base itself.
+#[test]
+fn forum_off_when_the_base_has_too_many_entries() {
+    assert_eq!(MAX_PROFILE_ENTRIES, 4096);
+    let tmp = tempfile::tempdir().unwrap();
+    let with = |mode: ForumMode| {
+        let mut c = cfg(json!({}));
+        c.base = tmp.path().to_path_buf();
+        c.forum = mode;
+        c
+    };
+    // Exactly the cap, no config anywhere: checked whole, on.
+    for i in 0..MAX_PROFILE_ENTRIES {
+        std::fs::write(tmp.path().join(format!("f{i:05}")), "").unwrap();
+    }
+    assert!(with(ForumMode::Auto).forum_on());
+    assert_eq!(with(ForumMode::Auto).forum_decided_by(), None);
+    // One more: too many to check, off.
+    std::fs::write(tmp.path().join("f99999"), "").unwrap();
+    assert!(!with(ForumMode::Auto).forum_on());
+    assert_eq!(with(ForumMode::Auto).forum_decided_by(), Some(tmp.path().to_path_buf()));
+    // `on` and `off` still do not look.
+    assert!(with(ForumMode::On).forum_on());
+    assert!(!with(ForumMode::Off).forum_on());
+    assert_eq!(with(ForumMode::On).forum_decided_by(), None);
 }
 
 /// Section 6, "The clash": `auto` declares the forum unless the host's config says the host
