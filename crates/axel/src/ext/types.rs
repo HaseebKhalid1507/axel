@@ -82,6 +82,9 @@ pub struct Status {
     pub jobs_dropped: AtomicU64,
     pub tokens_blanked: AtomicU64,
     pub turns_withheld: AtomicU64,
+    /// Turns the capture buffer let go without storing them and without core's rule being
+    /// the reason: a buffer evicted, a reply with no `has_tool_use`, a buffer cleared.
+    pub turns_dropped: AtomicU64,
     pub write_errors: AtomicU64,
     pub panics: AtomicU64,
     // indexer thread

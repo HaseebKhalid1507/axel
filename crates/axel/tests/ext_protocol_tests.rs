@@ -930,7 +930,8 @@ fn open_state_and_open_ctx_hand_back_the_other_ends_of_their_channels() {
         "pid", "mode", "reason", "written_ms", "started_ms", "scan", "indexer_running", "embed_stopped",
         "model_loaded", "model", "model_dir", "embedder", "vectors_waiting", "docs_waiting", "breaker_open",
         "breaker_trips",
-        "hook_misses", "sessions_dropped", "jobs_dropped", "tokens_blanked", "turns_withheld", "write_errors",
+        "hook_misses", "sessions_dropped", "jobs_dropped", "tokens_blanked", "turns_withheld", "turns_dropped",
+        "write_errors",
         "panics", "forum", "base", "warnings",
     ] {
         assert!(row.get(key).is_some(), "the status row has no {key}");

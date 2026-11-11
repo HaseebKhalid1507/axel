@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Database
-rusqlite = { version = "0.32", features = ["bundled", "vtab", "blob"] }
+rusqlite = { version = "0.32", features = ["bundled", "vtab", "blob", "hooks"] }
 
 # Vector search (HNSW)
 usearch = "2"

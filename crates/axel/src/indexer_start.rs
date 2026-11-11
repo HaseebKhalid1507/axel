@@ -521,6 +521,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "jobs_dropped": n(&s.jobs_dropped),
         "tokens_blanked": n(&s.tokens_blanked),
         "turns_withheld": n(&s.turns_withheld),
+        "turns_dropped": n(&s.turns_dropped),
         "write_errors": n(&s.write_errors),
         "panics": n(&s.panics),
         "forum": {

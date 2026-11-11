@@ -998,7 +998,9 @@ impl<W: Write> Pump<W> {
                 .cloned()
                 .and_then(|c| serde_json::from_value(c).ok()),
         };
-        let forget = name == "forget" || name == "axel_forget";
+        // The host sends the name the extension declared (`forget`), never the name a model
+        // sees (`axel_forget`): core's `tools/extension.rs` keeps `spec.name` for the call.
+        let forget = name == "forget";
         let session_id = caller.session_id.clone();
         let input = params.get("input").cloned().unwrap_or(Value::Null);
         let work = FrontWork::Tool { name, input, caller };
