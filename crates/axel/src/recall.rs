@@ -7,8 +7,9 @@
 //! returns is resolved against its row, and a key with no visible row is dropped.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, NaiveDateTime, SecondsFormat, Utc};
@@ -146,17 +147,48 @@ pub struct RecallConfig {
     pub home: Option<PathBuf>,
 }
 
+/// Each excluded folder as the file system resolved it (`None`: it could not be), and how
+/// many times it was resolved, by the folder as typed.
+type Resolved = HashMap<PathBuf, (Option<PathBuf>, u64)>;
+
+fn resolved_folders() -> MutexGuard<'static, Resolved> {
+    static RESOLVED: OnceLock<Mutex<Resolved>> = OnceLock::new();
+    RESOLVED.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `folder` as the file system resolved it the first time it was asked for. The file
+/// system is looked at once per folder and process, never again.
+// RULING: v2 capture/recall review, item 4 (finding 3). `from_ext` runs at every prompt and
+// every search; a hung mount would hold the front thread at each of them. A folder that
+// could not be resolved the first time stays as typed until the process ends.
+fn resolved(folder: &Path) -> Option<PathBuf> {
+    let mut known = resolved_folders();
+    let entry = known.entry(folder.to_path_buf()).or_insert((None, 0));
+    if entry.1 == 0 {
+        entry.0 = std::fs::canonicalize(folder).ok();
+        entry.1 += 1;
+    }
+    entry.0.clone()
+}
+
+/// How many times `folder` (as the config names it) was resolved by the file system: 0 or
+/// 1. For the test of item 4.
+#[doc(hidden)]
+pub fn times_resolved(folder: &Path) -> u64 {
+    resolved_folders().get(folder).map_or(0, |entry| entry.1)
+}
+
 /// Each folder as typed, then as the file system resolves it when that is another path.
-/// One look at the file system per folder, here and not per row: a folder that does not
-/// exist (or cannot be read) stays as typed.
+/// One look at the file system per folder and process (`resolved`), and not per row: a
+/// folder that does not exist (or cannot be read) stays as typed.
 fn both_forms(folders: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::with_capacity(folders.len());
     for folder in folders {
         if folder.as_os_str().is_empty() {
             continue;
         }
-        let resolved = std::fs::canonicalize(folder).ok();
-        for form in std::iter::once(folder.clone()).chain(resolved) {
+        let real = resolved(folder);
+        for form in std::iter::once(folder.clone()).chain(real) {
             if !out.contains(&form) {
                 out.push(form);
             }
@@ -1350,23 +1382,37 @@ fn filed_dirs(conn: &Connection, logical: &str) -> rusqlite::Result<Vec<String>>
     Ok(out)
 }
 
+/// `FrontState.filed`: by session, when the read was made and what it found.
+type Filed = HashMap<String, (i64, Option<Vec<String>>)>;
+
 /// True when this chat's rows are filed under another project than `scope_dir`: recall
 /// then runs with no project. The read is kept per session for 60 s. A read that failed
-/// counts as "elsewhere": global material only.
-fn filed_elsewhere(st: &mut FrontState, session_id: &str, logical: &str, scope_dir: &str, now: i64) -> bool {
+/// counts as "elsewhere": global material only. It takes `st.filed` and `st.conn` apart, so
+/// that the hook's deadline (`StopAt`, which borrows the connection) covers the read.
+fn filed_elsewhere(
+    filed: &mut Filed,
+    conn: Option<&Connection>,
+    (session_id, logical): (&str, &str),
+    scope_dir: &str,
+    now: i64,
+) -> bool {
     let fresh = |at: i64| now >= at && now - at < FILED_KEEP_MS;
-    let known = st.filed.get(session_id).filter(|(at, _)| fresh(*at)).map(|(_, dirs)| dirs.clone());
+    let known = filed.get(session_id).filter(|(at, _)| fresh(*at)).map(|(_, dirs)| dirs.clone());
     let dirs = match known {
         Some(dirs) => dirs,
         None => {
-            let dirs = st.conn.as_ref().and_then(|conn| filed_dirs(conn, logical).ok());
-            if st.filed.len() >= FILED_SESSIONS {
-                st.filed.retain(|_, (at, _)| fresh(*at));
-                if st.filed.len() >= FILED_SESSIONS {
-                    st.filed.clear();
+            let dirs = conn.and_then(|conn| filed_dirs(conn, logical).ok());
+            if filed.len() >= FILED_SESSIONS {
+                filed.retain(|_, (at, _)| fresh(*at));
+                if filed.len() >= FILED_SESSIONS {
+                    filed.clear();
                 }
             }
-            st.filed.insert(session_id.to_string(), (now, dirs.clone()));
+            // A read that failed (the deadline stopped it) is not kept: the next prompt
+            // reads again.
+            if dirs.is_some() {
+                filed.insert(session_id.to_string(), (now, dirs.clone()));
+            }
             dirs
         }
     };
@@ -1404,14 +1450,23 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
     let session_id = ev.session_id.as_deref();
     let logical = session_id.map(project::logical);
     let ready = st.conn.is_some() && st.mode.load(Ordering::SeqCst) == Mode::Ready as u8;
+    // RULING: v2 capture/recall review, item 4 (finding 3). The deadline holds from here:
+    // the pauses and the folders the chat is filed under are read inside it, not only the
+    // recall (which sets it again, and clears it when it returns; nothing reads after).
+    let _stop = st.conn.as_ref().map(|conn| StopAt::set(conn, deadline));
 
     // The chat's pauses. A read that fails is read as both for what is kept (nothing of the
-    // prompt), and the recall is not made: it is logged as `error`, not as a pause.
+    // prompt), and the recall is not made: it is logged as `error` (or `timeout`, when the
+    // deadline stopped it), not as a pause.
     let read = match (st.conn.as_ref(), logical.as_deref()) {
         (Some(conn), Some(logical)) => pauses(conn, logical),
         _ => Ok((false, false)),
     };
-    let pauses_unread = read.is_err();
+    let pauses_unread = match &read {
+        Ok(_) => None,
+        Err(e) if interrupted(e) || Instant::now() >= deadline => Some("timeout"),
+        Err(_) => Some("error"),
+    };
     let (learning_paused, recall_paused) = read.unwrap_or((true, true));
 
     // `Some(None)`: answered at once and no row is written. `Some(Some(outcome))`: answered
@@ -1429,8 +1484,8 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         || word_count(text) < 3
     {
         Some(None)
-    } else if pauses_unread {
-        Some(Some("error"))
+    } else if let Some(why) = pauses_unread {
+        Some(Some(why))
     } else if recall_paused {
         Some(Some("skipped:paused"))
     } else {
@@ -1459,7 +1514,7 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         // A chat whose rows are filed under another project gets global material only.
         let mut elsewhere = false;
         if let (Some(session), Some(logical), Some(p)) = (session_id, logical.as_deref(), view.project.clone()) {
-            if filed_elsewhere(st, session, logical, &p.scope_dir, now) {
+            if filed_elsewhere(&mut st.filed, st.conn.as_ref(), (session, logical), &p.scope_dir, now) {
                 view.project = None;
                 elsewhere = true;
             }

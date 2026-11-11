@@ -1878,3 +1878,30 @@ fn review_3_the_word_generators_read_the_bodies_of_the_rows_they_take_only() {
     // Reading every matching body would cost `many` about 3.5 times `few`.
     assert!(many < 2 * few, "pages read: {many} with 220 + 100 matching rows, {few} with 48 + 24");
 }
+
+/// Item 4 (finding 3): the excluded folders are resolved by the file system once, not at
+/// each prompt or each `from_ext`; what is excluded is the same.
+#[test]
+fn review_4_the_excluded_folders_are_resolved_once() {
+    let notes = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(notes.path()).unwrap();
+    let (real, link) = (root.join("real"), root.join("link"));
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let mut h = Hook::new(json!({ "recall_exclude_paths": link.to_string_lossy() }));
+    let folder = h.ext.recall_exclude_paths[0].clone();
+    assert_eq!(folder, link);
+    let scope = h.scope_dir.clone();
+    let mut new = row("mem_deploy", "staging deploy note", "the staging server deploy uses the blue pipeline");
+    new.project_key = &scope;
+    h.put(&new);
+
+    for i in 0..20 {
+        assert!(matches!(h.before(&format!("s{i}"), "which pipeline does the staging server deploy use"), HookOut::Inject(_)));
+        assert_eq!(h.trace().outcome, "injected");
+    }
+    for _ in 0..5 {
+        assert_eq!(RecallConfig::from_ext(&h.ext, NOW).exclude_paths, [link.clone(), real.clone()]);
+    }
+    assert_eq!(recall::times_resolved(&folder), 1, "the folder was resolved at more than one prompt");
+}
