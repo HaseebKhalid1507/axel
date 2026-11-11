@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use sha2::{Digest, Sha256};
 use velocirag::embedder::Embedder;
 
 use crate::ext::types::{Job, TestHooks};
@@ -83,7 +84,7 @@ pub struct BulkRow {
 // purged newest row to the next row inserted. The batch carries what the row was when its
 // text was read, and comes back with its vectors.
 /// What a finished bulk carries beside its vectors: for each `vid` that was sent, the
-/// `mem_id` and `content_hash` the row had then.
+/// `mem_id` and `content_hash` the row had then, and the `text_hash` of the text sent.
 ///
 /// It also holds the batch's place in `backlog()`: the count comes off when this is dropped,
 /// which is when the indexer has finished with the job (or the job was thrown away), not
@@ -94,7 +95,7 @@ pub struct BulkRow {
 // (a degraded process, a shutdown, a panic).
 #[derive(Debug)]
 pub struct BatchOut {
-    rows: HashMap<i64, (String, String)>,
+    rows: HashMap<i64, (String, String, String)>,
     counted: usize,
     backlog: Arc<AtomicUsize>,
 }
@@ -106,15 +107,22 @@ impl Drop for BatchOut {
 }
 
 impl BatchOut {
-    /// `(mem_id, content_hash)` of the row that was sent under this number.
-    pub fn row(&self, vid: i64) -> Option<(&str, &str)> {
-        self.rows.get(&vid).map(|(mem_id, hash)| (mem_id.as_str(), hash.as_str()))
+    /// `(mem_id, content_hash, text_hash)` of the row that was sent under this number.
+    pub fn row(&self, vid: i64) -> Option<(&str, &str, &str)> {
+        self.rows.get(&vid).map(|(mem_id, hash, text)| (mem_id.as_str(), hash.as_str(), text.as_str()))
     }
+}
+
+// RULING: wave5 review finding 4. `content_hash` covers the normalised content only, and
+// what is embedded is `title\ncontent`: a vector belongs to the exact text sent.
+/// sha256 of the exact text given to the embedder, hex.
+pub fn text_hash(text: &str) -> String {
+    hex::encode(Sha256::digest(text.as_bytes()))
 }
 
 enum BulkTo {
     /// `submit_bulk` and `submit_rows`: the result goes to the indexer as `Job::Embedded`.
-    Rows(Vec<VecKey>, HashMap<i64, (String, String)>),
+    Rows(Vec<VecKey>, HashMap<i64, (String, String, String)>),
     /// `embed_wait`: the result goes back to the blocked caller.
     Caller { reply: Sender<Vec<Vec<f32>>>, deadline: Instant },
 }
@@ -192,7 +200,7 @@ impl EmbedService {
         let mut sent = HashMap::new();
         let mut items = Vec::with_capacity(rows.len());
         for row in rows {
-            sent.insert(row.vid, (row.mem_id, row.content_hash));
+            sent.insert(row.vid, (row.mem_id, row.content_hash, text_hash(&row.text)));
             items.push((VecKey::Mem(row.vid), row.text));
         }
         self.submit(items, sent);
@@ -204,7 +212,7 @@ impl EmbedService {
         self.submit(items, HashMap::new());
     }
 
-    fn submit(&self, items: Vec<(VecKey, String)>, sent: HashMap<i64, (String, String)>) {
+    fn submit(&self, items: Vec<(VecKey, String)>, sent: HashMap<i64, (String, String, String)>) {
         let Some(tx) = &self.tx else { return };
         if items.is_empty() || self.stopped() {
             return;

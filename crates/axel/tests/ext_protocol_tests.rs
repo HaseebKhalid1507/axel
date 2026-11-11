@@ -1933,6 +1933,44 @@ fn w4_4_a_row_made_secret_or_rewritten_while_its_text_is_embedded_gets_no_vector
     assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Upsert(items)) if items.len() == 1));
 }
 
+// Wave 5 review, finding 4: `content_hash` covers the content only; the text sent is
+// `title\ncontent`.
+#[test]
+fn w4_4_a_title_edited_while_its_text_is_embedded_gets_no_vector_of_the_old_title() {
+    let dirs = Dirs::new();
+    let conn = make_brain(&dirs.brain());
+    let vid = insert_memory(&conn, "mem_titled", None, None, false);
+    let test = TestHooks { embed_sleep_ms: 400, ..TestHooks::default() };
+    let (b, _status) = boot(Some(Embedder::hashing()), test);
+    let (mut ctx, jobs_rx, vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Replace(_))));
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert_eq!(ctx.embed.backlog(), 1);
+
+    // Same `mem_id`, same `vid`, same `content_hash`: only the title moves.
+    conn.execute("UPDATE memories SET title = 'a new title' WHERE id = 'mem_titled'", []).unwrap();
+    assert_eq!(conn.query_row("SELECT vid FROM memory_ext WHERE mem_id = 'mem_titled'", [], |r| r.get::<_, i64>(0)).unwrap(), vid);
+
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
+    assert_eq!(stored_vector(&conn, "mem_titled"), None, "the row got the vector of its old title");
+    assert!(vec_rx.try_recv().is_err());
+    drop(out);
+
+    // Its own text is embedded in the next turn.
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    let Ok(Job::Embedded { model, vectors, out }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
+    assert_eq!(
+        stored_vector(&conn, "mem_titled"),
+        Some(hashed_blob("a new title\nthe body of mem_titled about retry limits"))
+    );
+}
+
 // ── Wave 4, R-12b item 5: the backlog goes down when the job is done ────────
 
 #[test]

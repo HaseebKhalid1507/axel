@@ -11,7 +11,7 @@ use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde_json::json;
 
 use crate::brain_v2::{self, OpenOpts};
-use crate::embed::{BatchOut, BulkRow, EmbedService};
+use crate::embed::{text_hash, BatchOut, BulkRow, EmbedService};
 use crate::error::{AxelError, Result};
 use crate::ext::config::{base_config_value, ExtConfig};
 use crate::ext::server::{degrade, log_line, recover, JOB_QUEUE};
@@ -408,8 +408,9 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
 /// transaction, and the same vectors go to the front thread as a `VecDelta::Upsert`.
 ///
 /// A vector is written only to the row its text was read from: the number, the `mem_id` and
-/// the `content_hash` must all be what `out` recorded when the batch was sent, and the
-/// memory must not be `secret` now. A row purged while its text was with the embed thread
+/// the `content_hash` must all be what `out` recorded when the batch was sent, the row's
+/// `title\ncontent` now must hash to the text that was sent, and the memory must not be
+/// `secret` now. A row purged while its text was with the embed thread
 /// may have given its number to a new row, which must not get the purged text's vector.
 // RULING: wave4 R-12b item 4.
 pub fn on_embedded(
@@ -440,7 +441,23 @@ pub fn on_embedded(
                 if v.len() != EMBEDDING_DIM {
                     continue;
                 }
-                let Some((mem_id, content_hash)) = out.and_then(|out| out.row(*vid)) else { continue };
+                let Some((mem_id, content_hash, sent)) = out.and_then(|out| out.row(*vid)) else { continue };
+                // RULING: wave5 review finding 4. The text is built as `pump_embeddings` built it.
+                let now: Option<String> = conn
+                    .query_row(
+                        "SELECT m.title, m.content FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                         WHERE e.vid = ?1 AND e.mem_id = ?2",
+                        params![vid, mem_id],
+                        |r| {
+                            let title = brain_v2::text_at(r, 0)?.unwrap_or_default();
+                            let body = brain_v2::text_at(r, 1)?.unwrap_or_default();
+                            Ok(format!("{title}\n{body}"))
+                        },
+                    )
+                    .optional()?;
+                if now.as_deref().map(text_hash).as_deref() != Some(sent) {
+                    continue;
+                }
                 let changed = conn.execute(
                     "UPDATE memory_ext SET embedding = ?1, embed_model = ?2
                      WHERE vid = ?3 AND mem_id = ?4 AND content_hash = ?5 AND embedding IS NULL
