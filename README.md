@@ -1,313 +1,153 @@
 # Axel
 
-**Portable agent intelligence — search, memory, and self-organizing knowledge in one `.r8` file.**
+One local brain for Synaps. Axel runs as a
+Synaps extension: it recalls what matters before each message, gives the model search and
+remember tools, learns from your chats as they happen, and keeps the project forum. It reads
+Synaps's archive and note files and never writes them. Nothing leaves this machine.
 
-One file is your agent's entire brain. It searches, remembers, and gets smarter the more you use it.
+If Axel is absent, crashed or slow, Synaps loses recall and nothing else: every hook it
+answers late is answered "continue".
 
----
+## What it adds to Synaps
 
-## What It Does
+- **Recall before each message.** Before a message goes to the model, Axel looks for earlier
+  chats, saved memories and notes that match it and adds the best few (at most 5 items,
+  1,600 characters) to the message. It has 150 ms; after that the message goes on without
+  recall.
+- **Four tools** for the model: `axel_search`, `axel_remember`, `axel_recall`, `axel_forget`.
+  A model's `axel_forget` hides a memory; it does not delete it. `axel_forget
+  {"stop":"learning"}` (or `"recall"`, `"both"`) pauses Axel for that chat only.
+- **Learning from chats.** Whole turns are captured as they happen, and Synaps's context
+  archives and notes are indexed in the background.
+- **The project forum**: `axel_forum_post`, `axel_forum_read`, `axel_forum_forget`, shared by
+  the sessions of one project.
 
-Axel gives AI agents persistent, self-organizing memory. Three systems, one file:
+## Install
 
-- **VelociRAG** — 4-layer search (vector + BM25 + knowledge graph + metadata), fused with Reciprocal Rank Fusion, enhanced with MMR diversity, graph-boosted retrieval, query expansion, and excitability-aware ranking
-- **Memkoshi** — Structured memory with staging, HMAC signing, importance decay/boost, and injection detection
-- **Consolidation** — Biologically-inspired memory lifecycle that strengthens accessed documents, decays forgotten ones, wires related docs together, and prunes stale content
-
-Everything lives in a single `.r8` file — a SQLite database that IS your agent's brain.
-
----
-
-## Quick Start
+Axel is the binary `axel` of this repository. Build it and install it as
+`~/.local/bin/axel-v2`, beside the old `~/.local/bin/axel`, never over it:
 
 ```bash
-# Build
-cargo build --release
-
-# Create a brain
-axel init --name myagent
-
-# Index your notes
-axel index ./notes --source mynotes
-
-# Search
-axel search "rust async patterns"
-
-# Remember something
-axel remember --category preferences --topic stack "Chose axum over actix for async websocket support"
-
-# Boot context (handoff + recent memories + hot docs)
-axel recall
-
-# Run consolidation (or let the timer do it)
-axel consolidate
+cargo build --release --locked -p axel
+install -m 0755 target/release/axel ~/.local/bin/axel-v2
 ```
 
----
+Then write the plugin manifest into Synaps's plugins folder:
+
+```bash
+axel-v2 plugin install --plugins-dir ~/.synaps-cli/plugins
+```
+
+This writes `~/.synaps-cli/plugins/axel/.synaps-plugin/plugin.json` with `command` set to the
+absolute path of the binary you ran. `--plugins-dir` has no default. An existing manifest is
+not replaced unless you add `--force`, which first keeps the old one as
+`plugin.json.bak-<stamp>`. `--print` prints the manifest and writes nothing. A copy of the
+manifest is in [`plugin/plugin.json`](plugin/plugin.json).
+
+Restart Synaps (or reload the extension). The extension starts with Synaps, answers at once,
+and indexes in the background.
+
+**An older Synaps** that does not know the hooks `on_context_archived` and
+`on_memory_forgotten` refuses to load the plugin and runs without it. To use Axel there,
+delete those two hook lines from `plugin.json` by hand; the background scan then does the
+work, up to 10 minutes late.
+
+**A sandbox Synaps.** Set `SYNAPS_BASE_DIR=<dir>`, run `axel-v2 plugin install --plugins-dir
+<dir>/plugins`, and put `extension.axel.brain = <dir>/axel/brain.r8` in `<dir>/config`, so the
+sandbox never opens your real brain. If you forget the last step, Axel sees that the brain
+belongs to another Synaps base and writes nothing.
+
+## Where the brain lives
+
+One SQLite file, `~/.local/share/axel/brain.r8` (folder mode 0700, file 0600). The config key
+`brain` moves it; on the command line `--brain <file>` or `AXEL_BRAIN` does. The extension's
+log is `extension.log` beside the brain: ids, counts, timings and error kinds, never text;
+it is renamed to `extension.log.1` at 4 MiB.
+
+The brain records the Synaps base it mirrors. To move a brain to another base on purpose,
+change that row:
+
+```sql
+UPDATE context_data SET value = '<the new base>' WHERE layer = 'axel' AND key = 'synaps_base';
+```
+
+The embedding model is `all-MiniLM-L6-v2`, read from `~/.cache/velocirag/models/all-MiniLM-L6-v2`
+(or the config key `model_dir`). Axel never downloads it by itself: `axel-v2 model fetch`
+does, when you run it. Without the model files, recall and search work on words alone and
+`status` says so.
+
+The old brain `~/.config/axel/axel.r8` is not changed by this version; it is the rollback copy.
+`axel-v2 migrate init --from-axel ~/.config/axel/axel.r8` makes a version 2 brain from it.
+
+## Configuration
+
+Set a key in the Synaps config as `extension.axel.<key> = <value>`, or in the environment as
+`SYNAPS_EXTENSION_AXEL_<KEY>`. The manifest gives every default. Switches take
+`on|off|true|false|1|0`; a value Axel cannot read keeps its default and is listed by `status`.
+
+| key | default | meaning |
+|---|---|---|
+| `brain` | `~/.local/share/axel/brain.r8` | the brain file |
+| `synaps_base` | derived from the plugin folder | the Synaps base to read archives and notes from |
+| `recall` | `on` | recall before each message |
+| `recall_max_items` | `5` | most items injected per message (1-8) |
+| `recall_max_chars` | `1600` | most characters injected per message |
+| `recall_budget_ms` | `150` | time allowed for one recall |
+| `recall_min_sem` | `0.30` | least similarity by meaning (0-1) |
+| `recall_min_lex` | `0.50` | least share of the prompt's words, when meaning does not pass (0-1) |
+| `recall_on_events` | `off` | also recall on host event messages |
+| `recall_exclude_paths` | empty | comma-separated folders never recalled or searched |
+| `capture` | `turns` | learning from chats as they happen: `turns` or `off` |
+| `archives` | `on` | index Synaps's context archives |
+| `forum` | `auto` | the forum tools: `auto` (on unless Synaps still uses its Axel backend), `on`, `off` |
+| `worker_scope` | `project` | what subagent workers can search: `project` or `all` |
+| `forget_now_min_hidden_hours` | `24` | hours a memory must have been hidden before `forget --now` deletes it; `0`: at once |
+| `handoff_on_start` | `off` | inject the handoff written with `axel handoff set` at session start |
+| `sources` | `~/.config/axel/sources.toml`, else the built-in list | the note folders to index |
+| `archive_events` | empty | comma-separated event sources to index from archives besides worker reports |
+| `embedder` | `onnx` | `onnx` (the local model), `off` (words only), `hash` (tests only) |
+| `model_dir` | `~/.cache/velocirag/models/all-MiniLM-L6-v2` | the model folder |
+| `log_queries` | `on` | keep the first 120 characters of a prompt in the recall log, for turns that are captured anyway |
 
 ## Commands
 
-| Command | Description |
-|---------|-------------|
-| `axel init [--name N]` | Create a new `.r8` brain |
-| `axel index <path> [--source S]` | Index a file or directory |
-| `axel index-sync <path> [--source S]` | Incremental sync — only re-index changed files |
-| `axel search <query> [--limit N] [--json]` | Search with excitability boost, MMR diversity, graph expansion |
-| `axel remember <content>` | Store a signed memory |
-| `axel recall [query]` | Boot context or query-based recall |
-| `axel handoff <set\|get\|clear>` | Session handoff management |
-| `axel forget <id>` | Delete a memory |
-| `axel stats` | Brain health dashboard — docs, access events, excitability, top queries |
-| `axel memories [--limit N]` | List stored memories |
-| `axel consolidate` | Run the 4-phase memory lifecycle |
-| `axel excitability [--limit N]` | Visualize document importance distribution |
-| `axel suggest <query>` | Graph-based document recommendations |
-| `axel extension` | Run as SynapsCLI extension (JSON-RPC) |
-| `axel mcp` | Run as MCP server (6 tools) |
+The binary's command name is `axel`; installed as `axel-v2`, it is run as below.
 
-### Consolidation Flags
+| command | what it does |
+|---|---|
+| `axel-v2 extension` | speaks the extension protocol on stdin and stdout; Synaps runs it |
+| `axel-v2 plugin install --plugins-dir <dir> [--force] [--print]` | writes the plugin manifest (above) |
+| `axel-v2 status [--json] [--check]` | the one place to look: the brain, the running extension and its mode, what is indexed and waiting, the model, pauses, what a model hid. `--check` adds an integrity check. Exit 0 when nothing is wrong, 1 when something is |
+| `axel-v2 why [--last N] [--session <id>] [--json]` | why the last recalls chose what they chose |
+| `axel-v2 show <id>` | one memory in full, or one archive (`ctx-<id>`) |
+| `axel-v2 search`, `recall`, `memories`, `remember` | search, recall, list and save memories from the command line |
+| `axel-v2 forget <id>...` | hides memories, as the tool does |
+| `axel-v2 forget --now <id>...`, `forget --now --hidden` | deletes for good, only rows hidden for at least `forget_now_min_hidden_hours` |
+| `axel-v2 restore <id>...` | brings back hidden memories |
+| `axel-v2 restore --by-model --since <date>` | brings back everything a model hid or superseded since that date |
+| `axel-v2 restore --forget-turns ctx-<id>` | brings back the turns an archive left out because a forget tool was called in them |
+| `axel-v2 pause <session id> [learning\|recall\|both]` | pauses one chat |
+| `axel-v2 resume <session id> [learning\|recall\|both] [--catch-up]` | lifts a pause; `--catch-up` also indexes the chat's archives sealed during it |
+| `axel-v2 migrate init --from-axel <axel.r8>` | makes a version 2 brain from the old one |
+| `axel-v2 migrate synaps --from <brain.r8>` | brings over the forum posts of Synaps's own brain |
+| `axel-v2 migrate verify --from-axel <axel.r8> --from-synaps <brain.r8>` | checks that the import is complete |
+| `axel-v2 migrate catch-up --from-axel <axel.r8>` | brings over what was saved in the old brain after the import |
+| `axel-v2 model fetch` | downloads the embedding model; the only command that does |
 
-```bash
-axel consolidate                    # Full 4-phase run
-axel consolidate --phase reindex    # Single phase only
-axel consolidate --dry-run          # Preview without changes
-axel consolidate -v                 # Per-document detail
-axel consolidate --history          # Past runs + timer status
-axel consolidate --report out.md    # Export prune candidates
-axel consolidate --json             # Machine-readable output
-axel consolidate --sources cfg.toml # Custom source config
-```
+The commands of the first version (`init`, `index`, `index-sync`, `stats`, `consolidate`,
+`handoff` and the rest) are still there; `axel-v2 --help` lists them all.
 
----
+## Turning it off
 
-## Consolidation
-
-The brain self-organizes through a 4-phase cycle that runs automatically every 6 hours:
-
-**Phase 1 — Reindex.** Walk source directories, detect changed files via mtime comparison, re-embed modified content, prune deleted files. New documents get linked to high-excitability neighbors (competitive allocation).
-
-**Phase 2 — Strengthen.** Read the access log since last run. Documents that were searched for get an excitability boost. Documents with consistently low search scores get an extinction signal. Documents untouched for weeks decay following an exponential forgetting curve. More accesses = slower decay.
-
-**Phase 3 — Reorganize.** Documents that keep appearing in the same search results get graph edges between them. Unreinforced edges decay. The knowledge graph wires itself through usage.
-
-**Phase 4 — Prune.** Flag stale documents (low excitability, zero access, old). Auto-remove from low-priority sources. Flag for human review from high-priority sources. Detect misaligned embeddings.
-
-### The Feedback Loop
-
-```
-search → access logged → consolidation boosts excitability →
-search ranking improves → more access → more boost → repeat
-```
-
-Documents you use get stronger. Documents you don't fade away. The brain self-organizes.
-
-### Setup
-
-```bash
-# Enable the systemd timer (every 6 hours)
-systemctl --user enable --now axel-consolidate.timer
-
-# Configure sources
-cat ~/.config/axel/sources.toml
-```
-
-```toml
-[[source]]
-name = "notes"
-path = "~/notes/"
-priority = "high"
-
-[[source]]
-name = "archive"
-path = "~/archive/"
-priority = "low"
-```
-
----
-
-## Search
-
-Search combines 4 retrieval layers via Reciprocal Rank Fusion, then applies post-processing:
-
-1. **Vector similarity** — ONNX MiniLM-L6-v2 embeddings, USearch HNSW index
-2. **BM25 keywords** — FTS5 full-text search with pseudo-relevance query expansion
-3. **Knowledge graph** — traverse entity and relationship edges
-4. **Metadata** — tags and cross-references
-5. **RRF fusion** — merge all layers into a single ranked list
-6. **Excitability boost** — recently accessed docs rank higher, with exponential temporal decay
-7. **Graph boost** — documents connected via co-retrieval edges get a spreading activation bump
-8. **MMR diversity** — penalize near-duplicate results via cosine similarity
-
-```bash
-axel search "deployment strategy" --limit 5
-axel search "deployment strategy" --json | jq '.results[0].content'
-```
-
----
-
-## The `.r8` Format
-
-A `.r8` file is a **single SQLite database** (WAL mode). One file = one brain.
-
-```
-axel.r8  →  SQLite
-  ├── documents              — indexed corpus with excitability scores
-  ├── documents_fts          — FTS5 full-text search index
-  ├── document_access        — search hit log (feeds consolidation)
-  ├── co_retrieval           — co-appearance tracking (feeds graph wiring)
-  ├── consolidation_log      — audit trail for consolidation runs
-  ├── nodes + edges          — knowledge graph (co-retrieval + entity edges)
-  ├── memories               — HMAC-signed structured memories
-  ├── staged_memories        — memories pending review
-  ├── memory_access          — memory retrieval log
-  ├── context_data           — session handoff (key/value)
-  └── brain_meta             — schema version, agent name, model info
-```
-
-```bash
-# It's just SQLite
-sqlite3 axel.r8 "SELECT doc_id, excitability FROM documents ORDER BY excitability DESC LIMIT 5"
-sqlite3 axel.r8 "SELECT COUNT(*) FROM document_access"
-```
-
----
-
-## Architecture
-
-```
-┌──────────────────────────────────────────────────────┐
-│                      axel (crate)                     │
-│  CLI · MCP server · SynapsCLI extension · library     │
-│                                                       │
-│  ┌──────────┐  ┌──────────┐  ┌───────────────────┐   │
-│  │ search   │  │ memory   │  │  consolidation    │   │
-│  │ (query)  │  │ (store)  │  │  (4-phase cycle)  │   │
-│  └────┬─────┘  └────┬─────┘  └────────┬──────────┘   │
-│       └──────────────┼────────────────-┘              │
-│              ┌───────▼───────┐                        │
-│              │   brain.r8    │                        │
-│              │   (SQLite)    │                        │
-│              └───────────────┘                        │
-└──────────────────────────────────────────────────────┘
-```
-
-### Crates
-
-| Crate | Role |
-|-------|------|
-| `velocirag` | 4-layer RAG engine, ONNX embeddings, HNSW index, RRF fusion, MMR, graph boost |
-| `axel-memkoshi` | Memory storage, HMAC signing, decay/boost, pattern detection |
-| `axel` | CLI, `.r8` format, consolidation engine, MCP server, context injection |
-
----
-
-## Integration with SynapsCLI
-
-Axel is designed to be the memory layer for [SynapsCLI](https://github.com/HaseebKhalid1507/synaps-cli) — a terminal-native AI agent runtime. Three integration points:
-
-### 1. MCP Server
-
-Axel runs as an MCP (Model Context Protocol) server, exposing 6 tools that any SynapsCLI agent can call:
-
-```bash
-axel mcp   # Start the MCP server (configured in ~/.synaps-cli/mcp.json)
-```
-
-| Tool | What It Does |
-|------|-------------|
-| `axel_search` | Search the brain — returns ranked results with scores |
-| `axel_remember` | Store a new memory with category, importance, TTL |
-| `axel_recall` | Get boot context — handoff + recent memories + hot docs |
-| `axel_verify` | Check a memory's HMAC signature and provenance |
-| `axel_update` | Edit a memory's content or importance (re-signs) |
-| `axel_consolidate` | Trigger a consolidation pass (any phase, dry-run supported) |
-
-```json
-// ~/.synaps-cli/mcp.json
-{
-  "mcpServers": {
-    "axel": {
-      "command": "/path/to/axel",
-      "args": ["mcp"]
-    }
-  }
-}
-```
-
-### 2. Native Plugin
-
-The `axel-brain` plugin hooks directly into SynapsCLI's extension system for zero-friction integration:
-
-```
-~/.synaps-cli/plugins/axel-brain/
-├── .synaps-plugin/
-│   └── plugin.json          # Extension manifest
-└── main.py                  # Hook handlers
-```
-
-**What it does:**
-
-| Hook | When | Action |
-|------|------|--------|
-| `on_session_start` | Agent boots | Runs Phase 1 (reindex) to catch file changes |
-| `before_message` | First user message | Searches brain, injects relevant context into system prompt |
-| `on_session_end` | Session closes | Logs session boundary |
-
-The plugin only injects on the **first message** of a session — after that, the agent calls `axel_search` explicitly when it needs context. This keeps token costs minimal.
-
-Results below a confidence threshold (0.025) are filtered out — only genuinely relevant documents get injected.
-
-### 3. Multi-Agent Shared Memory
-
-Every SynapsCLI agent — main session and subagents — can read from the same `.r8` brain. When one agent searches for "CS646" and another later searches for "network security," the access patterns compound:
-
-- Agent A searches → document_access logged → consolidation boosts excitability
-- Agent B searches → boosted doc ranks higher → access logged again → stronger boost
-- The whole crew builds shared knowledge through a single brain
-
-### Configuration
-
-```bash
-AXEL_BRAIN=/path/to/custom.r8   # Override default brain path
-```
-
-| Path | Purpose |
-|------|---------|
-| `~/.config/axel/axel.r8` | Default brain location |
-| `~/.config/axel/sources.toml` | Consolidation source directories |
-| `~/.cache/axel/models/` | ONNX embedding model cache |
-| `~/.synaps-cli/mcp.json` | MCP server configuration |
-| `~/.synaps-cli/plugins/axel-brain/` | Native plugin |
-
----
+- Recall only: `extension.axel.recall = off`.
+- Learning from chats only: `extension.axel.capture = off`; archives only:
+  `extension.axel.archives = off`.
+- The forum tools only: `extension.axel.forum = off`.
+- One chat: `axel-v2 pause <session id>`, or the model's `axel_forget {"stop":"both"}`.
+- The whole extension: add `axel` to `disabled_plugins` in the Synaps config, or remove the
+  folder `<plugins>/axel`. Putting the old plugin folder back returns Synaps to the old
+  binary and the old brain, which this version never changed.
 
 ## License
 
 MIT
-
-## Project-scoped memory (T32–T36)
-
-`axel::project_memory` adds an additive, backward-compatible layer on the
-`.r8` memories table: `project_key`, `sensitivity` (`normal`/`secret`),
-`retention` disclosure classes (`standard`, `local_only`,
-`visible_after_consent`, `persist_never_transmit`, `never_persist` — the
-last is rejected and never enters the file), `provenance`, persisted
-`expires_at`, a `memory_tombstones` table for exact project-scoped forget,
-and a `memories_fts` FTS5 lexical index that works fully offline (no
-embedding model, no network). Legacy rows are `NULL`-scoped and excluded
-from every project-scoped query by default (fail closed).
-
-### Scoped-search scale benchmark
-
-`cargo test -p axel --release --test scoped_search_bench -- --ignored --nocapture`
-on the reference dev machine (limit=10, text query matching ~all rows):
-
-| corpus  | batch insert | search (limit=10) |
-|--------:|-------------:|------------------:|
-| 1K      | 0.01 s       | 0.44 ms           |
-| 10K     | 0.10 s       | 3.61 ms           |
-| 100K    | 1.20 s       | 53.7 ms           |
-
-Result-set memory is proportional to the requested limit (hard cap 50),
-never to the total match count. 1M extrapolates to sub-second search
-(FTS5 rank + `LIMIT`); run with `AXEL_BENCH_1M=1` to measure it directly.
