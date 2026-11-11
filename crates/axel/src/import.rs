@@ -137,6 +137,28 @@ impl From<serde_json::Error> for Stop {
 type Res<T> = Result<T, Stop>;
 type Report = Map<String, Value>;
 
+/// What a test hangs at the named points of a command: called with the point's name and a
+/// path (the destination, the copy or the source, as the point says); `true` stops the
+/// command there with exit 5.
+pub type Seam = Box<dyn Fn(&str, &Path) -> bool>;
+
+thread_local! {
+    static SEAM: std::cell::RefCell<Option<Seam>> = const { std::cell::RefCell::new(None) };
+}
+
+/// For tests only: the seam of the commands run on this thread. Nothing else sets it.
+#[doc(hidden)]
+pub fn set_test_seam(seam: Option<Seam>) {
+    SEAM.with(|s| *s.borrow_mut() = seam);
+}
+
+fn seam(point: &str, path: &Path) -> Res<()> {
+    if SEAM.with(|s| s.borrow().as_ref().is_some_and(|f| f(point, path))) {
+        return Err(stop(EXIT_FAILED, format!("stopped at {point} (test seam)")));
+    }
+    Ok(())
+}
+
 /// A temporary directory beside the destination. Deleted by `finish` on every path, and by
 /// `Drop` if a panic passes it.
 struct Temp {
@@ -743,6 +765,7 @@ pub fn init(brain: &BrainArg, opts: &InitOpts) -> Outcome {
     let mut rep = Report::new();
     let mut temp = None;
     let result = init_steps(brain, opts, &mut rep, &mut temp);
+    rep.entry("destination_made").or_insert(json!(false));
     finish("migrate init", rep, temp, result)
 }
 
@@ -885,16 +908,113 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
     }
     clean_stale(&folder, rep);
 
+    // 2 to 5. Nothing is put at `D` before the new brain is finished.
+    let (db, aside_note) = prepare(&dest, source, opts, existing.is_some(), &base, base_from, rep, temp)
+        .map_err(|s| {
+            let sep = if s.message.ends_with('.') { " " } else { ". " };
+            stop(s.code, format!("{}{sep}Nothing was put at {}.", s.message, dest.display()))
+        })?;
+
+    // 6.
+    // SPEC: 1351 renames `T/axel.r8` to `D` and 1352-1357 then open, migrate, record and
+    // `VACUUM` the file at `D`. Here all of that ran on `T/axel.r8` (ruling, wave5-c19-review
+    // finding 1), and putting the finished file at `D` is the very last step: until it, `D`
+    // is absent or the old brain, never a brain that is not finished. It is put there by a
+    // hard link, which never writes over a file that appeared at `D` meanwhile (an
+    // extension that started makes an empty brain); on a file system without hard links by
+    // `renameat2(RENAME_NOREPLACE)`, which never does either; where neither exists, the
+    // command refuses.
+    match place(&db, &dest) {
+        Ok(how) => {
+            rep.insert("placed_by".into(), json!(how));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(stop(
+                EXIT_REFUSED,
+                format!(
+                    "a file appeared at {} while the new brain was being made; it is kept and nothing was put \
+                     there. Stop Synaps and run this again with --replace.{aside_note}",
+                    dest.display()
+                ),
+            ))
+        }
+        Err(e) => {
+            return Err(stop(
+                EXIT_FAILED,
+                format!("the new brain could not be put at {}: {e}. Nothing was put there.{aside_note}", dest.display()),
+            ))
+        }
+    }
+    rep.insert("destination_made".into(), json!(true));
+    if let Err(e) = sync_dir(&folder) {
+        return Err(stop(
+            EXIT_FAILED,
+            format!("the new brain is at {} and is finished, but its folder could not be synced: {e}", dest.display()),
+        ));
+    }
+    Ok(EXIT_OK)
+}
+
+/// Puts the finished brain at `to` without ever writing over a file there; says how.
+fn place(from: &Path, to: &Path) -> std::io::Result<&'static str> {
+    match fs::hard_link(from, to) {
+        Ok(()) => return Ok("hard link"),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Err(e),
+        // The answers of a file system that has no hard links.
+        Err(e) if matches!(e.raw_os_error(), Some(libc::EPERM | libc::EOPNOTSUPP | libc::EMLINK | libc::ENOSYS)) => {}
+        Err(e) => return Err(e),
+    }
+    rename_noreplace(from, to).map(|()| "renameat2(RENAME_NOREPLACE)")
+}
+
+#[cfg(target_os = "linux")]
+fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
+    let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
+    // SAFETY: two NUL-terminated paths that live across the call.
+    let done = unsafe {
+        libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+    };
+    if done == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_noreplace(_from: &Path, _to: &Path) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "this file system has no hard links and this system no renameat2: refused rather than risk a file at the destination",
+    ))
+}
+
+/// Steps 2 to 5: the checked copy, made into a finished, closed and synced version 2 brain
+/// at its temporary name, and then, with `--replace`, the old `D` moved aside. Returns the
+/// finished file and the note of where the old brain went.
+#[allow(clippy::too_many_arguments)]
+fn prepare(
+    dest: &Path,
+    source: &Path,
+    opts: &InitOpts,
+    existing: bool,
+    base: &str,
+    base_from: &str,
+    rep: &mut Report,
+    temp: &mut Option<Temp>,
+) -> Res<(PathBuf, String)> {
+    let folder = folder_of(dest);
     // 2 to 4.
     let copy = checked_copy(source, &folder, ".init-", temp)?;
     rep.insert("source".into(), copy.stat.json(source));
     rep.insert("source_log_carried".into(), json!(copy.stat.sides[0].as_ref().is_some_and(|s| s.size > 0)));
     // The numbers `status` compares with: of `--watch` when given, else of the source as
     // step 2 found it (taken again by `lstat`, which is how `status` reads them).
-    let watch = watch_detail(opts.watch.as_deref().unwrap_or(source.as_path()))?;
+    let watch = watch_detail(opts.watch.as_deref().unwrap_or(source))?;
 
-    // SPEC: 1354: `open_v2` runs on `D`, after the old `D` was moved aside. What it would
-    // refuse is refused here, on the copy, while nothing has been moved.
+    // What `open_v2` would refuse is refused first, as a source this command cannot import.
     match brain_v2::require_v2(&copy.db) {
         Ok(()) | Err(AxelError::V1Brain(_)) => {}
         Err(e) => {
@@ -904,15 +1024,37 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
     for suffix in SIDES {
         let _ = fs::remove_file(side(&copy.db, suffix));
     }
+    seam("checked", &copy.db)?;
+
+    // 7, 7b, 8 and 7a, on the copy.
+    upgrade(&copy.db, source, &copy, base, base_from, &watch, rep)?;
+    // Closed: nothing that SQLite or `open_v2` made may be left beside it.
+    let dir = folder_of(&copy.db);
+    let mut left: Vec<String> = fs::read_dir(&dir)?
+        .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+        .collect::<std::io::Result<_>>()?;
+    left.retain(|n| n != "axel.r8");
+    if !left.is_empty() {
+        left.sort();
+        return Err(stop(
+            EXIT_FAILED,
+            format!("the new brain was closed and files are still beside it: {}", left.join(", ")),
+        ));
+    }
+    seam("closed", &copy.db)?;
+    fs::set_permissions(&copy.db, fs::Permissions::from_mode(0o600))?;
+    File::open(&copy.db)?.sync_all()?;
+    sync_dir(&dir)?;
+    seam("synced", &copy.db)?;
 
     // 5. `--replace`: the old destination is moved aside, never deleted.
     let mut aside_note = String::new();
-    if existing.is_some() {
+    if existing {
         if !opts.even_if_running {
-            refuse_if_running(&dest)?;
+            refuse_if_running(dest)?;
         }
         let checkpoint = Connection::open_with_flags(
-            &dest,
+            dest,
             OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )
         .and_then(|c| c.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0)));
@@ -922,11 +1064,11 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
             Err(e) => format!("not done ({e}): the file was moved as it was"),
         };
         let stamp = Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-        let mut aside = side(&dest, &format!(".replaced-{stamp}"));
+        let mut aside = side(dest, &format!(".replaced-{stamp}"));
         let mut n = 1;
         // SPEC: 1349: `<brain>.r8.hnsw`, the vector index of the old search, belongs to the
         // brain that is moved: it goes with it.
-        let hnsw = dest.with_extension("r8.hnsw");
+        let hnsw = hnsw_of(dest);
         let taken = |aside: &Path| {
             [String::new(), "-wal".into(), "-shm".into(), ".hnsw".into()]
                 .iter()
@@ -934,14 +1076,14 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
         };
         while taken(&aside) {
             n += 1;
-            aside = side(&dest, &format!(".replaced-{stamp}.{n}"));
+            aside = side(dest, &format!(".replaced-{stamp}.{n}"));
         }
         let mut moved = Vec::new();
-        fs::rename(&dest, &aside)?;
+        fs::rename(dest, &aside)?;
         aside_note = format!(" The brain that was there before is at {}.", aside.display());
         for (from, to) in [
-            (side(&dest, "-wal"), side(&aside, "-wal")),
-            (side(&dest, "-shm"), side(&aside, "-shm")),
+            (side(dest, "-wal"), side(&aside, "-wal")),
+            (side(dest, "-shm"), side(&aside, "-shm")),
             (hnsw, side(&aside, ".hnsw")),
         ] {
             match fs::rename(&from, &to) {
@@ -957,56 +1099,21 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
         }
         rep.insert(
             "replaced".into(),
-            json!({ "moved_from": shown(&dest), "moved_to": shown(&aside), "with": moved, "checkpoint": checkpoint }),
+            json!({ "moved_from": shown(dest), "moved_to": shown(&aside), "with": moved, "checkpoint": checkpoint }),
         );
+        seam("replaced", dest).map_err(|s| stop(s.code, format!("{}.{aside_note}", s.message)))?;
     }
-
-    // 6.
-    fs::set_permissions(&copy.db, fs::Permissions::from_mode(0o600))?;
-    // A file that appeared at `D` since step 1 (an extension that started meanwhile makes an
-    // empty brain) is never written over: the link fails when the name is taken.
-    match fs::hard_link(&copy.db, &dest) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            return Err(stop(
-                EXIT_REFUSED,
-                format!(
-                    "a file appeared at {} while the source was being copied; it is kept. Stop Synaps and run \
-                     this again with --replace.{aside_note}",
-                    dest.display()
-                ),
-            ))
-        }
-        Err(e) => {
-            return Err(stop(
-                EXIT_FAILED,
-                format!("the copy could not be moved to {}: {e}.{aside_note}", dest.display()),
-            ))
-        }
-    }
-    sync_dir(&folder)?;
-    if !delete_temp(temp, rep) {
-        return Err(stop(EXIT_FAILED, format!("the temporary copy could not be deleted.{aside_note}")));
-    }
-
-    // 7 to 8, on the new file. A failure from here on leaves a file at `D` that is not
-    // finished, and says so.
-    upgrade(&dest, source, &copy, &base, base_from, &watch, rep).map_err(|s| {
-        stop(
-            s.code,
-            format!(
-                "{}. {} holds the copy of the source and is NOT a finished v2 brain: run \"migrate init \
-                 --replace\" again.{aside_note}",
-                s.message,
-                dest.display()
-            ),
-        )
-    })?;
-    Ok(EXIT_OK)
+    Ok((copy.db, aside_note))
 }
 
+fn hnsw_of(brain: &Path) -> PathBuf {
+    brain.with_extension("r8.hnsw")
+}
+
+/// Steps 7, 7b, 8 and 7a on `db`, the copy at its temporary name, which nobody else has
+/// open. The connection is closed when this returns.
 fn upgrade(
-    dest: &Path,
+    db: &Path,
     source: &Path,
     copy: &Checked,
     base: &str,
@@ -1016,9 +1123,10 @@ fn upgrade(
 ) -> Res<()> {
     // 7.
     let opts = OpenOpts { agent: None, model: DEFAULT_EMBEDDER, dim: EMBEDDING_DIM, upgrade_v1: true };
-    let brain = brain_v2::open_v2(dest, &opts)?;
+    let brain = brain_v2::open_v2(db, &opts)?;
     let conn = &brain.conn;
     conn.execute_batch("PRAGMA synchronous=FULL")?;
+    seam("open_v2", db)?;
 
     // 7b and 8, in one transaction.
     let previous_base = in_write(conn, || {
@@ -1039,6 +1147,7 @@ fn upgrade(
         }
         Ok(previous)
     })?;
+    seam("7b_8", db)?;
     eprintln!("base recorded: {base}");
     rep.insert("base_recorded".into(), json!(base));
     rep.insert("base_from".into(), json!(base_from));
@@ -1085,10 +1194,12 @@ fn upgrade(
     // statement `migrate init` runs on the new file". It is last here, so that the
     // integrity check that follows it is of the file as the command leaves it.
     conn.execute_batch("VACUUM")?;
+    seam("vacuum", db)?;
     let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
     if busy != 0 {
         return Err(stop(EXIT_FAILED, "the checkpoint after VACUUM was blocked: another process has the new brain open"));
     }
+    seam("checkpoint", db)?;
     let verdict = integrity(conn)?;
     if verdict != ["ok"] {
         return Err(stop(
@@ -1101,6 +1212,8 @@ fn upgrade(
     }
     rep.insert("vacuum".into(), json!("done"));
     rep.insert("integrity_check".into(), json!("ok"));
+    seam("integrity_check", db)?;
+    brain.conn.close().map_err(|(_, e)| stop(EXIT_FAILED, format!("the new brain could not be closed: {e}")))?;
     Ok(())
 }
 

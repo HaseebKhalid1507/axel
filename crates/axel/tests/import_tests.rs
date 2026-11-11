@@ -1464,3 +1464,71 @@ fn the_four_commands_through_the_binary() {
     assert_eq!(done.status.code(), Some(2));
     assert!(done.stdout.is_empty());
 }
+
+// ── The fix round (wave5-c19-review) ────────────────────────────────────────
+
+/// Runs `body` with a seam on this thread and takes it away again.
+fn with_seam<T>(seam: impl Fn(&str, &Path) -> bool + 'static, body: impl FnOnce() -> T) -> T {
+    import::set_test_seam(Some(Box::new(seam)));
+    let out = body();
+    import::set_test_seam(None);
+    out
+}
+
+/// Finding 1: the new brain is finished at its temporary name, and the link to the
+/// destination is the last step. A stop after any step before it leaves nothing at the
+/// destination, deletes the temporary copy, and the report says both.
+#[test]
+fn f1_a_stop_before_the_link_leaves_nothing_at_the_destination() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let folder = fx.new.parent().unwrap().to_path_buf();
+    for step in ["checked", "open_v2", "7b_8", "vacuum", "checkpoint", "integrity_check", "closed", "synced"] {
+        let out = with_seam(move |point, _| point == step, || fx.init(&fx.old));
+        show(&format!("init, stopped at {step}"), &out);
+        assert_eq!(out.code, 5, "{step}: {}", out.report);
+        let error = out.report["error"].as_str().unwrap();
+        assert!(error.starts_with(&format!("stopped at {step}")), "{error}");
+        assert!(error.ends_with(&format!("Nothing was put at {}.", fx.new.display())), "{error}");
+        assert_eq!(out.report["destination_made"], false, "{step}");
+        assert!(out.report["temporary_copy_deleted"].as_str().unwrap().contains(".init-"), "{step}: {}", out.report);
+        assert!(listing(&folder).is_empty(), "{step}: {:?}", listing(&folder));
+    }
+
+    // A file left beside the closed new brain stops it too.
+    let out = with_seam(
+        |point, db| {
+            if point == "integrity_check" {
+                fs::write(db.with_extension("r8.hnsw"), b"stray").unwrap();
+            }
+            false
+        },
+        || fx.init(&fx.old),
+    );
+    assert_eq!(out.code, 5, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().contains("files are still beside it: axel.r8.hnsw"), "{}", out.report);
+    assert!(listing(&folder).is_empty(), "{:?}", listing(&folder));
+
+    // With --replace, a stop after the old brain was moved aside: nothing at the
+    // destination, and the report says where the old brain is.
+    empty_v2(&fx.new);
+    settle(&fx.new);
+    let old_bytes = sha(&fx.new);
+    let mut opts = fx.init_opts(&fx.old);
+    opts.replace = true;
+    let out = with_seam(|point, _| point == "replaced", || import::init(&fx.dest(), &opts));
+    show("init --replace, stopped after the move", &out);
+    assert_eq!(out.code, 5, "{}", out.report);
+    assert!(!fx.new.exists());
+    let moved_to = PathBuf::from(out.report["replaced"]["moved_to"].as_str().unwrap());
+    assert_eq!(sha(&moved_to), old_bytes);
+    assert!(out.report["error"].as_str().unwrap().contains(&format!("The brain that was there before is at {}.", moved_to.display())));
+    assert!(temporaries(&folder).is_empty(), "{:?}", listing(&folder));
+
+    // And a run that is not stopped makes it, in one step, by a hard link.
+    let out = fx.init(&fx.old);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["destination_made"], true);
+    assert_eq!(out.report["placed_by"], "hard link");
+    assert_eq!(listing(&folder).iter().filter(|n| n.starts_with("brain.r8") && !n.contains(".replaced-")).collect::<Vec<_>>(), ["brain.r8"]);
+}
