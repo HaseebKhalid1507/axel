@@ -632,40 +632,22 @@ fn cmd_remember(
     category_str: &str,
     topic: &str,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    // RULING: wave3-c11 ruling 4: this command writes `memories` through memkoshi, past the
-    // row writer (no redaction, no project, a second copy of the text in `documents`). On a
-    // version 2 brain it refuses before anything is opened for writing. The version is read
-    // by the gate's own read-only look, `brain_v2::require_v2`.
-    let path = brain_path(cli);
-    match brain_v2::require_v2(&path) {
-        Ok(()) => {
-            return Err(format!(
-                "this brain is version 2 and this command does not write to it ({}); save a memory with \"axel-v2 remember\".",
-                path.display()
-            )
-            .into());
-        }
-        // A version 1 brain: as before.
-        Err(axel::error::AxelError::V1Brain(_)) => {}
-        Err(e) => return Err(e.into()),
-    }
+    use axel::cli::show;
+    use axel::store::{self, Inserted, NewRow, GLOBAL_KEY};
 
+    // Spec 4215-4219 (commit 18b): `store::insert_row` with origin `cli` inside `begin_write`
+    // on a `connect(Cli)` connection, and no shadow document. `main::run`'s gate has refused
+    // a version 1 brain before this runs.
+    let path = brain_path(cli);
     let content = content_parts.join(" ");
     if content.is_empty() {
         eprintln!("Please provide memory content.");
         return Ok(ExitCode::FAILURE);
     }
-
     let category = parse_category(category_str)?;
-
-    ensure_brain(&path)?;
-
     let title: String = content.chars().take(60).collect();
-    let mut mem = Memory::new(category, topic, &title, &content);
-
-    // Validate
-    let pipeline = MemoryPipeline::new();
-    if let Err(errors) = pipeline.validate(&mem) {
+    let mem = Memory::new(category, topic, &title, &content);
+    if let Err(errors) = MemoryPipeline::new().validate(&mem) {
         eprintln!("Validation failed:");
         for e in &errors {
             eprintln!("  • {e}");
@@ -673,24 +655,41 @@ fn cmd_remember(
         return Ok(ExitCode::FAILURE);
     }
 
-    // Sign if brain has a signing key
-    let brain = Brain::open(&path)?;
-    if let Some(signer) = brain.signer() {
-        mem.signature = Some(signer.sign(&mem));
+    let conn = show::open(&path)?;
+    let signer = brain_v2::signer(&conn)?;
+    // SPEC: 4215-4219 name origin, provenance and project only. The rest as the tool's
+    // `remember` writes a saved row; the class is the category, the topic is a tag, and
+    // `origin_ref` is empty as on a row adopted with origin `cli`.
+    let tags = vec![format!("topic:{topic}")];
+    let row = NewRow {
+        id: mem.id.clone(),
+        class: category.as_str(),
+        project_key: GLOBAL_KEY,
+        title: title.clone(),
+        abstract_text: String::new(),
+        content: content.clone(),
+        tags,
+        created_ms: chrono::Utc::now().timestamp_millis(),
+        time_source: "exact",
+        sensitivity: axel::project_memory::Sensitivity::Normal,
+        provenance: "axel:cli:remember".to_string(),
+        expires_ms: None,
+        importance: mem.importance,
+        origin_kind: "cli",
+        origin_ref: "",
+        unit_pos: None,
+        session_id: None,
+        logical: None,
+        links: axel::project_memory::RecordLinks::default(),
+        turn_key: None,
+        hidden: None,
+    };
+    let inserted = show::write(&conn, || store::insert_row(&conn, signer.as_ref(), &row))?;
+    if !matches!(inserted, Inserted::New { .. }) {
+        return Err("the memory could not be saved; nothing was stored; try again".into());
     }
-    drop(brain);
-
-    // Store
-    let mut storage = MemoryStorage::open_existing(&path)?;
-    let staged = storage.stage_memory(&mem)?;
-    storage.approve(&staged.memory.id)?;
-
-    // Index for search
-    let mut search = BrainSearch::open(&path)?;
-    search.index_memory(&mem)?;
-
-    println!("✓ Remembered: {} ({})", mem.title, mem.id);
-    println!("  category: {:?} | topic: {}", category, topic);
+    println!("✓ Remembered: {} ({})", show::one(&axel::screen::redact(&title).text), mem.id);
+    println!("  category: {} | topic: {} | every project", category.as_str(), show::one(topic));
     Ok(ExitCode::SUCCESS)
 }
 

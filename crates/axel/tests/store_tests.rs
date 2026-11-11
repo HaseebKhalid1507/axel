@@ -1548,33 +1548,6 @@ fn old_remember(path: &Path, words: &[&str]) -> std::process::Output {
 }
 
 #[test]
-fn the_old_remember_command_refuses_on_a_version_2_brain() {
-    let dir = TempDir::new().unwrap();
-    let (path, brain) = open(&dir);
-    put(&brain, &row("mem_kept", "note", "tool", "a row saved through the row writer"));
-    checkpoint_truncate(&brain.conn, &path);
-    drop(brain);
-    let before = file_bytes(&path);
-
-    let token = format!("{}{}{}", "AKIA", "ABCDEFGH", "12345678");
-    for words in [
-        vec!["the", "deploy", "key", "is", token.as_str(), "and", "the", "harbour", "is", "quiet"],
-        // Refused before the command looks at its words at all.
-        vec![],
-    ] {
-        let out = old_remember(&path, &words);
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(!out.status.success(), "the old remember wrote to a version 2 brain: {stderr}");
-        assert!(stderr.contains("this brain is version 2") && stderr.contains("\"axel-v2 remember\""), "{stderr}");
-        assert!(!String::from_utf8_lossy(&out.stdout).contains("Remembered"));
-        assert_eq!(file_bytes(&path), before, "the file or its log changed");
-    }
-    let conn = brain_v2::connect(&path, Role::Cli).unwrap();
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM memories"), 1);
-    assert_eq!(count(&conn, "SELECT COUNT(*) FROM documents"), 0);
-}
-
-#[test]
 fn the_old_remember_command_and_a_version_1_brain() {
     // The gate in `main` runs before `remember` and refuses a version 1 brain with
     // `V1Brain` ("axel-v2 does not change it"): that is what "as before" is in this binary.

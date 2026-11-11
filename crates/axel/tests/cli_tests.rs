@@ -15,7 +15,9 @@ use axel::brain_v2::{self, OpenOpts, Role, V2Brain};
 use axel::cli::show::Term;
 use axel::cli::{forget, memories, pause, recall, restore, resume, search, show};
 use axel::ext::config::ExtConfig;
-use axel::ext::types::{Boot, IndexerCtx, Job, Mode, Status, TestHooks};
+use axel::ext::types::{Boot, Caller, IndexerCtx, Job, Mode, Status, TestHooks};
+use axel::ext::{front, tools};
+use axel::r8::Brain;
 use axel::project_memory::{RecordLinks, Sensitivity};
 use axel::search::BrainSearch;
 use axel::store::{self, NewRow};
@@ -1078,4 +1080,130 @@ fn t19_restore_forget_turns_of_an_archive_that_leaves_nothing_out_says_so_and_ch
     assert_eq!(forget_units(world.db(), &c), (0, 0));
     let unknown = restore_turns(&world.path(), "ctx-ffffffff");
     assert_eq!(unknown.code, 1);
+}
+
+// ── remember (spec 4215-4219) ───────────────────────────────────────────────
+
+/// The binary itself, on `path`.
+fn axel_cmd(path: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new(env!("CARGO_BIN_EXE_axel"))
+        .arg("--brain")
+        .arg(path)
+        .args(args)
+        .env_remove("AXEL_BRAIN")
+        .output()
+        .unwrap()
+}
+
+/// The one `memories` row the command wrote, by its origin.
+fn cli_rows(conn: &Connection) -> Vec<(String, String, String, String, String)> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.id, m.project_key, m.provenance, m.content, e.origin_kind
+               FROM memories m JOIN memory_ext e ON e.mem_id = m.id WHERE e.origin_kind = 'cli'",
+        )
+        .unwrap();
+    stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
+/// A tool `search` by a chat whose folder is project `name`, on a front thread of `w`'s brain.
+fn tool_search(w: &World, name: &str, query: &str) -> String {
+    let cwd = w._tmp.path().join(name);
+    std::fs::create_dir_all(&cwd).unwrap();
+    std::fs::write(cwd.join(".synaps-project"), b"").unwrap();
+    std::fs::create_dir_all(w._tmp.path().join("model")).unwrap();
+    let config = json!({
+        "brain": w.path.to_string_lossy(),
+        "synaps_base": w.base.to_string_lossy(),
+        "model_dir": w._tmp.path().join("model").to_string_lossy(),
+        "embedder": "hash",
+        "recall_budget_ms": 2000,
+    });
+    let cfg = ExtConfig::from_initialize(&json!({ "config": config }), w._tmp.path());
+    let boot = Boot {
+        embedder: Some(Embedder::hashing()),
+        clock: Arc::new(now_ms),
+        test: Arc::new(TestHooks::default()),
+        status: Arc::new(Status::default()),
+    };
+    let (mut st, _jobs, _vec_tx) = front::open_state(cfg, boot);
+    let caller = Caller {
+        session_id: Some(format!("s-{name}")),
+        cwd: Some(cwd.to_string_lossy().into_owned()),
+        author: Some(axel::forum::Author::fresh()),
+    };
+    tools::call(&mut st, "search", &json!({ "query": query }), &caller).unwrap()
+}
+
+#[test]
+fn remember_stores_one_global_cli_row_that_recall_and_the_tool_search_of_any_project_find() {
+    let w = World::new();
+    let text = "the harbour ferry timetable changes to the winter schedule on the first of November";
+    let done = axel_cmd(&w.path, &["remember", text]);
+    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+
+    let rows = cli_rows(w.db());
+    assert_eq!(rows.len(), 1, "{rows:?}");
+    let (id, project_key, provenance, content, origin) = &rows[0];
+    assert_eq!((project_key.as_str(), provenance.as_str(), origin.as_str()), (store::GLOBAL_KEY, "axel:cli:remember", "cli"));
+    assert_eq!(content, text);
+    assert!(String::from_utf8_lossy(&done.stdout).contains(id.as_str()));
+    // No shadow document (spec 4217-4218).
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM documents"), 0);
+
+    // `axel-v2 recall` lists it.
+    let listed = ran("", |t| recall::boot(&w.path, t));
+    assert!(listed.out.contains("winter schedule"), "{}", listed.out);
+
+    // The tool's search finds it from any project: it is global.
+    for project in ["alpha", "beta"] {
+        let found = tool_search(&w, project, "harbour ferry timetable winter");
+        assert!(found.contains(id.as_str()), "{project}: {found}");
+        assert!(found.contains("saved with the axel command"), "{project}: {found}");
+    }
+}
+
+#[test]
+fn remember_blanks_a_secret_looking_token_as_insert_row_does() {
+    let w = World::new();
+    let text = format!("the deploy key for the staging bucket is {} and it rotates monthly", token());
+    let done = axel_cmd(&w.path, &["remember", &text]);
+    assert!(done.status.success(), "{}", String::from_utf8_lossy(&done.stderr));
+    let rows = cli_rows(w.db());
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].3.contains(&token()), "{}", rows[0].3);
+    assert!(rows[0].3.contains("rotates monthly"));
+    assert_eq!(in_tables(w.db(), &token()), 0);
+    assert!(!String::from_utf8_lossy(&done.stdout).contains(&token()));
+}
+
+#[test]
+fn remember_says_the_brain_is_busy_when_the_write_lock_is_held() {
+    let w = World::new();
+    let other = brain_v2::connect(&w.path, Role::Indexer).unwrap();
+    other.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let done = axel_cmd(&w.path, &["remember", "a memory that waits for a lock that never comes free"]);
+    other.execute_batch("ROLLBACK").unwrap();
+    assert!(!done.status.success());
+    assert!(String::from_utf8_lossy(&done.stderr).contains("the brain is busy"), "{}", String::from_utf8_lossy(&done.stderr));
+    assert!(cli_rows(w.db()).is_empty());
+}
+
+#[test]
+fn remember_refuses_a_version_1_brain_as_every_other_command_does() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join("axel.r8");
+    drop(Brain::create(&path, Some("old")).unwrap());
+    let before = std::fs::read(&path).unwrap();
+    let remember = axel_cmd(&path, &["remember", "a memory for a brain that is still at version 1 of the schema"]);
+    let memories = axel_cmd(&path, &["memories"]);
+    assert_eq!(remember.status.code(), Some(1));
+    assert_eq!(remember.status.code(), memories.status.code());
+    let said = String::from_utf8_lossy(&remember.stderr);
+    assert!(said.contains("this is a version 1 brain"), "{said}");
+    assert_eq!(said, String::from_utf8_lossy(&memories.stderr));
+    assert_eq!(std::fs::read(&path).unwrap(), before);
 }
