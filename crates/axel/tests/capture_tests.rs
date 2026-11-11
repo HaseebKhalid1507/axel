@@ -1886,3 +1886,41 @@ fn final_2_a_marked_or_withheld_turn_let_go_before_its_end_still_closes_and_keep
     assert_eq!(dropped(&status), 0, "a marked or withheld turn is not a dropped one");
     nothing_stored(ctx_conn(&ctx));
 }
+
+/// Item 5 (silverhand 5): a turn that is not stored takes its log rows only where recall
+/// kept text of it. With `log_queries` off recall never does, and a hook with an empty
+/// session id never gets any: those rows stay, with their record of what was injected.
+// RULING: v2 final capture round, item 5
+#[test]
+fn final_5_a_turn_that_is_not_stored_keeps_log_rows_that_hold_no_text() {
+    let lab = Lab::new();
+    let brain = lab.open();
+    let cfg = lab.cfg();
+    let mut quiet = cfg.clone();
+    quiet.log_queries = false;
+    let conn = &brain.conn;
+    let a = lab.project("alpha");
+    let at = 1_700_000_000_000;
+
+    let short = pair("short", &a, "so?", "yes.", at);
+    let withheld = pair("withheld", &a, "my password is hunter2, keep it", REPLY, at);
+    assert!(withheld.withheld);
+    let paused = pair("paused", &a, PROMPT, REPLY, at);
+    tx(conn, || store::set_pause(conn, &project::logical("paused"), Some("paused"), "learning", "model").unwrap());
+    for turn in [&short, &withheld, &paused] {
+        let chat = turn.session_id.as_str();
+        log_row(conn, chat, PROMPT, at);
+        assert_eq!(write(&brain, &quiet, turn), Written::Skipped, "{chat}");
+        assert_eq!(log_times(conn, chat), [at], "{chat}: a row with no text was deleted");
+        // With `log_queries` on, the same turn takes its row.
+        assert_eq!(write(&brain, &cfg, turn), Written::Skipped, "{chat}");
+        assert_eq!(log_times(conn, chat), Vec::<i64>::new(), "{chat}: the row of a turn recall kept text of survived");
+    }
+
+    // An empty session id: recall keeps no text of it, whatever the config.
+    let nobody = CompletedTurn { session_id: String::new(), ..pair("x", &a, PROMPT, REPLY, at) };
+    log_row(conn, "", PROMPT, at);
+    assert_eq!(write(&brain, &cfg, &nobody), Written::Skipped);
+    assert_eq!(log_times(conn, ""), [at]);
+    nothing_stored(conn);
+}

@@ -408,8 +408,16 @@ fn in_transaction<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Res
 /// of the turn, a chat filed elsewhere since, a turn too short, a tombstone). On the bare
 /// connection in its own transaction, inside `in_transaction` as part of it.
 // RULING: v2 capture/recall review, item 2 (finding 6). The same delete as item 1's.
-fn not_stored(conn: &Connection, turn: &CompletedTurn) -> Result<Written> {
-    recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
+// RULING: v2 final capture round, item 5. Only where recall kept text of the turn. With
+// `log_queries` off it never does, and no row is deleted. Each other reason can go either
+// way, as recall decided it at the prompt and this is the turn's end (withheld: by the reply
+// after a clean prompt; too short: a prompt recall took, a short reply; no project, filed
+// elsewhere, paused: the file system, the archives, a pause changed during the turn; a
+// tombstone: recall does not know it), so the delete stays for them.
+fn not_stored(conn: &Connection, cfg: &ExtConfig, turn: &CompletedTurn) -> Result<Written> {
+    if cfg.log_queries {
+        recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
+    }
     Ok(Written::Skipped)
 }
 
@@ -466,16 +474,18 @@ pub fn write_turn(
         // RULING: v2 capture/recall review, item 1. By time, not by hash: every row of this
         // chat from the turn's first hook to its end, a message in the middle included, and
         // no row of another turn with the same prompt.
-        return not_stored(conn, turn);
+        return not_stored(conn, cfg, turn);
     }
+    // RULING: v2 final capture round, item 5: recall keeps no text of a hook with an empty
+    // session id (`never_captured`), so there is nothing of this turn to take out of the log.
     if turn.session_id.is_empty() {
-        return not_stored(conn, turn);
+        return Ok(Written::Skipped);
     }
     if turn.prompt.chars().count() + turn.reply.chars().count() < MIN_TURN_CHARS {
-        return not_stored(conn, turn);
+        return not_stored(conn, cfg, turn);
     }
     let Some(project) = project::resolve(turn.cwd.as_deref()) else {
-        return not_stored(conn, turn);
+        return not_stored(conn, cfg, turn);
     };
 
     in_transaction(conn, || {
@@ -491,7 +501,7 @@ pub fn write_turn(
             .optional()?
             .is_some();
         if paused {
-            return not_stored(conn, turn);
+            return not_stored(conn, cfg, turn);
         }
 
         // A chat filed elsewhere (R17).
@@ -506,7 +516,7 @@ pub fn write_turn(
             rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().flatten().collect()
         };
         if !filed.is_empty() && !filed.contains(&project.scope_dir) {
-            return not_stored(conn, turn);
+            return not_stored(conn, cfg, turn);
         }
 
         let row = NewRow {
@@ -536,7 +546,7 @@ pub fn write_turn(
         match store::insert_row(conn, signer, &row)? {
             Inserted::New { .. } | Inserted::Exists => Ok(Written::Stored),
             // Forgotten for good: left alone, and no row is there.
-            Inserted::Tombstoned => not_stored(conn, turn),
+            Inserted::Tombstoned => not_stored(conn, cfg, turn),
         }
     })
 }
@@ -614,7 +624,9 @@ fn send_turn(st: &mut FrontState, turn: CompletedTurn, blanked: u64) {
     }
     // RULING: v2 final small round, item 3: a marked or withheld turn carries no text, so
     // it is kept for the case the queue refuses it.
-    let unstored = (turn.suppressed || (turn.withheld && st.cfg.capture)).then(|| turn.clone());
+    // RULING: v2 final capture round, item 5: a withheld turn's log rows hold no text with
+    // `log_queries` off, as `not_stored` says.
+    let unstored = (turn.suppressed || (turn.withheld && st.cfg.capture && st.cfg.log_queries)).then(|| turn.clone());
     // A full queue drops the turn (the job is counted there, the turn here); it arrives
     // with its archive.
     let sent = front::send_job(st, Job::Capture(turn));
