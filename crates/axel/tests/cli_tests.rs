@@ -2594,3 +2594,33 @@ fn forget_now_finds_the_same_key_rows_of_a_file_known_by_its_session_only() {
     assert_eq!(visible_with(world.db(), "SESSIONOTHER"), 0, "{}", run.out);
     assert_eq!(hidden_by_with(world.db(), "SESSIONOTHER"), [Some("cli:unproven".to_string())]);
 }
+
+/// Real-binaries round 2, item 3: an archive core forgot while no extension ran is not
+/// printed by `show` or `memories` (through `open_to_read`): each runs the forget pass
+/// first.
+// RULING: v2 real-binaries round 2, item 3
+#[test]
+fn rb5_the_command_line_does_not_print_an_archive_forgotten_while_no_extension_ran() {
+    let mut world = Indexed::new();
+    let a = Arch::new(11, "s-rb5", T0).about("zeppelin hangar");
+    world.file(&a);
+    world.scan();
+    assert!(!world.rows(&a).is_empty(), "the archive was not indexed: the test proves nothing");
+    let path = world.path();
+    let listed = ran("", |t| memories::run_with(&memories::Args { limit: 10 }, &path, t));
+    assert!(listed.out.contains("zeppelin"), "memories does not list it: the test proves nothing\n{}", listed.out);
+    let shown = show_cmd(&path, &format!("ctx-{}", a.id));
+    assert!(shown.out.contains("state: indexed"), "{}", shown.out);
+
+    // Core forgets it; no extension runs.
+    let dir = world.tmp.path().join("base").join("context-archives").join(scope()).join("s000001");
+    let dead = json!({"version": 1, "scope": scope(), "logical": a.logical, "id": a.id,
+                      "digest": format!("{:0>64}", a.id), "body": {"state": "tombstone"}});
+    std::fs::write(dir.join(format!("{}.json", a.id)), dead.to_string()).unwrap();
+
+    let listed = ran("", |t| memories::run_with(&memories::Args { limit: 10 }, &path, t));
+    assert!(!listed.out.contains("zeppelin"), "{}", listed.out);
+    assert!(world.rows(&a).is_empty(), "the rows are still in the brain");
+    let shown = show_cmd(&path, &format!("ctx-{}", a.id));
+    assert!(shown.out.contains("state: tombstone"), "show still says what was indexed: {}", shown.out);
+}

@@ -36,6 +36,8 @@ const DEFAULT_LAST: usize = 1;
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
     // Section 1, "which subcommand opens how": `connect(Cli)`, reads only.
     let conn = brain_v2::connect(&brain.path, Role::Cli)?;
+    // RULING: v2 real-binaries round 2, item 3: titles are read from rows.
+    crate::cli::show::forget_pass(&conn)?;
     let recalls = read(&conn, args.last.unwrap_or(DEFAULT_LAST), args.session.as_deref())?;
     if recalls.is_empty() && !args.json {
         println!("no recall is logged");

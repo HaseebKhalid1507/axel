@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::show::{self, one, open, rows_where, Term, FAILED, OK};
+use crate::cli::show::{self, one, open_to_read, rows_where, Term, FAILED, OK};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
 use crate::screen;
@@ -23,7 +23,7 @@ pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
 }
 
 pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
-    let conn = open(path)?;
+    let conn = open_to_read(path)?;
     let limit = i64::try_from(args.limit).unwrap_or(i64::MAX);
     let rows = rows_where(&conn, "ORDER BY m.created DESC, m.id LIMIT ?1", [limit])?;
     if rows.is_empty() {

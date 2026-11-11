@@ -12,7 +12,7 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate};
 use rusqlite::{params, Connection};
 
-use crate::cli::show::{self, find_all, find_archive, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
+use crate::cli::show::{self, find_all, find_archive, one, open_to_read, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
 use crate::{index_archives, screen, store};
@@ -63,7 +63,7 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
         )?;
         return Ok(USAGE);
     }
-    let conn = open(path)?;
+    let conn = open_to_read(path)?;
     if let Some(archive) = &args.forget_turns {
         return forget_turns(&conn, archive, term);
     }

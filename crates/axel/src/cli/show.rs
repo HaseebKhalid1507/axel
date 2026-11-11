@@ -58,6 +58,30 @@ pub fn open(path: &Path) -> Result<Connection> {
     brain_v2::connect(path, Role::Cli)
 }
 
+/// [`open`], then [`forget_pass`]: for a command that prints text of rows.
+pub fn open_to_read(path: &Path) -> Result<Connection> {
+    let conn = open(path)?;
+    forget_pass(&conn)?;
+    Ok(conn)
+}
+
+/// What the extension does before it serves the brain (`indexer_start::forget_pass`), in
+/// the base the brain records: archives that are tombstones now and notes files that
+/// changed. Nothing is written unless a file changed; a lock that did not come in time is
+/// `BUSY`, and the command prints nothing of the brain.
+// RULING: v2 real-binaries round 2, item 3: forgotten text is not printed by a command
+// run while no extension has applied the forget.
+pub fn forget_pass(conn: &Connection) -> Result<()> {
+    let Some(base) = crate::cli::forget::recorded_base(conn)? else { return Ok(()) };
+    let signer = brain_v2::signer(conn)?;
+    let clock: crate::ext::types::Clock = std::sync::Arc::new(now_ms);
+    let mut gone = Vec::new();
+    crate::index_archives::forget_tombstoned(conn, &base, &mut gone)
+        .and_then(|_| crate::index_notes::forget_changed(conn, signer.as_ref(), &base, &clock, &mut gone))
+        .map(|_| ())
+        .map_err(|e| if is_busy(&e) { AxelError::Other(BUSY.into()) } else { e })
+}
+
 fn is_busy(e: &AxelError) -> bool {
     matches!(
         e,
@@ -308,7 +332,7 @@ pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
 }
 
 pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
-    let conn = open(path)?;
+    let conn = open_to_read(path)?;
     let given = args.id.trim();
     if let Some(archive) = given.strip_prefix("ctx-") {
         return show_archive(&conn, archive, term);

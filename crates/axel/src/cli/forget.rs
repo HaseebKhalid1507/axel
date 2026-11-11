@@ -13,7 +13,7 @@ use std::process::ExitCode;
 
 use rusqlite::{params, Connection, OptionalExtension};
 
-use crate::cli::show::{self, bare, find_all, now_ms, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
+use crate::cli::show::{self, bare, find_all, now_ms, one, open_to_read, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
 use crate::{index_archives, screen, store};
@@ -76,7 +76,7 @@ pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Res
         writeln!(term.err, "name the rows to forget: \"axel-v2 forget <id>...\" (or \"axel-v2 forget --now --hidden\")")?;
         return Ok(USAGE);
     }
-    let conn = open(path)?;
+    let conn = open_to_read(path)?;
     let Some(ids) = find_all(&conn, &args.ids, term.err)? else {
         writeln!(term.err, "Nothing was changed.")?;
         return Ok(FAILED);
