@@ -509,3 +509,32 @@ fn t22_the_tick_does_nothing_without_a_brain() {
     assert!(docsync::tick(&mut w.ctx).is_ok());
     assert_eq!(docsync::sync(&mut w.ctx).unwrap(), SyncReport::default());
 }
+
+// ── Wave 4 rulings R-22 ─────────────────────────────────────────────────────
+
+/// R-22.1: a file over 2 MiB is never opened and counts as skipped, every tick; a row it
+/// had keeps its text and stays visible.
+#[test]
+fn r22_1_a_file_over_two_mib_is_skipped_and_keeps_its_row() {
+    let big = format!("{BODY}\n{}", "x".repeat(2 * 1024 * 1024));
+    let mut w = world();
+    let a = w.file("notes/a.md", BODY);
+    w.file("notes/huge.txt", &big);
+    let report = w.sync();
+    assert_eq!((report.indexed, report.skipped, report.waiting), (1, 1, 0));
+    assert!(w.row("notes::huge").is_none());
+
+    // A noted file that grows past the bound.
+    std::fs::write(&a, &big).unwrap();
+    touch_ahead(&a, 5);
+    let report = w.sync();
+    assert_eq!((report.indexed, report.skipped, report.hidden), (0, 2, 0));
+    let (_, content, hidden, ..) = w.row("notes::a").unwrap();
+    assert_eq!((content.as_str(), hidden), (BODY, None));
+
+    // With no model it is still skipped, not left waiting for one.
+    let mut w = world_with(None, "hash-384", TestHooks::default());
+    w.file("notes/huge.md", &big);
+    let report = w.sync();
+    assert_eq!((report.skipped, report.waiting), (1, 0));
+}

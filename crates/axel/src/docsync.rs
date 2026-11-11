@@ -26,6 +26,9 @@ const FILES_PER_TICK: usize = 8;
 const EMBED_DEADLINE: Duration = Duration::from_secs(5);
 /// Smaller files are not indexed, as today.
 const MIN_BYTES: u64 = 50;
+/// Larger files are never opened (wave 4 ruling R-22.1): only the first 256 tokens are
+/// embedded, and a huge file would be held whole and written in one transaction.
+const MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// The one mark this file writes and clears.
 const MISSING: &str = "missing_source";
 
@@ -56,6 +59,8 @@ struct Plan {
     gone: Vec<i64>,
     /// Rows hidden as `missing_source` whose file the walk found again.
     back: Vec<i64>,
+    /// Files over `MAX_BYTES`: not opened, their rows untouched.
+    too_big: usize,
 }
 
 /// Every 900 s (called by `indexer::tick`).
@@ -82,6 +87,7 @@ pub fn sync(ctx: &mut IndexerCtx) -> Result<SyncReport> {
         None => return Ok(report),
     };
     let model_loaded = ctx.status.model_loaded.load(Ordering::Relaxed);
+    report.skipped += plan.too_big;
 
     for id in plan.gone {
         if !ready(ctx) {
@@ -239,6 +245,7 @@ fn plan(conn: &Connection, sources: &[SourceDir]) -> Result<Plan> {
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut index: BTreeMap<String, ToIndex> = BTreeMap::new();
+    let mut too_big = 0usize;
     for (root, source) in &roots {
         let walk = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
             // A folder that is another source's root is walked as that source only.
@@ -259,6 +266,10 @@ fn plan(conn: &Connection, sources: &[SourceDir]) -> Result<Plan> {
             let abs = path.to_string_lossy().into_owned();
             seen.insert(abs.clone());
             if meta.len() < MIN_BYTES {
+                continue;
+            }
+            if meta.len() > MAX_BYTES {
+                too_big += 1;
                 continue;
             }
             let doc_id = doc_id(source, root, path);
@@ -296,7 +307,7 @@ fn plan(conn: &Connection, sources: &[SourceDir]) -> Result<Plan> {
             }
         }
     }
-    Ok(Plan { index: index.into_values().collect(), gone: gone.into_iter().collect(), back: back.into_iter().collect() })
+    Ok(Plan { index: index.into_values().collect(), gone: gone.into_iter().collect(), back: back.into_iter().collect(), too_big })
 }
 
 /// Only "not found" says a file is gone. Any other answer (no permission, an I/O error, a
@@ -356,7 +367,7 @@ fn needs_index(conn: &Connection, doc_id: &str, abs: &str, mtime_ms: i64) -> Res
 fn read_file(file: &ToIndex) -> Option<(String, i64)> {
     let handle = crate::fs_open::open_no_wait(&file.path).ok()?;
     let meta = handle.metadata().ok()?;
-    if !meta.file_type().is_file() || file_id(&meta) != file.file_id || meta.len() < MIN_BYTES {
+    if !meta.file_type().is_file() || file_id(&meta) != file.file_id || !(MIN_BYTES..=MAX_BYTES).contains(&meta.len()) {
         return None;
     }
     let mut bytes = Vec::with_capacity(meta.len() as usize);
