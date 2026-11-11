@@ -386,9 +386,14 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
          WHERE e.embedding IS NULL AND m.sensitivity <> 'secret'
          ORDER BY e.created_ms DESC, e.vid DESC LIMIT ?1",
     )?;
+    // RULING: wave4 R-12b item 3. A title or a body that is not text, or not valid UTF-8,
+    // is embedded as empty: read as a string it failed the whole query, every second, and
+    // no older row was ever embedded.
     let items = stmt
         .query_map([BATCH as i64], |r| {
-            Ok((VecKey::Mem(r.get(0)?), format!("{}\n{}", r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            let title = brain_v2::text_at(r, 1)?.unwrap_or_default();
+            let body = brain_v2::text_at(r, 2)?.unwrap_or_default();
+            Ok((VecKey::Mem(r.get(0)?), format!("{title}\n{body}")))
         })?
         .collect::<rusqlite::Result<Vec<(VecKey, String)>>>()?;
     drop(stmt);

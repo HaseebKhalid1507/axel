@@ -1803,3 +1803,25 @@ fn w4_2_the_unreadable_memories_are_counted_at_open_and_by_the_tick_and_the_row_
     assert_eq!(status_row(&dirs.brain()).unwrap()["unreadable_memories"], 2);
     assert_eq!(status.panics.load(Ordering::Relaxed), 0);
 }
+
+// ── Wave 4, R-12b item 3: a title that is not text does not stop the pump ───
+
+#[test]
+fn w4_3_a_title_that_is_not_text_does_not_stop_the_embedding_of_the_other_rows() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        insert_memory(&conn, "mem_fine", None, None, false);
+        insert_memory(&conn, "mem_badtitle", None, None, false);
+        insert_memory(&conn, "mem_badbytes", None, None, false);
+        conn.execute("UPDATE memories SET title = x'FFFE0001' WHERE id = 'mem_badtitle'", []).unwrap();
+        conn.execute("UPDATE memories SET title = CAST(x'C328' AS TEXT) WHERE id = 'mem_badbytes'", []).unwrap();
+    }
+    let (b, _status) = boot(Some(Embedder::hashing()), TestHooks::default());
+    let (mut ctx, jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    indexer_start::pump_embeddings(&mut ctx).expect("one unreadable title failed the pump");
+    let Ok(Job::Embedded { vectors, .. }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
+        panic!("no Job::Embedded")
+    };
+    assert_eq!(vectors.len(), 3);
+}

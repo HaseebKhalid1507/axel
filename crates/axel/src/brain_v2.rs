@@ -593,7 +593,7 @@ struct Orphan {
 }
 
 /// The column as a string; `None` when it is not text or not valid UTF-8.
-fn text_at(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Option<String>> {
+pub(crate) fn text_at(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Option<String>> {
     Ok(match row.get_ref(index)? {
         ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
         _ => None,
@@ -652,15 +652,32 @@ fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<Adoption> {
     }
 
     // The word rows that are missing, and only those (B-3, R-9k). Never a rebuild.
-    conn.execute(
-        "INSERT INTO memories_fts(mem_id, title, abstract, content)
-         SELECT m.id, m.title,
-                CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.abstract_text END,
-                CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.content END
-         FROM memories m WHERE m.id NOT IN (SELECT mem_id FROM memories_fts)
-           AND typeof(m.id) = 'text' AND typeof(m.content) = 'text'",
-        [],
-    )?;
+    // RULING: wave4 R-12b item 3. The same test as the adoption above (`text_at` on `id` and
+    // `content`), row by row: a row that is not adopted gets no word row either. A title or
+    // an abstract that cannot be read is indexed as empty.
+    let mut words: Vec<(String, String, String, String)> = Vec::new();
+    {
+        let mut stmt = conn.prepare(
+            "SELECT m.id, m.content, m.title, m.abstract_text, COALESCE(m.sensitivity = 'secret', 0)
+             FROM memories m WHERE m.id NOT IN (SELECT mem_id FROM memories_fts)",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let (Some(id), Some(content)) = (text_at(r, 0)?, text_at(r, 1)?) else { continue };
+            let title = text_at(r, 2)?.unwrap_or_default();
+            let secret: bool = r.get(4)?;
+            let (abstract_text, content) =
+                if secret { (String::new(), String::new()) } else { (text_at(r, 3)?.unwrap_or_default(), content) };
+            words.push((id, title, abstract_text, content));
+        }
+    }
+    {
+        let mut insert =
+            conn.prepare("INSERT INTO memories_fts(mem_id, title, abstract, content) VALUES (?1, ?2, ?3, ?4)")?;
+        for (id, title, abstract_text, content) in &words {
+            insert.execute(params![id, title, abstract_text, content])?;
+        }
+    }
     Ok(Adoption { adopted, skipped })
 }
 

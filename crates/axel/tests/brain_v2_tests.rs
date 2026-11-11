@@ -1071,6 +1071,13 @@ fn f5_an_unreadable_memory_is_skipped_and_counted_and_the_rest_are_adopted() {
     project_memory::store_scoped(conn, &good, &scope()).unwrap();
     let third = brain_v2::adopt_orphans_counted(conn, "cli").unwrap();
     assert_eq!((third.adopted, third.skipped), (1, 3));
+    // RULING: wave4 R-12b item 3. A row that is not adopted has no word row either: text that
+    // is not valid UTF-8 passes `typeof(...) = 'text'`, and must not pass the fill.
+    for skipped in ["mem_blob", "mem_badtext"] {
+        assert_eq!(count_id(conn, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = ?1", skipped), 0, "{skipped}");
+    }
+    assert_eq!(count_id(conn, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = ?1", &good.id), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 3);
     assert_eq!(origins(conn), vec![("cli".to_string(), 1), ("legacy".to_string(), 2)]);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 6);
     drop(brain);
