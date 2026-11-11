@@ -335,9 +335,9 @@ fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
     );
     assert_eq!(ctx.status.panics.load(Ordering::Relaxed), 1);
 
-    // The first tick runs all eight calls; a second at the same time runs none.
+    // The first tick runs all nine calls; a second at the same time runs none.
     indexer::tick(&mut ctx);
-    assert_eq!(ctx.last_run.len(), 8);
+    assert_eq!(ctx.last_run.len(), 9);
     indexer::tick(&mut ctx);
     assert_eq!(ctx.status.panics.load(Ordering::Relaxed), 1);
     assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);

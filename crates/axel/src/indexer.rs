@@ -80,7 +80,7 @@ const RESYNC_MS: i64 = 60_000;
 const TRIM_MS: i64 = 3_600_000;
 const STATUS_MS: i64 = 30_000;
 
-/// The eight calls, in this order, each at most as often as its interval and each inside
+/// The nine calls, in this order, each at most as often as its interval and each inside
 /// `catch_unwind`. There is no sweep: nothing is deleted by time.
 pub fn tick(ctx: &mut IndexerCtx) {
     if due(ctx, "adopt_orphans", ADOPT_MS) {
@@ -97,6 +97,12 @@ pub fn tick(ctx: &mut IndexerCtx) {
     }
     if due(ctx, "index_archives::scan", SCAN_MS) {
         guarded(ctx, index_archives::scan);
+    }
+    // RULING: wave4 R-13 item 3. A loop that is never idle (a job every second) still
+    // truncates the log after a purge: the checkpoint is tried from the tick too. It does
+    // nothing while there is no purge mark.
+    if due(ctx, "index_archives::checkpoint_after_purge", index_archives::CHECKPOINT_EVERY_MS) {
+        guarded(ctx, index_archives::checkpoint_after_purge);
     }
     if due(ctx, "docsync::tick", DOCSYNC_MS) {
         guarded(ctx, docsync::tick);

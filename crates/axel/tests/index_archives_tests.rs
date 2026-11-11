@@ -20,7 +20,7 @@ use axel::ext::server::serve;
 use axel::ext::types::{Boot, IndexerCtx, Job, Mode, ServeEnd, Status, TestHooks};
 use axel::project_memory::{RecordLinks, Sensitivity};
 use axel::store::{self, NewRow};
-use axel::vindex::VecDelta;
+use axel::vindex::{VecDelta, VecKey};
 use axel::{index_archives, indexer, indexer_start, project};
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -44,7 +44,7 @@ struct Env {
 struct Run {
     ctx: IndexerCtx,
     jobs_rx: Receiver<Job>,
-    _vec_rx: Receiver<VecDelta>,
+    vec_rx: Receiver<VecDelta>,
 }
 
 impl Env {
@@ -87,7 +87,7 @@ impl Env {
         };
         let (ctx, jobs_rx, vec_rx) = indexer_start::open_ctx(self.cfg(kind), boot);
         assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8, "the brain did not open");
-        Run { ctx, jobs_rx, _vec_rx: vec_rx }
+        Run { ctx, jobs_rx, vec_rx }
     }
     /// Writes one archive file; the directories are made on the way.
     fn put(&self, scope: &str, shelf: &str, id: &str, text: &str) -> PathBuf {
@@ -121,6 +121,20 @@ impl Run {
     }
     fn errors(&self) -> u64 {
         self.ctx.status.write_errors.load(Ordering::Relaxed)
+    }
+    /// The `vid`s the front thread was told to remove from its vector array, so far.
+    fn removed(&self) -> Vec<i64> {
+        let mut out = Vec::new();
+        while let Ok(delta) = self.vec_rx.try_recv() {
+            if let VecDelta::Remove(keys) = delta {
+                out.extend(keys.into_iter().filter_map(|key| match key {
+                    VecKey::Mem(vid) => Some(vid),
+                    VecKey::Doc(_) => None,
+                }));
+            }
+        }
+        out.sort_unstable();
+        out
     }
     fn panics(&self) -> u64 {
         self.ctx.status.panics.load(Ordering::Relaxed)
@@ -723,6 +737,10 @@ fn t11_a_capture_of_a_chat_whose_file_is_first_seen_as_a_tombstone_goes() {
     let dir = scope(KEY);
     let mut run = env.run();
     capture(&run, "mem_cap_forgotten", &dir, "s-tomb", T0 - 60_000, None);
+    // RULING: wave4 R-13 item 4. A tombstone says nothing of when the archive was sealed,
+    // so the chat's captures go up to now, with no lower bound: also one made after the
+    // time the archive had (`T0`). The choice errs towards forgetting, and is pinned here.
+    capture(&run, "mem_cap_after_the_archive", &dir, "s-tomb", T0 + 3_600_000, None);
     capture(&run, "mem_cap_other_chat", &dir, "s-other", T0 - 60_000, None);
     let a = Arch::new(1, "s-tomb");
     env.put_tombstone(&dir, &a);
@@ -730,6 +748,7 @@ fn t11_a_capture_of_a_chat_whose_file_is_first_seen_as_a_tombstone_goes() {
     let conn = run.db();
     assert_eq!(state_of(conn, &dir, &a), "tombstone");
     assert!(!has(conn, "mem_cap_forgotten"));
+    assert!(!has(conn, "mem_cap_after_the_archive"), "a capture made after the archive outlived the forget");
     assert!(has(conn, "mem_cap_other_chat"));
     assert!(purge_pending(conn));
     assert_eq!(run.errors(), 0);
@@ -884,9 +903,12 @@ fn t13_a_live_file_whose_id_has_a_tombstone_row_in_the_directory_is_not_indexed(
     );
     assert_eq!(archive_memories(conn), 0);
 
-    // The other order: the live copy is indexed first, the tombstone is met after it.
+    // The other order: the live copy is indexed first, the tombstone is met after it. One
+    // scan takes a tombstone before the new live files (ruling 1a), so two scans here.
     let b = Arch::new(2, "s-thirteen").about("upload queue");
     env.put_live(&dir, &b);
+    run.scan();
+    assert_eq!(state_of(run.db(), &dir, &b), "indexed");
     env.put(&dir, "s000002", &b.id, &b.tombstone(&dir));
     run.scan();
     let conn = run.db();
@@ -1515,7 +1537,7 @@ fn t34a_the_loop_itself_truncates_the_log_on_its_idle_turn() {
     let dir = scope(KEY);
     let a = marked(1, "s-loop");
     env.put_live(&dir, &a);
-    let Run { ctx, jobs_rx, _vec_rx } = env.run_with(TestHooks::default(), Some(Embedder::hashing()));
+    let Run { ctx, jobs_rx, vec_rx: _vec_rx } = env.run_with(TestHooks::default(), Some(Embedder::hashing()));
     let jobs = ctx.jobs.clone();
     let stop = ctx.stop.clone();
     let status = ctx.status.clone();
@@ -1587,20 +1609,31 @@ fn t34a_a_reader_blocks_the_checkpoint_the_mark_stays_and_the_next_idle_turn_fin
 // ── Test 34 (b): a file that stops being a live record ──────────────────────
 
 #[test]
-fn t34b_an_indexed_file_that_is_no_longer_a_record_loses_its_rows_and_an_io_failure_does_not() {
+fn t34b_an_indexed_file_that_is_refused_loses_its_own_rows_and_is_skipped_and_an_io_failure_does_nothing() {
     let env = Env::new();
     let dir = scope(KEY);
     let refused = Arch::new(1, "s-b").about("retry limit");
     let unreadable = Arch::new(2, "s-b").at(T0 + 60_000).about("upload queue");
+    // Another file with the digest of the first: a forget would reach it, a refusal does not.
+    let mut copy = Arch::new(3, "s-b").at(T0 + 120_000).about("deploy window");
+    copy.digest = refused.digest.clone();
     let refused_path = env.put_live(&dir, &refused);
     let unreadable_path = env.put_live(&dir, &unreadable);
+    env.put_live(&dir, &copy);
     let mut run = env.run();
+    // A hidden capture of the archive's window and a log row of the chat: a forget takes both.
+    capture(&run, "mem_cap_hidden", &dir, "s-b", T0 - 1_000, Some("cli"));
+    let log = log_row(run.db(), &refused.logical, &dir, T0 - 500, "a question of that window");
     run.scan();
     assert_eq!(positions(run.db(), &dir, &refused), ["x0.0"]);
     assert_eq!(positions(run.db(), &dir, &unreadable), ["x0.0"]);
+    assert_eq!(positions(run.db(), &dir, &copy), ["x0.0"]);
+    let old_vid = count(run.db(), &format!("SELECT vid FROM memory_ext WHERE origin_ref = '{}'", refused.id));
+    run.removed();
 
-    // Valid JSON of another length that says `version: 2`.
-    std::fs::write(&refused_path, json!({"version": 2, "scope": dir, "id": refused.id}).to_string()).unwrap();
+    // Not JSON, of another length.
+    let live = refused.json(&dir);
+    std::fs::write(&refused_path, "x".repeat(live.len() + 40)).unwrap();
     // A directory of the same name: nothing can be read from it.
     std::fs::remove_file(&unreadable_path).unwrap();
     std::fs::create_dir(&unreadable_path).unwrap();
@@ -1609,8 +1642,16 @@ fn t34b_an_indexed_file_that_is_no_longer_a_record_loses_its_rows_and_an_io_fail
     run.scan();
     let conn = run.db();
     assert!(rows(conn, &dir, &refused).is_empty(), "a file that is no longer a live record kept its rows");
-    assert_eq!(state_of(conn, &dir, &refused), "tombstone");
+    let (state_now, reason) = state(conn, &dir, &rel(&refused.id)).unwrap();
+    assert_eq!(state_now, "skipped", "a refused file is not a forgotten one");
+    assert!(reason.is_some_and(|r| !r.is_empty()));
     assert!(purge_pending(conn));
+    assert_eq!(run.removed(), [old_vid], "the front thread was not told to drop the vector");
+    // Nothing by digest, no capture, no log row.
+    assert_eq!(positions(conn, &dir, &copy), ["x0.0"], "the refusal reached another file by its digest");
+    assert!(has(conn, "mem_cap_hidden"), "the refusal purged a capture");
+    assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM recall_log WHERE id = {log}")), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM archive_index WHERE state = 'tombstone'"), 0);
     assert_eq!(positions(conn, &dir, &unreadable), ["x0.0"], "an unreadable path lost its rows");
     assert_eq!(state_of(conn, &dir, &unreadable), "indexed");
     assert_eq!(run.errors(), 0);
@@ -1623,8 +1664,28 @@ fn t34b_an_indexed_file_that_is_no_longer_a_record_loses_its_rows_and_an_io_fail
     run.scan();
     assert_eq!(positions(run.db(), &dir, &unreadable), ["x0.0"]);
     assert_eq!(count(run.db(), "SELECT MAX(vid) FROM memory_ext"), before);
-    // The refused file stays forgotten.
     assert!(rows(run.db(), &dir, &refused).is_empty());
+
+    // The refused file is read again when its TIME changes, its size being the same: the
+    // live record again, padded to the length of the refused bytes.
+    let seen_ms = count(
+        run.db(),
+        &format!("SELECT created_ms FROM archive_index WHERE rel_name = '{}'", rel(&refused.id)),
+    );
+    std::fs::write(&refused_path, format!("{live}{}", " ".repeat(40))).unwrap();
+    set_mtime(&refused_path, seen_ms);
+    run.scan();
+    assert_eq!(state_of(run.db(), &dir, &refused), "skipped", "the same size and the same time, and it was read");
+    set_mtime(&refused_path, seen_ms + 7_000);
+    run.scan();
+    assert_eq!(state_of(run.db(), &dir, &refused), "indexed", "another time, and it was not read again");
+    assert_eq!(positions(run.db(), &dir, &refused), ["x0.0"]);
+    assert_eq!(run.errors(), 0);
+}
+
+fn set_mtime(path: &Path, ms: i64) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::UNIX_EPOCH + Duration::from_millis(ms as u64)).unwrap();
 }
 
 // ── Test 34 (c): a scan stops when the mode is not Ready ────────────────────
@@ -2280,10 +2341,13 @@ fn t31_a_hidden_capture_hides_its_twins_in_three_windows_and_no_further() {
         .collect();
     // A hidden capture with the prompt "continue", made in window 5.
     capture_keyed(&run, "mem_cap_h", &dir, "s-bounded", T0 + 4 * W + W / 2, Some("cli"), &key_of("continue"));
-    // Windows 4, 5, 6 and 8 as they were sealed; window 2 is found last. (A file indexed
-    // while it is the newest known takes a later hidden capture for one of the window
-    // that is still open: that is the only window "after it" it knows.)
-    index_in_order(&env, &mut run, &dir, &files, &[1, 2, 3, 4, 0]);
+    // As they were sealed, one scan each. Window 2, indexed while it is the newest known,
+    // takes the later hidden capture for one of the window that is still open; when
+    // window 4 arrives its twin is judged again and is no twin (ruling 1c).
+    env.put_live(&dir, &files[0]);
+    run.scan();
+    assert_eq!(hidden_by(run.db(), &dir, &files[0])[0].1.as_deref(), Some("twin:mem_cap_h"));
+    index_in_order(&env, &mut run, &dir, &files, &[1, 2, 3, 4]);
     let conn = run.db();
     for (n, a) in windows.iter().zip(&files) {
         let expect = if matches!(n, 4..=6) { Some("twin:mem_cap_h".to_string()) } else { None };
@@ -2581,4 +2645,462 @@ fn the_forget_mark_takes_the_recall_log_rows_of_its_turn_and_of_no_other_chat_or
     });
     assert!(!there(at_it));
     assert!(there(after_it));
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// The fix round of wave 4 (rulings R-13, and R-13 round 2 on the review of 13b)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// ── R-13 item 3: the checkpoint from the tick ───────────────────────────────
+
+#[test]
+fn the_tick_truncates_the_log_when_the_loop_is_never_idle() {
+    let env = Env::new();
+    let (mut run, _a) = indexed_then_forgotten(&env);
+    assert!(purge_pending(run.db()));
+    assert!(in_file(&env.wal(), WAL_MARKER) > 0, "the marker never was in the log: the test proves nothing");
+    // No idle turn: only the tick.
+    indexer::tick(&mut run.ctx);
+    assert!(!purge_pending(run.db()), "the tick did not try the checkpoint");
+    assert_eq!(in_file(&env.wal(), WAL_MARKER), 0, "the marker is in brain.r8-wal");
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_writer_blocks_the_checkpoint_and_that_is_not_a_write_error() {
+    let env = Env::new();
+    let (mut run, _a) = indexed_then_forgotten(&env);
+    let writer = brain_v2::connect(&env.brain(), Role::Cli).unwrap();
+    brain_v2::begin_write(&writer).unwrap();
+    run.idle_turn();
+    assert!(purge_pending(run.db()), "the mark went though another connection held the write lock");
+    assert_eq!(run.errors(), 0, "a blocked checkpoint was counted as a write error");
+    assert_eq!(count(run.db(), "PRAGMA busy_timeout"), 5_000);
+    writer.execute_batch("ROLLBACK").unwrap();
+    run.idle_turn();
+    assert!(!purge_pending(run.db()));
+    assert_eq!(run.errors(), 0);
+}
+
+// ── R-13 item 4: hides carried over a replaced file; vectors removed ────────
+
+#[test]
+fn a_replaced_file_keeps_the_hide_of_the_row_at_the_same_position() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let old = Arch::new(1, "s-carry")
+        .turn("what colour is the build lamp on the wall today?", "the lamp is oldcrimsonlamp and has been since noon")
+        .about("upload queue");
+    env.put_live(&dir, &old);
+    let mut run = env.run();
+    run.scan();
+    let first = rows(run.db(), &dir, &old)[0].0.clone();
+    assert_eq!(tx(run.db(), || store::hide(run.db(), &first, "cli").unwrap()), 1);
+
+    let mut new = Arch::new(1, "s-carry")
+        .turn("what colour is the build lamp on the wall today?", "the lamp is newemeraldlamp, somebody fixed the build")
+        .about("deploy window");
+    new.digest = format!("{:064x}", 78);
+    assert_ne!(old.json(&dir).len(), new.json(&dir).len());
+    env.put_live(&dir, &new);
+    run.scan();
+    let conn = run.db();
+    assert!(rows(conn, &dir, &new)[0].2.contains("newemeraldlamp"));
+    assert_eq!(
+        hidden_by(conn, &dir, &new),
+        [("x0.0".to_string(), Some("cli".to_string())), ("x2.0".to_string(), None)],
+        "replacing the file brought back a row a person hid"
+    );
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn the_front_thread_is_told_to_remove_the_vectors_of_purged_rows() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let a = Arch::new(1, "s-vec").about("retry limit").about("upload queue");
+    env.put_live(&dir, &a);
+    let mut run = env.run();
+    capture(&run, "mem_cap_covered", &dir, "s-vec", T0 - 60_000, None);
+    let vid = |conn: &Connection, id: &str| count(conn, &format!("SELECT vid FROM memory_ext WHERE mem_id = '{id}'"));
+    let stand_in = vid(run.db(), "mem_cap_covered");
+    run.scan();
+    assert_eq!(run.removed(), [stand_in], "the covered capture's vector was left in the array");
+
+    let mut ids: Vec<i64> = rows(run.db(), &dir, &a).iter().map(|r| vid(run.db(), &r.0)).collect();
+    ids.sort_unstable();
+    assert_eq!(ids.len(), 2);
+    // The forget of the archive takes both.
+    env.put_tombstone(&dir, &a);
+    run.job(forgotten(&a, KEY));
+    assert_eq!(run.removed(), ids);
+    // Nothing is sent for a transaction that purged nothing.
+    run.scan();
+    assert!(run.removed().is_empty());
+}
+
+// ── R-13 item 5: the job leaves the tree as it is ───────────────────────────
+
+#[test]
+fn the_archived_job_changes_nothing_under_context_archives() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let a = Arch::new(1, "s-jobtree").about("retry limit");
+    let b = Arch::new(2, "s-jobtree")
+        .at(T0 + W)
+        .user(FORGET_PROMPT)
+        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .about("upload queue");
+    let path = env.put_live(&dir, &a);
+    env.put_live(&dir, &b);
+    std::fs::write(env.archives().join(&dir).join("lock"), "").unwrap();
+    let before = tree(&env.archives());
+
+    let mut run = env.run();
+    run.job(archived(&a, KEY, Some(&path), Some("s-jobtree"), Some(1), Some(1)));
+    run.job(archived(&b, KEY, None, Some("s-jobtree"), Some(2), Some(1)));
+    // The same event twice, and one for a file that is not there.
+    run.job(archived(&b, KEY, None, Some("s-jobtree"), Some(2), Some(1)));
+    run.job(archived(&Arch::new(9, "s-jobtree"), KEY, None, None, None, None));
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0"]);
+    assert_eq!(positions(run.db(), &dir, &b), ["x2.0"]);
+    run.idle_turn();
+    assert_eq!(tree(&env.archives()), before);
+    assert_eq!(run.errors(), 0);
+}
+
+// ── Round 2, ruling 1: the order of indexing ────────────────────────────────
+
+/// What the brain holds of these files, with every archive named by its place in seal
+/// order: the rows `(file, unit_pos, hidden_by)`, `forget_units` of each file, and the
+/// marks `(source, key, head, tail, file)`.
+type Shape = (Vec<(usize, String, Option<String>)>, Vec<i64>, Vec<(String, String, i64, i64, usize)>);
+
+fn shape(conn: &Connection, dir: &str, files: &[Arch]) -> Shape {
+    let mut held = Vec::new();
+    for (at, a) in files.iter().enumerate() {
+        let mut of_file = hidden_by(conn, dir, a);
+        of_file.sort();
+        held.extend(of_file.into_iter().map(|(pos, by)| (at, pos, by)));
+    }
+    let units = files.iter().map(|a| forget_units(conn, dir, a)).collect();
+    let mut marks: Vec<_> = forgot_rows(conn)
+        .into_iter()
+        .map(|(source, key, head, tail, id)| (source, key, head, tail, files.iter().position(|a| a.id == id).unwrap()))
+        .collect();
+    marks.sort();
+    (held, units, marks)
+}
+
+fn four_windows() -> Vec<Arch> {
+    let mut files = five_windows(1, "s-order", FORGET_PROMPT);
+    files.truncate(4);
+    files
+}
+
+/// The four files indexed one at a time as they were sealed.
+fn sealed_in_order() -> Shape {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let files = four_windows();
+    index_in_order(&env, &mut run, &dir, &files, &[0, 1, 2, 3]);
+    let got = shape(run.db(), &dir, &files);
+    // A keeps its first exchange, B its new one, C nothing, and D, out of reach, its own.
+    assert_eq!(got.0.iter().map(|r| (r.0, r.1.as_str())).collect::<Vec<_>>(), [(0, "x0.0"), (1, "x4.0"), (3, "x0.0")]);
+    assert_eq!(got.1, [1, 1, 1, 0]);
+    got
+}
+
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in permutations(n - 1) {
+        for at in 0..=rest.len() {
+            let mut next = rest.clone();
+            next.insert(at, n - 1);
+            out.push(next);
+        }
+    }
+    out
+}
+
+#[test]
+fn one_scan_gives_the_same_rows_whatever_the_names_and_the_times_of_the_files() {
+    let dir = scope(KEY);
+    let expect = sealed_in_order();
+    let orders = permutations(4);
+    assert_eq!(orders.len(), 24);
+    for names in &orders {
+        for times in ["as sealed", "equal", "reversed"] {
+            let env = Env::new();
+            let mut run = env.run();
+            // The scan lists by name, and a name is an id: file `i` in seal order gets
+            // the id whose place among the names is `names[i]`.
+            let mut files = four_windows();
+            for (a, name) in files.iter_mut().zip(names) {
+                a.id = format!("{:032x}", name + 1);
+            }
+            for (at, a) in files.iter().enumerate() {
+                let path = env.put_live(&dir, a);
+                let step = match times {
+                    "as sealed" => at as i64,
+                    "equal" => 0,
+                    _ => -(at as i64),
+                };
+                set_mtime(&path, 1_600_000_000_000 + step * 5_000);
+            }
+            run.scan();
+            assert_eq!(shape(run.db(), &dir, &files), expect, "names {names:?}, file times {times}");
+            assert_eq!(run.errors(), 0);
+        }
+    }
+}
+
+#[test]
+fn a_far_file_scanned_alone_before_the_files_between_gives_the_same_rows_as_seal_order() {
+    // D is scanned alone; the next scan finds A, B and C. Each is indexed knowing the new
+    // files of its scan sealed after it, so when B is indexed C stands between B and D,
+    // and D is not in "the window after" B.
+    let dir = scope(KEY);
+    let expect = sealed_in_order();
+    let env = Env::new();
+    let mut run = env.run();
+    let files = four_windows();
+    env.put_live(&dir, &files[3]);
+    run.scan();
+    assert_eq!(positions(run.db(), &dir, &files[3]), ["x0.0"]);
+    for a in &files[..3] {
+        env.put_live(&dir, a);
+    }
+    run.scan();
+    assert_eq!(shape(run.db(), &dir, &files), expect, "D was indexed before the files between");
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_mark_whose_window_after_is_not_known_yet_takes_the_far_files_turn_and_counts_it() {
+    // FINDING (reported, not hidden): "near" is judged from the files known at that
+    // moment. D is scanned alone, then B alone, then A and C. When B is indexed nothing
+    // says a file lies between B and D, so D stands in "the window after" B and step 3b of
+    // B's mark takes D's turn with the same prompt. C's arrival repairs nothing: a unit
+    // that was purged is read again only by `restore --forget-turns`. It is counted in D's
+    // `forget_units`, and everything else is as in seal order.
+    let dir = scope(KEY);
+    let expect = sealed_in_order();
+    let env = Env::new();
+    let mut run = env.run();
+    let files = four_windows();
+    index_in_order(&env, &mut run, &dir, &files, &[3, 1]);
+    assert!(rows(run.db(), &dir, &files[3]).is_empty());
+    env.put_live(&dir, &files[0]);
+    env.put_live(&dir, &files[2]);
+    run.scan();
+    let got = shape(run.db(), &dir, &files);
+    assert_eq!(got.0, expect.0[..2], "only D's row is missing");
+    assert_eq!(got.2, expect.2);
+    assert!(rows(run.db(), &dir, &files[3]).is_empty());
+    assert_eq!(got.1, [1, 1, 1, 1], "the unit D lost is not in forget_units");
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_file_that_is_the_newest_known_takes_no_mark_made_long_after_its_seal() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let key = key_of(FORGET_PROMPT);
+    // Marks made before any file of the chat is known: one five windows after the file's
+    // seal, one inside the seal's own span.
+    assert!(live_call(&run, "s-late", T0 + 5 * W, T0 + 5 * W + 1_000, Some(&key)).is_empty());
+    assert!(live_call(&run, "s-soon", T0 + 5_000, T0 + 6_000, Some(&key)).is_empty());
+    let late = Arch::new(1, "s-late").at(T0).turn(FORGET_PROMPT, &reply("FARFROMTHEMARK"));
+    let soon = Arch::new(2, "s-soon").at(T0).turn(FORGET_PROMPT, &reply("RIGHTATTHEMARK"));
+    index_in_order(&env, &mut run, &dir, &[late.clone(), soon.clone()], &[0, 1]);
+    assert_eq!(positions(run.db(), &dir, &late), ["x0.0"], "files between it and the mark may simply not be known");
+    assert!(rows(run.db(), &dir, &soon).is_empty());
+    // A mark made now, with the file known, reaches it: the window after it is open.
+    assert_eq!(live_call(&run, "s-late", T0 + 6 * W, T0 + 6 * W, Some(&key)).len(), 1);
+    assert!(rows(run.db(), &dir, &late).is_empty());
+}
+
+#[test]
+fn a_twin_whose_capture_fell_out_of_the_stretch_becomes_the_twin_of_one_inside_it() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let key = key_of("continue");
+    capture_keyed(&run, "mem_cap_old", &dir, "s-repoint", T0 + W / 2, Some("pause"), &key);
+    capture_keyed(&run, "mem_cap_near", &dir, "s-repoint", T0 + 7 * W + W / 2, Some("pause"), &key);
+    let last = Arch::new(8, "s-repoint").at(T0 + 8 * W).turn("continue", &reply("WINDOWEIGHT"));
+    let between: Vec<Arch> = [2u32, 4, 6]
+        .iter()
+        .map(|n| Arch::new(*n, "s-repoint").at(T0 + i64::from(*n) * W).about(&format!("matter {n}")))
+        .collect();
+    // Alone, window 8 reaches back to the beginning and takes the oldest hidden capture.
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&last), &[0]);
+    assert_eq!(hidden_by(run.db(), &dir, &last)[0].1.as_deref(), Some("twin:mem_cap_old"));
+    index_in_order(&env, &mut run, &dir, &between, &[0, 1, 2]);
+    assert_eq!(
+        hidden_by(run.db(), &dir, &last),
+        [("x0.0".to_string(), Some("twin:mem_cap_near".to_string()))],
+        "the old capture is three windows away; the near one hides the turn"
+    );
+    assert!(has(run.db(), "mem_cap_old") && has(run.db(), "mem_cap_near"));
+}
+
+// ── Round 2, rulings 2 and 3: the recall log ────────────────────────────────
+
+fn plant_log(conn: &Connection, dir: &str, logical: &str, ts_ms: i64, hash: &str, preview: &str) -> i64 {
+    tx(conn, || {
+        conn.execute(
+            "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome,
+                                    total_ms, detail)
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'ok', 1.0, '{}')",
+            params![ts_ms, logical, dir, preview, hash],
+        )
+        .unwrap();
+        conn.last_insert_rowid()
+    })
+}
+
+fn logged(conn: &Connection, id: i64) -> bool {
+    count(conn, &format!("SELECT COUNT(*) FROM recall_log WHERE id = {id}")) == 1
+}
+
+#[test]
+fn a_mark_read_from_an_archive_takes_the_log_row_of_its_prompt() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let files = four_windows();
+    let chat = files[0].logical.clone();
+    let other = project::logical("t-order");
+    let key = key_of(FORGET_PROMPT);
+    let conn = run.db();
+    // The forgotten turn began in A's window and its forget call is in B (sealed at 2 W).
+    let of_turn = plant_log(conn, &dir, &chat, T0 + W - 5_000, &key, "forget that I told you about LOGGEDOFFER");
+    let other_prompt = plant_log(conn, &dir, &chat, T0 + W - 4_000, "0123456789abcdef", "another question");
+    let other_chat = plant_log(conn, &dir, &other, T0 + W - 5_000, &key, "the same words in another chat");
+    let far_later = plant_log(conn, &dir, &chat, T0 + 9 * W, &key, "the same words, weeks later");
+    // B alone: no row with the key exists, so no purge takes the log row on its way.
+    index_in_order(&env, &mut run, &dir, &files, &[1]);
+    let conn = run.db();
+    assert!(!logged(conn, of_turn), "the prompt of a forgotten turn is still in the recall log");
+    assert_eq!(in_tables(conn, "LOGGEDOFFER"), 0);
+    assert!(logged(conn, other_prompt) && logged(conn, other_chat) && logged(conn, far_later));
+    assert!(purge_pending(conn));
+}
+
+#[test]
+fn the_live_call_takes_the_log_row_by_key_and_with_nothing_pending_the_newest_one() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let run = env.run();
+    let conn = run.db();
+    let chat = project::logical("s-nopending");
+    let other = project::logical("t-nopending");
+    let key = key_of(FORGET_PROMPT);
+
+    // Nothing pending: the front gives `from_ms` = the time of the call, later than the
+    // turn's log row.
+    let older = plant_log(conn, &dir, &chat, T0 - 60_000, "aaaaaaaaaaaaaaaa", "the turn before");
+    let of_turn = plant_log(conn, &dir, &chat, T0 - 2_000, "bbbbbbbbbbbbbbbb", "forget what I said about NOPENDING");
+    let elsewhere = plant_log(conn, &dir, &other, T0 - 1_000, "bbbbbbbbbbbbbbbb", "another chat, later");
+    assert!(live_call(&run, "s-nopending", T0, T0, None).is_empty());
+    assert!(!logged(conn, of_turn), "with no pending turn the turn's log row stays");
+    assert!(logged(conn, older) && logged(conn, elsewhere));
+    // A second forget in the same turn, and a retry of the first mark: the turn's row is
+    // gone already, and the row of the turn before is not taken for it.
+    assert!(live_call(&run, "s-nopending", T0 + 1_000, T0 + 1_000, None).is_empty());
+    assert!(live_call(&run, "s-nopending", T0, T0 + 5_000, None).is_empty());
+    assert!(logged(conn, older), "a second mark took the log row of an older turn");
+
+    // By key: a row with the prompt's hash from before `from_ms` goes, and no other.
+    let same_key = plant_log(conn, &dir, &chat, T0 + 20_000, &key, "forget that I told you about BYKEYONLY");
+    let other_key = plant_log(conn, &dir, &chat, T0 + 20_001, "cccccccccccccccc", "a question in between");
+    let after = plant_log(conn, &dir, &chat, T0 + 40_001, &key, "the same words after the mark's end");
+    assert!(live_call(&run, "s-nopending", T0 + 30_000, T0 + 40_000, Some(&key)).is_empty());
+    assert!(!logged(conn, same_key), "the log row with the key of the forgotten prompt stays");
+    assert!(logged(conn, other_key) && logged(conn, after) && logged(conn, older));
+}
+
+#[test]
+fn a_mark_written_late_takes_no_log_row_from_after_its_turn() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let run = env.run();
+    let conn = run.db();
+    let chat = project::logical("s-latemark");
+    let of_turn = plant_log(conn, &dir, &chat, T0, "aaaaaaaaaaaaaaaa", "the forgotten turn");
+    let at_end = plant_log(conn, &dir, &chat, T0 + 30_000, "bbbbbbbbbbbbbbbb", "at the mark's end");
+    let next_turn = plant_log(conn, &dir, &chat, T0 + 30_001, "cccccccccccccccc", "the next turn");
+    let much_later = plant_log(conn, &dir, &chat, T0 + 600_000, "dddddddddddddddd", "ten minutes later");
+    // The front could not write the mark and writes it minutes later, with the turn's times.
+    assert!(live_call(&run, "s-latemark", T0, T0 + 30_000, None).is_empty());
+    assert!(!logged(conn, of_turn) && !logged(conn, at_end));
+    assert!(logged(conn, next_turn) && logged(conn, much_later), "a late mark took the log rows of later turns");
+    // And once more, as a retry does: nothing else goes.
+    assert!(live_call(&run, "s-latemark", T0, T0 + 30_000, None).is_empty());
+    assert!(logged(conn, next_turn) && logged(conn, much_later));
+}
+
+// ── Round 2, rulings 6 and 7 ────────────────────────────────────────────────
+
+#[test]
+fn two_chats_with_an_empty_logical_do_not_share_their_marks() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let mut marks = Arch::new(1, "s-empty-one")
+        .at(T0)
+        .user(FORGET_PROMPT)
+        .calls(&reply("FORGETTINGNOW"), "axel_forget")
+        .about("upload queue");
+    let mut plain = Arch::new(2, "s-empty-two").at(T0 + 1_000).turn(FORGET_PROMPT, &reply("ANOTHERCHATSTURN"));
+    marks.logical = String::new();
+    plain.logical = String::new();
+    index_in_order(&env, &mut run, &dir, &[marks.clone(), plain.clone()], &[0, 1]);
+    assert_eq!(forgot_rows(run.db()).len(), 1);
+    assert_eq!(positions(run.db(), &dir, &plain), ["x0.0"], "a chat with no `logical` took another chat's mark");
+}
+
+#[test]
+fn a_replaced_file_gives_up_the_marks_and_the_keep_flag_of_the_file_before_it() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let old = Arch::new(1, "s-swap")
+        .about("retry limit")
+        .user(FORGET_PROMPT)
+        .calls(&reply("OLDFORGET"), "axel_forget")
+        .about("upload queue");
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&old), &[0]);
+    assert_eq!(forgot_rows(run.db()).len(), 1);
+
+    // Another file under the name, with no forget turn: the old file's mark is not its.
+    let mut plain = Arch::new(1, "s-swap").about("deploy window");
+    plain.digest = format!("{:064x}", 91);
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&plain), &[0]);
+    assert_eq!(positions(run.db(), &dir, &plain), ["x0.0"]);
+    assert!(forgot_rows(run.db()).is_empty(), "the mark of a file that is gone still leaves units out");
+
+    // `restore --forget-turns` was asked for this file; then a third file takes the name,
+    // with a forget turn of its own. The flag was not asked for that one.
+    tx(run.db(), || run.db().execute("UPDATE archive_index SET keep_forget_turns = 1", []).unwrap());
+    let mut third = Arch::new(1, "s-swap")
+        .about("release notes")
+        .user("forget the thing about the first matter, the one from Monday")
+        .calls(&reply("THIRDFORGET"), "axel_forget")
+        .about("rollback plan");
+    third.digest = format!("{:064x}", 92);
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&third), &[0]);
+    let conn = run.db();
+    assert_eq!(positions(conn, &dir, &third), ["x0.0", "x4.0"], "the forget turn of a new file was indexed");
+    assert_eq!(in_tables(conn, "THIRDFORGET"), 0);
+    assert_eq!(count(conn, "SELECT keep_forget_turns FROM archive_index"), 0);
+    assert_eq!(forgot_rows(conn).len(), 1);
+    assert_eq!(run.errors(), 0);
 }

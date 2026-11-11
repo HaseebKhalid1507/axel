@@ -7,23 +7,24 @@
 //! live call (`mark_forgotten_turn`). Nothing here writes, locks, renames or chmods
 //! anything under `context-archives`.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, ErrorCode, OptionalExtension};
 
 use crate::archive::{self, ArchiveEntry, ArchiveFile, ArchivePolicy, LiveArchive, SkipReason, Start, Unit, UnitKind};
 use crate::brain_v2;
-use crate::error::Result;
+use crate::error::{AxelError, Result};
 use crate::ext::server::log_line;
 use crate::ext::types::{IndexerCtx, Job, Mode};
 use crate::indexer_start;
 use crate::project;
 use crate::project_memory::{RecordLinks, Sensitivity};
 use crate::store::{self, Inserted, NewRow};
+use crate::vindex::{VecDelta, VecKey};
 
 /// Kept in each `archive_index` row. Version 1 does not re-extract old rows.
 pub const INDEXER_VERSION: i64 = 1;
@@ -35,6 +36,9 @@ pub const PARTS_SPAN_MS: i64 = 10_000;
 const STATUS_EVERY_MS: i64 = 30_000;
 /// How long the idle checkpoint waits for a reader before it gives up until the next turn.
 const CHECKPOINT_WAIT_MS: u64 = 100;
+/// How often the tick tries the checkpoint while a purge mark exists (the idle turn tries
+/// it every second; a loop that is never idle has only the tick).
+pub const CHECKPOINT_EVERY_MS: i64 = 5_000;
 
 // ── The log after a purge ───────────────────────────────────────────────────
 
@@ -52,7 +56,8 @@ pub fn mark_purged(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The indexer's idle turn (called by `indexer::run` through `guarded`): when a purge is
+/// The indexer's idle turn, and its tick every [`CHECKPOINT_EVERY_MS`] (called by
+/// `indexer::run` and `indexer::tick` through `guarded`): when a purge is
 /// pending, `wal_checkpoint(TRUNCATE)`; when the checkpoint was not blocked, the mark is
 /// deleted in one small transaction, whose frame holds no text. When it was blocked
 /// (`busy` is 1) the mark stays and the next idle turn tries again (section 2.7).
@@ -74,14 +79,31 @@ pub fn checkpoint_after_purge(ctx: &mut IndexerCtx) -> Result<()> {
     let usual: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
     conn.busy_timeout(Duration::from_millis(CHECKPOINT_WAIT_MS))?;
     let answer = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0));
+    // RULING: wave4 R-13 item 3. A busy answer is "blocked", in whichever form it comes:
+    // the pragma's row with `busy` = 1, an error that says busy or locked, or the lock of
+    // the small transaction below not being free. The mark stays, the next turn tries
+    // again, and nothing is counted as a write error.
+    let done = match answer {
+        Ok(0) => match in_write(conn, || {
+            conn.execute("DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", [])?;
+            Ok(())
+        }) {
+            Err(e) if is_busy(&e) => Ok(()),
+            other => other,
+        },
+        Ok(_) => Ok(()),
+        Err(e) => match AxelError::from(e) {
+            e if is_busy(&e) => Ok(()),
+            e => Err(e),
+        },
+    };
     conn.busy_timeout(Duration::from_millis(usual.max(0) as u64))?;
-    if answer? != 0 {
-        return Ok(());
-    }
-    in_write(conn, || {
-        conn.execute("DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", [])?;
-        Ok(())
-    })
+    done
+}
+
+fn is_busy(e: &AxelError) -> bool {
+    matches!(e, AxelError::Db(db)
+        if matches!(db.sqlite_error_code(), Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)))
 }
 
 // ── Small things ────────────────────────────────────────────────────────────
@@ -97,6 +119,36 @@ fn in_write<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T>
         let _ = conn.execute_batch("ROLLBACK");
     }
     out
+}
+
+/// [`in_write`] for work that purges rows: the work pushes the `vid` of every row it
+/// purged, and after the `COMMIT` they go to the front thread, whose vector array would
+/// otherwise keep them until the next resync.
+// RULING: wave4 R-13 item 4. `VecDelta::Remove` after a purge commits.
+fn in_write_gone<T>(ctx: &IndexerCtx, conn: &Connection, work: impl FnOnce(&mut Vec<i64>) -> Result<T>) -> Result<T> {
+    let mut gone: Vec<i64> = Vec::new();
+    let out = in_write(conn, || work(&mut gone))?;
+    if !gone.is_empty() {
+        let _ = ctx.vec_tx.send(VecDelta::Remove(gone.into_iter().map(VecKey::Mem).collect()));
+    }
+    Ok(out)
+}
+
+/// `store::purge_many`, and the `vid`s of the rows that went are pushed to `gone`.
+fn purge(conn: &Connection, ids: &[String], tombstone: bool, forget_log: bool, gone: &mut Vec<i64>) -> Result<usize> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let mut vids: Vec<i64> = Vec::new();
+    {
+        let mut stmt = conn.prepare("SELECT vid FROM memory_ext WHERE mem_id = ?1")?;
+        for id in ids {
+            vids.extend(stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()?);
+        }
+    }
+    let purged = store::purge_many(conn, ids, tombstone, forget_log)?;
+    gone.extend(vids);
+    Ok(purged)
 }
 
 fn is_ready(ctx: &IndexerCtx) -> bool {
@@ -168,13 +220,25 @@ impl<'a> FileAt<'a> {
     }
 }
 
-/// What an `on_context_archived` event said about a file. The scan has none.
+/// What an `on_context_archived` event said about a file. The scan has none, but it
+/// knows the new files it will index after this one.
 #[derive(Clone, Copy, Default)]
 struct Seen<'a> {
     session_id: Option<&'a str>,
     received_ms: Option<i64>,
     window: Option<i64>,
     part: Option<i64>,
+    /// The new files of this scan that come after this one in seal order.
+    later: &'a [Later],
+}
+
+/// A new file of the scan that is not indexed yet, with the archive's own time.
+struct Later {
+    scope_dir: String,
+    logical: String,
+    rel_name: String,
+    archive_id: String,
+    cover_ms: i64,
 }
 
 /// The `archive_index` row of one file, as far as this file reads it.
@@ -454,7 +518,9 @@ fn index_archive(
     if ctx.test.panic_archive_id.as_deref() == Some(a.id.as_str()) {
         panic!("test switch: panic_archive_id");
     }
-    let policy = policy(ctx, row.is_some_and(|r| r.keep_forget_turns == 1));
+    // RULING: wave4 R-13 round 2, item 6. `keep_forget_turns` was asked for the file that
+    // was under this name; a file that replaced it is read with the forget rules on.
+    let policy = policy(ctx, !replace && row.is_some_and(|r| r.keep_forget_turns == 1));
     let units = archive::extract_units(a, &policy);
     // One mark for each forget span of the file; none when the row has `keep_forget_turns`.
     let spans = archive::forgotten_keys(a, &policy);
@@ -480,9 +546,9 @@ fn index_archive(
     // writer refuses a `created_ms` that is no time. Such a file is skipped with a reason,
     // not tried and failed at every scan.
     if chrono::DateTime::<chrono::Utc>::from_timestamp_millis(created_ms).is_none() {
-        return in_write(conn, || {
+        return in_write_gone(ctx, conn, |gone| {
             if replace {
-                forget_rows(conn, at.scope_dir, row)?;
+                forget_rows(conn, at.scope_dir, row, gone)?;
             }
             let skipped = RowOut {
                 digest: Some(&a.digest),
@@ -507,6 +573,29 @@ fn index_archive(
         // of its neighbours are bounded by it too.
         let mut files = chat_files(conn, at.scope_dir, &a.logical, session_id)?;
         files.retain(|f| f.rel_name != at.rel_name);
+        // RULING: wave4 R-13 round 2, item 1a. The new files of this scan that are sealed
+        // after this one take their place too, not indexed yet: a far file indexed by an
+        // earlier scan is then not "the window after" this one when a file between is here.
+        let later = seen.later.iter().filter(|l| {
+            l.scope_dir == at.scope_dir
+                && !a.logical.is_empty()
+                && l.logical == a.logical
+                && l.rel_name != at.rel_name
+                && !files.iter().any(|f| f.rel_name == l.rel_name)
+        });
+        let later: Vec<ChatFile> = later
+            .map(|l| ChatFile {
+                rel_name: l.rel_name.clone(),
+                archive_id: l.archive_id.clone(),
+                cover_ms: l.cover_ms,
+                first_seen_ms: i64::MAX,
+                keep: false,
+                indexed: false,
+                win_no: None,
+                part_no: None,
+            })
+            .collect();
+        files.extend(later);
         files.push(ChatFile {
             rel_name: at.rel_name.to_string(),
             archive_id: a.id.clone(),
@@ -527,19 +616,41 @@ fn index_archive(
     let next = me.and_then(|at_me| files.get(at_me + 1));
     let window_from = start_of(&files, cover_ms);
     let stretch = stretch_of(&files, cover_ms);
+    // RULING: wave4 R-13 round 2, item 1b. A file that is the newest known of its chat has
+    // no window after it yet, and files between it and a later mark may simply not be
+    // known: it takes marks (and gives up log rows) only up to its cover time plus
+    // `PARTS_SPAN_MS`. A later mark reaches it through step 3b of the mark's own file and
+    // through the live call, which then know the files between. (A `call` or `cli` mark
+    // made before this file was indexed, for a turn after its seal, is the one case that
+    // nothing visits again: a same-key turn of this file stays.)
+    let mark_stretch =
+        (stretch.0, if stretch.1 == i64::MAX { cover_ms.saturating_add(PARTS_SPAN_MS) } else { stretch.1 });
     // Step 3b by position: which unit of the file just before, and of the file just after,
     // this file's own marks leave out. Read from those files, not from their rows: a row
     // another rule already took must not make the one before it "the last".
     let before = if own.iter().any(|m| m.head) { prev.and_then(|f| edges_of(ctx, at, f)) } else { None };
     let after = if own.iter().any(|m| m.tail) { next.and_then(|f| edges_of(ctx, at, f)) } else { None };
 
-    in_write(conn, || {
+    in_write_gone(ctx, conn, |gone| {
+        // RULING: wave4 R-13 item 4. A row of the old file that was hidden (by the model,
+        // by the command line, by a pause) hands its hide to the new file's row of the same
+        // position: replacing a file does not bring back what a person hid. A `twin:` hide
+        // is not carried, it is judged again from the hidden captures (step 3a).
+        let mut carried: HashMap<String, (i64, String)> = HashMap::new();
         if replace {
-            forget_rows(conn, at.scope_dir, row)?;
+            if let Some(old) = row {
+                carried = hides_of(conn, at.scope_dir, &old.archive_id)?;
+            }
+            forget_rows(conn, at.scope_dir, row, gone)?;
             // The marks the old file gave are not the new file's.
+            // (What those marks took out of its neighbours does not come back.)
             conn.execute(
                 "DELETE FROM forgotten_turns WHERE source = 'archive' AND scope_dir = ?1 AND archive_id = ?2",
                 params![at.scope_dir, row.map_or(a.id.as_str(), |r| r.archive_id.as_str())],
+            )?;
+            conn.execute(
+                "UPDATE archive_index SET keep_forget_turns = 0 WHERE scope_dir = ?1 AND rel_name = ?2",
+                params![at.scope_dir, at.rel_name],
             )?;
         }
 
@@ -597,8 +708,23 @@ fn index_archive(
                 )?;
             }
             let marks = forgotten_of(conn, &a.logical, session_id)?;
-            let place = Place { scope_dir: at.scope_dir, cover_ms, window_from, stretch, prev, next };
+            let place = Place { scope_dir: at.scope_dir, cover_ms, window_from, stretch: mark_stretch, prev, next };
             out = left_out(&units, &marks, &place);
+
+            // RULING: wave4 R-13 round 2, item 2. A unit that is left out was never a row,
+            // so no purge takes the recall-log row of its turn: the log rows of this chat
+            // with the key of one of this file's marks, inside its stretch, go here.
+            let mut log_rows = 0;
+            for key in own.iter().filter_map(|m| m.turn_key.as_deref()).filter(|k| !k.is_empty()) {
+                log_rows += conn.execute(
+                    "DELETE FROM recall_log
+                      WHERE ?1 <> '' AND logical = ?1 AND query_hash = ?2 AND ts_ms > ?3 AND ts_ms <= ?4",
+                    params![a.logical, key, mark_stretch.0, mark_stretch.1],
+                )?;
+            }
+            if log_rows > 0 {
+                mark_purged(conn)?;
+            }
         }
 
         // 3a. Twins of hidden captures: a unit whose key is the key of a hidden capture of
@@ -626,6 +752,7 @@ fn index_archive(
                 continue;
             }
             let (letter, class) = kind_of(unit);
+            let pos = format!("{letter}{}.{}", unit.source_index, unit.block_index);
             let content = if unit.aux.is_empty() {
                 unit.body.clone()
             } else {
@@ -647,12 +774,12 @@ fn index_archive(
                 importance: 0.5,
                 origin_kind: "archive",
                 origin_ref: &a.id,
-                unit_pos: Some(format!("{letter}{}.{}", unit.source_index, unit.block_index)),
+                unit_pos: Some(pos.clone()),
                 session_id,
                 logical: Some(&a.logical),
                 links: RecordLinks::default(),
                 turn_key: unit.turn_key.clone(),
-                hidden: twin_of(unit),
+                hidden: twin_of(unit).or_else(|| carried.get(&pos).cloned()),
             };
             match store::insert_row(conn, ctx.signer.as_ref(), &new)? {
                 Inserted::New { .. } | Inserted::Exists => rows_indexed += 1,
@@ -666,7 +793,13 @@ fn index_archive(
             .filter(|(_, left)| **left)
             .map(|(unit, _)| archive::unit_id(at.scope_dir, &a.id, unit))
             .collect();
-        purge_left_out(conn, at.scope_dir, &left)?;
+        purge_left_out(conn, at.scope_dir, &left, gone)?;
+
+        // RULING: wave4 R-13 round 2, item 1c. Twins are judged again: this file changed
+        // the stretch of the chat's files around it.
+        if timed {
+            rejudge_twins(conn, at, &a.logical, session_id, &files)?;
+        }
 
         // A hidden capture of this file's own window that no unit of the file matches and
         // that has no twin anywhere is counted, and nothing else is hidden for it.
@@ -676,7 +809,8 @@ fn index_archive(
                 units.iter().any(|unit| unit.turn_key.as_deref() == Some(key))
             });
             let has_twin: bool = conn.query_row(
-                "SELECT EXISTS(SELECT 1 FROM memory_ext WHERE hidden_by = ?1)",
+                // `hidden_ms IS NOT NULL`: the partial index serves it (no walk of the table).
+                "SELECT EXISTS(SELECT 1 FROM memory_ext WHERE hidden_ms IS NOT NULL AND hidden_by = ?1)",
                 [format!("twin:{}", h.id)],
                 |r| r.get(0),
             )?;
@@ -702,7 +836,7 @@ fn index_archive(
             elsewhere.extend(before.as_ref().and_then(|e| e.last.clone()));
             elsewhere.extend(after.as_ref().and_then(|e| e.lead.clone()));
             elsewhere.extend(after.as_ref().and_then(|e| e.note.clone()));
-            purge_left_out(conn, at.scope_dir, &elsewhere)?;
+            purge_left_out(conn, at.scope_dir, &elsewhere, gone)?;
         }
 
         // 4. Covered live captures go: they were stand-ins for turns that are rows of this
@@ -716,7 +850,7 @@ fn index_archive(
                 .filter(|(_, hidden)| !hidden)
                 .map(|(id, _)| id)
                 .collect();
-            store::purge_many(conn, &covered, false, false)?;
+            purge(conn, &covered, false, false, gone)?;
         }
 
         // 5. The row.
@@ -740,11 +874,73 @@ fn index_archive(
 // SPEC: 2240-2241 say "purge the archive's rows without tombstones" and 2413-2416 do not
 // list this purge under either value of `forget_log`. The text these rows held is in no
 // file any more, so it is a forget: `forget_log = true`, and the log is truncated.
-fn forget_rows(conn: &Connection, scope_dir: &str, row: Option<&Known>) -> Result<()> {
+fn forget_rows(conn: &Connection, scope_dir: &str, row: Option<&Known>, gone: &mut Vec<i64>) -> Result<()> {
     let Some(row) = row else { return Ok(()) };
     let ids = archive_rows(conn, scope_dir, &row.archive_id)?;
-    if store::purge_many(conn, &ids, false, true)? > 0 {
+    if purge(conn, &ids, false, true, gone)? > 0 {
         mark_purged(conn)?;
+    }
+    Ok(())
+}
+
+/// The hides of an archive's rows that are not twin marks, by `unit_pos`.
+fn hides_of(conn: &Connection, scope_dir: &str, archive_id: &str) -> Result<HashMap<String, (i64, String)>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.unit_pos, e.hidden_ms, e.hidden_by FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+          WHERE e.origin_kind = 'archive' AND e.origin_ref = ?1 AND m.project_key = ?2
+            AND e.unit_pos IS NOT NULL AND e.hidden_ms IS NOT NULL AND e.hidden_by IS NOT NULL
+            AND substr(e.hidden_by, 1, 5) <> 'twin:'",
+    )?;
+    let rows = stmt.query_map(params![archive_id, scope_dir], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?))))?;
+    Ok(rows.collect::<rusqlite::Result<_>>()?)
+}
+
+/// Twins judged again for the chat's files whose stretch the file at `at` changed, and for
+/// that file itself: a row hidden as the twin of a capture that lies outside its archive's
+/// stretch as now known becomes the twin of a hidden capture with its key inside the
+/// stretch, or, with none, visible. A twin whose capture is gone is left as it is.
+// A row made visible here has its vector back in the front's array at the next resync.
+fn rejudge_twins(
+    conn: &Connection,
+    at: &FileAt,
+    logical: &str,
+    session_id: Option<&str>,
+    files: &[ChatFile],
+) -> Result<()> {
+    let now: Vec<i64> = files.iter().map(|f| f.cover_ms).collect();
+    let before: Vec<i64> = files.iter().filter(|f| f.rel_name != at.rel_name).map(|f| f.cover_ms).collect();
+    for file in files {
+        let stretch = stretch_in(&now, file.cover_ms);
+        if file.rel_name != at.rel_name && stretch_in(&before, file.cover_ms) == stretch {
+            continue;
+        }
+        let stale: Vec<(String, Option<String>)> = {
+            let mut stmt = conn.prepare(
+                "SELECT e.mem_id, e.turn_key FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                  WHERE e.origin_kind = 'archive' AND e.origin_ref = ?1 AND m.project_key = ?2
+                    AND e.hidden_ms IS NOT NULL AND substr(COALESCE(e.hidden_by, ''), 1, 5) = 'twin:'
+                    AND EXISTS (SELECT 1 FROM memory_ext c
+                                 WHERE c.mem_id = substr(e.hidden_by, 6)
+                                   AND (c.created_ms <= ?3 OR c.created_ms > ?4))",
+            )?;
+            let rows = stmt
+                .query_map(params![file.archive_id, at.scope_dir, stretch.0, stretch.1], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        if stale.is_empty() {
+            continue;
+        }
+        let hidden = hidden_captures(conn, at.scope_dir, logical, session_id, stretch.0, stretch.1)?;
+        for (id, key) in stale {
+            let inside = key
+                .as_deref()
+                .filter(|k| !k.is_empty())
+                .and_then(|k| hidden.iter().find(|h| h.turn_key.as_deref() == Some(k)));
+            conn.execute(
+                "UPDATE memory_ext SET hidden_ms = ?1, hidden_by = ?2 WHERE mem_id = ?3",
+                params![inside.map(|h| h.hidden_ms), inside.map(|h| format!("twin:{}", h.id)), id],
+            )?;
+        }
     }
     Ok(())
 }
@@ -774,7 +970,7 @@ fn settle(
             };
             index_archive(ctx, at, &a, seen, row, false)
         }
-        Ok(ArchiveFile::Tombstone { id, logical, digest }) => in_write(conn, || {
+        Ok(ArchiveFile::Tombstone { id, logical, digest }) => in_write_gone(ctx, conn, |gone| {
             let tombstone = RowOut {
                 logical: Some(logical.as_str()).filter(|l| !l.is_empty()),
                 digest: Some(digest.as_str()).filter(|d| !d.is_empty()),
@@ -782,24 +978,79 @@ fn settle(
                 ..RowOut::new(&id, "tombstone", first_seen_ms)
             };
             upsert_row(conn, at, &tombstone)?;
-            forget_archive(conn, at.scope_dir, &id)?;
+            forget_archive_in(conn, at.scope_dir, &id, gone)?;
             mark_purged(conn)
         }),
         Err(reason) if is_io(&reason) => Ok(()),
-        Err(reason) => in_write(conn, || {
-            let archive_id = at.name_id.or(row.map(|r| r.archive_id.as_str())).unwrap_or("");
-            let skipped =
-                RowOut { skip_reason: Some(&reason.0), ..RowOut::new(archive_id, "skipped", first_seen_ms) };
-            upsert_row(conn, at, &skipped)
-        }),
+        Err(reason) => in_write(conn, || write_refused(conn, at, row, &reason, first_seen_ms)),
     }
 }
 
-/// An indexed file that is a tombstone now, or that can be read and is no longer a live
-/// record: its rows go, and the row says `tombstone` and has the file's new size.
-fn forget_indexed(conn: &Connection, at: &FileAt, archive_id: &str) -> Result<()> {
-    in_write(conn, || {
-        forget_archive(conn, at.scope_dir, archive_id)?;
+/// The `skipped` row of a file that can be read and is refused, with the reader's reason.
+// RULING: wave4 R-13 item 2. Such a file is read again when its size or its time changes.
+// `archive_index` has no column for a file's time and the schema is not this commit's, so
+// the row holds it the way the row of a record that gives no time does: `created_ms` is
+// the `lstat` modification time, `time_source` is `mtime`, and `cover_ms` is null (which
+// is what tells this row from the row of an archive timed by `mtime`).
+fn write_refused(
+    conn: &Connection,
+    at: &FileAt,
+    row: Option<&Known>,
+    reason: &SkipReason,
+    first_seen_ms: i64,
+) -> Result<()> {
+    let archive_id = at.name_id.or(row.map(|r| r.archive_id.as_str())).unwrap_or("");
+    let file_ms = mtime_ms(&at.path());
+    let skipped = RowOut {
+        skip_reason: Some(&reason.0),
+        created_ms: file_ms,
+        time_source: file_ms.map(|_| "mtime"),
+        ..RowOut::new(archive_id, "skipped", first_seen_ms)
+    };
+    upsert_row(conn, at, &skipped)?;
+    conn.execute(
+        "UPDATE archive_index SET cover_ms = NULL WHERE scope_dir = ?1 AND rel_name = ?2",
+        params![at.scope_dir, at.rel_name],
+    )?;
+    Ok(())
+}
+
+/// An indexed file that can be read and is refused now (not valid JSON, another version,
+/// over the size limit): it loses its own rows and its row says `skipped` with the reason.
+// RULING: wave4 R-13 item 2 (spec 2.5 changes). It is not a tombstone: nothing is done by
+// digest, no capture is purged, no recall-log row is deleted, and the file is read again
+// when its size or time changes. A second file of the same id that is still indexed in
+// this directory owns the rows, and then they stay.
+fn refuse_indexed(ctx: &IndexerCtx, at: &FileAt, row: &Known, reason: &SkipReason) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    in_write_gone(ctx, conn, |gone| {
+        let shared: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM archive_index
+                            WHERE scope_dir = ?1 AND archive_id = ?2 AND rel_name <> ?3 AND state = 'indexed')",
+            params![at.scope_dir, row.archive_id, at.rel_name],
+            |r| r.get(0),
+        )?;
+        if !shared {
+            let ids = archive_rows(conn, at.scope_dir, &row.archive_id)?;
+            // The text of these rows is in no file any more: the log is truncated.
+            if purge(conn, &ids, false, false, gone)? > 0 {
+                mark_purged(conn)?;
+            }
+            conn.execute(
+                "DELETE FROM forgotten_turns WHERE source = 'archive' AND scope_dir = ?1 AND archive_id = ?2",
+                params![at.scope_dir, row.archive_id],
+            )?;
+        }
+        write_refused(conn, at, Some(row), reason, row.first_seen_ms)
+    })
+}
+
+/// An indexed file that is a tombstone now: its rows go, and the row says `tombstone` and
+/// has the file's new size.
+fn forget_indexed(ctx: &IndexerCtx, at: &FileAt, archive_id: &str) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    in_write_gone(ctx, conn, |gone| {
+        forget_archive_in(conn, at.scope_dir, archive_id, gone)?;
         conn.execute(
             "UPDATE archive_index SET file_size = ?1 WHERE scope_dir = ?2 AND rel_name = ?3",
             params![at.size, at.scope_dir, at.rel_name],
@@ -860,6 +1111,7 @@ pub fn on_job(ctx: &mut IndexerCtx, job: &Job) -> Result<()> {
         received_ms: Some(*received_ms),
         window: *window,
         part: *part,
+        later: &[],
     };
 
     match known(conn, &scope_dir, &entry.rel_name)? {
@@ -947,7 +1199,7 @@ pub fn on_forgotten(ctx: &mut IndexerCtx, id: &str, project_key: &str) -> Result
         return Ok(());
     }
 
-    in_write(conn, || {
+    in_write_gone(ctx, conn, |gone| {
         for f in &fresh {
             let at = FileAt::of(&dir, &scope_dir, &f.entry);
             let tombstone = RowOut {
@@ -960,7 +1212,7 @@ pub fn on_forgotten(ctx: &mut IndexerCtx, id: &str, project_key: &str) -> Result
             };
             upsert_row(conn, &at, &tombstone)?;
         }
-        forget_archive(conn, &scope_dir, id)?;
+        forget_archive_in(conn, &scope_dir, id, gone)?;
         mark_purged(conn)
     })
 }
@@ -975,7 +1227,13 @@ pub fn on_forgotten(ctx: &mut IndexerCtx, id: &str, project_key: &str) -> Result
 /// 4. the captures the archive covered: hidden ones always, visible ones when no target was
 ///    ever indexed here;
 /// 5. the chat's recall log up to the archive's cover time.
+// The caller that owns a vector array removes the purged rows from it; the indexer's own
+// calls go through `forget_archive_in`, which hands back their `vid`s.
 pub fn forget_archive(conn: &Connection, scope_dir: &str, archive_id: &str) -> Result<usize> {
+    forget_archive_in(conn, scope_dir, archive_id, &mut Vec::new())
+}
+
+fn forget_archive_in(conn: &Connection, scope_dir: &str, archive_id: &str, gone: &mut Vec<i64>) -> Result<usize> {
     struct Target {
         rel_name: String,
         archive_id: String,
@@ -1021,7 +1279,7 @@ pub fn forget_archive(conn: &Connection, scope_dir: &str, archive_id: &str) -> R
             ids.extend(archive_rows(conn, scope_dir, &target.archive_id)?);
         }
     }
-    let mut purged = store::purge_many(conn, &ids, false, true)?;
+    let mut purged = purge(conn, &ids, false, true, gone)?;
 
     // 3.
     for target in &targets {
@@ -1062,7 +1320,7 @@ pub fn forget_archive(conn: &Connection, scope_dir: &str, archive_id: &str) -> R
             params![target.logical, session_id, target.cover_ms.unwrap_or(now)],
         )?;
     }
-    purged += store::purge_many(conn, &stand_ins, false, true)?;
+    purged += purge(conn, &stand_ins, false, true, gone)?;
     Ok(purged)
 }
 
@@ -1100,12 +1358,61 @@ pub fn scan(ctx: &mut IndexerCtx) -> Result<()> {
     let listed: HashSet<(&str, &str)> =
         files.iter().map(|(scope_dir, entry)| (scope_dir.as_str(), entry.rel_name.as_str())).collect();
 
-    // 3. and 4.
-    for (scope_dir, entry) in &files {
+    // 3. and 4. The files `archive_index` knows first, in the order of their names; then
+    // the new ones.
+    // RULING: wave4 R-13 round 2, item 1a. New files are indexed in SEAL order, oldest
+    // first: "near" and "the file just before" are judged from the files known at that
+    // moment, and names are ids, not times. The time is the archive's own `created_ms`,
+    // not the file's (an import writes a hundred files within seconds, in any order), and
+    // it is not to be had without reading the record: with more than one new file, each is
+    // read once for its time and once more to be indexed. The file's `lstat` time, then
+    // its place in the listing, only break ties. A tombstone or a file that is refused has
+    // no seal time and goes first: a forget lands before anything is indexed. Each new
+    // file is indexed knowing the new files of the scan sealed after it, so a far file
+    // indexed by an earlier scan is not taken for "the window after" when a file between
+    // is in this scan.
+    let mut fresh: Vec<usize> = Vec::new();
+    for (at, (scope_dir, entry)) in files.iter().enumerate() {
         if !between_files(ctx)? {
             return Ok(());
         }
-        one_file(ctx, &root.join(scope_dir), scope_dir, entry)?;
+        let is_new = ctx.cfg.archives
+            && ctx.conn.as_ref().is_some_and(|conn| matches!(known(conn, scope_dir, &entry.rel_name), Ok(None)));
+        if is_new {
+            fresh.push(at);
+        } else {
+            one_file(ctx, &root.join(scope_dir), scope_dir, entry, &[])?;
+        }
+    }
+    // Each new file is indexed knowing the new files sealed after it (`Seen::later`).
+    let mut places: Vec<Option<Later>> = Vec::new();
+    if fresh.len() > 1 {
+        let mut timed: Vec<(i64, i64, usize, Option<Later>)> = Vec::with_capacity(fresh.len());
+        for at in fresh {
+            if !between_files(ctx)? {
+                return Ok(());
+            }
+            let (scope_dir, entry) = &files[at];
+            let (seal_ms, file_ms, place) = seal_time(&root.join(scope_dir), scope_dir, entry);
+            timed.push((seal_ms, file_ms, at, place));
+        }
+        timed.sort_unstable_by_key(|t| (t.0, t.1, t.2));
+        fresh = timed.iter().map(|t| t.2).collect();
+        places = timed.into_iter().map(|t| t.3).collect();
+    }
+    // `after[i]`: where the places of the files after the i-th begin in `later`.
+    let mut after: Vec<usize> = Vec::with_capacity(places.len());
+    for place in &places {
+        after.push(after.last().copied().unwrap_or(0) + usize::from(place.is_some()));
+    }
+    let later: Vec<Later> = places.into_iter().flatten().collect();
+    for (i, at) in fresh.into_iter().enumerate() {
+        if !between_files(ctx)? {
+            return Ok(());
+        }
+        let (scope_dir, entry) = &files[at];
+        let after_this = after.get(i).map_or(&[][..], |from| &later[*from..]);
+        one_file(ctx, &root.join(scope_dir), scope_dir, entry, after_this)?;
     }
 
     // Gone files are looked at after new files, so a move seen whole by one scan is
@@ -1117,6 +1424,29 @@ pub fn scan(ctx: &mut IndexerCtx) -> Result<()> {
 
     ctx.status.scan.store(2, Ordering::Relaxed);
     Ok(())
+}
+
+/// `(seal time, lstat time, place)` of a file the scan has not seen before: the record's
+/// own `created_ms`, or the file's time when the record gives none; `i64::MIN` for a
+/// tombstone and for a file that cannot be read as a record. `place` is the file as one
+/// sealed after another, for a record that gives its time and its chat. Nothing is written.
+fn seal_time(dir: &Path, scope_dir: &str, entry: &ArchiveEntry) -> (i64, i64, Option<Later>) {
+    let path = dir.join(&entry.rel_name);
+    let file_ms = mtime_ms(&path).unwrap_or(0);
+    let read = catch_unwind(AssertUnwindSafe(|| archive::read_archive(&path, scope_dir, entry.id_from_name.as_deref())));
+    match read {
+        Ok(Ok(ArchiveFile::Live(a))) => {
+            let place = a.created_ms.filter(|_| !a.logical.is_empty()).map(|cover_ms| Later {
+                scope_dir: scope_dir.to_string(),
+                logical: a.logical.clone(),
+                rel_name: entry.rel_name.clone(),
+                archive_id: a.id.clone(),
+                cover_ms,
+            });
+            (a.created_ms.unwrap_or(file_ms), file_ms, place)
+        }
+        _ => (i64::MIN, file_ms, None),
+    }
 }
 
 /// Between two files: false when the scan must stop (no connection, or a mode that is not
@@ -1141,8 +1471,8 @@ fn between_files(ctx: &mut IndexerCtx) -> Result<bool> {
 /// One file, inside `catch_unwind`. A panic marks the file `skipped`, `panic`; an `Err` is
 /// rolled back and counted; either way the scan goes on, unless the error says the brain
 /// is damaged or was changed, and then the scan returns it at once.
-fn one_file(ctx: &mut IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry) -> Result<()> {
-    let got = catch_unwind(AssertUnwindSafe(|| scan_file(ctx, dir, scope_dir, entry)));
+fn one_file(ctx: &mut IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry, later: &[Later]) -> Result<()> {
+    let got = catch_unwind(AssertUnwindSafe(|| scan_file(ctx, dir, scope_dir, entry, later)));
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
     if !matches!(got, Ok(Ok(()))) && !conn.is_autocommit() {
         let _ = conn.execute_batch("ROLLBACK");
@@ -1190,11 +1520,11 @@ fn mark_panic(conn: &Connection, dir: &Path, scope_dir: &str, entry: &ArchiveEnt
 }
 
 /// Step 3 of the scan for one listed file.
-fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry) -> Result<()> {
+fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry, later: &[Later]) -> Result<()> {
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
     let at = FileAt::of(dir, scope_dir, entry);
     let on = ctx.cfg.archives;
-    let no_event = Seen::default();
+    let no_event = Seen { later, ..Seen::default() };
     let Some(row) = known(conn, scope_dir, &entry.rel_name)? else {
         // Not known. With `archives = off` nothing is indexed and no row is written for it.
         if !on {
@@ -1206,7 +1536,7 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
     match row.state.as_str() {
         // A live archive never changes and a tombstone is always shorter: "forgotten since".
         "indexed" if changed => match at.read(None) {
-            Ok(ArchiveFile::Tombstone { .. }) => forget_indexed(conn, &at, &row.archive_id),
+            Ok(ArchiveFile::Tombstone { .. }) => forget_indexed(ctx, &at, &row.archive_id),
             // Still live: a person replaced it. The mirror follows the file.
             Ok(ArchiveFile::Live(mut a)) => {
                 if !on {
@@ -1217,8 +1547,8 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
             }
             // The rows stay, the row keeps its old size, the next scan tries again.
             Err(reason) if not_read(&reason) => Ok(()),
-            // It can be read and is no longer the same live record: it loses its rows.
-            Err(_) => forget_indexed(conn, &at, &row.archive_id),
+            // It can be read and is refused: it loses its own rows and is `skipped`.
+            Err(reason) => refuse_indexed(ctx, &at, &row, &reason),
         },
         // What `restore --forget-turns` asks for: read again with the forget rules off.
         "indexed" if on && row.keep_forget_turns == 1 && row.forget_units > 0 => match at.read(None) {
@@ -1230,7 +1560,12 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
         },
         "skipped" => {
             let reason = row.skip_reason.as_deref();
-            if !(changed || (reason == Some("panic") && INDEXER_VERSION > row.indexer_version)) {
+            // A refused file (see `write_refused`) whose time is another now.
+            let touched = row.time_source.as_deref() == Some("mtime")
+                && row.cover_ms.is_none()
+                && row.created_ms.is_some()
+                && mtime_ms(&at.path()) != row.created_ms;
+            if !(changed || touched || (reason == Some("panic") && INDEXER_VERSION > row.indexer_version)) {
                 return Ok(());
             }
             let got = at.read(None);
@@ -1284,7 +1619,7 @@ fn settle_moved(ctx: &mut IndexerCtx, listed: &HashSet<(&str, &str)>) -> Result<
         })?;
         rows.collect::<rusqlite::Result<_>>()?
     };
-    for gone in indexed.iter().filter(|g| !listed.contains(&(g.scope_dir.as_str(), g.rel_name.as_str()))) {
+    for moved in indexed.iter().filter(|g| !listed.contains(&(g.scope_dir.as_str(), g.rel_name.as_str()))) {
         if !between_files(ctx)? {
             return Ok(());
         }
@@ -1296,38 +1631,38 @@ fn settle_moved(ctx: &mut IndexerCtx, listed: &HashSet<(&str, &str)>) -> Result<
                     AND (archive_id = ?2 OR (?3 <> '' AND digest = ?3))",
             )?;
             let rows =
-                stmt.query_map(params![gone.scope_dir, gone.archive_id, gone.digest], |r| Ok((r.get(0)?, r.get(1)?)))?;
+                stmt.query_map(params![moved.scope_dir, moved.archive_id, moved.digest], |r| Ok((r.get(0)?, r.get(1)?)))?;
             rows.collect::<rusqlite::Result<_>>()?
         };
         if !copies.iter().any(|(scope_dir, rel_name)| listed.contains(&(scope_dir.as_str(), rel_name.as_str()))) {
             continue;
         }
-        in_write(conn, || {
+        in_write_gone(ctx, conn, |gone| {
             // A second file of the same id in the old directory still owns the rows.
             let shared: bool = conn.query_row(
                 "SELECT EXISTS(SELECT 1 FROM archive_index
                                 WHERE scope_dir = ?1 AND archive_id = ?2 AND rel_name <> ?3 AND state = 'indexed')",
-                params![gone.scope_dir, gone.archive_id, gone.rel_name],
+                params![moved.scope_dir, moved.archive_id, moved.rel_name],
                 |r| r.get(0),
             )?;
             if !shared {
-                let ids = archive_rows(conn, &gone.scope_dir, &gone.archive_id)?;
-                store::purge_many(conn, &ids, false, false)?;
+                let ids = archive_rows(conn, &moved.scope_dir, &moved.archive_id)?;
+                purge(conn, &ids, false, false, gone)?;
             }
-            if let (Some(cover), false) = (gone.cover_ms, gone.from_mtime) {
-                let session_id = gone.session_id.as_deref();
-                let start = window_start(conn, &gone.scope_dir, &gone.logical, session_id, cover)?;
+            if let (Some(cover), false) = (moved.cover_ms, moved.from_mtime) {
+                let session_id = moved.session_id.as_deref();
+                let start = window_start(conn, &moved.scope_dir, &moved.logical, session_id, cover)?;
                 let covered: Vec<String> =
-                    captures(conn, &gone.scope_dir, &gone.logical, session_id, start, cover)?
+                    captures(conn, &moved.scope_dir, &moved.logical, session_id, start, cover)?
                         .into_iter()
                         .filter(|(_, hidden)| !hidden)
                         .map(|(id, _)| id)
                         .collect();
-                store::purge_many(conn, &covered, false, false)?;
+                purge(conn, &covered, false, false, gone)?;
             }
             conn.execute(
                 "DELETE FROM archive_index WHERE scope_dir = ?1 AND rel_name = ?2",
-                params![gone.scope_dir, gone.rel_name],
+                params![moved.scope_dir, moved.rel_name],
             )?;
             Ok(())
         })?;
@@ -1389,8 +1724,16 @@ fn chat_files(conn: &Connection, scope_dir: &str, logical: &str, session_id: Opt
 /// `window_start_ms` over a list of the chat's files: the largest cover time more than
 /// `PARTS_SPAN_MS` below `t`, or 0.
 fn start_of(files: &[ChatFile], t: i64) -> i64 {
+    start_in(&covers(files), t)
+}
+
+fn covers(files: &[ChatFile]) -> Vec<i64> {
+    files.iter().map(|f| f.cover_ms).collect()
+}
+
+fn start_in(covers: &[i64], t: i64) -> i64 {
     let below = t.saturating_sub(PARTS_SPAN_MS);
-    files.iter().map(|f| f.cover_ms).filter(|cover| *cover < below).max().unwrap_or(0)
+    covers.iter().copied().filter(|cover| *cover < below).max().unwrap_or(0)
 }
 
 /// The stretch of an archive sealed at `cover_ms`: from the start of the window before its
@@ -1400,11 +1743,15 @@ fn start_of(files: &[ChatFile], t: i64) -> i64 {
 // with the next seal, and the parts of one seal lie within `PARTS_SPAN_MS` of each other:
 // the end is the first cover time more than that above X's, plus that span.
 fn stretch_of(files: &[ChatFile], cover_ms: i64) -> (i64, i64) {
-    let from = start_of(files, start_of(files, cover_ms));
+    stretch_in(&covers(files), cover_ms)
+}
+
+fn stretch_in(covers: &[i64], cover_ms: i64) -> (i64, i64) {
+    let from = start_in(covers, start_in(covers, cover_ms));
     let above = cover_ms.saturating_add(PARTS_SPAN_MS);
-    let to = files
+    let to = covers
         .iter()
-        .map(|f| f.cover_ms)
+        .copied()
         .filter(|cover| *cover > above)
         .min()
         .map_or(i64::MAX, |next| next.saturating_add(PARTS_SPAN_MS));
@@ -1459,7 +1806,7 @@ struct Forgot {
 fn forgotten_of(conn: &Connection, logical: &str, session_id: Option<&str>) -> Result<Vec<Forgot>> {
     let mut stmt = conn.prepare(
         "SELECT source, turn_key, from_ms, to_ms, scope_dir, archive_id, head, tail FROM forgotten_turns
-          WHERE logical = ?1 OR (?2 IS NOT NULL AND session_id = ?2)",
+          WHERE (?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2)",
     )?;
     let rows = stmt.query_map(params![logical, session_id], |r| {
         Ok(Forgot {
@@ -1659,7 +2006,7 @@ fn turn_rows(conn: &Connection, scope_dir: &str, archive_id: &str) -> Result<Vec
 /// went. **No row of an archive whose `keep_forget_turns` is 1 is touched** (the exclusion
 /// is in the `WHERE`), and none that is not an archive row of this directory. Inside the
 /// caller's transaction. Returns the ids that went.
-fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String]) -> Result<Vec<String>> {
+fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut Vec<i64>) -> Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1689,7 +2036,7 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String]) -> Result<
     if going.is_empty() {
         return Ok(going);
     }
-    store::purge_many(conn, &going, false, true)?;
+    purge(conn, &going, false, true, gone)?;
     for (archive_id, n) in &per_archive {
         conn.execute(
             "UPDATE archive_index SET forget_units = forget_units + ?1
@@ -1718,8 +2065,11 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String]) -> Result<
 ///   its last `Exchange` or `Continued` row, and one whose window starts there its leading
 ///   `Continued` row.
 /// - No row of an archive whose `keep_forget_turns` is 1 is touched.
-/// - The turn's own trace leaves the recall log: the chat's rows from `from_ms` on for a
-///   `call`, the rows of the mark's one moment for a `cli` mark.
+/// - The turn's own trace leaves the recall log: the chat's rows in `[from_ms, to_ms]`,
+///   its rows with the prompt's key, and for a `call` with no pending turn the chat's
+///   newest row.
+/// - It may be called late and more than once for one mark: a second call changes nothing
+///   but `to_ms`.
 /// - `mark_purged`, always: the log row deleted here held the prompt's first characters.
 // SPEC: 3644-3647 bound the function to indexed lookups, so the time rule reads an
 // archive's edge from the rows that are in the brain, not from its file (step 3b of the
@@ -1779,8 +2129,14 @@ pub fn mark_forgotten_turn(
     )?;
     let keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
     let mut purged: Vec<String> = Vec::new();
+    // The front thread owns the vector array and removes the ids this returns from it.
+    let mut vids: Vec<i64> = Vec::new();
+    // Where the window before the turn's own begins, in the directory where that is
+    // earliest: the lower bound of the log rows that go by key.
+    let mut key_from = if dirs.is_empty() { 0 } else { i64::MAX };
     for scope_dir in &dirs {
         let files = chat_files(conn, scope_dir, logical, session_id)?;
+        key_from = key_from.min(start_of(&files, start_of(&files, from_ms)));
         let mut targets: Vec<String> = Vec::new();
         let near = near_archives(&files, from_ms, to_ms);
         targets.extend(keyed.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())).map(|(id, _)| id.clone()));
@@ -1802,21 +2158,50 @@ pub fn mark_forgotten_turn(
                 }
             }
         }
-        purged.extend(purge_left_out(conn, scope_dir, &targets)?);
+        purged.extend(purge_left_out(conn, scope_dir, &targets, &mut vids)?);
     }
 
     // The turn's own trace in the recall log: its row was written at the start of the turn,
     // with the prompt's first characters, and no stored row names it.
-    // SPEC: 3652-3655 give the delete for `call` only, with no upper bound: the turn is
-    // still running, and its `to_ms` grows. A `cli` mark is one moment (the hidden turn's
-    // time) and takes the log rows of that moment (ruling on the review of commit 15).
-    let log_to = if source == "call" { i64::MAX } else { to_ms };
-    let log_rows = conn.execute(
+    // SPEC: 3652-3655 give the delete for `call` only, with no upper bound.
+    // RULING: wave4 R-13 round 2, item 3. `ts_ms <= to_ms` for every source: the front
+    // thread keeps a mark it could not write and writes it minutes later, and an open end
+    // would then take every later log row of the chat. (A log job that arrives late is
+    // refused by `recall` when its time lies in a `call` mark.)
+    let mut log_rows = conn.execute(
         "DELETE FROM recall_log
           WHERE ((?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2))
             AND ts_ms >= ?3 AND ts_ms <= ?4",
-        params![logical, session_id, from_ms, log_to],
+        params![logical, session_id, from_ms, to_ms],
     )?;
+    // RULING: wave4 R-13 round 2, item 2. By key too: the chat's log rows with the hash of
+    // this prompt, from the window before the turn's own up to the mark's end.
+    if !key.is_empty() {
+        log_rows += conn.execute(
+            "DELETE FROM recall_log
+              WHERE ?1 <> '' AND logical = ?1 AND query_hash = ?2 AND ts_ms > ?3 AND ts_ms <= ?4",
+            params![logical, key, key_from, to_ms],
+        )?;
+    }
+    // The same ruling: with no pending turn the front gives `from_ms` = the time of the
+    // call, and the turn's log row, written at its start, is older than that. A `call`
+    // mark with no key that found no log row in its interval takes the chat's newest log
+    // row at or before `to_ms`. Once for a mark (a retry of the same mark finds its row),
+    // and not when an earlier keyless `call` mark already stands between that log row and
+    // this one: that mark took the turn's row, and what is newest now is an older turn's.
+    if source == "call" && turn_key.is_none() && covered_to.is_none() && log_rows == 0 {
+        log_rows += conn.execute(
+            "DELETE FROM recall_log
+              WHERE id = (SELECT id FROM recall_log
+                           WHERE ((?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2))
+                             AND ts_ms <= ?4
+                           ORDER BY ts_ms DESC, id DESC LIMIT 1)
+                AND NOT EXISTS (SELECT 1 FROM forgotten_turns f
+                                 WHERE f.logical = ?1 AND f.source = 'call' AND f.turn_key = ''
+                                   AND f.from_ms >= recall_log.ts_ms AND f.from_ms < ?3)",
+            params![logical, session_id, from_ms, to_ms],
+        )?;
+    }
     if log_rows > 0 {
         log_line(&format!("forget mark: {log_rows} recall-log rows of the turn deleted"));
     }
