@@ -156,3 +156,47 @@ fn a_query_is_served_while_a_bulk_batch_of_64_is_queued() {
         other => panic!("expected Job::Embedded, got {other:?}"),
     }
 }
+
+/// An embed service whose indexer queue holds one job and starts full (a dummy `Job::Tick`).
+fn start_latched() -> (EmbedService, Receiver<Job>) {
+    let (jobs, jobs_rx) = sync_channel(1);
+    jobs.try_send(Job::Tick).unwrap();
+    (EmbedService::start(Some(Embedder::hashing()), jobs, Arc::new(TestHooks::default())), jobs_rx)
+}
+
+fn rows(from: i64, n: i64) -> Vec<(VecKey, String)> {
+    (from..from + n).map(|i| (VecKey::Mem(i), format!("row number {i} of the bulk"))).collect()
+}
+
+fn embedded(jobs_rx: &Receiver<Job>) -> Vec<(VecKey, Vec<f32>)> {
+    match jobs_rx.recv_timeout(Duration::from_secs(5)) {
+        Ok(Job::Embedded { vectors, .. }) => vectors,
+        other => panic!("expected Job::Embedded, got {other:?}"),
+    }
+}
+
+#[test]
+fn bulk_work_goes_on_while_the_indexer_queue_is_full() {
+    let (svc, jobs_rx) = start_latched();
+    // The first bulk finishes and cannot be handed over; the queue stays full.
+    svc.submit_bulk(rows(0, 4));
+    svc.submit_bulk(rows(4, 4));
+    // An `embed_wait` queued behind both, from another thread, as the indexer calls it.
+    let other = svc.clone();
+    let waiter = thread::spawn(move || {
+        let t0 = Instant::now();
+        let got = other.embed_wait(vec!["late note".to_string()], secs(5));
+        (got, t0.elapsed())
+    });
+    let (got, took) = waiter.join().unwrap();
+    assert_eq!(got, Some(vec![hashed("late note")]), "embed_wait was not served while a job waited");
+    assert!(took < Duration::from_secs(2), "answered at its deadline, not inside it: {took:?}");
+
+    // Nothing was lost: the dummy, then both bulks in order.
+    assert!(matches!(jobs_rx.recv_timeout(Duration::from_secs(5)), Ok(Job::Tick)));
+    let first = embedded(&jobs_rx);
+    let second = embedded(&jobs_rx);
+    assert_eq!(first.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (0..4).map(VecKey::Mem).collect::<Vec<_>>());
+    assert_eq!(second.iter().map(|(k, _)| *k).collect::<Vec<_>>(), (4..8).map(VecKey::Mem).collect::<Vec<_>>());
+    assert_eq!(second[0].1, hashed("row number 4 of the bulk"));
+}

@@ -134,16 +134,21 @@ fn wait<T>(answer: &Receiver<T>, deadline: Instant) -> Option<T> {
 fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: Arc<TestHooks>, model: String) {
     let mut queries: VecDeque<(String, Instant, Sender<Vec<f32>>)> = VecDeque::new();
     let mut bulks: VecDeque<Bulk> = VecDeque::new();
-    let mut pending: Option<Job> = None;
+    // RULING: wave2-c9 review finding 3: finished bulks wait here for room on the indexer's
+    // queue while bulk work goes on; what fits is sent at the top of each round.
+    let mut pending: VecDeque<Job> = VecDeque::new();
     let mut open = true;
 
     loop {
+        flush(&jobs, &mut pending);
+
         // Take every request that has arrived; block only when there is nothing to do.
         let mut first = None;
-        if open && queries.is_empty() && (bulks.is_empty() || pending.is_some()) {
-            let got = match pending {
-                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                Some(_) => rx.recv_timeout(RETRY_SEND),
+        if open && queries.is_empty() && bulks.is_empty() {
+            let got = if pending.is_empty() {
+                rx.recv().map_err(|_| RecvTimeoutError::Disconnected)
+            } else {
+                rx.recv_timeout(RETRY_SEND)
             };
             match got {
                 Ok(req) => first = Some(req),
@@ -183,62 +188,76 @@ fn run(mut embedder: Embedder, rx: Receiver<Req>, jobs: SyncSender<Job>, test: A
             }
         }
 
-        // A finished bulk waits for room on the indexer's queue; queries go on being served.
-        if let Some(job) = pending.take() {
-            match jobs.try_send(job) {
-                Ok(()) | Err(TrySendError::Disconnected(_)) => {}
-                Err(TrySendError::Full(job)) => {
-                    pending = Some(job);
-                    if !open {
-                        thread::sleep(RETRY_SEND);
-                    }
-                    continue;
-                }
-            }
+        // Then one batch of the bulk queue.
+        if let Some(job) = step(&mut embedder, &mut bulks, &model) {
+            pending.push_back(job);
         }
 
-        // Then one batch of the bulk queue.
-        let Some(bulk) = bulks.front_mut() else {
-            if !open && pending.is_none() {
+        if !open && bulks.is_empty() {
+            if pending.is_empty() {
                 return;
             }
-            continue;
-        };
-        if let BulkTo::Caller { deadline, .. } = &bulk.to {
-            if Instant::now() >= *deadline {
+            flush(&jobs, &mut pending);
+            if !pending.is_empty() {
+                thread::sleep(RETRY_SEND);
+            }
+        }
+    }
+}
+
+/// Hands finished bulks to the indexer's queue, oldest first, until it is full. A send that
+/// fails as disconnected drops the job: the indexer is gone.
+fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>) {
+    while let Some(job) = pending.pop_front() {
+        match jobs.try_send(job) {
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
+            Err(TrySendError::Full(job)) => {
+                pending.push_front(job);
+                return;
+            }
+        }
+    }
+}
+
+/// Embeds one batch of the oldest bulk request. Returns the `Job::Embedded` of a
+/// `submit_bulk` request it finished; a finished `embed_wait` is answered here.
+fn step(embedder: &mut Embedder, bulks: &mut VecDeque<Bulk>, model: &str) -> Option<Job> {
+    let bulk = bulks.front_mut()?;
+    if let BulkTo::Caller { deadline, .. } = &bulk.to {
+        if Instant::now() >= *deadline {
+            bulks.pop_front();
+            return None;
+        }
+    }
+    let from = bulk.done.len();
+    let to = (from + BATCH).min(bulk.texts.len());
+    let batch: Vec<&str> = bulk.texts[from..to].iter().map(String::as_str).collect();
+    match embedder.embed(&batch) {
+        Ok(vs) if vs.len() == batch.len() => bulk.done.extend(vs),
+        // SPEC: 1789-1795: a failed batch is not retried here. A caller gets `None`; the
+        // rows of `submit_bulk` are left out of `Job::Embedded` and keep `embedding = NULL`,
+        // so the indexer's next pump offers them again.
+        _ => {
+            if let BulkTo::Caller { .. } = bulk.to {
                 bulks.pop_front();
-                continue;
+                return None;
             }
+            bulk.done.extend(std::iter::repeat_with(Vec::new).take(batch.len()));
         }
-        let from = bulk.done.len();
-        let to = (from + BATCH).min(bulk.texts.len());
-        let batch: Vec<&str> = bulk.texts[from..to].iter().map(String::as_str).collect();
-        match embedder.embed(&batch) {
-            Ok(vs) if vs.len() == batch.len() => bulk.done.extend(vs),
-            // SPEC: 1789-1795: a failed batch is not retried here. A caller gets `None`; the
-            // rows of `submit_bulk` are left out of `Job::Embedded` and keep `embedding = NULL`,
-            // so the indexer's next pump offers them again.
-            _ => {
-                if let BulkTo::Caller { .. } = bulk.to {
-                    bulks.pop_front();
-                    continue;
-                }
-                bulk.done.extend(std::iter::repeat_with(Vec::new).take(batch.len()));
-            }
+    }
+    if bulk.done.len() < bulk.texts.len() {
+        return None;
+    }
+    let bulk = bulks.pop_front()?;
+    match bulk.to {
+        BulkTo::Caller { reply, .. } => {
+            let _ = reply.send(bulk.done);
+            None
         }
-        if bulk.done.len() < bulk.texts.len() {
-            continue;
-        }
-        let Some(bulk) = bulks.pop_front() else { continue };
-        match bulk.to {
-            BulkTo::Caller { reply, .. } => {
-                let _ = reply.send(bulk.done);
-            }
-            BulkTo::Rows(keys) => {
-                let vectors: Vec<(VecKey, Vec<f32>)> =
-                    keys.into_iter().zip(bulk.done).filter(|(_, v)| !v.is_empty()).collect();
-                pending = Some(Job::Embedded { model: model.clone(), vectors });
-            }
+        BulkTo::Rows(keys) => {
+            let vectors: Vec<(VecKey, Vec<f32>)> =
+                keys.into_iter().zip(bulk.done).filter(|(_, v)| !v.is_empty()).collect();
+            Some(Job::Embedded { model: model.to_string(), vectors })
         }
     }
 }
