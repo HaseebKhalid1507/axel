@@ -682,3 +682,61 @@ fn r22_3_a_file_replaced_by_an_older_one_is_indexed() {
     assert_eq!(w.sync().indexed, 1);
     assert!(w.row("notes::a").unwrap().1.ends_with("from a backup."));
 }
+
+/// R-22.5: the mode is read again after `embed_wait`: a process that degraded during the
+/// wait writes nothing.
+#[test]
+fn r22_5_the_mode_is_read_after_embed_wait() {
+    let test = TestHooks { embed_sleep_ms: 1_000, ..TestHooks::default() };
+    let mut w = world_with(Some(Embedder::hashing()), "hash-384", test);
+    w.file("notes/a.md", BODY);
+    let mode = w.ctx.mode.clone();
+    let watcher = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        mode.store(Mode::Degraded as u8, Ordering::SeqCst);
+    });
+    let report = w.sync();
+    watcher.join().unwrap();
+    assert_eq!(report.indexed, 0);
+    assert_eq!(w.count(), 0);
+}
+
+/// R-22.5: the mode is read between two files. The first file's write is held back (the
+/// front thread is "writing") past its check after `embed_wait`; the process degrades during
+/// that hold, so the first file is written and the second is not even embedded.
+#[test]
+fn r22_5_the_mode_is_read_between_two_files() {
+    let test = TestHooks { embed_sleep_ms: 1_500, ..TestHooks::default() };
+    let mut w = world_with(Some(Embedder::hashing()), "hash-384", test);
+    w.file("notes/a.md", BODY);
+    w.file("notes/b.md", &format!("{BODY} Another one."));
+    let (mode, writing) = (w.ctx.mode.clone(), w.ctx.writing.clone());
+    let start = Instant::now();
+    let front = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(1_000));
+        writing.store(true, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(800));
+        mode.store(Mode::Degraded as u8, Ordering::SeqCst);
+        writing.store(false, Ordering::SeqCst);
+    });
+    let report = w.sync();
+    let took = start.elapsed();
+    front.join().unwrap();
+    assert_eq!(report.indexed, 1);
+    assert_eq!(w.count(), 1);
+    assert!(took < Duration::from_millis(2_600), "the second file was embedded: {took:?}");
+}
+
+/// R-22.5: a memory row is never the sync's, even with a file path under a named folder.
+#[test]
+fn r22_5_a_memory_row_with_a_file_path_is_not_hidden() {
+    let mut w = world();
+    let gone = format!("{}/never-there.md", canon(&w.path("notes")));
+    let v = vec![0.1f32; 384];
+    velocirag::db::upsert_document(w.conn(), "mem-2", "a memory shadow", &json!({"type": "memory"}), &v, Some(&gone)).unwrap();
+    velocirag::db::upsert_document(w.conn(), "notes::x", "a note row", &json!({}), &v, Some(&gone.replace("never-there", "x"))).unwrap();
+    let report = w.sync();
+    assert_eq!(report.hidden, 1, "the note row is hidden, the memory row is not");
+    assert_eq!(w.row("mem-2").unwrap().2, None);
+    assert_eq!(w.row("notes::x").unwrap().2.as_deref(), Some("missing_source"));
+}
