@@ -1507,8 +1507,11 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
     if let Some(logged) = skip {
         // SPEC: 3250 says every recall becomes a log row and 3215 gives a skip an outcome.
         // A skip that is logged keeps no preview and no tokens (nothing was looked for).
+        // RULING: v2 final capture round, item 6: a log row's time is the hook's own
+        // (`received_ms`), the clock capture starts the turn by: a clock that steps back
+        // between the two cannot put the row before the turn's start.
         trace = logged.map(|why| RecallTrace {
-            ts_ms: now,
+            ts_ms: ev.received_ms,
             session_id: ev.session_id.clone(),
             logical: logical.clone(),
             scope_dir: view.project.as_ref().map(|p| p.scope_dir.clone()),
@@ -1591,6 +1594,8 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
                 found.trace.query_preview = Some(first_chars(text, PREVIEW_CHARS).to_string());
                 found.trace.query_tokens = tokens(text);
             }
+            // RULING: v2 final capture round, item 6.
+            found.trace.ts_ms = ev.received_ms;
             trace = Some(found.trace);
         }
     }

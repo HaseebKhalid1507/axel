@@ -1943,6 +1943,24 @@ fn final_3_an_excluded_folder_that_could_not_be_resolved_is_tried_again() {
     assert_eq!(recall::times_resolved(&folder), resolved_at);
 }
 
+/// Item 6 (silverhand 7): the log row's time is the hook's `received_ms`, not the front
+/// thread's clock read later, for a recall and for a skip that is logged.
+// RULING: v2 final capture round, item 6
+#[test]
+fn final_6_the_log_row_is_timed_by_the_hook() {
+    let mut h = Hook::new(json!({}));
+    let question = "which pipeline does the staging server deploy use";
+    let mut ev = h.event("before_message", "s1", Some(question));
+    ev.received_ms = NOW - 5_000;
+    let _ = recall::on_before_message(&mut h.st, &ev, true);
+    assert_eq!(h.trace().ts_ms, NOW - 5_000);
+    // The breaker is open: a skip, logged.
+    ev.received_ms = NOW - 7_000;
+    let _ = recall::on_before_message(&mut h.st, &ev, false);
+    let skipped = h.trace();
+    assert_eq!((skipped.outcome.as_str(), skipped.ts_ms), ("skipped:breaker", NOW - 7_000));
+}
+
 /// Item 6 (finding 8): core's Muse nudge is a host message for the hook too, by capture's
 /// one list: no recall, no log row. The same words from the person are recalled.
 #[test]
