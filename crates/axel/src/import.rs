@@ -663,6 +663,7 @@ fn checked_copy(source: &Path, folder: &Path, prefix: &str, temp: &mut Option<Te
             _ => return Err(changed()),
         }
     }
+    seam("copied", source)?;
     if SourceStat::read(source)? != before {
         return Err(changed());
     }
@@ -1679,6 +1680,7 @@ fn synaps_steps(brain: &BrainArg, opts: &SynapsOpts, rep: &mut Report, reads: &m
         }
 
         // The source is as it was when the first byte was read, or nothing is kept.
+        seam("read", source)?;
         if SourceStat::read(source)? != before {
             return Err(stop(EXIT_SOURCE, "the source changed while it was read; nothing was imported"));
         }
@@ -2188,6 +2190,7 @@ fn verify_steps(
     }
 
     // Neither source moved while it was read.
+    seam("read", axel_path)?;
     if !found.copied && SourceStat::read(axel_path)? != found.stat {
         return Err(stop(EXIT_SOURCE, "--from-axel changed while it was read; nothing of this verify may be used"));
     }
@@ -2577,6 +2580,7 @@ fn catch_up_steps(
         let total = (memories + shadows + documents) as i64;
         log_row(&conn, &source_text, &sha, "catch-up", total, total, 0, changed.len() as i64, not_back.len() as i64, &watch.to_string())?;
 
+        seam("read", source)?;
         if !found.copied && SourceStat::read(source)? != found.stat {
             return Err(stop(EXIT_SOURCE, "the source changed while it was read; nothing was changed"));
         }

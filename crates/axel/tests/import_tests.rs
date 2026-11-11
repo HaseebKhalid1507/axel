@@ -1878,3 +1878,143 @@ fn f13_init_refuses_a_created_that_adoption_cannot_read() {
     assert!(listing(fx.new.parent().unwrap()).is_empty());
     assert_eq!(state(&fx.old), before);
 }
+
+// ── Guards the review found untested (its answer 6) ─────────────────────────
+
+/// Moves a file's modification time one second on: what any write does to it.
+fn touch(path: &Path) {
+    let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+    let was = file.metadata().unwrap().modified().unwrap();
+    file.set_modified(was + std::time::Duration::from_secs(1)).unwrap();
+}
+
+/// Step 3: a source written between the copy and the second look is refused.
+#[test]
+fn g_init_refuses_a_source_that_changed_while_it_was_copied() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let out = with_seam(|point, source| { if point == "copied" { touch(source) } false }, || fx.init(&fx.old));
+    assert_eq!(out.code, 3, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().starts_with("the source changed while it was being copied"), "{}", out.report);
+    assert!(out.report["temporary_copy_deleted"].is_string(), "{}", out.report);
+    assert!(listing(fx.new.parent().unwrap()).is_empty());
+}
+
+/// `synaps`, `verify` and `catch-up` read a source in place and look at it again at the
+/// end: a source that moved meanwhile is exit 3, and nothing of the run is kept.
+#[test]
+fn g_synaps_refuses_a_source_that_changed_while_it_was_read() {
+    let fx = fx();
+    empty_v2(&fx.new);
+    let conn = synaps_conn(&fx.syn);
+    three_posts(&conn, now_ms());
+    conn.close().unwrap();
+    settle(&fx.new);
+    let hash = sha(&fx.new);
+    let out = with_seam(|point, source| { if point == "read" { touch(source) } false }, || fx.synaps(&[], true));
+    assert_eq!(out.code, 3, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().starts_with("the source changed while it was read; nothing was imported"));
+    settle(&fx.new);
+    assert_eq!(sha(&fx.new), hash);
+}
+
+#[test]
+fn g_verify_refuses_a_source_that_changed_while_it_was_read() {
+    let fx = fx();
+    let (_, map) = migrated(&fx);
+    let out = with_seam(|point, source| { if point == "read" { touch(source) } false }, || fx.verify(&[&map]));
+    assert_eq!(out.code, 3, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().starts_with("--from-axel changed while it was read"), "{}", out.report);
+}
+
+#[test]
+fn g_catch_up_refuses_a_source_that_changed_while_it_was_read() {
+    let fx = fx();
+    make_axel(&fx.old);
+    assert_eq!(fx.init(&fx.old).code, 0);
+    change_axel(&fx.old, |conn| add_memory(conn, "mem-ffff0006", "late note", "written after the import", 0.5));
+    settle(&fx.new);
+    let hash = sha(&fx.new);
+    let out = with_seam(|point, source| { if point == "read" { touch(source) } false }, || fx.catch_up());
+    assert_eq!(out.code, 3, "{}", out.report);
+    settle(&fx.new);
+    assert_eq!(sha(&fx.new), hash, "the catch-up was kept");
+}
+
+/// Step 5 asks again before it moves anything: an extension that started during the copy
+/// is exit 4, and the destination is as it was.
+#[test]
+fn g_replace_asks_again_before_it_moves_the_old_brain() {
+    let fx = fx();
+    make_axel(&fx.old);
+    with_status_row(&fx.new, 600_000);
+    settle(&fx.new);
+    let dest = fx.new.clone();
+    let mut opts = fx.init_opts(&fx.old);
+    opts.replace = true;
+    let out = with_seam(
+        move |point, _| {
+            if point == "synced" {
+                let conn = Connection::open(&dest).unwrap();
+                conn.execute(
+                    "UPDATE context_data SET value = ?1 WHERE layer = 'axel' AND key = 'status'",
+                    [json!({ "pid": 1, "mode": "ready", "written_ms": now_ms() }).to_string()],
+                )
+                .unwrap();
+                conn.close().unwrap();
+            }
+            false
+        },
+        || import::init(&fx.dest(), &opts),
+    );
+    assert_eq!(out.code, 4, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().starts_with("an Axel extension is running on this brain"), "{}", out.report);
+    assert!(out.report.get("replaced").is_none(), "{}", out.report);
+    assert!(!listing(fx.new.parent().unwrap()).iter().any(|n| n.contains(".replaced-")));
+    assert_eq!(count(&Connection::open(&fx.new).unwrap(), "SELECT COUNT(*) FROM memories"), 0);
+}
+
+/// A forum row whose body is not text is not imported, is named, and is exit 1.
+#[test]
+fn g_a_forum_row_that_is_not_text_is_named_and_exit_1() {
+    let fx = fx();
+    empty_v2(&fx.new);
+    let conn = synaps_conn(&fx.syn);
+    let posts = three_posts(&conn, now_ms());
+    let bad = format!("msg-{}", "ab".repeat(32));
+    conn.execute(
+        "INSERT INTO memories(id, category, topic, title, content, created) VALUES (?1, 'events', 'synaps', '', x'00ff', '2026-01-01T00:00:00+00:00')",
+        [&bad],
+    )
+    .unwrap();
+    conn.close().unwrap();
+    let out = fx.synaps(&[], true);
+    show("synaps, a forum row that is not text", &out);
+    assert_eq!(out.code, 1, "{}", out.report);
+    assert_eq!(ids(&out.report["forum_unreadable"]), [bad.as_str()]);
+    assert_eq!(out.report["forum_posts"]["rows_in"], 4);
+    let new = Connection::open(&fx.new).unwrap();
+    assert_eq!(count(&new, "SELECT COUNT(*) FROM forum_posts"), 3);
+    assert_eq!(count(&new, &format!("SELECT COUNT(*) FROM forum_posts WHERE id = '{bad}'")), 0);
+    assert_eq!(count(&new, &format!("SELECT COUNT(*) FROM forum_posts WHERE id = '{}'", posts.root)), 1);
+}
+
+/// `catch-up` from a source with a log reads a checked copy, so the row that is only in the
+/// log arrives, and the source is as it was.
+#[test]
+fn g_catch_up_reads_a_source_with_a_log_from_a_copy() {
+    let fx = fx();
+    make_axel(&fx.old);
+    assert_eq!(fx.init(&fx.old).code, 0);
+    let source = snapshot_with_log(&fx.old, &fx.root().join("snap"));
+    let before = state(&source);
+    let out = import::catch_up(&fx.dest(), &CatchUpOpts { from_axel: source.clone(), watch: None });
+    show("catch-up, a source with a log", &out);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["source_read_from"], "a checked temporary copy");
+    assert_eq!(ids(&out.report["memories"]["ids"]), ["mem-dddd0004"]);
+    assert_eq!(word_hits(&Connection::open(&fx.new).unwrap(), "heron"), ["mem-dddd0004"]);
+    assert!(out.report["temporary_copy_deleted"].as_str().unwrap().contains(".catchup-"), "{}", out.report);
+    assert!(temporaries(fx.new.parent().unwrap()).is_empty());
+    assert_eq!(state(&source), before);
+}
