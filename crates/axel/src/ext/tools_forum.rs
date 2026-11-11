@@ -26,6 +26,7 @@ pub const MAX_RESULT_BYTES: usize = 32 * 1024;
 pub const NO_CALLER: &str = "this Synaps does not say who is calling (tool.call has no caller); Axel's tools need a host that does";
 
 pub const NOTE_DUPLICATE: &str = "an identical post from this author already exists; nothing new was written";
+pub const NOTE_STOPPED: &str = "the scan stopped early; read again with next";
 pub const NOTE_TOMBSTONED: &str = "this exact post was deleted or has expired and cannot be re-created; change request_key to post it again";
 
 const NO_PROJECT: &str = "forum: no project for this folder; the forum is per project";
@@ -431,7 +432,9 @@ fn read(st: &FrontState, input: &Value, caller: &Caller, author: &Author) -> Res
             stats.elapsed.as_millis()
         ));
     }
-    encode_response(&project, author, page, None)
+    // A read a bound ended may list nothing and still have more behind `next`.
+    let note = stats.stopped.is_some().then_some(NOTE_STOPPED);
+    encode_response(&project, author, page, note)
 }
 
 fn forget(st: &FrontState, input: &Value, caller: &Caller, author: &Author) -> Result<String> {

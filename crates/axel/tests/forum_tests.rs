@@ -15,7 +15,8 @@ use axel::ext::config::ExtConfig;
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::serve;
 use axel::ext::tools_forum::{
-    self, LOWER_AUTHORITY_HEADER, MAX_RESULT_BYTES, NOTE_DUPLICATE, NOTE_TOMBSTONED, NO_CALLER,
+    self, LOWER_AUTHORITY_HEADER, MAX_RESULT_BYTES, NOTE_DUPLICATE, NOTE_STOPPED, NOTE_TOMBSTONED,
+    NO_CALLER,
 };
 use axel::ext::types::{Boot, Caller, FrontState, HookEvent, Job, Status, TestHooks, ToolError};
 use axel::ext::{front, hooks, tools};
@@ -1584,6 +1585,10 @@ const BULK: &str = "p5555555555555555";
 /// `count` live roots of `BULK`, one millisecond apart from `start_ms`; the body is `fill`
 /// bytes of mixed-case text after a line that names the row.
 fn bulk(db: &Connection, from: usize, count: usize, fill: usize, start_ms: i64, days: u32) -> Vec<Cursor> {
+    bulk_in(db, BULK, from, count, fill, start_ms, days)
+}
+
+fn bulk_in(db: &Connection, project: &str, from: usize, count: usize, fill: usize, start_ms: i64, days: u32) -> Vec<Cursor> {
     let author = who("bulk", "bulk-group", None);
     let filler = "Lorem Ipsum DOLOR sit Amet, consectetur ADIPISCING elit. ".repeat(fill / 57 + 1);
     let mut cursors = Vec::new();
@@ -1594,7 +1599,7 @@ fn bulk(db: &Connection, from: usize, count: usize, fill: usize, start_ms: i64, 
             ..a_post(&format!("bulk-{i}"), &format!("Bulk {i}"), &format!("row {i}\n{}", &filler[..fill]))
         };
         let timestamp_ms = start_ms + i as i64;
-        let id = insert_row(db, BULK, BULK, &author, &post, timestamp_ms, "axel", 1);
+        let id = insert_row(db, project, project, &author, &post, timestamp_ms, "axel", 1);
         cursors.push(Cursor { timestamp_ms: timestamp_ms as u64, id });
     }
     db.execute_batch("COMMIT").unwrap();
@@ -1759,4 +1764,40 @@ fn read_on_five_thousand_rows_is_bounded() {
     assert_eq!(page.entries.iter().map(Entry::cursor).collect::<Vec<_>>(), live);
     assert_eq!(stats.examined, 1, "expired rows are passed over by the statement and are not counted");
     eprintln!("[forum_tests] read, {build} build, 5,000 expired rows before one live row: {:?} (not under either bound)", stats.elapsed);
+}
+
+// ── The rulings on the review of wave 4 (R-17) ──────────────────────────────
+
+/// R-17.2: a read a bound stopped says so, because it may list nothing and still have rows
+/// behind `next`.
+#[test]
+fn a_read_stopped_by_a_bound_says_so_in_a_note() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let key = project::resolve(Some(&cwd)).unwrap().key;
+    let me = chat(&cwd, "s-note", &who("a", "ga", None));
+    let rows = bulk_in(&fx.db(), &key, 0, forum_store::READ_MAX_ROWS + 40, 100, T0 - 100_000, 30);
+
+    let mut after = Value::Null;
+    let mut stopped = 0;
+    for _ in 0..200 {
+        let got = fx.ok("forum_read", json!({"query": "no such words", "after": after}), &me);
+        assert!(got["result"]["entries"].as_array().unwrap().is_empty());
+        if got["result"]["next"].is_null() {
+            assert!(got.get("note").is_none(), "a read that ran out of rows has no note: {got}");
+            break;
+        }
+        assert_eq!(got["note"], NOTE_STOPPED, "{got}");
+        assert_eq!(got["note"], "the scan stopped early; read again with next");
+        stopped += 1;
+        after = got["result"]["next"].clone();
+    }
+    assert!(stopped >= 1, "5,040 rows end one read by a bound");
+    assert!(after["id"].is_string());
+
+    // A page that filled is not a stopped scan.
+    let got = fx.ok("forum_read", json!({"limit": 2}), &me);
+    assert_eq!(got["result"]["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(got["result"]["next"]["id"], rows[1].id.as_str());
+    assert!(got.get("note").is_none(), "{got}");
 }
