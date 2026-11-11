@@ -1383,7 +1383,7 @@ type Filed = HashMap<String, (i64, Option<Vec<String>>)>;
 /// then runs with no project. The read is kept per session for 60 s. A read that failed
 /// counts as "elsewhere": global material only. It takes `st.filed` and `st.conn` apart, so
 /// that the hook's deadline (`StopAt`, which borrows the connection) covers the read.
-fn filed_elsewhere(
+pub(crate) fn filed_elsewhere(
     filed: &mut Filed,
     conn: Option<&Connection>,
     (session_id, logical): (&str, &str),

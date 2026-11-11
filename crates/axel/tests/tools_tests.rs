@@ -1862,3 +1862,74 @@ fn r2_remember_of_a_superseded_expired_or_note_file_text_stores_a_new_row() {
     assert!(answer.starts_with("This was hidden on ") && answer.contains(&saved), "{answer}");
     assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows);
 }
+
+// RULING: v2 c18a review, item 3: a chat whose rows are filed under another project gets
+// the global view in all four tools, as ambient recall gives it (spec 3451-3456).
+fn filed_elsewhere_world(lab: &mut Lab) -> (Caller, Caller, String, String) {
+    let (a, dir_a, dir_b) = (lab.a.clone(), lab.dir_a.clone(), lab.dir_b.clone());
+    // Chat P's rows are filed under project B; it now calls from A's folder.
+    lab.put(&capture_row("mem_pinnedinbeta0001", &dir_b, "P", "where was the pinned chat", "under beta"));
+    lab.put(&row("mem_alphasaved000001", "note", &dir_a, "tool", "the sandpiper roost of alpha is by the sluice"));
+    lab.put(&row("mem_globalsaved00001", "note", GLOBAL_KEY, "tool", "the sandpiper ringing rules hold for every site"));
+    lab.put(&capture_row("mem_alpharecent00001", &dir_a, "R", "where is the sandpiper roost", "by the sluice of alpha"));
+    let p = lab.chat(&a, "P");
+    // A chat with no rows anywhere is not filed elsewhere: it sees A.
+    let q = lab.chat(&a, "Q");
+    (p, q, "mem_alphasaved000001".to_string(), "mem_globalsaved00001".to_string())
+}
+
+#[test]
+fn r3_search_and_recall_of_a_chat_filed_elsewhere_are_global_only() {
+    let mut lab = Lab::new();
+    let (p, q, alpha, global) = filed_elsewhere_world(&mut lab);
+    let found = lab.search(&p, "sandpiper roost sluice ringing");
+    assert!(found.contains(&global), "{found}");
+    assert!(!found.contains(&alpha) && !found.contains("mem_alpharecent00001"), "{found}");
+    assert!(found.contains("this chat is filed under another project, global material only"), "{found}");
+    let recalled = lab.recall(&p);
+    assert!(recalled.contains(&global), "{recalled}");
+    assert!(!recalled.contains(&alpha) && !recalled.contains("mem_alpharecent00001"), "{recalled}");
+
+    let found = lab.search(&q, "sandpiper roost sluice ringing");
+    assert!(found.contains(&global) && found.contains(&alpha), "{found}");
+    let recalled = lab.recall(&q);
+    assert!(recalled.contains(&alpha) && recalled.contains("mem_alpharecent00001"), "{recalled}");
+}
+
+#[test]
+fn r3_remember_of_a_chat_filed_elsewhere_needs_scope_global() {
+    let mut lab = Lab::new();
+    let (p, q, ..) = filed_elsewhere_world(&mut lab);
+    let before = snapshot(lab.conn());
+    let refusal = lab.refused("remember", json!({ "content": "the sandpiper roost moved to the north sluice" }), &p);
+    assert_eq!(refusal, tools_core::FILED_ELSEWHERE);
+    let refusal =
+        lab.refused("remember", json!({ "content": "the sandpiper roost moved to the north sluice", "scope": "project" }), &p);
+    assert_eq!(refusal, tools_core::FILED_ELSEWHERE);
+    assert_eq!(snapshot(lab.conn()), before, "a refused remember wrote");
+
+    let answer = lab.ok("remember", json!({ "content": "the sandpiper roost moved to the north sluice", "scope": "global" }), &p);
+    assert!(answer.ends_with("for every project."), "{answer}");
+    let id = saved_id(&answer);
+    let key: String = lab.conn().query_row("SELECT project_key FROM memories WHERE id = ?1", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(key, GLOBAL_KEY);
+    // The chat that is not filed elsewhere still saves into A.
+    let id = lab.remember(&q, "the sandpiper roost of alpha floods at spring tide");
+    let key: String = lab.conn().query_row("SELECT project_key FROM memories WHERE id = ?1", [&id], |r| r.get(0)).unwrap();
+    assert_eq!(key, lab.dir_a);
+}
+
+#[test]
+fn r3_forget_of_a_chat_filed_elsewhere_hides_only_global_rows_and_still_marks_the_turn() {
+    let mut lab = Lab::new();
+    let (p, _, alpha, global) = filed_elsewhere_world(&mut lab);
+    let marks = |lab: &Lab| {
+        count_id(lab.conn(), "SELECT COUNT(*) FROM forgotten_turns WHERE source = 'call' AND logical = ?1", &project::logical("P"))
+    };
+    let refusal = lab.refused("forget", json!({ "id": format!("m:{alpha}") }), &p);
+    assert_eq!(refusal, "not found");
+    assert_eq!(hidden_by(lab.conn(), &alpha), None);
+    assert_eq!(marks(&lab), 1, "the turn mark is written whatever the view");
+    lab.ok("forget", json!({ "id": format!("m:{global}") }), &p);
+    assert_eq!(hidden_by(lab.conn(), &global), Some("model:P".to_string()));
+}
