@@ -67,7 +67,7 @@ pub const MANIFEST: &str = r#"{
       {"key": "archives",         "description": "Index Synaps's context archives: on or off.", "default": "on"},
       {"key": "forum",            "description": "Provide the project forum tools: auto (on unless Synaps still uses its Axel backend), on, or off.", "default": "auto"},
       {"key": "worker_scope",     "description": "What subagent workers can search: project (this project's chat memory only) or all (also global memories and note files).", "default": "project"},
-      {"key": "forget_now_min_hidden_hours", "description": "Hours a memory must have been hidden before 'axel-v2 forget --now' will delete it. 0: at once.", "default": "24"},
+      {"key": "forget_now_min_hidden_hours", "description": "Hours a memory must have been hidden before 'axel-v2 forget --now' will delete it. Read by that command from extension.axel.forget_now_min_hidden_hours in the Synaps config; it can lengthen the 24-hour wait, never shorten it.", "default": "24"},
       {"key": "handoff_on_start", "description": "Inject the handoff written with 'axel handoff set' at session start: on or off.", "default": "off"},
       {"key": "sources",          "description": "Path of sources.toml listing note folders. Empty: ~/.config/axel/sources.toml, else the built-in list.", "default": ""},
       {"key": "archive_events",   "description": "Comma-separated event sources to index from archives besides worker reports.", "default": ""},
