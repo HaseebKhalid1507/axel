@@ -2254,3 +2254,23 @@ fn f4_a_turn_the_carry_drops_is_counted_at_once() {
     assert_eq!(status.turns_dropped.load(Ordering::Relaxed), 1, "the dropped turn waits for another hook");
 }
 
+#[test]
+fn f5_kept_marks_on_a_locked_brain_are_reported_lost_inside_serves_wait() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks::default());
+    let holder = Connection::open(dirs.brain()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    assert_eq!(host.hook("on_memory_forgotten", "session-S"), continues());
+    assert_eq!(host.hook("before_message", "session-S"), continues());
+    wait_for_log(&dirs, "front carry: forget mark not written, kept");
+    // The front thread has answered the late hook and is idle again.
+    std::thread::sleep(Duration::from_millis(300));
+
+    let start = Instant::now();
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    let took = start.elapsed();
+    let log = read_log(&dirs);
+    assert!(log.contains("front carry: forget marks lost at the end: 1"), "{log}");
+    assert!(took < Duration::from_millis(1_000), "{took:?}");
+    holder.execute_batch("ROLLBACK").unwrap();
+}

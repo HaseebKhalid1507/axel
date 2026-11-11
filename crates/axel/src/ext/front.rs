@@ -28,6 +28,10 @@ use crate::{capture, index_archives, project, recall};
 
 /// Forget marks kept for a later try (wave 3, 12b ruling 7; wave 4, R-12b item 1).
 const FORGET_MARKS_KEPT: usize = 256;
+/// How long the last try of the kept forget marks waits for the write lock. It must fit
+/// inside `server::EXIT_WAIT` (200 ms), what `serve` waits for this thread at the end;
+/// change the two together.
+const LAST_TRY_WAIT: Duration = Duration::from_millis(150);
 /// How long the loop waits for a call before it looks after its own state.
 const IDLE: Duration = Duration::from_millis(250);
 
@@ -423,16 +427,22 @@ fn retry_forget_marks(st: &mut FrontState) {
     }
 }
 
-/// Before the loop returns: the kept marks once more, this time waiting for the lock as any
-/// write of this thread does. What is still not written is lost with the process, and the
-/// log says how many.
+/// Before the loop returns: the kept marks once more, waiting `LAST_TRY_WAIT` for the lock.
+/// What is still not written is lost with the process, and the log says how many before
+/// the thread returns.
 // RULING: wave4 R-12b item 1. The list lives in memory only.
+// RULING: v2 front follow-up, item 5. Not this thread's usual 1.5 s: `serve` would have
+// returned first and the log line would be lost too. The archive carries the forget call
+// anyway (index_archives step 3).
 fn last_try_forget_marks(st: &mut FrontState) {
     if st.forget_marks.is_empty() {
         return;
     }
     if is_ready(st) && connect(st) {
-        retry_written(st);
+        let waits = st.conn.as_ref().is_some_and(|conn| conn.busy_timeout(LAST_TRY_WAIT).is_ok());
+        if waits {
+            retry_written(st);
+        }
     }
     if !st.forget_marks.is_empty() {
         log_line(&format!("front carry: forget marks lost at the end: {}", st.forget_marks.len()));
