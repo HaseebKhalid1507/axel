@@ -1234,14 +1234,15 @@ fn forget_indexed(ctx: &IndexerCtx, at: &FileAt, archive_id: &str) -> Result<()>
 /// not at the first scan, which comes after the notes pass and may be long. Only the files
 /// `archive_index` holds as `indexed` are looked at: `lstat`, and a read for a size that
 /// changed.
-// RULING: v2 real-binaries round, item 2.
-pub fn forget_tombstoned(ctx: &IndexerCtx) -> Result<usize> {
-    let Some(conn) = ctx.conn.as_ref() else { return Ok(0) };
+// RULING: v2 real-binaries round, item 2. On the bare connection and the base (the round
+// after: the command line runs it too); the `vid`s of the rows that went are pushed to
+// `gone`.
+pub fn forget_tombstoned(conn: &Connection, base: &Path, gone: &mut Vec<i64>) -> Result<usize> {
     let rows: Vec<(String, String, String, Option<i64>)> = conn
         .prepare("SELECT scope_dir, rel_name, archive_id, file_size FROM archive_index WHERE state = 'indexed'")?
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let root = archives_root(ctx);
+    let root = base.join("context-archives");
     let mut listed: HashMap<String, Vec<ArchiveEntry>> = HashMap::new();
     let mut forgotten = 0;
     for (scope_dir, rel_name, archive_id, size) in rows {
@@ -1253,7 +1254,14 @@ pub fn forget_tombstoned(ctx: &IndexerCtx) -> Result<usize> {
             continue;
         }
         if let Ok(Ok(ArchiveFile::Tombstone { .. })) = catch_unwind(AssertUnwindSafe(|| at.read(None))) {
-            forget_indexed(ctx, &at, &archive_id)?;
+            in_write(conn, || {
+                forget_archive_in(conn, at.scope_dir, &archive_id, gone)?;
+                conn.execute(
+                    "UPDATE archive_index SET file_size = ?1 WHERE scope_dir = ?2 AND rel_name = ?3",
+                    params![at.size, at.scope_dir, at.rel_name],
+                )?;
+                mark_purged(conn)
+            })?;
             forgotten += 1;
         }
     }

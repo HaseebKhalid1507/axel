@@ -204,6 +204,27 @@ pub fn degrade_if_replaced(ctx: &IndexerCtx) -> bool {
     true
 }
 
+/// The forgets that came while nothing read them: archives that are tombstones now
+/// (`index_archives::forget_tombstoned`) and notes files that changed
+/// (`index_notes::forget_changed`). `lstat` first; a file is read only when it changed.
+// RULING: v2 real-binaries round 2, item 1: the notes beside the archives.
+pub fn forget_pass(ctx: &IndexerCtx) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    let mut gone = Vec::new();
+    let done = crate::index_archives::forget_tombstoned(conn, &ctx.cfg.base, &mut gone).and_then(|archives| {
+        let notes = crate::index_notes::forget_changed(conn, ctx.signer.as_ref(), &ctx.cfg.base, &ctx.clock, &mut gone)?;
+        Ok((archives, notes))
+    });
+    if !gone.is_empty() {
+        let _ = ctx.vec_tx.send(VecDelta::Remove(gone.into_iter().map(VecKey::Mem).collect()));
+    }
+    let (archives, notes) = done?;
+    if archives + notes > 0 {
+        log_line(&format!("forget pass: {archives} archives, {notes} notes files"));
+    }
+    Ok(())
+}
+
 /// `open_v2`, with the base guard on both sides of it: a brain recorded for another Synaps
 /// base is refused before anything can write to it.
 fn open(ctx: &mut IndexerCtx) -> Result<()> {
@@ -261,10 +282,7 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
     }
     // RULING: v2 real-binaries round, item 2: an archive forgotten while no extension ran
     // is gone before the front can read the brain. A failure here fails the open.
-    let forgotten = crate::index_archives::forget_tombstoned(ctx)?;
-    if forgotten > 0 {
-        log_line(&format!("forgotten at open: {forgotten} archives"));
-    }
+    forget_pass(ctx)?;
     recover(&ctx.status, &ctx.mode);
     Ok(())
 }

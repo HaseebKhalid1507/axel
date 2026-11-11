@@ -858,3 +858,28 @@ fn rb2_an_archive_forgotten_while_no_extension_ran_is_not_served_at_the_next_sta
     assert_eq!(w.rows_of_archive(NEW_ID), 0);
     ext.shutdown();
 }
+
+/// Real-binaries round 2, item 1: a note core forgot while no extension ran is not served
+/// by the next extension's first call.
+// RULING: v2 real-binaries round 2, item 1
+#[test]
+fn rb3_a_note_forgotten_while_no_extension_ran_is_not_served_at_the_next_start() {
+    let w = World::new();
+    let proj = w.proj();
+    w.put_notes(&[("mem-e2e-deploys", "Deploys to staging happen on Thursdays after the standup meeting.")]);
+    let ext = Ext::start(&w, "1");
+    w.wait_ready("the first process ready");
+    wait_for("the note indexed", || (w.rows_holding("Thursdays after the standup") == 1).then_some(()));
+    ext.shutdown();
+
+    // Core forgets it while nothing runs: a tombstone line.
+    let file = w.base().join("memory").join(format!("project-{}.jsonl", w.key));
+    let mut notes = std::fs::OpenOptions::new().append(true).open(&file).unwrap();
+    notes.write_all(b"{\"tombstone\":\"mem-e2e-deploys\",\"timestamp_ms\":1777000009000}\n").unwrap();
+    drop(notes);
+    let mut ext = Ext::start(&w, "2");
+    let found = ext.search("when do deploys to staging happen", &proj);
+    assert!(!found.contains("Thursdays"), "the forgotten note was served: {found}");
+    assert_eq!(w.rows_holding("Thursdays after the standup"), 0);
+    ext.shutdown();
+}

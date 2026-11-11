@@ -269,6 +269,51 @@ fn stored_row(conn: &Connection, path: &str) -> Result<Option<Stored>> {
         .optional()?)
 }
 
+/// The notes files the brain has read whose size or time changed since: each is read and
+/// mirrored as the pass does it, so a note core forgot (a tombstone line, a line gone)
+/// leaves. Nothing else is listed or read. The `vid`s of the rows that went are pushed to
+/// `gone`; returns the files read.
+// RULING: v2 real-binaries round 2, item 1: before `Ready` (and from the command line),
+// not the whole pass.
+pub fn forget_changed(
+    conn: &Connection,
+    signer: Option<&axel_memkoshi::security::MemorySigner>,
+    base: &Path,
+    clock: &Clock,
+    gone: &mut Vec<i64>,
+) -> Result<usize> {
+    let dir = base.join("memory");
+    let rows: Vec<(String, i64, i64)> = conn
+        .prepare("SELECT path, size, mtime_ns FROM note_files WHERE ok = 1")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut read = 0;
+    for (path_text, size, mtime) in rows {
+        let path = Path::new(&path_text);
+        if path.parent() != Some(dir.as_path()) {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Ok(meta) = std::fs::symlink_metadata(path) else { continue };
+        if !meta.file_type().is_file() || (i64::try_from(meta.len()).unwrap_or(i64::MAX), mtime_ns(&meta)) == (size, mtime) {
+            continue;
+        }
+        let mut report = PassReport::default();
+        match catch_unwind(AssertUnwindSafe(|| one_file(conn, signer, &dir, name, clock, &mut report))) {
+            Ok(Ok(removed)) => {
+                gone.extend(removed);
+                read += 1;
+            }
+            Ok(Err(e)) => {
+                rollback(conn);
+                return Err(e);
+            }
+            Err(_) => rollback(conn),
+        }
+    }
+    Ok(read)
+}
+
 fn one_file(
     conn: &Connection,
     signer: Option<&axel_memkoshi::security::MemorySigner>,
