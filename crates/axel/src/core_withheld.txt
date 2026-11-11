@@ -1,4 +1,5 @@
-# core babe8511
+# core a373ff06
+# sha256 28b451dc3382e659bb1816d9974d787741281fd7cf758d8cf61312680dda118c
 "password"
 "passwd"
 "api_key"

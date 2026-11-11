@@ -83,6 +83,13 @@ pub fn show_block(text: &str, max_chars: usize) -> String {
 /// The copy of core's withholding rule: true when the ASCII-lowercase form of `text`
 /// contains one of the words of `core_withheld.txt`. Core stores such a string as
 /// `[archive: withheld]`, whole. A copy that cannot be read withholds everything.
+// RULING: wave2-c8 review A4: this is core's FUNCTION, not core's decision. Core applies
+// `credential_like` to the output of its redactor, so a word the redactor removed is stored
+// after all, and it withholds some classes of content whatever their words. Called on the
+// text Axel was given, this is close to what core does with a string, not equal to it:
+// Axel may skip a turn core stores, and core may withhold one this function passes.
+// `scripts/check-core-rule.sh` proves the words and the text of the function (the
+// `# sha256` line of the copy), and nothing of what core does around it.
 pub fn core_withholds(text: &str) -> bool {
     let rule = core_rule();
     if !rule.ok {
@@ -115,7 +122,9 @@ fn core_rule() -> &'static CoreRule {
         let commit = lines.next().and_then(|l| l.strip_prefix("# core ")).map(str::trim).unwrap_or("");
         let mut words = Vec::new();
         let mut ok = !commit.is_empty();
-        for line in lines.map(str::trim).filter(|l| !l.is_empty()) {
+        // A `#` line after the first is a comment: the `# sha256` of core's function, which
+        // the script reads. No word starts with `#`: a word is a JSON string.
+        for line in lines.map(str::trim).filter(|l| !l.is_empty() && !l.starts_with('#')) {
             match serde_json::from_str::<String>(line) {
                 Ok(word) if !word.is_empty() => words.push(word),
                 _ => ok = false,
@@ -912,7 +921,7 @@ mod tests {
     }
 
     // Test 14, and the strings core's own tests withhold with this rule
-    // (context_archive.rs at babe8511: "password=bad", "password=synthetic-credential",
+    // (context_archive.rs at a373ff06: "password=bad", "password=synthetic-credential",
     // "the password is example-only"). Core has no direct test of `credential_like`.
     #[test]
     fn core_withholds_is_cores_rule() {
@@ -950,6 +959,13 @@ mod tests {
         let commit = first.strip_prefix("# core ").expect("the first line names a core commit");
         assert!(commit.len() >= 7 && commit.bytes().all(|b| b.is_ascii_hexdigit()), "commit {commit:?}");
         assert_eq!(core_rule_commit(), commit);
+        // RULING: wave2-c8 review A4: the copy carries the hash of core's whole function.
+        let hashes: Vec<&str> =
+            include_str!("core_withheld.txt").lines().filter_map(|l| l.strip_prefix("# sha256 ")).collect();
+        assert_eq!(hashes.len(), 1, "one sha256 line");
+        let hash = hashes[0];
+        assert!(hash.len() == 64 && hash.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')), "hash {hash:?}");
+        assert!(hash.bytes().any(|b| b != b'0'), "the hash is a placeholder");
     }
 
     // The spec gives no size or time bound; this one only catches a scan that is quadratic.
