@@ -4,7 +4,7 @@
 use std::io::{BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 
-use axel::ext::config::{base_config_value, EmbedderKind, ExtConfig, ForumMode};
+use axel::ext::config::{base_config_value, default_brain, EmbedderKind, ExtConfig, ForumMode};
 use axel::ext::rpc::{
     parse_request, write_frame, write_response, FrameError, FrameReader, MessageError, Response,
     MAX_BODY, METHOD_NOT_FOUND,
@@ -316,6 +316,23 @@ fn the_base_config_reader() {
     assert_eq!(base_config_value(tmp.path(), key).as_deref(), Some("axel"));
     write("memory.backend = \"files\" # comment\nmemory.backend.x = axel\n");
     assert_eq!(base_config_value(tmp.path(), key).as_deref(), Some("files"));
+}
+
+/// The extension and the command line must open the same brain when neither is told one.
+#[test]
+fn default_brain_is_the_command_lines_default() {
+    // For the process's own home: exactly `AxelConfig::default()`, whatever the platform
+    // and `XDG_DATA_HOME` make of it.
+    if let Some(real) = dirs::home_dir() {
+        assert_eq!(default_brain(&real), axel::config::AxelConfig::default().brain_path);
+    }
+    // For another home (a test's): under that home, never under the real one.
+    assert_eq!(
+        default_brain(&home()),
+        home().join(".local/share/axel/brain.r8")
+    );
+    assert_eq!(cfg(json!({})).brain, home().join(".local/share/axel/brain.r8"));
+    assert_eq!(cfg(json!({ "brain": "" })).brain, home().join(".local/share/axel/brain.r8"));
 }
 
 /// Section 6, "The clash": `auto` declares the forum unless the host's config says the host

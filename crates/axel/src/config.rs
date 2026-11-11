@@ -1,6 +1,19 @@
 //! Axel plugin configuration.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// The data folder for `home`.
+///
+/// When `home` is this process's own home it is `dirs::data_dir()`, so `XDG_DATA_HOME` and
+/// the platform's rule are honoured and the command line (`AxelConfig::default`) and the
+/// extension (`ext::config::default_brain`) name the same default brain. For any other
+/// `home` (a test's) it is `<home>/.local/share`.
+pub fn data_dir_for(home: &Path) -> PathBuf {
+    match (dirs::data_dir(), dirs::home_dir()) {
+        (Some(data), Some(real)) if real == home => data,
+        _ => home.join(".local/share"),
+    }
+}
 
 /// Plugin configuration, loaded from `~/.synaps-cli/axel.toml`.
 #[derive(Debug, Clone)]

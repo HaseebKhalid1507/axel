@@ -52,9 +52,11 @@ pub struct ExtConfig {
     pub warnings: Vec<String>,
 }
 
-/// The default brain under `home` (section 1: `~/.local/share/axel/brain.r8`).
+/// The default brain for `home` (section 1: `dirs::data_dir()/axel/brain.r8`, which is
+/// `~/.local/share/axel/brain.r8` on Linux without `XDG_DATA_HOME`). For the process's own
+/// home this is the file the command line opens by default (`AxelConfig::default`).
 pub fn default_brain(home: &Path) -> PathBuf {
-    home.join(".local/share/axel/brain.r8")
+    crate::config::data_dir_for(home).join("axel").join("brain.r8")
 }
 
 /// The default model folder under `home` (section 11, "The model").
