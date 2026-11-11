@@ -2203,8 +2203,13 @@ pub fn mark_forgotten_turn_vids(
     // call, and the turn's log row, written at its start, is older than that. A `call`
     // mark with no key that found no log row in its interval takes the chat's newest log
     // row at or before `to_ms`. Once for a mark (a retry of the same mark finds its row),
-    // and not when an earlier keyless `call` mark already stands between that log row and
-    // this one: that mark took the turn's row, and what is newest now is an older turn's.
+    // and not when an earlier `call` mark, with a key or without, already stands between
+    // that log row and this one: that mark took the turn's row, and what is newest now is
+    // an older turn's.
+    // RULING: wave4 R-13 round 3, item 1. A forgotten turn that wrote no log row at all (a
+    // prompt too short for the log, a hook that was never forwarded) gives up the row of
+    // the turn before it: ACCEPTED as it is. Only a trace of that turn is lost, and it errs
+    // towards forgetting.
     if source == "call" && turn_key.is_none() && covered_to.is_none() && log_rows == 0 {
         log_rows += conn.execute(
             "DELETE FROM recall_log
@@ -2213,7 +2218,7 @@ pub fn mark_forgotten_turn_vids(
                              AND ts_ms <= ?4
                            ORDER BY ts_ms DESC, id DESC LIMIT 1)
                 AND NOT EXISTS (SELECT 1 FROM forgotten_turns f
-                                 WHERE f.logical = ?1 AND f.source = 'call' AND f.turn_key = ''
+                                 WHERE f.logical = ?1 AND f.source = 'call'
                                    AND f.from_ms >= recall_log.ts_ms AND f.from_ms < ?3)",
             params![logical, session_id, from_ms, to_ms],
         )?;

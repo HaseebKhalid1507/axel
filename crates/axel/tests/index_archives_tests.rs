@@ -3028,6 +3028,39 @@ fn the_live_call_takes_the_log_row_by_key_and_with_nothing_pending_the_newest_on
 }
 
 #[test]
+fn a_keyless_mark_after_a_keyed_one_in_the_same_turn_takes_no_older_log_row() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let run = env.run();
+    let conn = run.db();
+    let chat = project::logical("s-keyedfirst");
+    let key = key_of(FORGET_PROMPT);
+    let older = plant_log(conn, &dir, &chat, T0 - 60_000, "aaaaaaaaaaaaaaaa", "the turn before");
+    let of_turn = plant_log(conn, &dir, &chat, T0 - 2_000, &key, "forget that I told you about KEYEDFIRST");
+    // The turn's mark with its key, from the hook's arrival: it takes the turn's row.
+    assert!(live_call(&run, "s-keyedfirst", T0 - 3_000, T0 - 1_000, Some(&key)).is_empty());
+    assert!(!logged(conn, of_turn));
+    // A second forget in the same turn, with nothing pending: no key, after the first.
+    assert!(live_call(&run, "s-keyedfirst", T0, T0, None).is_empty());
+    assert!(logged(conn, older), "a keyless mark after a keyed one took the log row of the turn before");
+}
+
+#[test]
+fn a_keyless_mark_that_found_its_turns_log_row_takes_no_other() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let run = env.run();
+    let conn = run.db();
+    let chat = project::logical("s-foundone");
+    let older = plant_log(conn, &dir, &chat, T0 - 60_000, "aaaaaaaaaaaaaaaa", "the turn before");
+    let of_turn = plant_log(conn, &dir, &chat, T0 + 500, "bbbbbbbbbbbbbbbb", "forget what I said about FOUNDONE");
+    // The first mark of the chat, whose interval holds the turn's log row.
+    assert!(live_call(&run, "s-foundone", T0, T0 + 1_000, None).is_empty());
+    assert!(!logged(conn, of_turn));
+    assert!(logged(conn, older), "a mark that found its turn's row also took the newest one before it");
+}
+
+#[test]
 fn a_mark_written_late_takes_no_log_row_from_after_its_turn() {
     let env = Env::new();
     let dir = scope(KEY);
