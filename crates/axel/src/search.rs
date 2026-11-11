@@ -29,6 +29,14 @@ pub struct BrainSearch {
     cache_path: PathBuf,
     /// Set to true when the live index has been modified since the last save.
     cache_stale: bool,
+    /// `PRAGMA data_version` when the vectors of other writers were read (the warm load,
+    /// or `build_index`); `None` while nothing has been read.
+    read_version: Option<i64>,
+}
+
+/// `PRAGMA data_version`: it changes when another connection commits to the file.
+fn data_version(conn: &rusqlite::Connection) -> Option<i64> {
+    conn.query_row("PRAGMA data_version", [], |r| r.get(0)).ok()
 }
 
 impl BrainSearch {
@@ -167,6 +175,7 @@ impl BrainSearch {
 
         // Try to load a warm index from disk if it exists and the vector
         // count matches what the database currently holds.
+        let version = data_version(db.conn());
         let (index, index_built) = if cache_path.exists() {
             let db_count = db
                 .document_count()
@@ -204,6 +213,7 @@ impl BrainSearch {
             index_built,
             cache_path,
             cache_stale: false,
+            read_version: if index_built { version } else { None },
         })
     }
 
@@ -218,6 +228,8 @@ impl BrainSearch {
             return Ok(());
         }
 
+        // Before the read: a commit between the two then counts as one after it.
+        self.read_version = data_version(self.db.conn());
         let embeddings = self.db.load_all_embeddings()
             .map_err(|e| AxelError::Search(format!("Failed to load embeddings: {e}")))?;
 
@@ -234,7 +246,7 @@ impl BrainSearch {
         tracing::info!(count = embeddings.len(), "HNSW index built from stored embeddings");
 
         // Persist the freshly built index so the next open() is a warm load.
-        if let Err(e) = self.index.save(&self.cache_path) {
+        if let Err(e) = self.save_cache() {
             tracing::warn!("Failed to persist HNSW index cache: {e}");
         } else {
             tracing::debug!("HNSW index saved to {}", self.cache_path.display());
@@ -250,12 +262,33 @@ impl BrainSearch {
     /// called explicitly after bulk `index_document()` operations.
     pub fn flush(&mut self) -> Result<()> {
         if self.cache_stale && self.index_built {
-            self.index.save(&self.cache_path)
+            self.save_cache()
                 .map_err(|e| AxelError::Search(format!("Failed to flush HNSW cache: {e}")))?;
             self.cache_stale = false;
             tracing::debug!("HNSW index flushed to {}", self.cache_path.display());
         }
         Ok(())
+    }
+
+    /// Writes `<brain>.r8.hnsw`, the one way every save goes (`build_index`, `flush`, the
+    /// flush on drop): only when no other writer has committed since the vectors were
+    /// read; else the file is deleted, and the next open builds the index again.
+    // RULING: v2 c18b review round 3, item 6. A `forget --now` that commits and removes the
+    // file between this handle's read and its save would find the file written back with
+    // a deleted vector. `PRAGMA data_version` does not move for this handle's own commits
+    // (`index_document`), so `index` and `index-sync` still save.
+    fn save_cache(&self) -> std::result::Result<(), String> {
+        let unchanged = match self.read_version {
+            Some(read) => data_version(self.db.conn()) == Some(read),
+            None => true,
+        };
+        if unchanged {
+            return self.index.save(&self.cache_path).map_err(|e| e.to_string());
+        }
+        match std::fs::remove_file(&self.cache_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        }
     }
 
     /// Search the brain for documents matching a query.
@@ -357,7 +390,7 @@ impl Drop for BrainSearch {
     /// index_document() additions across sessions.
     fn drop(&mut self) {
         if self.cache_stale && self.index_built {
-            if let Err(e) = self.index.save(&self.cache_path) {
+            if let Err(e) = self.save_cache() {
                 tracing::warn!("Failed to persist HNSW index on drop: {e}");
             }
         }
@@ -604,5 +637,50 @@ mod tests {
 
         // Suppress unused variable warning — dir must stay alive for path to be valid.
         drop(dir);
+    }
+
+    /// A brain with two documents, its cache file removed, and a handle that has read
+    /// every vector (`build_index`) and saved.
+    fn read_then_cache_removed() -> (tempfile::TempDir, PathBuf, BrainSearch) {
+        let (dir, path) = tmp_brain_with_search();
+        {
+            let mut search = open_hashing(&path).unwrap();
+            search.index_document("a", "alpha document", None, None).unwrap();
+            search.index_document("b", "beta document", None, None).unwrap();
+        }
+        let cache = path.with_extension("r8.hnsw");
+        std::fs::remove_file(&cache).unwrap();
+        let mut reader = open_hashing(&path).unwrap();
+        reader.build_index().unwrap();
+        assert!(cache.exists(), "build_index did not save");
+        // What `forget --now` does after its commit.
+        std::fs::remove_file(&cache).unwrap();
+        (dir, path, reader)
+    }
+
+    /// v2 c18b review round 3, item 6: a handle whose vectors were read before another
+    /// writer committed does not write the cache file back, on `flush` or on drop.
+    #[test]
+    fn a_save_after_another_writer_committed_deletes_the_cache_file() {
+        let (_dir, path, mut reader) = read_then_cache_removed();
+        let cache = path.with_extension("r8.hnsw");
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute("INSERT INTO context_data(key, value, layer) VALUES ('k', 'v', 'test')", []).unwrap();
+        reader.index_document("c", "gamma document", None, None).unwrap();
+        reader.flush().unwrap();
+        assert!(!cache.exists(), "flush wrote the cache back after another writer's commit");
+        reader.index_document("d", "delta document", None, None).unwrap();
+        std::fs::write(&cache, b"old").unwrap();
+        drop(reader);
+        assert!(!cache.exists(), "the drop wrote the cache back, or left an old one");
+    }
+
+    /// The handle's own commits do not stop its save (`index`, `index-sync`).
+    #[test]
+    fn a_save_after_only_its_own_commits_writes_the_cache_file() {
+        let (_dir, path, mut reader) = read_then_cache_removed();
+        reader.index_document("c", "gamma document", None, None).unwrap();
+        reader.flush().unwrap();
+        assert!(path.with_extension("r8.hnsw").exists());
     }
 }

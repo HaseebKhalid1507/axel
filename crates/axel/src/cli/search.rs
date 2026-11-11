@@ -81,27 +81,12 @@ pub fn shown(conn: &Connection, hidden: &HashSet<String>, doc_id: &str) -> Resul
     Ok(!gone)
 }
 
-/// `PRAGMA data_version`: it changes when another connection commits to the brain.
-// RULING: v2 c18b review round 2, item 7: exact where a count and a sum of ids are not (a
-// document deleted and another written with its id). Any commit of another writer counts,
-// so the cache file goes more often than needed; the next search builds it again.
-fn data_version(conn: &Connection) -> Result<i64> {
-    Ok(conn.query_row("PRAGMA data_version", [], |r| r.get(0))?)
-}
-
 /// The search for three times `limit`, the hidden hits dropped, at most `limit` kept.
 pub fn visible_hits(search: &mut BrainSearch, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
-    let before = data_version(search.db().conn())?;
+    // RULING: v2 c18b review round 3, item 6: the `.hnsw` file is guarded where it is
+    // written (`BrainSearch::save_cache`), for every command that searches or indexes.
     let response = search.search(query, limit.saturating_mul(3))?;
     let conn = search.db().conn();
-    // RULING: v2 c18b review, item 9. The first search of a process reads every vector and
-    // then writes `<brain>.r8.hnsw`; a `forget --now` that commits and removes that file in
-    // between would find it written back with the deleted shadow's vector. When another
-    // writer committed while this search ran, the file it may have written goes, and the
-    // next search builds it again.
-    if data_version(conn)? != before {
-        let _ = std::fs::remove_file(search.db().path().with_extension("r8.hnsw"));
-    }
     let hidden = hidden_ids(conn)?;
     let mut kept = Vec::new();
     for hit in response.results {
