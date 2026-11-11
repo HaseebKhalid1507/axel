@@ -350,6 +350,42 @@ fn config_switches_lists_and_bad_shapes() {
     assert!(c.warnings.is_empty());
 }
 
+/// RULING: wave2-c12a review finding 7: a path is taken as typed only when it is absolute
+/// after `~` is expanded; `recall_budget_ms` is at most 2 s.
+#[test]
+fn paths_are_absolute_or_unreadable() {
+    let h = home();
+    let c = cfg(json!({"brain": "~/x/brain.r8", "model_dir": "~", "synaps_base": "~/base"}));
+    assert!(c.warnings.is_empty(), "{:?}", c.warnings);
+    assert_eq!(c.brain, h.join("x/brain.r8"));
+    assert_eq!(c.model_dir, h);
+    assert_eq!(c.base, h.join("base"));
+
+    let c = cfg(json!({"brain": "x/brain.r8"}));
+    assert_eq!(c.brain, default_brain(&h));
+    assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+    assert!(c.warnings[0].contains("brain"));
+
+    // `~user` is not expanded and stays relative.
+    let c = cfg(json!({"sources": "~other/s.toml", "model_dir": "./m"}));
+    assert_eq!(c.sources, None);
+    assert_eq!(c.model_dir, h.join(".cache/velocirag/models/all-MiniLM-L6-v2"));
+    assert_eq!(c.warnings.len(), 2, "{:?}", c.warnings);
+
+    // A list: the relative items are dropped with one warning naming the key.
+    let c = cfg(json!({"recall_exclude_paths": "/a, rel, ~/b, also/rel"}));
+    assert_eq!(c.recall_exclude_paths, vec![PathBuf::from("/a"), h.join("b")]);
+    assert_eq!(c.warnings.len(), 1, "{:?}", c.warnings);
+    assert!(c.warnings[0].contains("recall_exclude_paths"));
+
+    let c = cfg(json!({"recall_budget_ms": "2000"}));
+    assert_eq!(c.recall_budget_ms, 2000);
+    assert!(c.warnings.is_empty());
+    let c = cfg(json!({"recall_budget_ms": 2001}));
+    assert_eq!(c.recall_budget_ms, 150);
+    assert_eq!(c.warnings.len(), 1);
+}
+
 #[test]
 fn the_base_config_reader() {
     let tmp = tempfile::tempdir().unwrap();

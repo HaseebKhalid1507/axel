@@ -69,7 +69,23 @@ pub fn default_model_dir(home: &Path) -> PathBuf {
 
 struct Reader<'a> {
     cfg: Option<&'a Map<String, Value>>,
+    /// What a leading `~` stands for in a path value.
+    home: &'a Path,
     warnings: Vec<String>,
+}
+
+/// A path as typed, made absolute: a leading `~/` (or a bare `~`) is `home`; a path that is
+/// still relative is `None` (RULING: wave2-c12a review finding 7: the host starts this
+/// process in the plugin's folder, so a relative path would name a file there).
+fn absolute(home: &Path, s: &str) -> Option<PathBuf> {
+    let p = if s == "~" {
+        home.to_path_buf()
+    } else if let Some(rest) = s.strip_prefix("~/") {
+        home.join(rest)
+    } else {
+        PathBuf::from(s)
+    };
+    p.is_absolute().then_some(p)
 }
 
 impl Reader<'_> {
@@ -133,8 +149,29 @@ impl Reader<'_> {
         }
     }
 
+    /// A path (`absolute`); a relative one is unreadable: `None` (the caller's default)
+    /// and a warning (RULING: wave2-c12a review finding 7).
     fn path(&mut self, key: &str) -> Option<PathBuf> {
-        self.text(key).map(PathBuf::from)
+        let s = self.text(key)?;
+        let p = absolute(self.home, &s);
+        if p.is_none() {
+            self.warnings
+                .push(format!("config {key}: not an absolute path, using the default"));
+        }
+        p
+    }
+
+    /// A list of paths (`list`, then `absolute`); a relative item is dropped, with one
+    /// warning for the key, and the rest are kept (RULING: wave2-c12a review finding 7).
+    fn path_list(&mut self, key: &str) -> Vec<PathBuf> {
+        let items = self.list(key);
+        let n = items.len();
+        let paths: Vec<PathBuf> = items.iter().filter_map(|s| absolute(self.home, s)).collect();
+        if paths.len() < n {
+            self.warnings
+                .push(format!("config {key}: {} item(s) not an absolute path, left out", n - paths.len()));
+        }
+        paths
     }
 
     /// Comma-separated, each item trimmed, empty items dropped.
@@ -213,7 +250,7 @@ impl ExtConfig {
                 None
             }
         };
-        let mut r = Reader { cfg, warnings };
+        let mut r = Reader { cfg, home, warnings };
 
         let brain = r.path("brain").unwrap_or_else(|| default_brain(home));
         let plugin_root = params
@@ -240,11 +277,12 @@ impl ExtConfig {
         // read as unreadable: the default and a warning, not a clamp.
         let recall_max_items = r.number("recall_max_items", 5usize, 1, 8);
         let recall_max_chars = r.number("recall_max_chars", 1600usize, 1, usize::MAX);
-        let recall_budget_ms = r.number("recall_budget_ms", 150u64, 1, u64::MAX);
+        // RULING: wave2-c12a review finding 7: at most 2 s; above it, unreadable.
+        let recall_budget_ms = r.number("recall_budget_ms", 150u64, 1, 2000);
         let recall_min_sem = r.fraction("recall_min_sem", 0.30);
         let recall_min_lex = r.fraction("recall_min_lex", 0.50);
         let recall_on_events = r.switch("recall_on_events", false);
-        let recall_exclude_paths = r.list("recall_exclude_paths").into_iter().map(PathBuf::from).collect();
+        let recall_exclude_paths = r.path_list("recall_exclude_paths");
         let capture = r
             .choice(
                 "capture",
