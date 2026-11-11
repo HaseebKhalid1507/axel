@@ -2299,7 +2299,8 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut
 ///   its rows with the prompt's key, and for a `call` with no pending turn the chat's
 ///   newest row.
 /// - It may be called late and more than once for one mark: a second call changes nothing
-///   but `to_ms`.
+///   but `to_ms`. The rows of one call with other keys (same `from_ms`) are the same call
+///   for the time rule.
 /// - `mark_purged`, always: the log row deleted here held the prompt's first characters.
 ///
 /// `mark_forgotten_turn_vids` is the same call, and also returns the `vid`s of the rows it
@@ -2356,6 +2357,17 @@ pub fn mark_forgotten_turn_vids(
             |r| r.get(0),
         )
         .optional()?;
+    // RULING: v2 archives round 5, item 4. Capture writes one keyed row per key of a turn,
+    // all with the turn's `from_ms`. The time rule runs once for the call, not once per key:
+    // an archive any row of this call already reached is not visited again (`purge` leaves
+    // no tombstone, so a second run would take the unit before the last one). The key purge
+    // and the log steps stay per key.
+    let call_covered_to: Option<i64> = conn.query_row(
+        "SELECT MAX(to_ms) FROM forgotten_turns
+          WHERE logical = ?1 AND source = ?2 AND from_ms = ?3 AND archive_id = ''",
+        params![logical, source, from_ms],
+        |r| r.get(0),
+    )?;
     conn.execute(
         "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, added_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2365,7 +2377,7 @@ pub fn mark_forgotten_turn_vids(
         params![logical, session_id, source, key, from_ms, to_ms, chrono::Utc::now().timestamp_millis()],
     )?;
     let to_ms = covered_to.map_or(to_ms, |old| old.max(to_ms));
-    let seen_before = |t: i64| covered_to.is_some_and(|old| t <= old);
+    let seen_before = |t: i64| call_covered_to.is_some_and(|old| t <= old);
 
     let dirs: Vec<String> = ids_of(
         conn,

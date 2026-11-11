@@ -3568,3 +3568,28 @@ fn a_file_refused_on_first_sight_takes_its_place_from_the_event_and_bounds_the_f
         assert_eq!(run.errors(), 0);
     }
 }
+
+// ── Round 5, item 4: the time rule runs once per call, not once per key ──────
+
+/// Guards what the owner would lose: finished exchanges nobody asked to forget, taken one
+/// per extra key of a forgotten turn from the end of the archive sealed during it.
+#[test]
+fn a_call_with_three_keys_takes_the_turns_own_unit_from_the_archive_sealed_during_it_and_no_more() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let p1 = "Bob's number is 555-0142, put it in the contacts file for me please";
+    let p2 = "actually, forget that, do not keep his number anywhere at all";
+    let p3 = "and drop his address from the contacts card as well while you are at it";
+    // The window rolls over while P1's turn runs: P1 is the archive's last exchange.
+    let a = Arch::new(1, "s-keys").at(T0).about("calendar").about("weather").turn(p1, &reply("PONEREPLY"));
+    index_in_order(&env, &mut run, &dir, std::slice::from_ref(&a), &[0]);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0", "x2.0", "x4.0"]);
+    // The call: one row per key, one interval, as capture writes them.
+    for p in [p2, p1, p3] {
+        live_call(&run, "s-keys", T0 - 5_000, T0 + 5_000, Some(&key_of(p)));
+    }
+    assert_eq!(count(run.db(), "SELECT COUNT(*) FROM forgotten_turns WHERE source = 'call'"), 3);
+    assert_eq!(positions(run.db(), &dir, &a), ["x0.0", "x2.0"], "each key of the call took another last unit");
+    assert_eq!(run.errors(), 0);
+}
