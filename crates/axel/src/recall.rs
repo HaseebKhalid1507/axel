@@ -148,8 +148,8 @@ pub struct RecallConfig {
     pub home: Option<PathBuf>,
 }
 
-/// Each excluded folder as the file system resolved it (`None`: it could not be), and how
-/// many times it was resolved, by the folder as typed.
+/// Each excluded folder as the file system resolved it (`None`: not yet), and how many
+/// times the file system was asked, by the folder as typed.
 type Resolved = HashMap<PathBuf, (Option<PathBuf>, u64)>;
 
 fn resolved_folders() -> MutexGuard<'static, Resolved> {
@@ -157,31 +157,33 @@ fn resolved_folders() -> MutexGuard<'static, Resolved> {
     RESOLVED.get_or_init(Mutex::default).lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// `folder` as the file system resolved it the first time it was asked for. The file
-/// system is looked at once per folder and process, never again.
+/// `folder` as the file system resolved it. Once it has been resolved the file system is
+/// not looked at again for it in this process.
 // RULING: v2 capture/recall review, item 4 (finding 3). `from_ext` runs at every prompt and
-// every search; a hung mount would hold the front thread at each of them. A folder that
-// could not be resolved the first time stays as typed until the process ends.
+// every search; a hung mount would hold the front thread at each of them.
+// RULING: v2 final capture round, item 3. Only a folder that was resolved is kept: one that
+// could not be (a mount that is down, a link not made yet) is asked for again at the next
+// prompt, or the files under its resolved form would be recalled until a restart.
 fn resolved(folder: &Path) -> Option<PathBuf> {
     let mut known = resolved_folders();
     let entry = known.entry(folder.to_path_buf()).or_insert((None, 0));
-    if entry.1 == 0 {
+    if entry.0.is_none() {
         entry.0 = std::fs::canonicalize(folder).ok();
         entry.1 += 1;
     }
     entry.0.clone()
 }
 
-/// How many times `folder` (as the config names it) was resolved by the file system: 0 or
-/// 1. For the test of item 4.
+/// How many times the file system was asked for `folder` (as the config names it): 0, then
+/// one per try until it was resolved once. For the tests.
 #[doc(hidden)]
 pub fn times_resolved(folder: &Path) -> u64 {
     resolved_folders().get(folder).map_or(0, |entry| entry.1)
 }
 
 /// Each folder as typed, then as the file system resolves it when that is another path.
-/// One look at the file system per folder and process (`resolved`), and not per row: a
-/// folder that does not exist (or cannot be read) stays as typed.
+/// Looked at once per folder and process once resolved (`resolved`), and not per row: a
+/// folder that does not exist (or cannot be read) stays as typed until it can be.
 fn both_forms(folders: &[PathBuf]) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::with_capacity(folders.len());
     for folder in folders {

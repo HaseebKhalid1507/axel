@@ -1906,6 +1906,43 @@ fn review_4_the_excluded_folders_are_resolved_once() {
     assert_eq!(recall::times_resolved(&folder), 1, "the folder was resolved at more than one prompt");
 }
 
+/// Item 3 (silverhand 3): an excluded folder that cannot be resolved at the first prompt
+/// (its link is not there yet) is tried again at the next; once resolved it is kept.
+// RULING: v2 final capture round, item 3
+#[test]
+fn final_3_an_excluded_folder_that_could_not_be_resolved_is_tried_again() {
+    let notes = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(notes.path()).unwrap();
+    let (real, link) = (root.join("real"), root.join("link"));
+    std::fs::create_dir_all(&real).unwrap();
+    let mut h = Hook::new(json!({ "recall_exclude_paths": link.to_string_lossy() }));
+    let folder = h.ext.recall_exclude_paths[0].clone();
+    assert_eq!(folder, link);
+    let question = "which pipeline does the staging server deploy use";
+
+    // The link is not there: only the typed form is excluded, and each prompt asks again.
+    let _ = h.before("s1", question);
+    let _ = h.trace();
+    let after_one = recall::times_resolved(&folder);
+    let _ = h.before("s2", question);
+    let _ = h.trace();
+    assert!(recall::times_resolved(&folder) > after_one, "a failed resolve was kept");
+    assert_eq!(RecallConfig::from_ext(&h.ext, NOW).exclude_paths, [link.clone()]);
+
+    // The link is made: the next prompt resolves it.
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let _ = h.before("s3", question);
+    let _ = h.trace();
+    let resolved_at = recall::times_resolved(&folder);
+    // Resolved once, it is not asked for again.
+    for _ in 0..5 {
+        assert_eq!(RecallConfig::from_ext(&h.ext, NOW).exclude_paths, [link.clone(), real.clone()]);
+    }
+    let _ = h.before("s4", question);
+    let _ = h.trace();
+    assert_eq!(recall::times_resolved(&folder), resolved_at);
+}
+
 /// Item 6 (finding 8): core's Muse nudge is a host message for the hook too, by capture's
 /// one list: no recall, no log row. The same words from the person are recalled.
 #[test]
