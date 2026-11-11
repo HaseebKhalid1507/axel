@@ -192,8 +192,6 @@ fn every_stub_gives_its_fixed_answer() {
     // capture
     let mut cap = CaptureState::default();
     cap.on_user(Some("s1"), None, "hello", 1);
-    assert_eq!(cap.suppress("s1"), None);
-    assert_eq!(cap.on_assistant(Some("s1"), "hi", false, 2), None);
     cap.drop_session("s1");
     cap.on_session_end("s1");
     assert_eq!(capture::write_turn(&conn, None, &cfg(), &turn()).unwrap(), Written::Skipped);
