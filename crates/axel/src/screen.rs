@@ -297,13 +297,19 @@ struct Span {
     hit: Hit,
 }
 
-const PREFIXES: [&str; 17] = [
+// RULING: screen measurement, ruling 5: `GOCSPX-` (a Google OAuth client secret) is a
+// certain prefix.
+const PREFIXES: [&str; 18] = [
     "sk-", "sk_live_", "sk_test_", "rk_live_", "pk_live_", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
-    "github_pat_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "xoxs-", "ya29.",
+    "github_pat_", "glpat-", "xoxb-", "xoxp-", "xoxa-", "xoxs-", "ya29.", "GOCSPX-",
 ];
 
-const NAMES: [&str; 9] = [
-    "password", "passwd", "secret", "token", "api_key", "apikey", "api-key", "access_key", "authorization",
+// RULING: screen measurement, ruling 8: `secret_key`, `private_key`, `signing_key` and
+// `encryption_key` are names. Not `pass`, not `pwd`, not `_key` in general.
+// The first that matches at a place is the one tried: `secret_key` stands before `secret`.
+const NAMES: [&str; 13] = [
+    "password", "passwd", "private_key", "secret_key", "secret", "signing_key", "token", "api_key", "apikey",
+    "api-key", "access_key", "authorization", "encryption_key",
 ];
 
 /// `[A-Za-z0-9_-]`
@@ -458,7 +464,7 @@ fn key_block(b: &[u8], i: usize) -> Option<Span> {
 }
 
 fn prefix(b: &[u8], i: usize, memo: &mut Memo) -> Option<Span> {
-    if !matches!(b[i], b's' | b'r' | b'p' | b'g' | b'x' | b'y' | b'A') {
+    if !matches!(b[i], b's' | b'r' | b'p' | b'g' | b'x' | b'y' | b'A' | b'G') {
         return None;
     }
     let rest = &b[i..];
@@ -546,7 +552,7 @@ fn url_password(b: &[u8], i: usize) -> Option<(usize, usize)> {
 // skipped the way `Bearer ` is.
 fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
     let b = s.as_bytes();
-    if !matches!(b[i] | 0x20, b'p' | b's' | b't' | b'a') {
+    if !matches!(b[i] | 0x20, b'p' | b's' | b't' | b'a' | b'e') {
         return None;
     }
     let name = NAMES
@@ -558,15 +564,21 @@ fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
         (Some(b'\\'), Some(&q @ (b'"' | b'\''))) => Some((2, q)),
         _ => None,
     };
-    let mut j = i + name.len();
+    let name_end = i + name.len();
+    let mut j = name_end;
     if let Some((len, _)) = quote_at(j) {
         j += len;
     }
+    let unquoted = j == name_end;
     j = skip_blank(b, j);
-    if !matches!(b.get(j), Some(b'=' | b':')) {
+    if matches!(b.get(j), Some(b'=' | b':')) {
+        j = skip_blank(b, j + 1);
+    } else if !(unquoted && j > name_end && long_flag(b, i)) {
+        // RULING: screen measurement, ruling 8: a long flag takes a space. When the name is
+        // part of a word that starts with `--`, one or more spaces stand where `=` or `:`
+        // does. Not `-p`, not `-u`.
         return None;
     }
-    j = skip_blank(b, j + 1);
     let (mut quote, mut escaped) = (None, false);
     if let Some((len, q)) = quote_at(j) {
         quote = Some(q as char);
@@ -603,6 +615,15 @@ fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
         return None;
     }
     Some(Span { start, end, hit: hit("named_value", Some(name)) })
+}
+
+/// Is the name at `i` part of a word of `[A-Za-z0-9_-]` that starts with `--`?
+fn long_flag(b: &[u8], i: usize) -> bool {
+    let mut start = i;
+    while start > 0 && is_word(b[start - 1]) {
+        start -= 1;
+    }
+    start < i && b[start..].starts_with(b"--")
 }
 
 /// `Bearer ` followed by at least 20 of `[A-Za-z0-9._~+/=-]`: the value.
@@ -698,6 +719,7 @@ mod tests {
             ("xoxp-", mk(&["xoxp", "-", "1234-5678-", LOW_A]), BLANK, "prefix", Some("xoxp-")),
             ("AIza", mk(&["AI", "za", "SyA-", LOW_A, "_", "ABCDEFGHIJ"]), BLANK, "prefix", Some("AIza")),
             ("AKIA", mk(&["AKIA", "ABCDEFGH", "12345678"]), BLANK, "prefix", Some("AKIA")),
+            ("GOCSPX-", mk(&["GOC", "SPX-", LOW_A, "klmnopqr"]), BLANK, "prefix", Some("GOCSPX-")),
             (
                 "jwt",
                 mk(&["ey", "J0eXAiOiJKV1Qi", ".", "eyJzdWIiOiIxMjM0", ".", "c2lnbmF0dXJlX3g"]),
@@ -857,6 +879,56 @@ mod tests {
             let percent = taken as f64 * 100.0 / TOKENS as f64;
             println!("long_token numbers: {len} characters: {taken} of {TOKENS} blanked, {percent:.2}%");
             assert!(percent >= at_least, "{len} characters: {percent:.2}% blanked, under {at_least}%");
+        }
+    }
+
+    // RULING: screen measurement, rulings 5 and 8.
+    #[test]
+    fn a_new_prefix_four_more_names_and_a_long_flag() {
+        let google = mk(&["GOC", "SPX-", LOW_A, "klmnopqr"]);
+        let certain = certain_hit(&format!("client secret {google} here"));
+        assert!(certain == Some(hit("prefix", Some("GOCSPX-"))), "case GOCSPX-: certain_hit");
+        let short = mk(&["GOC", "SPX-", "abcdefghij01234"]);
+        assert!(certain_hit(&short).is_none() && redact(&short).blanked == 0, "case GOCSPX- and 15: a hit");
+        let glued = format!("x{google}");
+        assert!(certain_hit(&glued).is_none(), "case GOCSPX- inside a word: a certain hit");
+
+        let value = mk(&["abcd1234", "efgh"]);
+        let hex16 = "0a1b2c3d4e5f6789";
+        // (case, text, what is left, the hit's name or None for no hit)
+        let cases: Vec<(&str, String, String, Option<&str>)> = vec![
+            ("secret_key", format!("secret_key={value}"), format!("secret_key={BLANK}"), Some("secret_key")),
+            ("AWS_SECRET_KEY", format!("AWS_SECRET_KEY: {value}"), format!("AWS_SECRET_KEY: {BLANK}"), Some("secret_key")),
+            ("private_key", format!("private_key = \"{value}\""), format!("private_key = \"{BLANK}\""), Some("private_key")),
+            ("signing_key", format!("jwt_signing_key:{value}"), format!("jwt_signing_key:{BLANK}"), Some("signing_key")),
+            ("ENCRYPTION_KEY", format!("ENCRYPTION_KEY={value}"), format!("ENCRYPTION_KEY={BLANK}"), Some("encryption_key")),
+            ("secret still", format!("secret={value}"), format!("secret={BLANK}"), Some("secret")),
+            ("project_key", "project_key = p429dc9cabb570899".into(), "project_key = p429dc9cabb570899".into(), None),
+            ("turn_key", format!("turn_key: {hex16}"), format!("turn_key: {hex16}"), None),
+            ("--password", "run --password hunter2abc now".into(), format!("run --password {BLANK} now"), Some("password")),
+            ("--db-password", "--db-password   hunter2abc".into(), format!("--db-password   {BLANK}"), Some("password")),
+            ("--api-key", format!("--api-key {value}"), format!("--api-key {BLANK}"), Some("api-key")),
+            ("--password=", "--password=hunter2abc".into(), format!("--password={BLANK}"), Some("password")),
+            ("--token and a variable", "--token $GH_TOKEN".into(), "--token $GH_TOKEN".into(), None),
+            ("--api-key and code", "--api-key \"$(cat f)\"".into(), "--api-key \"$(cat f)\"".into(), None),
+            ("cargo -p", "cargo test -p some-crate-name-2".into(), "cargo test -p some-crate-name-2".into(), None),
+            ("mkdir -p", "mkdir -p /a/b/c12345678".into(), "mkdir -p /a/b/c12345678".into(), None),
+            ("no dashes", "password hunter2abc".into(), "password hunter2abc".into(), None),
+            ("one dash", "-password hunter2abc".into(), "-password hunter2abc".into(), None),
+            ("dashes not at the start of the word", "a--password hunter2abc".into(), "a--password hunter2abc".into(), None),
+            ("--token-budget", "--token-budget 100000000".into(), "--token-budget 100000000".into(), None),
+            ("flag and a line break", "--password\nhunter2abc".into(), "--password\nhunter2abc".into(), None),
+        ];
+        for (case, text, left, name) in &cases {
+            let r = redact(text);
+            assert!(r.text == *left, "case {case}: wrong text");
+            match name {
+                Some(name) => {
+                    assert!(r.blanked == 1 && r.hits[0].rule == "named_value", "case {case}: blanked {}", r.blanked);
+                    assert!(r.hits[0].name.as_deref() == Some(*name), "case {case}: wrong name");
+                }
+                None => assert!(r.blanked == 0, "case {case}: blanked {}", r.blanked),
+            }
         }
     }
 
@@ -1078,6 +1150,8 @@ mod tests {
             ("url heads", fill("a://b:", ""), 0),
             ("prefix heads", fill("sk-a ", ""), 0),
             ("one long name chain", fill("token=", ""), 1),
+            ("long flags", fill("--token ", ""), 0),
+            ("one long flag word", fill("-token", " hunter2abc"), 0),
         ];
         for (case, text, blanked) in &cases {
             let started = std::time::Instant::now();
