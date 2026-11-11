@@ -16,9 +16,14 @@
 #   The gate: bash scripts/dirty-home.sh -p axel -p axel-memkoshi -p velocirag
 #   --locked is always passed; do not repeat it.
 #
+# It also fails if anything in the real HOME's axel folders (see `watched`
+# below) changed during the run. Another program that writes those folders
+# while the gate runs triggers this too.
+#
 # Never writes to the real HOME: the moved HOME is a fresh temp directory,
 # removed on exit. Not caught: a write that is undone before the run ends,
-# and writes outside HOME. Needs GNU find (Linux).
+# and writes outside the moved HOME and the watched folders. Needs GNU find
+# (Linux).
 
 set -uo pipefail
 
@@ -31,8 +36,21 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 # Build under the real HOME, so the moved HOME sees only test runs.
 cargo test --locked --no-run "$@" || exit $?
 
+# The real HOME, and the folders in it that this code base reads or writes.
+# Not the whole .synaps-cli: a live Synaps session writes its session files
+# there all the time, and the gate would fail for a reason that is not the
+# tests.
+real="$HOME"
+watched=(.config/axel .cache/axel .cache/velocirag .synaps-cli/memory .synaps-cli/plugins/axel)
+
 home="$(mktemp -d "${TMPDIR:-/tmp}/axel-dirty-home.XXXXXX")" || exit 1
-trap 'rm -rf "$home"' EXIT
+# The stamp is outside both homes. Anything in the watched folders that is
+# newer than it after the run was written during the run.
+stamp="$(mktemp "${TMPDIR:-/tmp}/axel-dirty-home-stamp.XXXXXX")" || exit 1
+trap 'rm -rf "$home" "$stamp"' EXIT
+# File times can be as coarse as a second: let the stamp age before the run,
+# so that a write right at its start is newer.
+sleep 1
 
 # None of the XDG directories is created: the directory starts empty, and a
 # test that creates one of them is a test that wrote into HOME.
@@ -68,6 +86,31 @@ elif [ -n "$left" ]; then
 else
     echo "dirty-home: the moved HOME is still empty"
 fi
+
+# The real HOME: nothing in the watched folders may be newer than the stamp.
+# A test gets there with HOME unset (the passwd entry is used instead) or
+# with an absolute path. A folder that does not exist is skipped.
+present=()
+for folder in "${watched[@]}"; do
+    [ -e "$real/$folder" ] && present+=("$real/$folder")
+done
+if [ ! -d "$real" ] || [ ! -e "$stamp" ]; then
+    echo "dirty-home: FAIL: the real HOME ($real) or the stamp file is gone; nothing could be checked" >&2
+    [ "$status" -eq 0 ] && status=1
+elif [ "${#present[@]}" -eq 0 ]; then
+    echo "dirty-home: none of the watched folders exists in the real HOME ($real)"
+elif ! touched="$(find -H "${present[@]}" \( -newer "$stamp" -o -cnewer "$stamp" \) -print | LC_ALL=C sort)"; then
+    echo "dirty-home: FAIL: could not search the watched folders of the real HOME ($real)" >&2
+    [ "$status" -eq 0 ] && status=1
+elif [ -n "$touched" ]; then
+    echo "dirty-home: FAIL: written in the real HOME during the run ($(printf '%s\n' "$touched" | wc -l) paths):" >&2
+    printf '%s\n' "$touched" | head -n 60 >&2
+    echo "dirty-home: (another program that writes these folders during the run also triggers this; if so, stop it and run the gate again)" >&2
+    [ "$status" -eq 0 ] && status=1
+else
+    echo "dirty-home: the real HOME is untouched (${#present[@]} of ${#watched[@]} watched folders exist)"
+fi
+
 if [ "$status" -ne 0 ]; then
     echo "dirty-home: FAIL (exit $status)" >&2
 fi
