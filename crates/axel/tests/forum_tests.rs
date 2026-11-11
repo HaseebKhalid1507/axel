@@ -22,7 +22,7 @@ use axel::ext::types::{Boot, Caller, FrontState, HookEvent, Job, Status, TestHoo
 use axel::ext::{front, hooks, tools};
 use axel::forum::{Author, Cursor, Entry, Envelope, Page, Post, Read, Status as PostStatus};
 use axel::forum_store::{self, Stop};
-use axel::project;
+use axel::{project, screen};
 use axel::vindex::VecDelta;
 use rusqlite::{params, Connection};
 use serde_json::{json, Value};
@@ -1860,4 +1860,49 @@ fn a_forget_keeps_the_first_tombstone() {
     assert_eq!(fx.count("forum_posts"), 0);
     assert_eq!(fx.count("forum_tombstones"), 1);
     assert!(purge_pending(&fx));
+}
+
+/// R-17.5: a body, title or request key holding a character `screen::show` removes is
+/// refused as invalid, by field name, and the character is not in the answer.
+#[test]
+fn a_post_with_an_invisible_character_is_refused() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let me = chat(&cwd, "s-inv", &who("a", "ga", None));
+    let root = id_of(&fx.root(&me, "k0", "Root", "plain"));
+    let before = fx.count("forum_posts");
+
+    let hidden = ['\u{202E}', '\u{2066}', '\u{200B}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{061C}', '\u{E0041}'];
+    for c in hidden {
+        assert_eq!(screen::show(&format!("a{c}b"), 10), "ab", "show removes U+{:04X}", c as u32);
+        for (field, input) in [
+            ("body", json!({"request_key": "k1", "title": "T", "body": format!("do{c}ne")})),
+            ("title", json!({"request_key": "k1", "title": format!("T{c}"), "body": "fine"})),
+            ("body", json!({"request_key": "k1", "thread_id": root, "body": format!("{c}reply")})),
+            // The body is named first when two fields hold one.
+            ("body", json!({"request_key": "k1", "title": format!("{c}"), "body": format!("x{c}")})),
+        ] {
+            let text = fx.invalid("forum_post", input, &me);
+            assert_eq!(text, forum_store::invisible_text(field));
+            assert!(text.starts_with(&format!("forum: [invalid] {field} holds an invisible character")), "{text}");
+            assert!(!text.contains(c), "the character is not repeated");
+        }
+    }
+    assert_eq!(fx.count("forum_posts"), before, "nothing was written");
+
+    // The store refuses it too, whoever calls it.
+    let db = fx.db();
+    db.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let post = a_post("k\u{200B}1", "T", "fine");
+    let err = forum_store::post(&db, BULK, &who("a", "ga", None), &post, T0).unwrap_err();
+    assert_eq!(forum_store::refusal(&err), Some(forum_store::invisible_text("request_key").as_str()));
+    db.execute_batch("ROLLBACK").unwrap();
+
+    // What `show` keeps or turns into a gap is still a post: other scripts, emoji, a
+    // no-break space, line breaks and tabs.
+    let kept = "caf\u{E9} \u{65E5}\u{672C}\u{8A9E} \u{1F600}\u{A0}wide\u{3000}gap\n\tline two";
+    let got = fx.ok("forum_post", json!({"request_key": "k2", "title": "Caf\u{E9} \u{65E5}\u{672C}", "body": kept}), &me);
+    assert_eq!(got["result"]["status"], "created");
+    let thread = fx.entries(json!({"thread_id": id_of(&got)}), &me);
+    assert_eq!(thread[0]["body"], kept);
 }

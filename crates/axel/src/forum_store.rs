@@ -176,6 +176,44 @@ fn credential(hit: &screen::Hit) -> AxelError {
     ))
 }
 
+/// True for a character `screen::show` drops without a trace (bidirectional controls,
+/// zero-width and other invisible characters). `show` of the one character is empty then;
+/// whitespace, which `show` turns into a gap, is not such a character.
+// SPEC: ruling R-17.5 names "what `screen::show` removes"; `screen` keeps that test private
+// (`removed`), so it is asked through `show`, once per distinct non-ASCII character.
+fn invisible(c: char) -> bool {
+    !c.is_ascii() && !c.is_whitespace() && screen::show(c.encode_utf8(&mut [0; 4]), 1).is_empty()
+}
+
+/// The first of `body`, `title`, `request_key` that holds an invisible character.
+pub fn invisible_field(post: &Post) -> Option<&'static str> {
+    let mut seen: Vec<(char, bool)> = Vec::new();
+    for (field, text) in [("body", &post.body), ("title", &post.title), ("request_key", &post.request_key)] {
+        for c in text.chars().filter(|c| !c.is_ascii()) {
+            let bad = match seen.iter().find(|(known, _)| *known == c) {
+                Some((_, bad)) => *bad,
+                None => {
+                    let bad = invisible(c);
+                    seen.push((c, bad));
+                    bad
+                }
+            };
+            if bad {
+                return Some(field);
+            }
+        }
+    }
+    None
+}
+
+/// What a post with an invisible character in `field` is told. The character is not repeated.
+pub fn invisible_text(field: &str) -> String {
+    format!(
+        "forum: [invalid] {field} holds an invisible character (a zero-width or text-direction \
+         control); remove it and post again"
+    )
+}
+
 /// One post, inside the caller's transaction. `clock_ms` is the caller's clock read inside
 /// that transaction.
 // SPEC: 4508 writes `post(conn, project, author, post)`, and step 6 needs `clock_ms`, which
@@ -187,6 +225,9 @@ pub fn post(conn: &Connection, project: &str, author: &Author, post: &Post, cloc
         if let Some(hit) = screen::certain_hit(part) {
             return Err(credential(&hit));
         }
+    }
+    if let Some(field) = invisible_field(post) {
+        return Err(refuse(invisible_text(field)));
     }
     // 2.
     let envelope = Envelope::new(project, author.clone(), post).map_err(|e| refuse(format!("forum: {e}")))?;

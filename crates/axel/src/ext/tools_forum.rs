@@ -407,6 +407,10 @@ fn post(st: &FrontState, input: &Value, caller: &Caller, author: &Author) -> Res
     let params: PostParams = parse(input.clone())?;
     let project = project_of(caller, params.project.as_deref())?;
     let post = params.into_post()?;
+    if let Some(field) = forum_store::invisible_field(&post) {
+        let text = forum_store::invisible_text(field);
+        return Err(ToolError::Invalid(text));
+    }
     let receipt = write(st, |conn, now| forum_store::post(conn, &project, author, &post, now))?;
     let note = match receipt.status {
         Status::Created => None,
