@@ -17,7 +17,8 @@ use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{self, degrade, recover, serve, BUSY_TEXT};
 use axel::ext::tools_forum::NO_CALLER;
 use axel::ext::types::{
-    Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, Job, Mode, ServeEnd, Status, TestHooks,
+    Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status,
+    TestHooks,
 };
 use axel::project_memory::{RecordLinks, Sensitivity};
 use axel::store::{self, Inserted, NewRow};
@@ -2158,5 +2159,45 @@ fn f1_a_mark_whose_commit_fails_removes_no_vector() {
         .unwrap();
     assert_eq!(marks, 0);
     assert!(st.index.get(&VecKey::Mem(vid)).is_some(), "a rolled-back mark removed a vector");
+}
+
+#[test]
+fn f2_a_carry_that_takes_the_budget_leaves_recall_none_of_it() {
+    let dirs = Dirs::new();
+    drop(make_brain(&dirs.brain()));
+    let (b, _status) = boot(None, TestHooks::default());
+    let (mut st, jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    assert!(st.cfg.recall);
+    // The forget mark of the carry waits the front thread's 1.5 s for a locked brain.
+    let holder = Connection::open(dirs.brain()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let ev = HookEvent {
+        kind: "before_message".to_string(),
+        session_id: Some("session-S".to_string()),
+        cwd: None,
+        message: Some("where is the retry limit of the deploy set".to_string()),
+        data: json!({}),
+        received_ms: now_ms(),
+    };
+    let deadline = Instant::now() + Duration::from_millis(st.cfg.recall_budget_ms);
+    let call = FrontCall {
+        seq: 1,
+        carry: Carry { skipped: Vec::new(), forgot: vec!["session-S".to_string()] },
+        work: FrontWork::Hook { ev, recall_allowed: true, deadline },
+    };
+    let start = Instant::now();
+    let answer = front::handle(&mut st, call);
+    assert!(start.elapsed() >= Duration::from_millis(1_000), "the carry did not wait: {:?}", start.elapsed());
+    assert!(matches!(answer, FrontAnswer::Hook(HookOut::Continue)));
+    assert_eq!(st.forget_marks.len(), 1);
+    let outcomes: Vec<String> = jobs_rx
+        .try_iter()
+        .filter_map(|job| match job {
+            Job::LogRecall(trace) => Some(trace.outcome),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(outcomes, ["timeout"], "recall worked a budget of its own after the rpc thread's had passed");
+    holder.execute_batch("ROLLBACK").unwrap();
 }
 

@@ -829,7 +829,10 @@ impl<W: Write> Pump<W> {
             data,
             received_ms: (self.clock)(),
         };
-        match self.forward(FrontWork::Hook { ev, recall_allowed }, Duration::from_millis(wait), label) {
+        // The front thread is handed the deadline this thread waits to: recall works to it,
+        // whatever the `Carry` took before it (review of 15/16, the hook's deadline).
+        let deadline = Instant::now() + Duration::from_millis(wait);
+        match self.forward(FrontWork::Hook { ev, recall_allowed, deadline }, deadline, label) {
             Got::Answer(FrontAnswer::Hook(out)) => {
                 if before_message {
                     self.misses = 0;
@@ -1006,7 +1009,7 @@ impl<W: Write> Pump<W> {
         let session_id = caller.session_id.clone();
         let input = params.get("input").cloned().unwrap_or(Value::Null);
         let work = FrontWork::Tool { name, input, caller };
-        match self.forward(work, Duration::from_millis(TOOL_WAIT_MS), "tool.call") {
+        match self.forward(work, Instant::now() + Duration::from_millis(TOOL_WAIT_MS), "tool.call") {
             Got::Answer(FrontAnswer::Tool(out)) => {
                 self.answer_tool(id, out);
                 None
@@ -1040,7 +1043,7 @@ impl<W: Write> Pump<W> {
 
     /// One call at a time. While the front thread is inside a call whose deadline has
     /// passed, nothing is forwarded; its late answer is discarded and forwarding resumes.
-    fn forward(&mut self, work: FrontWork, wait: Duration, method: &'static str) -> Got {
+    fn forward(&mut self, work: FrontWork, deadline: Instant, method: &'static str) -> Got {
         if self.front_is_dead() {
             return Got::Dead;
         }
@@ -1056,7 +1059,6 @@ impl<W: Write> Pump<W> {
             self.log("front thread ended");
             return Got::Dead;
         }
-        let deadline = started + wait;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match live.replies.recv_timeout(left) {

@@ -7,7 +7,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TrySendError};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -24,7 +24,7 @@ use crate::ext::{hooks, tools};
 use crate::r8::EMBEDDING_DIM;
 use crate::recall::View;
 use crate::vindex::{ExactIndex, VecDelta, VecKey};
-use crate::{index_archives, project};
+use crate::{capture, index_archives, project, recall};
 
 /// Forget marks kept for a later try (wave 3, 12b ruling 7; wave 4, R-12b item 1).
 const FORGET_MARKS_KEPT: usize = 256;
@@ -39,7 +39,8 @@ pub struct FrontCall {
 }
 
 pub enum FrontWork {
-    Hook { ev: HookEvent, recall_allowed: bool },
+    /// `deadline`: when the rpc thread stops waiting for this answer.
+    Hook { ev: HookEvent, recall_allowed: bool, deadline: Instant },
     Tool { name: String, input: Value, caller: Caller },
 }
 
@@ -210,9 +211,17 @@ pub fn handle(st: &mut FrontState, call: FrontCall) -> FrontAnswer {
     let ready = is_ready(st) && connect(st);
     apply_carry(st, &call.carry);
     match call.work {
-        FrontWork::Hook { ev, recall_allowed } => {
+        FrontWork::Hook { ev, recall_allowed, deadline } => {
             if !ready {
                 return FrontAnswer::Hook(HookOut::Continue);
+            }
+            // RULING: v2 front follow-up, item 2. Recall works to the rpc thread's deadline,
+            // which the `Carry` above may have used up. `hooks::handle` has no deadline to
+            // pass, so `before_message` is dispatched here, as its arm there does.
+            if ev.kind == "before_message" {
+                let out = recall::on_before_message_until(st, &ev, recall_allowed, deadline);
+                capture::on_user_event(st, &ev);
+                return FrontAnswer::Hook(out);
             }
             FrontAnswer::Hook(hooks::handle(st, &ev, recall_allowed))
         }

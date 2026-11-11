@@ -1357,10 +1357,18 @@ fn word_count(text: &str) -> usize {
 /// The `before_message` hook (called by `ext::hooks::handle`): recall, then one
 /// `Job::LogRecall`. It writes nothing itself.
 pub fn on_before_message(st: &mut FrontState, ev: &HookEvent, recall_allowed: bool) -> HookOut {
+    let until = Instant::now() + Duration::from_millis(st.cfg.recall_budget_ms);
+    on_before_message_until(st, ev, recall_allowed, until)
+}
+
+/// `on_before_message` for a hook the rpc thread waits for until `until`: the front thread
+/// works to `HEADROOM` before that, however much of it went before this call.
+// RULING: v2 front follow-up, item 2: the deadline is the rpc thread's, carried in
+// `FrontWork::Hook`, not a budget counted from here.
+pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allowed: bool, until: Instant) -> HookOut {
     let started = Instant::now();
     let now = (st.clock)();
-    let budget = Duration::from_millis(st.cfg.recall_budget_ms).saturating_sub(HEADROOM);
-    let deadline = started + budget;
+    let deadline = until.checked_sub(HEADROOM).unwrap_or(until);
 
     let prompt = ev.message.as_deref().unwrap_or("");
     let redacted = screen::redact(prompt);
