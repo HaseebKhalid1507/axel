@@ -551,6 +551,89 @@ fn f1_a_file_that_says_tombstone_is_a_forget() {
     assert_eq!(reason(read_shelf(&odd, &id(1))), "unknown state");
 }
 
+// -------------------------------------------- wave2-c6-review, findings 5 and 6 (rulings)
+
+#[test]
+fn f5_more_messages_than_the_count_is_refused() {
+    let scope = "ab".repeat(32);
+    // The first entries are good ones, so only the length can refuse the file.
+    let mut r = record(&scope, &id(1), live_body());
+    r["body"]["source_message_count"] = json!(2);
+    let extra = r["body"]["messages"][1].clone();
+    r["body"]["messages"].as_array_mut().unwrap().push(extra);
+    assert_eq!(reason(read_shelf(&r, &id(1))), "more messages than source_message_count");
+    // A hostile array of things that are not entries, far longer than the count.
+    let mut r = record(&scope, &id(1), live_body());
+    r["body"]["messages"] = Value::Array(vec![json!(0); 100_000]);
+    assert_eq!(reason(read_shelf(&r, &id(1))), "more messages than source_message_count");
+    // As many entries as the count, and fewer, are read.
+    let mut r = record(&scope, &id(1), live_body());
+    assert_eq!(live(read_shelf(&r, &id(1))).messages.len(), 2);
+    r["body"]["source_message_count"] = json!(3);
+    assert_eq!(live(read_shelf(&r, &id(1))).messages.len(), 2);
+}
+
+#[test]
+fn f6_a_linked_project_directory_is_refused() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let scope = "ef".repeat(32);
+    // The real directory has another name; the link has the scope's.
+    let real = tmp.path().join("elsewhere");
+    let shelf_file = format!("s000001/{}.json", id(1));
+    put(&real.join("000.json"), &record(&scope, &id(100), live_body()));
+    put(&real.join(&shelf_file), &record(&scope, &id(1), live_body()));
+    let link = tmp.path().join(&scope);
+    symlink(&real, &link).unwrap();
+    assert_eq!(
+        reason(archive::read_archive(&link.join("000.json"), &scope, None)),
+        "the project directory is not a directory"
+    );
+    assert_eq!(
+        reason(archive::read_archive(&link.join(&shelf_file), &scope, Some(&id(1)))),
+        "the project directory is not a directory"
+    );
+    assert!(archive::list_project(&link).is_empty());
+
+    // The same two files in a real directory of that name are read.
+    fs::remove_file(&link).unwrap();
+    fs::rename(&real, &link).unwrap();
+    assert!(archive::read_archive(&link.join("000.json"), &scope, None).is_ok());
+    assert!(archive::read_archive(&link.join(&shelf_file), &scope, Some(&id(1))).is_ok());
+}
+
+#[test]
+fn f6_a_fifo_in_place_of_the_file_is_refused_at_once() {
+    let (_tmp, dir, scope) = project();
+    let slot = dir.join("003.json");
+    let in_shelf = dir.join("s000001").join(format!("{}.json", id(1)));
+    for path in [&slot, &in_shelf] {
+        match std::process::Command::new("mkfifo").arg(path).status() {
+            Ok(status) if status.success() => {}
+            // No `mkfifo` here: the case is skipped.
+            _ => return,
+        }
+    }
+    // No writer ever opens them: a read that waited would never return. (The swap after
+    // the `lstat` is the unit test in `archive.rs`.)
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let got = (
+            archive::read_archive(&slot, &scope, None),
+            archive::read_archive(&in_shelf, &scope, Some(&id(1))),
+        );
+        let _ = tx.send(got);
+    });
+    let (a, b) = rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("read_archive waited on a FIFO");
+    assert_eq!(reason(a), "not a regular file");
+    assert_eq!(reason(b), "not a regular file");
+    // They are listed, as any entry with an archive's name is.
+    assert_eq!(archive::list_project(&dir).len(), 2);
+}
+
 // ------------------------------------------------------------------------------ test 3
 
 #[test]

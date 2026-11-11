@@ -257,9 +257,79 @@ fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
     true
 }
 
+/// `O_NOFOLLOW | O_NONBLOCK` of the targets this is built for; `None` elsewhere, where the
+/// open is a plain one and the two `stat`s around it are the only check.
+// RULING: wave2-c6-review finding 6: the crate does not depend on `libc`, so the two flags
+// are written out per target.
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64")
+))]
+const NOFOLLOW_NONBLOCK: Option<i32> = Some(0o400000 | 0o4000);
+#[cfg(all(
+    any(target_os = "linux", target_os = "android"),
+    any(target_arch = "arm", target_arch = "aarch64")
+))]
+const NOFOLLOW_NONBLOCK: Option<i32> = Some(0o100000 | 0o4000);
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+const NOFOLLOW_NONBLOCK: Option<i32> = Some(0x0100 | 0x0004);
+#[cfg(not(any(
+    all(
+        any(target_os = "linux", target_os = "android"),
+        any(
+            target_arch = "x86",
+            target_arch = "x86_64",
+            target_arch = "riscv64",
+            target_arch = "arm",
+            target_arch = "aarch64"
+        )
+    ),
+    target_os = "macos",
+    target_os = "ios"
+)))]
+const NOFOLLOW_NONBLOCK: Option<i32> = None;
+
+/// Opens for reading without following a link in the last place and without waiting: the
+/// open of a FIFO that has no writer returns at once instead of blocking the indexer.
+fn open_no_wait(path: &Path) -> std::io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(flags) = NOFOLLOW_NONBLOCK {
+            options.custom_flags(flags);
+        }
+    }
+    options.open(path)
+}
+
+/// The bytes of the file `lstat` saw as `listed`. The name can have been replaced between
+/// the `lstat` and the open: what was opened must be that same regular file, and it is
+/// checked before anything is read (non-blocking has no effect on a regular file).
+fn read_listed(path: &Path, listed: &fs::Metadata) -> Result<Vec<u8>, SkipReason> {
+    let file = match open_no_wait(path) {
+        Ok(file) => file,
+        Err(e) => return skip(format!("cannot open the file: {:?}", e.kind())),
+    };
+    match file.metadata() {
+        Ok(meta) if meta.file_type().is_file() && same_file(listed, &meta) => {}
+        _ => return skip("not a regular file"),
+    }
+    let mut bytes = Vec::with_capacity(listed.len().min(MAX_BYTES) as usize + 1);
+    if let Err(e) = file.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
+        return skip(format!("cannot read the file: {:?}", e.kind()));
+    }
+    if bytes.len() as u64 > MAX_BYTES {
+        return skip("larger than 16 MiB");
+    }
+    Ok(bytes)
+}
+
 /// Reads one archive file whole, or refuses it with a reason; never partly. `path` is
 /// `<project dir>/NNN.json` or `<project dir>/sNNNNNN/<32 hex>.json`, and the project
-/// directory's name is `scope_dir`. It never follows a link and never writes.
+/// directory's name is `scope_dir`. It follows no link in the file, the shelf or the
+/// project directory, never waits on a file that is not a regular one, and never writes.
 pub fn read_archive(
     path: &Path,
     scope_dir: &str,
@@ -286,6 +356,12 @@ pub fn read_archive(
     if dir_name(project) != Some(scope_dir) {
         return skip("not in the project directory");
     }
+    // RULING: wave2-c6-review finding 6: the project directory is checked as the shelf is,
+    // for a slot file as well, so that "never follows a link" holds one level up too.
+    match project.map(fs::symlink_metadata) {
+        Some(Ok(meta)) if meta.file_type().is_dir() => {}
+        _ => return skip("the project directory is not a directory"),
+    }
 
     let listed = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
@@ -297,24 +373,7 @@ pub fn read_archive(
     if listed.len() > MAX_BYTES {
         return skip("larger than 16 MiB");
     }
-    let mut bytes = Vec::with_capacity(listed.len() as usize + 1);
-    {
-        let file = match fs::File::open(path) {
-            Ok(file) => file,
-            Err(e) => return skip(format!("cannot open the file: {:?}", e.kind())),
-        };
-        // The name can have been replaced between the lstat and the open.
-        match file.metadata() {
-            Ok(meta) if meta.file_type().is_file() && same_file(&listed, &meta) => {}
-            _ => return skip("not a regular file"),
-        }
-        if let Err(e) = file.take(MAX_BYTES + 1).read_to_end(&mut bytes) {
-            return skip(format!("cannot read the file: {:?}", e.kind()));
-        }
-    }
-    if bytes.len() as u64 > MAX_BYTES {
-        return skip("larger than 16 MiB");
-    }
+    let bytes = read_listed(path, &listed)?;
     let record: Value = match serde_json::from_slice(&bytes) {
         Ok(value) => value,
         Err(_) => return skip("not valid JSON"),
@@ -399,6 +458,11 @@ fn parse_record(
             let Some(entries) = body.get("messages").and_then(Value::as_array) else {
                 return skip("messages is not an array");
             };
+            // RULING: wave2-c6-review finding 5: more entries than the count is not a
+            // record, and it is refused before anything is reserved for them.
+            if entries.len() as u64 > count {
+                return skip("more messages than source_message_count");
+            }
             let mut messages = Vec::with_capacity(entries.len());
             let mut next_index = 0u64;
             for entry in entries {
@@ -896,4 +960,43 @@ pub fn turn_key(prompt: &str) -> String {
 /// Trim, then every run of whitespace becomes one space.
 pub fn normalise(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// wave2-c6-review finding 6: the name is swapped for a FIFO between the `lstat` and the
+    /// open. The read must refuse at once; a plain open would wait for a writer for ever, so
+    /// the read runs on a thread of its own and the test waits five seconds for it.
+    #[test]
+    fn a_fifo_swapped_in_after_the_lstat_is_refused_at_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let regular = tmp.path().join("regular.json");
+        fs::write(&regular, b"{}").unwrap();
+        let listed = fs::symlink_metadata(&regular).unwrap();
+        assert_eq!(read_listed(&regular, &listed), Ok(b"{}".to_vec()));
+
+        // A link swapped in is not followed.
+        let link = tmp.path().join("link.json");
+        std::os::unix::fs::symlink(&regular, &link).unwrap();
+        if NOFOLLOW_NONBLOCK.is_some() {
+            assert!(matches!(read_listed(&link, &listed), Err(SkipReason(r)) if r.starts_with("cannot open")));
+        }
+
+        let fifo = tmp.path().join("swapped.json");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => {}
+            // No `mkfifo` here: the case is skipped.
+            _ => return,
+        }
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_listed(&fifo, &listed));
+        });
+        let got = rx.recv_timeout(Duration::from_secs(5)).expect("the open waited on a FIFO");
+        assert_eq!(got, skip("not a regular file"));
+    }
 }
