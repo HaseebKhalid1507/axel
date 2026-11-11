@@ -818,3 +818,57 @@ fn every_entry_point_but_model_fetch_leaves_the_process_offline() {
     }
     assert_eq!(found, vec![PathBuf::from("cli/model.rs")]);
 }
+
+// ── The process by its start ticks (RULING: v2 c18a review, item 5) ─────────
+
+/// Field 22 of `/proc/<pid>/stat`; `None` where there is no `/proc`.
+fn start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
+/// A status file of `pid` that says `ready`, with these start ticks and `started_ms`.
+fn ticked_status_file(dir: &Path, pid: u32, ticks: Option<u64>, started_ms: i64) {
+    let body = json!({
+        "pid": pid, "mode": "ready", "reason": "None", "reason_at": null,
+        "written_ms": now_ms(), "started_ms": started_ms, "start_ticks": ticks,
+    });
+    std::fs::write(dir.join(format!("extension.{pid}.status")), body.to_string()).unwrap();
+}
+
+// A wall clock stepped forward after the extension started makes its `started_ms` look a
+// day older than the start `btime` gives; the ticks are the same, so it is the same process.
+#[test]
+fn a_live_extension_is_known_by_its_start_ticks_after_the_wall_clock_stepped() {
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    let Some(ticks) = start_ticks(child.id()) else {
+        // No `/proc` (macOS): the wall-clock test of finding 7 is all there is.
+        let _ = child.kill();
+        let _ = child.wait();
+        return;
+    };
+    let dir = TempDir::new().unwrap();
+    let path = new_brain(&dir);
+    ticked_status_file(dir.path(), child.id(), Some(ticks), now_ms() - DAY_MS);
+    let (code, v) = status_json(&path);
+
+    // Other ticks, a `started_ms` of now: another process holds the pid.
+    ticked_status_file(dir.path(), child.id(), Some(ticks + 1), now_ms());
+    let (_, reused) = status_json(&path);
+    // No ticks in the file (an older extension): the wall-clock test, as before.
+    ticked_status_file(dir.path(), child.id(), None, now_ms() - DAY_MS);
+    let (_, older) = status_json(&path);
+    let _ = child.kill();
+    let _ = child.wait();
+
+    assert_eq!(code, 0, "{v:#}");
+    assert_eq!(v["extension"]["running"], json!(true), "{v:#}");
+    assert_eq!(v["extension"]["pid"], json!(child.id()), "{v:#}");
+    assert_eq!(v["extension"]["stale_status_files"], json!([]), "{v:#}");
+
+    assert_eq!(reused["extension"]["running"], json!(false), "{reused:#}");
+    assert_eq!(reused["extension"]["stale_status_files"][0]["why"], json!("pid reused by a later process"), "{reused:#}");
+
+    assert_eq!(older["extension"]["running"], json!(false), "{older:#}");
+    assert_eq!(older["extension"]["stale_status_files"][0]["why"], json!("pid reused by a later process"), "{older:#}");
+}

@@ -1933,3 +1933,25 @@ fn r3_forget_of_a_chat_filed_elsewhere_hides_only_global_rows_and_still_marks_th
     lab.ok("forget", json!({ "id": format!("m:{global}") }), &p);
     assert_eq!(hidden_by(lab.conn(), &global), Some("model:P".to_string()));
 }
+
+// RULING: v2 c18a review, item 5: the status file carries the process's own start ticks
+// (`/proc/self/stat` field 22), which `status` compares; `null` where there is no `/proc`.
+#[test]
+fn r5_the_status_file_carries_the_process_start_ticks() {
+    let host = Host::ready(TestHooks::default());
+    let file = host.brain.parent().unwrap().join(format!("extension.{}.status", std::process::id()));
+    let start = Instant::now();
+    while !file.exists() {
+        assert!(start.elapsed() < Duration::from_secs(10), "no status file");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let body: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+    let own = std::fs::read_to_string("/proc/self/stat")
+        .ok()
+        .and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19)?.parse::<u64>().ok()));
+    match own {
+        Some(ticks) => assert_eq!(body["start_ticks"], json!(ticks), "{body}"),
+        None => assert_eq!(body["start_ticks"], Value::Null, "{body}"),
+    }
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}

@@ -599,6 +599,8 @@ impl<W: Write> Pump<W> {
             "reason_at": if degraded { self.status.reason_place() } else { None },
             "written_ms": (self.clock)(),
             "started_ms": self.status.started_ms.load(Ordering::Relaxed),
+            // RULING: v2 c18a review, item 5: `status` knows this process by these.
+            "start_ticks": crate::cli::status::own_start_ticks(),
         });
         if write_status_file(&path, &body).is_err() {
             self.log("status file not written");

@@ -323,19 +323,41 @@ fn pid_alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// Field 22 of `/proc/<pid>/stat`: the clock ticks after boot at which the process started.
+/// It never changes while the process lives, and no wall clock goes into it. `None` where
+/// there is no `/proc` (macOS) or it cannot be read.
+fn start_ticks_of(path: &str) -> Option<u64> {
+    let stat = std::fs::read_to_string(path).ok()?;
+    // Field 2 is `(comm)`, which may hold spaces and `)`: count from the last `)`.
+    stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19)).and_then(|t| t.parse().ok())
+}
+
+/// This process's start ticks, for its status file (`ext/server.rs`). Read once.
+// RULING: v2 c18a review, item 5.
+pub fn own_start_ticks() -> Option<u64> {
+    static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
+    *TICKS.get_or_init(|| start_ticks_of("/proc/self/stat"))
+}
+
+/// The process now holding `pid` is not the one that wrote the file. With the file's
+/// `start_ticks` and a readable `/proc/<pid>/stat`: they differ. Otherwise (an older
+/// extension wrote the file, or there is no `/proc`): `started_after`.
+// RULING: v2 c18a review, item 5. Ticks, not the wall clock: a clock stepped forward after
+// the extension started moves the start `btime` gives, not the ticks.
+fn pid_reused(pid: u32, body: &Value) -> bool {
+    match (body["start_ticks"].as_u64(), start_ticks_of(&format!("/proc/{pid}/stat"))) {
+        (Some(written), Some(now)) => written != now,
+        _ => body["started_ms"].as_i64().is_some_and(|started| started_after(pid, started)),
+    }
+}
+
 /// RULING: wave 5 fix round of 21, finding 7: the process now holding `pid` started after
 /// the file's `started_ms`, so it is another process (Linux: `/proc/<pid>/stat` field 22,
 /// clock ticks after `btime`). Elsewhere, or when it cannot be read, false.
 fn started_after(pid: u32, started_ms: i64) -> bool {
     // `btime` is whole seconds, and the file is written after the process starts.
     const SLACK_MS: i64 = 2_000;
-    let Some(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok() else { return false };
-    // Field 2 is `(comm)`, which may hold spaces and `)`: count from the last `)`.
-    let Some(ticks) = stat
-        .rsplit_once(')')
-        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
-        .and_then(|t| t.parse::<i64>().ok())
-    else {
+    let Some(ticks) = start_ticks_of(&format!("/proc/{pid}/stat")).and_then(|t| i64::try_from(t).ok()) else {
         return false;
     };
     let Some(btime) = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
@@ -402,7 +424,7 @@ fn status_files(dir: &Path, now: i64) -> Files {
             stale.push(json!({ "pid": pid, "why": "not alive" }));
             continue;
         }
-        if body["started_ms"].as_i64().is_some_and(|started| started_after(pid, started)) {
+        if pid_reused(pid, &body) {
             stale.push(json!({ "pid": pid, "why": "pid reused by a later process" }));
             continue;
         }
