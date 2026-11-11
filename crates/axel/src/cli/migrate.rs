@@ -1,12 +1,14 @@
-//! `migrate init | synaps | verify | catch-up` (section 1, 1037-1040). Commit 19 writes this
-//! file. The destination is the global `--brain`; `run` refuses one that came from the
-//! environment (`brain.from_env`).
+//! `migrate init | synaps | verify | catch-up` (section 1). The work is in `import.rs`; this
+//! file is the flags, the one JSON report on standard output, and the exit code. The
+//! destination is the global `--brain`; `import` refuses one that came from the environment
+//! (`brain.from_env`).
 
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 use crate::error::Result;
 use crate::ext::types::BrainArg;
+use crate::import::{self, CatchUpOpts, InitOpts, Outcome, SynapsOpts, VerifyOpts};
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -24,8 +26,14 @@ pub enum Cmd {
         #[arg(long)]
         replace: bool,
         /// With --replace: even when an extension is running on the destination
-        #[arg(long)]
+        #[arg(long, requires = "replace")]
         even_if_running: bool,
+        /// The Synaps base this brain is for (default: <home>/.synaps-cli)
+        #[arg(long, value_name = "DIR")]
+        synaps_base: Option<PathBuf>,
+        /// The file `status` watches for writes after the import (default: --from-axel)
+        #[arg(long, value_name = "PATH")]
+        watch: Option<PathBuf>,
     },
     /// Bring over the forum posts and forum tombstones of the Synaps brain.r8
     Synaps {
@@ -34,9 +42,7 @@ pub enum Cmd {
         /// May be repeated
         #[arg(long, value_name = "OLD=NEW")]
         map: Vec<String>,
-        // SPEC: 1037-1040 do not list `--accept-foreign`; 1154 gives it to `migrate synaps`
-        // ("Exit status 1 when N is not 0, unless `--accept-foreign`") and 1182 to
-        // `migrate verify`. It is declared on both.
+        /// Exit 0 although rows that are neither forum posts nor Synaps notes stay behind
         #[arg(long)]
         accept_foreign: bool,
     },
@@ -56,11 +62,47 @@ pub enum Cmd {
     CatchUp {
         #[arg(long, value_name = "FILE")]
         from_axel: PathBuf,
+        /// The file `status` watches for writes after this run (default: --from-axel)
+        #[arg(long, value_name = "PATH")]
+        watch: Option<PathBuf>,
     },
 }
 
+/// Runs the command and returns its report and exit code. Prints nothing on standard output.
+pub fn execute(args: &Args, brain: &BrainArg) -> Outcome {
+    match &args.cmd {
+        Cmd::Init { from_axel, replace, even_if_running, synaps_base, watch } => import::init(
+            brain,
+            &InitOpts {
+                from_axel: from_axel.clone(),
+                replace: *replace,
+                even_if_running: *even_if_running,
+                synaps_base: synaps_base.clone(),
+                watch: watch.clone(),
+            },
+        ),
+        Cmd::Synaps { from, map, accept_foreign } => import::synaps(
+            brain,
+            &SynapsOpts { from: from.clone(), map: map.clone(), accept_foreign: *accept_foreign },
+        ),
+        Cmd::Verify { from_axel, from_synaps, map, accept_foreign } => import::verify(
+            brain,
+            &VerifyOpts {
+                from_axel: from_axel.clone(),
+                from_synaps: from_synaps.clone(),
+                map: map.clone(),
+                accept_foreign: *accept_foreign,
+            },
+        ),
+        Cmd::CatchUp { from_axel, watch } => {
+            import::catch_up(brain, &CatchUpOpts { from_axel: from_axel.clone(), watch: watch.clone() })
+        }
+    }
+}
+
+/// One JSON report on standard output; what a person reads goes to standard error.
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
-    let _ = (args, brain);
-    eprintln!("not built yet");
-    Ok(ExitCode::from(2))
+    let outcome = execute(args, brain);
+    println!("{}", serde_json::to_string_pretty(&outcome.report)?);
+    Ok(ExitCode::from(outcome.code))
 }
