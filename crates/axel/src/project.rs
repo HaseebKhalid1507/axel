@@ -55,9 +55,15 @@ pub fn derive_key(cwd: &Path) -> Option<String> {
     Some(key_of_canonical(&canonical))
 }
 
-/// `derive_key`, then `project_dir`.
+/// `derive_key`, then `project_dir`. `None` for a `cwd` that is not absolute.
 pub fn resolve(cwd: Option<&str>) -> Option<ProjectRef> {
-    let key = derive_key(Path::new(cwd?))?;
+    // RULING: wave2-rulings, commit 5, item 1: a relative `cwd` would be canonicalised
+    // against the extension's own folder, which is not the session's.
+    let cwd = Path::new(cwd?);
+    if !cwd.is_absolute() {
+        return None;
+    }
+    let key = derive_key(cwd)?;
     let scope_dir = project_dir(&key);
     Some(ProjectRef { key, scope_dir })
 }

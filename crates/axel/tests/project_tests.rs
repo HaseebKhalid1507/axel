@@ -187,3 +187,15 @@ fn synaps_base_takes_config_then_a_real_base_then_home() {
         home.join(".synaps-cli")
     );
 }
+
+/// RULING: wave2-rulings, commit 5, item 1: a `cwd` that is not absolute is no project,
+/// also when it names a folder relative to the extension's own working directory.
+#[test]
+fn resolve_refuses_a_relative_cwd() {
+    assert!(Path::new("src").is_dir(), "the test runs in the crate's folder");
+    for cwd in [".", "src", "./src", "src/..", ""] {
+        assert!(project::resolve(Some(cwd)).is_none(), "{cwd:?}");
+    }
+    let here = std::env::current_dir().unwrap();
+    assert!(project::resolve(here.to_str()).is_some());
+}
