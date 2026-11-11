@@ -1496,3 +1496,140 @@ fn t28_the_carried_head_from_files() {
         }
     }
 }
+
+// ------------------------------------------------- v2 archives round 5, item 1 (ruling)
+
+const P1: &str = "P1MARK Bob's number is 555-0142, put it in the contacts file for me please";
+const STEER: &str = "STEERMARK actually, forget that, do not keep his number anywhere at all";
+const WORK: &str = "WORKMARK I am opening the contacts file to add the number now, one moment.";
+const MID: &str = "MIDMARK I am reading the rest of the contacts file before I change anything.";
+
+/// Guards what the owner would see: "Bob's number is …", which he asked to forget while
+/// the model was still working on it, indexed and recalled into his other chats.
+#[test]
+fn r5_a_steer_sent_while_the_turn_ran_takes_the_prompt_it_steered() {
+    let p = policy();
+    // P1, a round of tools, the steer right after the tool result, the call.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, P1),
+        asst_tool(3, WORK, "edit"),
+        result(4),
+        user(5, STEER),
+        asst_tool(6, A2, "axel_forget"),
+        result(7),
+        asst(8, A2B),
+        user(9, Q3),
+        asst(10, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x9.0"], "the prompt the steer took back was kept");
+    for marker in ["P1MARK", "555-0142", "WORKMARK", "STEERMARK", "A2MARK"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
+
+    // The tool result not stored: the steer follows the message that asked for tools.
+    let mut no_result = a.clone();
+    no_result.messages.remove(4);
+    assert_eq!(positions(&units_of(&no_result)), vec!["x0.0", "x9.0"]);
+    assert_eq!(archive::forgotten_keys(&no_result, &p), vec![mark(Some(key_of(P1)), false, false)]);
+
+    // A successor whose carried tail asked for tools, and the steer first in the file: the
+    // turn began before it (`head`), with the carried prompt's key.
+    let second = arch(vec![
+        user(1, P1),
+        asst_tool(2, WORK, "edit"),
+        user(4, STEER),
+        asst_tool(5, A2, "axel_forget"),
+        result(6),
+        asst(7, A2B),
+        user(8, Q3),
+        asst(9, A3),
+    ]);
+    assert_eq!(archive::carried_head(&second), Some(1));
+    assert_eq!(positions(&units_of(&second)), vec!["x8.0"]);
+    assert_eq!(archive::forgotten_keys(&second, &p), vec![mark(Some(key_of(P1)), true, false)]);
+}
+
+#[test]
+fn r5_a_human_text_after_a_final_reply_or_an_interruption_opens_a_new_turn() {
+    let p = policy();
+    // The model asked "which one?" and called no tool: the answer is a new turn, and the
+    // exchange that names the thing stays (the known limit).
+    let which = "WHICHMARK which Bob do you mean, the one from the office or your neighbour?";
+    let a = arch(vec![
+        user(0, P1),
+        asst(1, which),
+        user(2, STEER),
+        asst_tool(3, A2, "axel_forget"),
+        result(4),
+        asst(5, A2B),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0"], "a text after a final reply joined the turn before");
+    assert!(holds(&units, "P1MARK") && holds(&units, "WHICHMARK"));
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(STEER)), false, true)]);
+
+    // A turn interrupted during its tools: the marker ends it, and the next text is a new
+    // turn.
+    let a = arch(vec![
+        user(0, P1),
+        asst_tool(1, WORK, "edit"),
+        result(2),
+        user(3, "[Request interrupted by user]"),
+        user(4, STEER),
+        asst_tool(5, A2, "axel_forget"),
+    ]);
+    assert_eq!(positions(&units_of(&a)), vec!["x0.0"], "a text after an interruption joined the turn before");
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(STEER)), false, true)]);
+}
+
+#[test]
+fn r5_a_steer_after_a_withheld_text_takes_the_prompt_before_both() {
+    let p = policy();
+    // P1, tools, a withheld text sent while the turn ran, more tools, the steer, the call:
+    // the walk passes the steer, then the placeholder, and stops at P1.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, P1),
+        asst_tool(3, WORK, "edit"),
+        result(4),
+        user(5, WITHHELD),
+        asst_tool(6, MID, "read"),
+        result(7),
+        user(8, STEER),
+        asst_tool(9, A2, "axel_forget"),
+        result(10),
+        asst(11, A2B),
+        user(12, Q3),
+        asst(13, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x12.0"]);
+    for marker in ["P1MARK", "WORKMARK", "MIDMARK", "STEERMARK", "A2MARK"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
+
+    // The steer right after the placeholder, or after a worker's report: neither says the
+    // turn ended.
+    for between in [WITHHELD, REPORT] {
+        let a = arch(vec![
+            user(0, Q1),
+            asst(1, A1),
+            user(2, P1),
+            asst_tool(3, WORK, "edit"),
+            result(4),
+            user(5, between),
+            user(6, STEER),
+            asst_tool(7, A2, "axel_forget"),
+        ]);
+        let units = units_of(&a);
+        assert_eq!(positions(&units), vec!["x0.0"], "{between}");
+        assert!(!holds(&units, "P1MARK"), "{between}");
+        assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, true)], "{between}");
+    }
+}

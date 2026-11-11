@@ -622,8 +622,25 @@ fn attribute<'a>(tag: &'a str, name: &str) -> &'a str {
 enum Opener<'a> {
     /// The messages before the file's first prompt (after the carried tail in a successor).
     Leading,
-    Human { text: &'a str, source_index: u32, block_index: u32 },
+    /// `mid_turn`: opened while the turn was still running (see `Before`).
+    Human { text: &'a str, source_index: u32, block_index: u32, mid_turn: bool },
     Withheld,
+}
+
+/// What stands just before a human text, in file order.
+// RULING: v2 archives round 5, item 1. Core takes a message sent while a turn runs (a
+// steer) into the conversation between two rounds of tools, as a user message of its own
+// right after the tool results; one waiting when the model replies without asking for a
+// tool is taken after that reply. So a human text right after a tool result, or after an
+// assistant message that asked for tools, was sent while the turn was still running. An
+// event or a withheld text between them does not change that: core delivers events the same
+// way, and a withheld text proves nothing. Any other user text (an interruption marker
+// among them) does.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Before {
+    /// An assistant message that asked for tools, or a tool result.
+    Tools,
+    Other,
 }
 
 struct Event<'a> {
@@ -663,6 +680,11 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
         );
     }
     let mut out = Vec::new();
+    let mut before = Before::Other;
+    // The carried head yields no span, but says what stands before the file's first text.
+    for message in &a.messages[..head.map_or(0, |h| h + 1)] {
+        before = after_message(before, message);
+    }
     for message in &a.messages[head.map_or(0, |h| h + 1)..] {
         for (at, block) in message.blocks.iter().enumerate() {
             let (source_index, block_index) = (message.source_index, at as u32);
@@ -683,17 +705,45 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
                         out.push(std::mem::replace(&mut current, Span::new(Opener::Withheld)))
                     }
                     UserText::Human => {
-                        let opener = Opener::Human { text, source_index, block_index };
+                        let mid_turn = before == Before::Tools;
+                        let opener = Opener::Human { text, source_index, block_index, mid_turn };
                         out.push(std::mem::replace(&mut current, Span::new(opener)))
                     }
                     UserText::Skip => {}
                 },
                 _ => {}
             }
+            if message.role == Role::User {
+                before = after_block(before, block);
+            }
+        }
+        if message.role == Role::Assistant {
+            before = after_message(before, message);
         }
     }
     out.push(current);
     out
+}
+
+/// `Before` after one block of a user message.
+fn after_block(before: Before, block: &Block) -> Before {
+    match block {
+        Block::ToolResult { .. } => Before::Tools,
+        Block::Text(text) => match classify(text) {
+            UserText::Event { .. } | UserText::Withheld => before,
+            UserText::Human | UserText::Skip => Before::Other,
+        },
+        Block::ToolUse { .. } | Block::Other => before,
+    }
+}
+
+/// `Before` after a whole message.
+fn after_message(before: Before, message: &ArchivedMessage) -> Before {
+    match message.role {
+        Role::Assistant if message.blocks.iter().any(|b| matches!(b, Block::ToolUse { .. })) => Before::Tools,
+        Role::Assistant => Before::Other,
+        Role::User => message.blocks.iter().fold(before, after_block),
+    }
 }
 
 /// Rule 9: which spans yield no unit, and for each span that holds a forget call the pair
@@ -707,10 +757,19 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
 /// the placeholder really was a new prompt, is accepted: `restore --forget-turns` brings
 /// it back, and nothing brings a forgotten prompt back out of the index.
 ///
-/// Known limit: a HUMAN text between the prompt and the call (a steer, or "yes, that one"
-/// after the model asked which) opens a span of its own, and the span before it, which
-/// holds the prompt that names the thing, is kept. No rule tells such a text from a new
-/// request without dropping real exchanges.
+/// RULING: v2 archives round 5, item 1. A span opened by a human text sent while the turn
+/// was still running (right after a tool result, or after an assistant message that asked
+/// for tools: `Before`) is part of the turn: the walk goes on past it, the same way, to the
+/// span before. A steer ("actually, forget that") then takes the prompt it steered. The
+/// cost, as for a withheld text: a prompt that follows a turn that stopped with no final
+/// reply and no interruption marker (a turn budget spent after a round of tools) is taken
+/// as a steer, and the turn before it goes too.
+///
+/// Known limit, now for this case only: a human text after a final reply (an assistant
+/// message that asked for no tool), such as "yes, that one" after the model asked "which
+/// one?", or a steer core took after such a reply, opens a new turn, and the span before
+/// it, which holds the prompt that names the thing, is kept. The record does not tell such
+/// a text from a new request.
 fn forget_spans(spans: &[Span<'_>]) -> (Vec<bool>, Vec<(usize, usize)>) {
     let mut dropped = vec![false; spans.len()];
     let mut turns = Vec::new();
@@ -720,7 +779,7 @@ fn forget_spans(spans: &[Span<'_>]) -> (Vec<bool>, Vec<(usize, usize)>) {
         }
         // The first span is always the leading one, so the walk ends there at the latest.
         let mut root = at;
-        while root > 0 && matches!(spans[root].opener, Opener::Withheld) {
+        while root > 0 && matches!(spans[root].opener, Opener::Withheld | Opener::Human { mid_turn: true, .. }) {
             root -= 1;
         }
         dropped[root..=at].iter_mut().for_each(|d| *d = true);
@@ -773,7 +832,7 @@ pub fn extract_units(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<Unit> {
         };
         let mut of_span = Vec::new();
         match span.opener {
-            Opener::Human { text, source_index, block_index } => {
+            Opener::Human { text, source_index, block_index, .. } => {
                 // The whole prompt, redacted, before any cut (B-2f).
                 let prompt = redact(text);
                 let shown = prompt.trim();
@@ -863,7 +922,8 @@ pub fn forgotten_keys(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<ForgetMark
             // began with, past any withheld text between it and the call.
             turn_key: match spans[root].opener {
                 Opener::Human { text, .. } => Some(turn_key(&redact(text))),
-                // `forget_spans` never stops at a withheld opener.
+                // `forget_spans` never stops at a withheld opener, nor at a human text sent
+                // while the turn ran.
                 Opener::Withheld => None,
                 Opener::Leading => carried_prompt_key(a),
             },
