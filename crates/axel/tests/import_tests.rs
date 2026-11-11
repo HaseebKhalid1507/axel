@@ -1599,3 +1599,35 @@ fn f3_files_beside_an_absent_destination_are_refused() {
     }
     assert_eq!(state(&fx.old), source_before);
 }
+
+/// Finding 4: a file that appears at the destination after `--replace` moved the old brain
+/// aside is kept: exit 4, and the report says where the old brain went.
+#[test]
+fn f4_a_file_that_appears_after_the_move_is_kept_with_exit_4() {
+    let fx = fx();
+    make_axel(&fx.old);
+    empty_v2(&fx.new);
+    settle(&fx.new);
+    let old_bytes = sha(&fx.new);
+    let mut opts = fx.init_opts(&fx.old);
+    opts.replace = true;
+    let out = with_seam(
+        |point, dest| {
+            if point == "replaced" {
+                fs::write(dest, b"made by an extension that started").unwrap();
+            }
+            false
+        },
+        || import::init(&fx.dest(), &opts),
+    );
+    show("init --replace, a file appeared after the move", &out);
+    assert_eq!(out.code, 4, "{}", out.report);
+    let moved_to = PathBuf::from(out.report["replaced"]["moved_to"].as_str().unwrap());
+    let error = out.report["error"].as_str().unwrap();
+    assert!(error.starts_with(&format!("a file appeared at {} while the new brain was being made; it is kept", fx.new.display())), "{error}");
+    assert!(error.ends_with(&format!("The brain that was there before is at {}.", moved_to.display())), "{error}");
+    assert_eq!(fs::read(&fx.new).unwrap(), b"made by an extension that started");
+    assert_eq!(sha(&moved_to), old_bytes);
+    assert_eq!(out.report["destination_made"], false);
+    assert!(temporaries(fx.new.parent().unwrap()).is_empty());
+}

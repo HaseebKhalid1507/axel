@@ -950,8 +950,10 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
             rep.insert("placed_by".into(), json!(how));
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Once step 5 has moved the old brain aside, something was touched: an extension
+            // that started meanwhile made this file, which is what exit 4 is for.
             return Err(stop(
-                EXIT_REFUSED,
+                if aside_note.is_empty() { EXIT_REFUSED } else { EXIT_RUNNING },
                 format!(
                     "a file appeared at {} while the new brain was being made; it is kept and nothing was put \
                      there. Stop Synaps and run this again with --replace.{aside_note}",
