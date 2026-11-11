@@ -817,10 +817,23 @@ fn after_message(before: Before, message: &ArchivedMessage) -> Before {
 /// RULING: v2 archives round 5, item 1. A span opened by a human text sent while the turn
 /// was still running (right after a tool result, or after an assistant message that asked
 /// for tools: `Before`) is part of the turn: the walk goes on past it, the same way, to the
-/// span before. A steer ("actually, forget that") then takes the prompt it steered. The
-/// cost, as for a withheld text: a prompt that follows a turn that stopped with no final
-/// reply and no interruption marker (a turn budget spent after a round of tools) is taken
-/// as a steer, and the turn before it goes too.
+/// span before. A steer ("actually, forget that") then takes the prompt it steered.
+///
+/// RULING: v2 archives round 6, item 3. The cost, as for a withheld text: a turn that
+/// stopped after a round of tools with no final reply and no interruption marker leaves
+/// the same shape as a turn still running. Core leaves it after a spent turn budget, a
+/// revalidation failure, and a provider error after a tool round (more common than a spent
+/// budget). A prompt whose turn failed before any reply leaves a prompt with no reply, which
+/// reads the same way since round 6, item 2. The person's next prompt is then read as a
+/// steer, in both directions:
+/// - backward: if the next prompt's turn calls forget, the turn before it goes too;
+/// - forward (round 5, item 3): if the stopped turn held a forget call, the next prompt's
+///   whole turn goes with it, and `tail` stays true, so the next file's leading unit and
+///   its note go too.
+///
+/// Both err towards forgetting and `restore --forget-turns` brings them back. Capture reads
+/// the same shape the same way (a marked buffer ends only at a reply that asks for no tool),
+/// and the record holds no message times that could tell the two apart.
 ///
 /// Known limit, now for this case only: a human text after a final reply (an assistant
 /// message that asked for no tool), such as "yes, that one" after the model asked "which
