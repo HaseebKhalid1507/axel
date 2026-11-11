@@ -1261,3 +1261,78 @@ fn no_vector_is_dropped_for_a_purge_that_did_not_commit() {
     assert_eq!(w.notes(), ids(&[N1, N3, N2]));
     assert_eq!(w.removed(), Vec::new());
 }
+
+const WAL_MARKER: &str = "quartzheronmarker";
+
+fn in_file(path: &Path, marker: &str) -> usize {
+    let bytes = fs::read(path).unwrap_or_default();
+    bytes.windows(marker.len()).filter(|w| *w == marker.as_bytes()).count()
+}
+
+/// The write-ahead log after a purge, not only the mark: the note's text is in
+/// `brain.r8-wal` until the indexer's idle turn, and in neither file after it.
+#[test]
+fn after_a_forgotten_note_the_idle_turn_takes_its_text_out_of_the_log() {
+    let mut w = world();
+    let (brain, wal) = (w.ctx.cfg.brain.clone(), w.ctx.cfg.brain.with_extension("r8-wal"));
+    w.write(KEY, &format!("{}{}", n1(), rec(N2, 5, &format!("the word is {WAL_MARKER} today"))));
+    w.pass();
+    assert_eq!(w.count(&format!("SELECT count(*) FROM memories WHERE content LIKE '%{WAL_MARKER}%'")), 1);
+
+    w.write(KEY, &format!("{}{}{}", n1(), rec(N2, 5, &format!("the word is {WAL_MARKER} today")), tomb(N2)));
+    assert_eq!(w.pass().purged, 1);
+    assert_eq!(w.count(&format!("SELECT count(*) FROM memories WHERE content LIKE '%{WAL_MARKER}%'")), 0);
+    assert_eq!(w.purge_pending(), 1);
+    assert!(in_file(&wal, WAL_MARKER) > 0, "the log does not hold the text: the test proves nothing");
+
+    // The idle turn, as `indexer::run` makes it. The connection stays open.
+    axel::indexer::guarded(&mut w.ctx, axel::index_archives::checkpoint_after_purge);
+    assert_eq!(in_file(&wal, WAL_MARKER), 0, "the marker is in brain.r8-wal");
+    assert_eq!(in_file(&brain, WAL_MARKER), 0, "the marker is in brain.r8");
+    assert_eq!(w.purge_pending(), 0);
+    assert_eq!(w.notes(), ids(&[N1]));
+    assert_eq!(w.ctx.status.write_errors.load(Ordering::Relaxed), 0);
+}
+
+/// Path, size, mode and time of the folder and of everything in it.
+fn folder_state(dir: &Path) -> Vec<(PathBuf, u64, u32, i64, i64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut out = Vec::new();
+    let mut paths = vec![dir.to_path_buf()];
+    paths.extend(fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()));
+    for path in paths {
+        let meta = fs::symlink_metadata(&path).unwrap();
+        out.push((path, meta.len(), meta.mode(), meta.mtime(), meta.mtime_nsec()));
+    }
+    out.sort();
+    out
+}
+
+/// The notes folder is core's: a pass that mirrors, purges, is refused, skips a link and
+/// reads a file again leaves its size, mode and time, and those of every file, as they were.
+#[test]
+fn a_pass_changes_nothing_in_the_notes_folder() {
+    use std::os::unix::fs::PermissionsExt;
+    let mut w = three_mirrored();
+    let memory = w.base.join("memory");
+    w.write(KEY, &format!("{}{GARBAGE_1}\n{}{}", n1(), n2(), tomb(N2)));
+    w.write(KEY_B, &rec_of(KEY_B, "mem-next", 9, "a note of the next file"));
+    let refused = memory.join(file_name("p3333333333333333"));
+    fs::File::create(&refused).unwrap().set_len(64 * 1024 * 1024 + 1).unwrap();
+    std::os::unix::fs::symlink(w.file(KEY_B), memory.join(file_name("p4444444444444444"))).unwrap();
+    fs::write(memory.join("lock"), "").unwrap();
+    fs::set_permissions(w.file(KEY_B), fs::Permissions::from_mode(0o400)).unwrap();
+    let before = folder_state(&memory);
+    assert_eq!(before.len(), 6);
+
+    // The pass that mirrors, purges by tombstone and holds absence back; then the pass
+    // that reads the file again and purges by absence; then a pass with nothing to do.
+    let report = w.pass();
+    assert_eq!((report.files_read, report.files_refused, report.purged, report.inserted), (2, 1, 1, 1));
+    assert_eq!(folder_state(&memory), before);
+    assert_eq!(w.pass().purged, 1);
+    index_notes::on_forgotten(&mut w.ctx, "mem-next", KEY_B).unwrap();
+    w.pass();
+    assert_eq!(folder_state(&memory), before);
+    assert_eq!(w.notes(), ids(&[N1]));
+}
