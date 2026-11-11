@@ -1,24 +1,71 @@
-//! `pause <session id> [learning|recall|both]`. Commit 18b writes this file.
+//! `pause <session id> <learning|recall|both>`. Commit 18b writes this file.
+//!
+//! The same rows as the tool's `forget {"stop": …}` (section 4): a `chat_pauses` row for the
+//! chat, and for `learning` its live captures hidden as `pause`. Only `resume` lifts it.
 
+use std::path::Path;
 use std::process::ExitCode;
 
+use crate::cli::show::{self, open, write, Term, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
+use crate::{project, store};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// The chat's session id
     pub session_id: String,
-    // SPEC: 4818-4819 write `pause <session id>` alone; 2762 writes
-    // `pause <session id> [learning|recall|both]`. The longer form is declared ("the
-    // sections are the authority", 4817). No default is written, so there is none here.
     /// What to pause
+    // SPEC: 3523 (4.3): what to pause is required and there is no default; the skeleton's
+    // `Option` is now required.
     #[arg(value_parser = ["learning", "recall", "both"])]
-    pub what: Option<String>,
+    pub what: String,
 }
 
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
-    let _ = (args, brain);
-    eprintln!("not built yet");
-    Ok(ExitCode::from(2))
+    show::on_std(|term| run_with(args, &brain.path, term))
+}
+
+/// `learning`, `recall`, or both of them.
+pub fn kinds(what: &str) -> Option<&'static [&'static str]> {
+    match what {
+        "learning" => Some(&["learning"]),
+        "recall" => Some(&["recall"]),
+        "both" => Some(&["learning", "recall"]),
+        _ => None,
+    }
+}
+
+pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
+    let session_id = args.session_id.trim();
+    let Some(kinds) = kinds(&args.what) else {
+        writeln!(term.err, "say what to pause: learning, recall or both")?;
+        return Ok(USAGE);
+    };
+    if session_id.is_empty() {
+        writeln!(term.err, "give the chat's session id")?;
+        return Ok(USAGE);
+    }
+    let conn = open(path)?;
+    let logical = project::logical(session_id);
+    let hidden = write(&conn, || {
+        let mut hidden = 0;
+        for what in kinds {
+            hidden += store::set_pause(&conn, &logical, Some(session_id), what, "cli")?;
+        }
+        Ok(hidden)
+    })?;
+    let shown = show::one(session_id);
+    for what in kinds {
+        match *what {
+            "learning" => writeln!(
+                term.out,
+                "Learning is paused for chat {shown}: none of its turns is learned and none of its archives is indexed. \
+                 {hidden} recent turns were hidden with it. What was archived and indexed before stays."
+            )?,
+            _ => writeln!(term.out, "Recall is paused for chat {shown}: nothing is recalled into it.")?,
+        }
+    }
+    writeln!(term.out, "Lift it with \"axel-v2 resume {shown} {}\".", args.what)?;
+    Ok(OK)
 }

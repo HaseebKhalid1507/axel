@@ -1,14 +1,15 @@
-//! `memories [--limit <n>]`. Commit 18b writes this file; the body is today's, moved as it
-//! is.
+//! `memories [--limit <n>]`. Commit 18b writes this file.
+//!
+//! The newest rows of `memories`, as before (chat rows among them, decision 16), with
+//! their state and "unchanged since saved"; every field passes the screen.
 
+use std::path::Path;
 use std::process::ExitCode;
 
-use axel_memkoshi::storage::MemoryStorage;
-
-use crate::cli::ensure_brain;
+use crate::cli::show::{self, one, open, rows_where, Term, FAILED, OK};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
-use crate::r8::Brain;
+use crate::screen;
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -18,34 +19,40 @@ pub struct Args {
 }
 
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
-    let path = &brain.path;
-    ensure_brain(path)?;
+    show::on_std(|term| run_with(args, &brain.path, term))
+}
 
-    let brain = Brain::open(path)?;
-    let signer = brain.signer();
-    drop(brain);
-
-    let storage = MemoryStorage::open_existing(path)?;
-    let memories = storage.list_memories(args.limit)?;
-
-    if memories.is_empty() {
-        eprintln!("No memories stored yet. Use `axel remember` to add some.");
-        return Ok(ExitCode::FAILURE);
+pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
+    let conn = open(path)?;
+    let limit = i64::try_from(args.limit).unwrap_or(i64::MAX);
+    let rows = rows_where(&conn, "ORDER BY m.created DESC, m.id LIMIT ?1", [limit])?;
+    if rows.is_empty() {
+        writeln!(term.err, "No memories stored yet. Use `axel remember` to add some.")?;
+        return Ok(FAILED);
     }
-
-    for mem in &memories {
-        let sig_status = match (&signer, &mem.signature) {
-            (Some(s), Some(_)) => if s.verify(mem) { "✓" } else { "⚠ TAMPERED" },
-            (Some(_), None) => "⚠ UNSIGNED",
-            (None, _) => "",
+    for row in &rows {
+        let signature = match show::unchanged(&conn, row)? {
+            "yes" => "✓",
+            "no" => "⚠ CHANGED SINCE SAVED",
+            _ => "⚠ UNSIGNED",
         };
-
-        println!("[{}] {} (importance: {:.1}) {}", mem.id, mem.title, mem.importance, sig_status);
-        println!("  category: {:?} | topic: {} | tags: {:?}", mem.category, mem.topic, mem.tags);
-        if !mem.abstract_text.is_empty() {
-            println!("  {}", mem.abstract_text);
+        writeln!(term.out, "[{}] {} {signature}", one(&row.id), one(&row.title))?;
+        writeln!(
+            term.out,
+            "  kind: {} | origin: {} | {} | tags: {}",
+            one(&row.kind),
+            one(&row.origin),
+            show::state(row),
+            one(&row.tags)
+        )?;
+        if row.secret {
+            writeln!(term.out, "  (a secret memory; its text is not shown)")?;
+        } else if !row.abstract_text.trim().is_empty() {
+            for line in screen::show_block(&row.abstract_text, 600).lines() {
+                writeln!(term.out, "  {line}")?;
+            }
         }
-        println!();
+        writeln!(term.out)?;
     }
-    Ok(ExitCode::SUCCESS)
+    Ok(OK)
 }

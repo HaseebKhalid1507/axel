@@ -1,12 +1,25 @@
-//! `search <query>... [--limit <n>] [--json]`. Commit 18b writes this file; the body is
-//! today's, moved as it is.
+//! `search <query>... [--limit <n>] [--json]`. Commit 18b writes this file.
+//!
+//! The old four-layer search over `documents`, as before, with two changes (R-8, R3-6c): it
+//! asks for three times the limit and drops every hit whose `documents` row is hidden (a
+//! file that is gone; the shadow of a hidden or superseded memory) and every hit whose id is
+//! that of a hidden or superseded memory, whichever layer returned it (the graph layer reads
+//! `nodes`, which have no `documents` row to test); and what it prints passes the screen.
+//! The shadow documents of visible memories stay: this is the search the owner's agents use
+//! to find his old memories.
 
+use std::collections::HashSet;
 use std::process::ExitCode;
 use std::time::Instant;
 
-use crate::cli::{ensure_brain, strip_frontmatter};
+use rusqlite::Connection;
+use velocirag::search::SearchResult;
+
+use crate::cli::show::{self, one, Term, FAILED, OK};
+use crate::cli::strip_frontmatter;
 use crate::error::Result;
 use crate::ext::types::BrainArg;
+use crate::screen;
 use crate::search::BrainSearch;
 
 #[derive(clap::Args)]
@@ -22,65 +35,119 @@ pub struct Args {
 }
 
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
-    let path = &brain.path;
-    let json_mode = args.json;
-    let query = args.query.join(" ");
-    if query.is_empty() {
-        eprintln!("Please provide a search query.");
-        return Ok(ExitCode::FAILURE);
+    show::on_std(|term| {
+        if args.query.join(" ").trim().is_empty() {
+            writeln!(term.err, "Please provide a search query.")?;
+            return Ok(FAILED);
+        }
+        let mut search = BrainSearch::open(&brain.path)?;
+        run_with(args, &mut search, term)
+    })
+}
+
+/// At most this many results: `--limit` is capped (to prevent OOM on large brains).
+pub fn limit_of(args: &Args) -> usize {
+    args.limit.min(100)
+}
+
+/// The ids of every hidden or superseded memory, read once.
+pub fn hidden_ids(conn: &Connection) -> Result<HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT mem_id FROM memory_ext WHERE hidden_ms IS NOT NULL
+         UNION SELECT id FROM memories WHERE superseded_by IS NOT NULL OR invalidated_at IS NOT NULL",
+    )?;
+    let rows = stmt.query_map([], |r| crate::brain_v2::text_at(r, 0))?;
+    let mut ids = HashSet::new();
+    for id in rows {
+        if let Some(id) = id? {
+            ids.insert(id);
+        }
     }
+    Ok(ids)
+}
 
-    ensure_brain(path)?;
+/// False for a hit that must not be shown: its id (without the graph layer's `graph:`) is
+/// a hidden or superseded memory, or its `documents` row is hidden.
+pub fn shown(conn: &Connection, hidden: &HashSet<String>, doc_id: &str) -> Result<bool> {
+    let bare = doc_id.strip_prefix("graph:").unwrap_or(doc_id);
+    if hidden.contains(doc_id) || hidden.contains(bare) {
+        return Ok(false);
+    }
+    let gone: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM documents WHERE doc_id IN (?1, ?2) AND hidden IS NOT NULL)",
+        [doc_id, bare],
+        |r| r.get(0),
+    )?;
+    Ok(!gone)
+}
 
-    let mut search = BrainSearch::open(path)?;
+/// The search for three times `limit`, the hidden hits dropped, at most `limit` kept.
+pub fn visible_hits(search: &mut BrainSearch, query: &str, limit: usize) -> Result<Vec<SearchResult>> {
+    let response = search.search(query, limit.saturating_mul(3))?;
+    let conn = search.db().conn();
+    let hidden = hidden_ids(conn)?;
+    let mut kept = Vec::new();
+    for hit in response.results {
+        if kept.len() == limit {
+            break;
+        }
+        if shown(conn, &hidden, &hit.doc_id)? {
+            kept.push(hit);
+        }
+    }
+    Ok(kept)
+}
+
+pub fn run_with(args: &Args, search: &mut BrainSearch, term: &mut Term) -> Result<u8> {
+    let query = args.query.join(" ");
+    if query.trim().is_empty() {
+        writeln!(term.err, "Please provide a search query.")?;
+        return Ok(FAILED);
+    }
     let start = Instant::now();
-    let limit = args.limit.min(100); // cap to prevent OOM on large brains
-    let response = search.search(&query, limit)?;
+    let limit = limit_of(args);
+    let results = visible_hits(search, &query, limit)?;
     let ms = start.elapsed().as_millis();
 
     // Record search feedback for consolidation
-    search.record_search_feedback(&query, &response.results);
+    search.record_search_feedback(&query, &results);
 
-    if json_mode {
-        let results: Vec<serde_json::Value> = response.results.iter().map(|r| {
-            serde_json::json!({
-                "doc_id": r.doc_id,
-                "score": r.score,
-                "content": strip_frontmatter(&r.content),
+    if args.json {
+        let results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "doc_id": one(&r.doc_id),
+                    "score": r.score,
+                    "content": screen::show_block(&strip_frontmatter(&r.content), 20_000),
+                })
             })
-        }).collect();
-        println!("{}", serde_json::json!({
-            "query": query,
-            "count": results.len(),
-            "ms": ms,
-            "results": results,
-        }));
-        return if results.is_empty() {
-            Ok(ExitCode::FAILURE)
-        } else {
-            Ok(ExitCode::SUCCESS)
-        };
-    }
-
-    if response.results.is_empty() {
-        eprintln!("No results for \"{query}\"");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    println!("🔍 \"{}\" — {} results ({ms}ms)\n", query, response.results.len());
-    for (i, result) in response.results.iter().enumerate() {
-        let clean = strip_frontmatter(&result.content);
-        let preview: String = clean
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(120)
             .collect();
-        println!("  {}. [{}] (score: {:.3})", i + 1, result.doc_id, result.score);
-        println!("     {preview}…\n");
+        writeln!(
+            term.out,
+            "{}",
+            serde_json::json!({
+                "query": query,
+                "count": results.len(),
+                "ms": ms,
+                "results": results,
+            })
+        )?;
+        return Ok(if results.is_empty() { FAILED } else { OK });
     }
-    Ok(ExitCode::SUCCESS)
+
+    if results.is_empty() {
+        writeln!(term.err, "No results for \"{}\"", one(&query))?;
+        return Ok(FAILED);
+    }
+
+    writeln!(term.out, "🔍 \"{}\" — {} results ({ms}ms)\n", one(&query), results.len())?;
+    for (i, result) in results.iter().enumerate() {
+        let clean = strip_frontmatter(&result.content);
+        let first: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).take(3).collect();
+        let preview = screen::show_block(&first.join(" "), 120);
+        writeln!(term.out, "  {}. [{}] (score: {:.3})", i + 1, one(&result.doc_id), result.score)?;
+        writeln!(term.out, "     {preview}…\n")?;
+    }
+    Ok(OK)
 }
