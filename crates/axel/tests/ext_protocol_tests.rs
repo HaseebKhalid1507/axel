@@ -1089,3 +1089,80 @@ fn a_model_that_is_not_the_brains_runs_on_words_alone() {
     assert!(jobs_rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is embedded");
     assert_eq!(status_row(&dirs.brain()).unwrap()["model_loaded"], false);
 }
+
+// ── Wave 3 ruling 1: the status file, one per process ───────────────────────
+
+fn status_file(dirs: &Dirs) -> PathBuf {
+    server::status_file_path(dirs.brain().parent().unwrap(), std::process::id())
+}
+
+fn read_status_file(dirs: &Dirs) -> Option<Value> {
+    serde_json::from_slice(&std::fs::read(status_file(dirs)).ok()?).ok()
+}
+
+/// Waits until this process's status file names `mode`; returns the object.
+fn wait_status_file(dirs: &Dirs, mode: &str, within: Duration) -> Value {
+    let start = Instant::now();
+    loop {
+        let seen = read_status_file(dirs);
+        if let Some(v) = seen.as_ref().filter(|v| v["mode"] == mode) {
+            return v.clone();
+        }
+        assert!(start.elapsed() < within, "the status file never said {mode:?}: {seen:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn r1_a_process_degraded_at_start_says_so_in_its_status_file_and_the_brain_is_unchanged() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        conn.execute_batch("PRAGMA user_version = 99; PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+    let before = sha256(&dirs.brain());
+
+    let mut host = Host::start(Some(Embedder::hashing()), TestHooks::default());
+    host.call("initialize", json!({"config": dirs.config("hash")}));
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(15));
+    assert_eq!(said["reason"], "BrainTooNew", "{said}");
+    assert_eq!(said["pid"], std::process::id());
+    assert!(said["started_ms"].as_i64().unwrap() > 0 && said["written_ms"].as_i64().unwrap() > 0, "{said}");
+    assert_eq!(host.hook("before_message", "s1"), continues());
+
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert!(!status_file(&dirs).exists(), "a clean end leaves its status file");
+    assert_eq!(sha256(&dirs.brain()), before, "a brain at version 99 was written");
+    assert_eq!(host_status_written(&dirs), None);
+}
+
+#[test]
+fn r1_a_healthy_process_says_ready_removes_old_files_at_start_and_its_own_at_a_clean_end() {
+    use std::os::unix::fs::PermissionsExt;
+    let dirs = Dirs::new();
+    let folder = dirs.brain().parent().unwrap().to_path_buf();
+    std::fs::create_dir_all(&folder).unwrap();
+    // Two files of other processes (pids 1 and 2 are never a test's): one 25 hours old.
+    let (old, fresh) = (server::status_file_path(&folder, 1), server::status_file_path(&folder, 2));
+    for path in [&old, &fresh] {
+        std::fs::write(path, br#"{"pid":1,"mode":"ready"}"#).unwrap();
+    }
+    let long_ago = std::time::SystemTime::now() - Duration::from_secs(25 * 3600);
+    std::fs::File::options().write(true).open(&old).unwrap().set_modified(long_ago).unwrap();
+
+    let host = Host::ready(&dirs, None, TestHooks::default());
+    let said = wait_status_file(&dirs, "ready", Duration::from_secs(15));
+    let mut keys: Vec<&str> = said.as_object().unwrap().keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["mode", "pid", "reason", "reason_at", "started_ms", "written_ms"]);
+    assert_eq!((&said["reason"], &said["reason_at"]), (&json!("None"), &Value::Null), "{said}");
+    assert_eq!(said["pid"], std::process::id());
+    assert_eq!(std::fs::metadata(status_file(&dirs)).unwrap().permissions().mode() & 0o777, 0o600);
+    assert!(!old.exists(), "a status file 25 hours old was left");
+    assert!(fresh.exists(), "another process's fresh status file was removed");
+    assert!(!folder.join(format!("extension.{}.status.tmp", std::process::id())).exists());
+
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert!(!status_file(&dirs).exists(), "a clean end leaves its status file");
+    assert!(fresh.exists(), "the end removed another process's status file");
+}

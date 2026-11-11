@@ -49,6 +49,10 @@ const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 const EXIT_WAIT: Duration = Duration::from_millis(200);
 /// The exit status of a process whose front thread died or hung.
 const EXIT_FRONT_STUCK: i32 = 70;
+/// The status file is written again after this long without a change.
+const STATUS_FILE_EVERY: Duration = Duration::from_secs(30);
+/// A status file older than this was left by a process that did not end cleanly.
+const STATUS_FILE_OLD: Duration = Duration::from_secs(24 * 3600);
 
 const INVALID_PARAMS: i64 = -32602;
 const INTERNAL_ERROR: i64 = -32603;
@@ -124,6 +128,64 @@ impl Log {
             let _ = std::fs::rename(&self.path, old);
         }
     }
+}
+
+// ── The status file ─────────────────────────────────────────────────────────
+
+// RULING: wave3-c12b ruling 1. One file per process, beside the log: the mode and its
+// reason, whatever the mode is. The brain's status row cannot say them: a degraded process
+// must not write the brain, and a starting one has none.
+
+/// `<data_dir>/extension.<pid>.status`.
+pub fn status_file_path(data_dir: &Path, pid: u32) -> PathBuf {
+    data_dir.join(format!("extension.{pid}.status"))
+}
+
+fn mode_name(mode: u8) -> &'static str {
+    match Mode::from_u8(mode) {
+        Some(Mode::Ready) => "ready",
+        Some(Mode::Degraded) => "degraded",
+        _ => "starting",
+    }
+}
+
+/// `extension.<digits>.status`, or that name with `.tmp` after it.
+fn is_status_file_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("extension.") else { return false };
+    let rest = rest.strip_suffix(".tmp").unwrap_or(rest);
+    let Some(pid) = rest.strip_suffix(".status") else { return false };
+    !pid.is_empty() && pid.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// At start: status files not written for 24 hours are removed. A younger file may be a
+/// running process's, and is left whatever its pid.
+fn remove_old_status_files(data_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(data_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if !name.to_str().is_some_and(is_status_file_name) {
+            continue;
+        }
+        let old = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|at| at.elapsed().ok())
+            .is_some_and(|age| age >= STATUS_FILE_OLD);
+        if old {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Under a temporary name, then renamed: a reader never sees half an object. Mode 0600.
+fn write_status_file(path: &Path, body: &Value) -> std::io::Result<()> {
+    let mut tmp = path.to_path_buf().into_os_string();
+    tmp.push(".tmp");
+    let mut file = std::fs::OpenOptions::new().create(true).write(true).truncate(true).mode(0o600).open(&tmp)?;
+    file.write_all(body.to_string().as_bytes())?;
+    drop(file);
+    std::fs::rename(&tmp, path)
 }
 
 thread_local! {
@@ -283,6 +345,9 @@ where
         carry: Carry::default(),
         seq: 0,
         busy: None,
+        status_file: None,
+        status_seen: None,
+        status_at: None,
     };
     let end = pump.pump(&frames);
     pump.finish(end)
@@ -342,6 +407,11 @@ struct Pump<W: Write> {
     carry: Carry,
     seq: u64,
     busy: Option<Busy>,
+    /// From `initialize` on: this process's status file.
+    status_file: Option<PathBuf>,
+    /// The mode and reason last written to it, and when.
+    status_seen: Option<(u8, u8)>,
+    status_at: Option<Instant>,
 }
 
 fn continue_result() -> Value {
@@ -399,7 +469,7 @@ impl<W: Write> Pump<W> {
     /// Only end of input, `shutdown`, or a dead front thread ends the loop.
     fn pump(&mut self, frames: &Receiver<Frame>) -> ServeEnd {
         loop {
-            let wait = Duration::from_millis(if self.busy.is_some() { 20 } else { 500 });
+            let wait = Duration::from_millis(if self.busy.is_some() { 20 } else { 250 });
             match frames.recv_timeout(wait) {
                 Ok(Ok(body)) => {
                     if let Some(end) = self.on_frame(&body) {
@@ -417,6 +487,34 @@ impl<W: Write> Pump<W> {
                 return ServeEnd::FrontStuck;
             }
             self.close_breaker_when_due();
+            self.status_file_when_due();
+        }
+    }
+
+    /// The status file, when the mode or the reason changed and every 30 s. This thread
+    /// writes it because it is the one that is alive in every mode.
+    fn status_file_when_due(&mut self) {
+        let Some(path) = self.status_file.clone() else { return };
+        // The mode first: whoever degrades stores the reason before it.
+        let mode = self.mode.load(Ordering::SeqCst);
+        let degraded = mode == Mode::Degraded as u8;
+        let reason = if degraded { self.status.reason.load(Ordering::SeqCst) } else { DegradedReason::None as u8 };
+        let unchanged = self.status_seen == Some((mode, reason));
+        if unchanged && self.status_at.is_some_and(|at| at.elapsed() < STATUS_FILE_EVERY) {
+            return;
+        }
+        self.status_seen = Some((mode, reason));
+        self.status_at = Some(Instant::now());
+        let body = json!({
+            "pid": std::process::id(),
+            "mode": mode_name(mode),
+            "reason": DegradedReason::from_u8(reason).as_str(),
+            "reason_at": if degraded { self.status.reason_at.get().cloned() } else { None },
+            "written_ms": (self.clock)(),
+            "started_ms": self.status.started_ms.load(Ordering::Relaxed),
+        });
+        if write_status_file(&path, &body).is_err() {
+            self.log("status file not written");
         }
     }
 
@@ -530,7 +628,10 @@ impl<W: Write> Pump<W> {
                 if forum_on { "on" } else { "off" },
                 cfg.warnings.len()
             ));
+            remove_old_status_files(&cfg.data_dir);
+            self.status_file = Some(status_file_path(&cfg.data_dir, std::process::id()));
             self.live = self.start(cfg, boot);
+            self.status_file_when_due();
         }
         let tools = self.tools.clone();
         self.answer(id, json!({"protocol_version": 1, "capabilities": {"tools": tools}}));
@@ -892,6 +993,10 @@ impl<W: Write> Pump<W> {
     fn finish(&mut self, end: ServeEnd) -> ServeEnd {
         self.stop.store(true, Ordering::SeqCst);
         self.log(&format!("serve ends: {end:?}"));
+        // A clean end leaves no status file behind.
+        if let (Some(path), ServeEnd::Shutdown | ServeEnd::InputClosed) = (self.status_file.as_ref(), end) {
+            let _ = std::fs::remove_file(path);
+        }
         let Some(mut live) = self.live.take() else { return end };
         if live.jobs.is_none() {
             live.jobs = live.jobs_from.try_recv().ok();
