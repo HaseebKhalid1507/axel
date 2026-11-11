@@ -36,6 +36,7 @@ type Result<T> = std::result::Result<T, ToolError>;
 
 pub const WORKER_REFUSAL: &str = "not available to subagent workers; ask the chat that started you";
 const NOT_FOUND: &str = "not found";
+pub const NOT_AGAIN: &str = "this text cannot be saved again from here";
 const MIRROR: &str = "this mirrors a Synaps archive or note; use memory_forget with ctx-… or mem-…";
 const A_FILE: &str = "that is a file of the user's; it is changed by editing the file";
 const NO_PROJECT: &str = "no project for this folder; use scope global";
@@ -519,6 +520,20 @@ fn remember(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<Strin
             Some((id, Some(hidden_ms))) => return Ok(Saved::Hidden { id, hidden_ms }),
             Some((id, None)) => return Ok(Saved::Exists { id }),
             None => {}
+        }
+        // RULING: v2 c18a review round 2, item 3. The text is held by a secret or not
+        // standard row: it is not saved again as a normal one, and the answer names no row.
+        let closed: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                  WHERE e.content_hash = ?1 AND m.category = ?2 AND m.project_key = ?3
+                    AND (m.sensitivity <> 'normal' OR m.retention <> 'standard'))",
+                params![content_hash, class, project_key],
+                |r| r.get(0),
+            )
+            .map_err(&read)?;
+        if closed {
+            return Err(ToolError::Refused(NOT_AGAIN.to_string()));
         }
 
         // `supersedes`: visible saved rows only; any other id is `not found`.

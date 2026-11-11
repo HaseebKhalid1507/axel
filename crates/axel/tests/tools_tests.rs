@@ -19,7 +19,7 @@ use axel::capture::{self, CompletedTurn, Written};
 use axel::ext::config::ExtConfig;
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{serve, BUSY_TEXT};
-use axel::ext::tools_core::{self, WORKER_REFUSAL};
+use axel::ext::tools_core::{self, NOT_AGAIN, WORKER_REFUSAL};
 use axel::ext::tools_forum::NO_CALLER;
 use axel::ext::types::{Boot, Caller, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status, TestHooks, ToolError};
 use axel::ext::{front, tools};
@@ -2012,4 +2012,30 @@ fn rr2_a_hidden_note_file_row_is_not_brought_back_by_saying_it_again() {
     assert!(answer.starts_with("This was hidden on ") && answer.contains("mem_notefilehidden01"), "{answer}");
     assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows, "a new row was stored");
     assert_eq!(hidden_by(lab.conn(), "mem_notefilehidden01").as_deref(), Some("user"));
+}
+
+// RULING: v2 c18a review round 2, item 3: a text held only by a secret or not standard row
+// is not saved again, and the answer names no row.
+#[test]
+fn rr3_a_text_held_by_a_secret_or_local_only_row_is_not_saved_again_and_no_row_is_named() {
+    let mut lab = Lab::new();
+    let (a, dir_a) = (lab.a.clone(), lab.dir_a.clone());
+    let s = lab.chat(&a, "S");
+    let secret = "the gate of the lower yard opens with the word heron";
+    lab.put(&NewRow { sensitivity: Sensitivity::Secret, ..row("mem_secretlegacy0001", "note", &dir_a, "legacy", secret) });
+    let local = "the spare dinghy oars are kept under the slipway";
+    lab.put(&row("mem_localonlytool001", "note", &dir_a, "tool", local));
+    lab.conn().execute("UPDATE memories SET retention = 'local_only' WHERE id = 'mem_localonlytool001'", []).unwrap();
+
+    let before = snapshot(lab.conn());
+    for (text, id) in [(secret, "mem_secretlegacy0001"), (local, "mem_localonlytool001")] {
+        let answer = lab.call("remember", json!({ "content": text }), &s);
+        assert_eq!(answer, Err(ToolError::Refused(NOT_AGAIN.to_string())), "{id}");
+        assert!(!NOT_AGAIN.contains("mem_") && !NOT_AGAIN.contains(id));
+    }
+    assert_eq!(snapshot(lab.conn()), before, "something was stored");
+
+    // A visible row of the same text beside the secret one is still the answer.
+    lab.put(&row("mem_visiblesame00001", "note", &dir_a, "tool", secret));
+    assert_eq!(lab.remember(&s, secret), "mem_visiblesame00001");
 }
