@@ -438,7 +438,8 @@ pub fn forget(conn: &Connection, project: &str, id: &str, caller: &Caller, now: 
     }
     let author = caller.author.as_ref();
     conn.execute(
-        "INSERT OR REPLACE INTO forum_tombstones(id, project_key, deleted_ms, source, by_actor, by_group, \
+        // The first record of a deletion wins: a tombstone already there (an imported one) is kept.
+        "INSERT OR IGNORE INTO forum_tombstones(id, project_key, deleted_ms, source, by_actor, by_group, \
          by_parent, by_session) VALUES (?1, ?2, ?3, 'tool', ?4, ?5, ?6, ?7)",
         params![
             id,

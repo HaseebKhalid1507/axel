@@ -1835,3 +1835,29 @@ fn expiry_is_counted_from_the_clock_not_from_a_bumped_timestamp() {
     assert!(!live.contains(&id_of(&got)), "expired after 7 days");
     assert!(live.contains(&id_of(&next)));
 }
+
+/// R-17.4: a tombstone that is already there is kept as it is; the post still goes.
+#[test]
+fn a_forget_keeps_the_first_tombstone() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let key = project::resolve(Some(&cwd)).unwrap().key;
+    let me = chat(&cwd, "s-tomb", &who("a", "ga", None));
+    let id = id_of(&fx.root(&me, "k1", "Finding", "to be forgotten"));
+    fx.db()
+        .execute(
+            "INSERT INTO forum_tombstones(id, project_key, deleted_ms, source, by_session) VALUES (?1, ?2, ?3, 'import', 'earlier')",
+            params![id, key, T0 - 5],
+        )
+        .unwrap();
+
+    fx.clock.store(T0 + 9, Ordering::SeqCst);
+    let got = fx.ok("forum_forget", json!({"id": id}), &me);
+    assert_eq!(got["result"]["status"], "tombstoned");
+    let tomb = tombstone(&fx, &id);
+    assert_eq!((tomb.source.as_str(), tomb.deleted_ms, tomb.by_session.as_deref()), ("import", T0 - 5, Some("earlier")));
+    assert_eq!(tomb.by_actor, None, "the first record, whole");
+    assert_eq!(fx.count("forum_posts"), 0);
+    assert_eq!(fx.count("forum_tombstones"), 1);
+    assert!(purge_pending(&fx));
+}
