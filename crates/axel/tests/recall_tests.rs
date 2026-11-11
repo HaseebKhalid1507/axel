@@ -1512,7 +1512,7 @@ fn t12c_the_log_keeps_no_text_of_a_worker_a_host_message_or_a_chat_filed_elsewhe
 }
 
 #[test]
-fn t12d_the_row_of_a_turn_that_ends_withheld_is_removed_by_chat_and_hash() {
+fn t12d_the_rows_of_a_turn_that_is_not_stored_are_removed_by_chat_and_time() {
     let mut h = Hook::new(json!({}));
     let (boot_indexer, _) = boot(None);
     let (mut ctx, _jobs, _vecs) = indexer_start::open_ctx(h.ext.clone(), boot_indexer);
@@ -1527,11 +1527,15 @@ fn t12d_the_row_of_a_turn_that_ends_withheld_is_removed_by_chat_and_hash() {
     let second = "which pipeline does the staging server deploy use";
     assert_eq!(recall::query_hash(&first), archive::turn_key(&screen::redact(&first).text));
     assert_ne!(recall::query_hash(&first), archive::turn_key(&first));
-    for (session, prompt) in [("s-one", first.as_str()), ("s-one", second), ("s-two", first.as_str())] {
+    // s-one: a turn of two messages (10 and 20 ms after NOW), then a later turn with the
+    // same first prompt (40). s-two: the same prompt at 30.
+    let logged = [("s-one", first.as_str(), 10), ("s-one", second, 20), ("s-two", first.as_str(), 30), ("s-one", first.as_str(), 40)];
+    for (session, prompt, at) in logged {
         assert!(matches!(h.before(session, prompt), HookOut::Inject(_)));
-        let trace = h.trace();
+        let mut trace = h.trace();
         assert_eq!(trace.query_hash, recall::query_hash(prompt));
         assert!(trace.query_preview.is_some());
+        trace.ts_ms = NOW + at;
         recall::write_log(&mut ctx, &trace).unwrap();
     }
     let conn = ctx.conn.as_ref().unwrap();
@@ -1540,21 +1544,25 @@ fn t12d_the_row_of_a_turn_that_ends_withheld_is_removed_by_chat_and_hash() {
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
         rows.map(Result::unwrap).collect()
     };
-    assert_eq!(left(conn).len(), 3);
+    assert_eq!(left(conn).len(), 4);
+    let (hash_first, hash_second) = (recall::query_hash(&first), recall::query_hash(second));
 
-    // On a bare connection: one row, of that chat and that prompt only; committed.
-    assert_eq!(recall::drop_logged_turn(conn, "s-one", &recall::query_hash(&first)).unwrap(), 1);
+    // The later turn: its row only. The earlier turn with the same prompt keeps its row.
+    assert_eq!(recall::drop_logged_turn(conn, "s-one", NOW + 35, NOW + 45).unwrap(), 1);
+    // On a bare connection: the turn's two rows, of that chat only; committed.
+    assert_eq!(recall::drop_logged_turn(conn, "s-one", NOW + 10, NOW + 20).unwrap(), 2);
     assert!(conn.is_autocommit());
-    let want = vec![("s-one".to_string(), recall::query_hash(second)), ("s-two".to_string(), recall::query_hash(&first))];
+    let want = vec![("s-two".to_string(), hash_first.clone())];
     assert_eq!(left(conn), want);
     assert_eq!(left(&h.brain.conn), want, "another connection sees it: it is committed");
     // Again: nothing to remove, no error.
-    assert_eq!(recall::drop_logged_turn(conn, "s-one", &recall::query_hash(&first)).unwrap(), 0);
-    assert_eq!(recall::drop_logged_turn(conn, "s-three", &recall::query_hash(second)).unwrap(), 0);
+    assert_eq!(recall::drop_logged_turn(conn, "s-one", NOW, NOW + 50).unwrap(), 0);
+    assert_eq!(recall::drop_logged_turn(conn, "s-three", NOW, NOW + 50).unwrap(), 0);
+    assert_ne!(hash_first, hash_second);
 
     // Inside the caller's transaction it is part of it: rolled back with it, and not committed by it.
     brain_v2::begin_write(conn).unwrap();
-    assert_eq!(recall::drop_logged_turn(conn, "s-two", &recall::query_hash(&first)).unwrap(), 1);
+    assert_eq!(recall::drop_logged_turn(conn, "s-two", NOW + 30, NOW + 30).unwrap(), 1);
     assert!(!conn.is_autocommit(), "the caller's transaction is still open");
     conn.execute_batch("ROLLBACK").unwrap();
     assert_eq!(left(conn), want);

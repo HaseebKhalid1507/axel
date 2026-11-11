@@ -323,10 +323,10 @@ const STOP_WORDS: [&str; 60] = [
 
 /// The `query_hash` of the `recall_log` row of a prompt: the turn key of the redacted text.
 ///
-/// For capture (R-16): give it the prompt exactly as the `before_message` hook carried it
-/// (`HookEvent.message`: whole, not redacted, not cut). It is the same value as
-/// `archive::turn_key(&screen::redact(prompt).text)`, which is the `turn_key` capture
-/// already makes of that text, so capture may pass that key to [`drop_logged_turn`] as it is.
+/// Give it the prompt exactly as the `before_message` hook carried it (`HookEvent.message`:
+/// whole, not redacted, not cut). It is the same value as
+/// `archive::turn_key(&screen::redact(prompt).text)`, which is the `turn_key` capture makes
+/// of that text.
 pub fn query_hash(prompt: &str) -> String {
     archive::turn_key(&screen::redact(prompt).text)
 }
@@ -1436,8 +1436,8 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         // RULING: wave 4 ruling R-15 item 2: the log decides at the prompt what capture
         // decides at the end of the turn, by capture's own rules. A hook with no session id
         // (a worker), a host message, a chat filed elsewhere and a hook with no project are
-        // never captured, so the log keeps no text of them. A turn that ends withheld is
-        // known only later: capture then calls `drop_logged_turn`.
+        // never captured, so the log keeps no text of them. A turn that ends withheld or
+        // marked is known only later: capture then calls `drop_logged_turn`.
         let never_captured = session_id.is_none_or(str::is_empty)
             || host_message(prompt)
             || elsewhere
@@ -1581,23 +1581,27 @@ fn in_write<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T>
     done
 }
 
-/// Removes the `recall_log` rows of one prompt of one chat; returns how many (0 when the
-/// row was never written, was trimmed, or was dropped by a forget call).
+/// Removes the `recall_log` rows of one turn of one chat: every row of `session_id` from
+/// `from_ms` to `to_ms`, both included. Returns how many (0 when none was written, or they
+/// were trimmed, or a forget call dropped them).
 ///
-/// For capture (R-16), on the indexer thread, when a turn ends withheld (its reply, or the
-/// turn as a whole, is something core would not store): the row was written at the
-/// prompt, before that could be known, and may hold the prompt's first 120 characters and
-/// up to 12 of its words. `session_id` is the hook's; `query_hash` is [`query_hash`] of
-/// the prompt as the hook carried it (equal to the turn key capture makes of it). The
-/// log job of a prompt is queued before the job of its turn's end, so the row is there.
+/// For capture, on the indexer thread, when a turn is not stored: the rows were written
+/// at each prompt of the turn, before that could be known, and may hold a prompt's first
+/// 120 characters and up to 12 of its words. `from_ms` is the turn's first hook, `to_ms`
+/// its end; a log row's `ts_ms` is read after its hook arrived, so it is not earlier than
+/// the first. The log jobs of a turn are queued before the job of its end, so the rows are
+/// there.
 ///
 /// On a bare connection it opens its own write transaction and commits it; inside a
 /// transaction of the caller it is one `DELETE` of that transaction.
-pub fn drop_logged_turn(conn: &Connection, session_id: &str, query_hash: &str) -> Result<usize> {
+// RULING: v2 capture/recall review, item 1 (findings 1 and 7). By time and not by hash: a
+// message in the middle of a turn has its own row, and an earlier turn of the chat with the
+// same prompt keeps its own.
+pub fn drop_logged_turn(conn: &Connection, session_id: &str, from_ms: i64, to_ms: i64) -> Result<usize> {
     let delete = || -> Result<usize> {
         Ok(conn.execute(
-            "DELETE FROM recall_log WHERE session_id = ?1 AND query_hash = ?2",
-            params![session_id, query_hash],
+            "DELETE FROM recall_log WHERE session_id = ?1 AND ts_ms BETWEEN ?2 AND ?3",
+            params![session_id, from_ms, to_ms],
         )?)
     };
     if conn.is_autocommit() {

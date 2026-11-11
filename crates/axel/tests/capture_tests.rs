@@ -1218,12 +1218,13 @@ fn r16_1_a_turn_the_queue_refuses_is_counted() {
     assert_eq!(status.jobs_dropped.load(Ordering::Relaxed), 1);
 }
 
-fn log_row(conn: &Connection, session_id: &str, prompt: &str) {
+/// The row the recall log writes at a prompt, at `ts_ms`.
+fn log_row(conn: &Connection, session_id: &str, prompt: &str, ts_ms: i64) {
     tx(conn, || {
         conn.execute(
             "INSERT INTO recall_log(ts_ms, session_id, logical, scope_dir, query_preview, query_hash, outcome, total_ms, detail)
-             VALUES (1000, ?1, ?1, NULL, ?2, ?3, 'injected', 1.0, '{}')",
-            params![session_id, prompt, recall::query_hash(prompt)],
+             VALUES (?4, ?1, ?1, NULL, ?2, ?3, 'injected', 1.0, '{}')",
+            params![session_id, prompt, recall::query_hash(prompt), ts_ms],
         )
         .unwrap();
     });
@@ -1247,10 +1248,10 @@ fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
     let cwd = lab.project("alpha");
     let other = "what did we decide about the order of the archive windows last week";
 
-    // A clean prompt whose reply core would withhold.
+    // A clean prompt whose reply core would withhold. Each chat had an earlier turn.
     for chat in ["S", "T"] {
-        log_row(ctx_conn(&ctx), chat, PROMPT);
-        log_row(ctx_conn(&ctx), chat, other);
+        log_row(ctx_conn(&ctx), chat, other, 500);
+        log_row(ctx_conn(&ctx), chat, PROMPT, 1_000);
     }
     user(&mut st, "S", &cwd, PROMPT, 1_000);
     assistant(&mut st, "S", &cwd, "It reads them in the order the secret of the build names.", false, 2_000);
@@ -1261,7 +1262,7 @@ fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
     let conn = ctx_conn(&ctx);
     assert!(conn.is_autocommit());
     assert_eq!(log_rows(conn, "S", PROMPT), 0, "the log kept the prompt of a withheld turn");
-    assert_eq!(log_rows(conn, "S", other), 1, "another prompt of the chat");
+    assert_eq!(log_rows(conn, "S", other), 1, "an earlier turn of the chat");
     assert_eq!(log_rows(conn, "T", PROMPT), 1, "the same prompt in another chat");
     assert_eq!(captures(conn), 0);
     assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
@@ -1278,7 +1279,7 @@ fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
     let brain = Lab::new();
     let cfg = brain.cfg();
     let b = brain.open();
-    log_row(&b.conn, "S", PROMPT);
+    log_row(&b.conn, "S", PROMPT, 1_000);
     let turn = CompletedTurn {
         session_id: "S".to_string(),
         cwd: Some(brain.project("alpha")),
@@ -1295,7 +1296,7 @@ fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
     assert_eq!(log_rows(&b.conn, "S", PROMPT), 0);
 
     // Capture off: `write_turn` touches nothing (the log keeps no text of a prompt then).
-    log_row(&b.conn, "S", PROMPT);
+    log_row(&b.conn, "S", PROMPT, 1_000);
     let mut off = cfg.clone();
     off.capture = false;
     assert_eq!(write(&b, &off, &CompletedTurn { withheld: true, ..turn }), Written::Skipped);
@@ -1361,4 +1362,128 @@ fn r16_4_tokens_blanked_are_counted_when_the_turn_is_sent() {
     assistant(&mut st, "S", &cwd, &last, false, 2_000);
     assert!(next_capture(&jobs).is_some());
     assert_eq!(blanked(&status), 0);
+}
+
+// ── The review of R-15 and R-16 ─────────────────────────────────────────────
+
+/// A row of the recall log, written as the indexer writes it (`recall::write_log`): the
+/// row of a prompt of `session_id` at `ts_ms`, with its first words when `preview` is given.
+fn log_at(ctx: &mut IndexerCtx, session_id: &str, prompt: &str, preview: bool, ts_ms: i64) {
+    let trace = recall::RecallTrace {
+        ts_ms,
+        session_id: Some(session_id.to_string()),
+        logical: Some(project::logical(session_id)),
+        query_preview: preview.then(|| prompt.to_string()),
+        query_hash: recall::query_hash(prompt),
+        outcome: "nothing_relevant".to_string(),
+        ..recall::RecallTrace::default()
+    };
+    recall::write_log(ctx, &trace).unwrap();
+}
+
+/// The times of the chat's log rows.
+fn log_times(conn: &Connection, session_id: &str) -> Vec<i64> {
+    let mut stmt = conn.prepare("SELECT ts_ms FROM recall_log WHERE session_id = ?1 ORDER BY ts_ms").unwrap();
+    let rows = stmt.query_map([session_id], |r| r.get(0)).unwrap();
+    rows.map(Result::unwrap).collect()
+}
+
+/// No memory row holds `word`, in any of its texts.
+fn nowhere(conn: &Connection, word: &str) {
+    let sql = format!(
+        "SELECT COUNT(*) FROM memories WHERE content LIKE '%{word}%' OR title LIKE '%{word}%' OR abstract_text LIKE '%{word}%'"
+    );
+    assert_eq!(count(conn, &sql), 0, "{word}");
+}
+
+/// Item 1 (finding 1): the person adds a message in the middle of the turn in which a
+/// forget tool was called. The turn stays marked: nothing of it is stored, the mark ends
+/// with the turn, and no log row of the turn survives, the second message's included.
+#[test]
+fn review_1_a_message_in_the_middle_of_a_forget_turn_keeps_it_forgotten() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let earlier = "what did the review say about the archive reader";
+    let first = "forget the phone number of Bob that I gave you this morning";
+    let second = "and the number of Alice as well, from the same message";
+    let reply = "Done: I forgot the numbers of Bob and Alice, nothing of them is kept.";
+    for text in [first, second, reply] {
+        assert!(!screen::core_withholds(text), "{text}");
+    }
+
+    log_at(&mut ctx, "S", earlier, true, 500);
+    user(&mut st, "S", &cwd, first, 1_000);
+    log_at(&mut ctx, "S", first, true, 1_000);
+    assistant(&mut st, "S", &cwd, "I will call the forget tool for that number.", true, 1_500);
+    // The live call (commit 18a): the buffer is marked and the `call` row ends at the call.
+    let (from_ms, key) = st.capture.suppress("S").unwrap();
+    call_row(ctx_conn(&ctx), "S", &key, from_ms, 1_600);
+    // The second message, after the mark's end: the log writes its row.
+    user(&mut st, "S", &cwd, second, 2_000);
+    log_at(&mut ctx, "S", second, true, 2_000);
+    log_at(&mut ctx, "T", second, true, 2_000);
+    assert_eq!(log_times(ctx_conn(&ctx), "S"), [500, 1_000, 2_000]);
+    assistant(&mut st, "S", &cwd, reply, false, 3_000);
+
+    let turn = next_capture(&jobs).unwrap();
+    assert!(next_capture(&jobs).is_none(), "one turn, one job");
+    assert!(turn.suppressed, "the second message cleared the mark");
+    assert_eq!((turn.started_ms, turn.at_ms), (1_000, 3_000));
+    assert_eq!((turn.prompt.as_str(), turn.reply.as_str()), ("", ""));
+    assert_eq!(dropped(&status), 0);
+
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    let conn = ctx_conn(&ctx);
+    nothing_stored(conn);
+    for word in ["Alice", "Bob"] {
+        nowhere(conn, word);
+    }
+    assert_eq!(to_ms(conn, "S"), 3_000, "the mark ends with the turn");
+    assert_eq!(log_times(conn, "S"), [500], "a log row of the turn survived");
+    assert_eq!(log_times(conn, "T"), [2_000], "another chat's row");
+    assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
+}
+
+/// Item 1 (finding 1): a message in the middle of a turn whose first prompt core withholds.
+/// The reply holds the secret and none of core's words; the turn stays withheld.
+#[test]
+fn review_1_a_message_in_the_middle_of_a_withheld_turn_keeps_it_withheld() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let earlier = "what did the review say about the archive reader";
+    let first = "the db password is hunter2, keep it for the deploy tonight";
+    let second = "and also set up the staging machine with it tonight";
+    let reply = "Done: I configured staging with hunter2 and restarted the deploy job.";
+    assert!(screen::core_withholds(first));
+    assert!(!screen::core_withholds(second) && !screen::core_withholds(reply));
+
+    log_at(&mut ctx, "S", earlier, true, 500);
+    user(&mut st, "S", &cwd, first, 1_000);
+    // The log keeps no words of a prompt core withholds; the row is there all the same.
+    log_at(&mut ctx, "S", first, false, 1_000);
+    assistant(&mut st, "S", &cwd, "Noted, I will use it for the deploy.", true, 1_500);
+    user(&mut st, "S", &cwd, second, 2_000);
+    log_at(&mut ctx, "S", second, true, 2_000);
+    log_at(&mut ctx, "T", second, true, 2_000);
+    assistant(&mut st, "S", &cwd, reply, false, 3_000);
+
+    let turn = next_capture(&jobs).unwrap();
+    assert!(next_capture(&jobs).is_none(), "one turn, one job");
+    assert!(turn.withheld, "the second message cleared what core withholds");
+    assert_eq!((turn.started_ms, turn.at_ms), (1_000, 3_000));
+    assert_eq!((turn.prompt.as_str(), turn.reply.as_str()), ("", ""), "the job carries text");
+    assert_eq!(status.turns_withheld.load(Ordering::Relaxed), 1);
+    assert_eq!(dropped(&status), 0);
+
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    let conn = ctx_conn(&ctx);
+    nothing_stored(conn);
+    for word in ["hunter2", "staging"] {
+        nowhere(conn, word);
+    }
+    assert_eq!(log_times(conn, "S"), [500], "a log row of the turn survived");
+    assert_eq!(log_times(conn, "T"), [2_000], "another chat's row");
+    assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
 }

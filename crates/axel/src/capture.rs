@@ -146,6 +146,14 @@ impl CaptureState {
         let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
             return;
         };
+        // RULING: v2 capture/recall review, item 1. A turn marked by a forget call, or one
+        // core withholds, stays so to its end: a message in the middle of it (the person's,
+        // or the host's) does not replace it, and none of its text is kept. The marked turn
+        // then reaches `write_turn`, which moves the mark's end to the turn's end and takes
+        // the turn's log rows.
+        if self.pending.get(session_id).is_some_and(|buf| buf.suppressed || buf.withheld) {
+            return;
+        }
         // RULING: wave4 R-16 item 2. The host calls the prompt hook before each request to
         // the model, so an advisory or a continuation may arrive inside a person's turn:
         // it starts no turn and ends none. Only an event clears what is pending. A second
@@ -326,7 +334,9 @@ pub fn write_turn(
     let logical = project::logical(&turn.session_id);
 
     // The turn in which a forget tool was called: no row, whatever else holds; the
-    // interval of the chat's `call` row is closed at the turn's end.
+    // interval of the chat's `call` row is closed at the turn's end, and the turn's log
+    // rows go (every message of it, by time: a message in the middle of the turn has its
+    // own row and its own hash).
     if turn.suppressed {
         in_transaction(conn, || {
             // SPEC: 3435-3436 say "sets `to_ms` … to `at_ms`"; an interval is never made
@@ -336,6 +346,7 @@ pub fn write_turn(
                   WHERE source = 'call' AND from_ms = ?2 AND (logical = ?3 OR session_id = ?4)",
                 params![turn.at_ms, turn.started_ms, logical, turn.session_id],
             )?;
+            recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
             Ok(())
         })?;
         return Ok(Written::Skipped);
@@ -349,12 +360,14 @@ pub fn write_turn(
     if turn.withheld || screen::core_withholds(&turn.prompt) || screen::core_withholds(&turn.reply) {
         // RULING: wave4 R-16 item 3. The recall log wrote its row of this prompt at the
         // start of the turn, when the reply was not yet known, and may hold the prompt's
-        // first characters and words: the row goes with the turn. `turn_key` is the
-        // `query_hash` of that row (`recall::query_hash`). This is the indexer thread and
-        // the connection is bare, so the call makes its own write transaction; the log's
-        // job was queued before this one, so the row is there. With capture off (above)
-        // the log keeps no text of a prompt and nothing is deleted.
-        recall::drop_logged_turn(conn, &turn.session_id, &turn.turn_key)?;
+        // first characters and words: the row goes with the turn. This is the indexer
+        // thread and the connection is bare, so the call makes its own write transaction;
+        // the log's jobs were queued before this one, so the rows are there. With capture
+        // off (above) the log keeps no text of a prompt and nothing is deleted.
+        // RULING: v2 capture/recall review, item 1. By time, not by hash: every row of this
+        // chat from the turn's first hook to its end, a message in the middle included, and
+        // no row of another turn with the same prompt.
+        recall::drop_logged_turn(conn, &turn.session_id, turn.started_ms, turn.at_ms)?;
         return Ok(Written::Skipped);
     }
     if turn.session_id.is_empty() {
