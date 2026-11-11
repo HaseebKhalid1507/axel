@@ -4,9 +4,13 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Instant;
 
-use clap::{Parser, Subcommand};
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand};
 
+use axel::brain_v2::{self, OpenOpts};
+use axel::cli::ensure_brain;
 use axel::config::AxelConfig;
+use axel::ext::types::BrainArg;
 use axel::r8::Brain;
 use axel::search::BrainSearch;
 use axel_memkoshi::memory::{Memory, MemoryCategory};
@@ -59,16 +63,7 @@ enum Commands {
         no_prune: bool,
     },
     /// Search the brain
-    Search {
-        /// Search query
-        query: Vec<String>,
-        /// Maximum results to return
-        #[arg(long, default_value = "5")]
-        limit: usize,
-        /// Output as JSON for scripting
-        #[arg(long)]
-        json: bool,
-    },
+    Search(axel::cli::search::Args),
     /// Store a memory permanently
     Remember {
         /// Memory content
@@ -81,10 +76,7 @@ enum Commands {
         topic: String,
     },
     /// Get relevant context (boot context or query-based recall)
-    Recall {
-        /// Optional search query (omit for boot context)
-        query: Vec<String>,
-    },
+    Recall(axel::cli::recall::Args),
     /// Manage session handoff
     Handoff {
         /// Subcommand: set, get, or clear
@@ -94,10 +86,7 @@ enum Commands {
         content: Vec<String>,
     },
     /// Delete a memory by ID
-    Forget {
-        /// Memory ID (e.g. mem_abc12345)
-        id: String,
-    },
+    Forget(axel::cli::forget::Args),
     /// Show brain statistics
     Stats,
     /// Show excitability distribution — top and bottom documents
@@ -115,11 +104,7 @@ enum Commands {
         limit: usize,
     },
     /// List stored memories
-    Memories {
-        /// Maximum memories to list
-        #[arg(long, default_value = "10")]
-        limit: usize,
-    },
+    Memories(axel::cli::memories::Args),
     /// Run a consolidation pass on the brain
     ///
     /// Reindexes changed files, strengthens accessed documents,
@@ -149,8 +134,26 @@ enum Commands {
     },
     /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     Extension,
-    /// Run as an MCP server (exposes search/remember/recall as tools)
-    Mcp,
+    /// Make a v2 brain from the old one, bring over the forum, verify, catch up
+    Migrate(axel::cli::migrate::Args),
+    /// Install the Synaps plugin manifest
+    Plugin(axel::cli::plugin::Args),
+    /// Show the brain and the running extension
+    Status(axel::cli::status::Args),
+    /// Show why the last recalls chose what they chose
+    Why(axel::cli::why::Args),
+    /// Show one row or one archive
+    Show(axel::cli::show::Args),
+    /// Pause learning or recall for one chat
+    Pause(axel::cli::pause::Args),
+    /// Lift a pause
+    Resume(axel::cli::resume::Args),
+    /// Bring back hidden rows
+    Restore(axel::cli::restore::Args),
+    /// Manage the embedding model
+    Model(axel::cli::model::Args),
+    /// Export archives and notes from the Synaps brain.r8
+    SynapsExport(axel::cli::synaps_export::Args),
 }
 
 fn brain_path(cli: &Cli) -> PathBuf {
@@ -165,45 +168,75 @@ fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::S
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-
-    let result = match &cli.command {
-        Commands::Init { name } => cmd_init(&cli, name.as_deref()),
-        Commands::Index { path, source } => cmd_index(&cli, path, source.as_deref()),
-        Commands::IndexSync { path, source, no_prune } => cmd_index_sync(&cli, path, source.as_deref(), *no_prune),
-        Commands::Search { query, limit, json } => cmd_search(&cli, query, *limit, *json),
-        Commands::Remember { content, category, topic } => cmd_remember(&cli, content, category, topic),
-        Commands::Recall { query } => cmd_recall(&cli, query),
-        Commands::Handoff { action, content } => cmd_handoff(&cli, action, content),
-        Commands::Forget { id } => cmd_forget(&cli, id),
-        Commands::Stats => cmd_stats(&cli),
-        Commands::Excitability { limit } => cmd_excitability(&cli, *limit),
-        Commands::Suggest { query, limit } => cmd_suggest(&cli, query, *limit),
-        Commands::Memories { limit } => cmd_memories(&cli, *limit),
-        Commands::Consolidate { phase, dry_run, verbose, sources, history, report, json } =>
-            if *history {
-                cmd_consolidate_history(&cli)
-            } else {
-                cmd_consolidate(&cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref(), report.as_deref(), *json)
-            },
-        Commands::Extension => {
-            let path = brain_path(&cli);
-            axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-        }
-        Commands::Mcp => {
-            let path = brain_path(&cli);
-            axel::mcp::run(&path).map(|_| ExitCode::SUCCESS)
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
-        }
+    // Parsed in two steps so that `main` can see where `--brain` came from (B-2b).
+    let matches = Cli::command().get_matches();
+    let from_env = matches.value_source("brain") == Some(ValueSource::EnvVariable);
+    let on_command_line = matches.value_source("brain") == Some(ValueSource::CommandLine);
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
     };
+    let brain = BrainArg { path: brain_path(&cli), from_env, on_command_line };
 
-    match result {
+    match run(&cli, &brain) {
         Ok(code) => code,
         Err(e) => {
             eprintln!("Error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+fn run(cli: &Cli, brain: &BrainArg) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // The gate (R-2) runs before every subcommand but these seven.
+    let gated = !matches!(
+        cli.command,
+        Commands::Extension
+            | Commands::Migrate(_)
+            | Commands::Plugin(_)
+            | Commands::Model(_)
+            | Commands::Init { .. }
+            | Commands::SynapsExport(_)
+            | Commands::Status(_)
+    );
+    if gated {
+        brain_v2::require_v2(&brain.path)?;
+    }
+
+    match &cli.command {
+        Commands::Init { name } => cmd_init(cli, name.as_deref()),
+        Commands::Index { path, source } => cmd_index(cli, path, source.as_deref()),
+        Commands::IndexSync { path, source, no_prune } => cmd_index_sync(cli, path, source.as_deref(), *no_prune),
+        Commands::Search(args) => Ok(axel::cli::search::run(args, brain)?),
+        Commands::Remember { content, category, topic } => cmd_remember(cli, content, category, topic),
+        Commands::Recall(args) => Ok(axel::cli::recall::run(args, brain)?),
+        Commands::Handoff { action, content } => cmd_handoff(cli, action, content),
+        Commands::Forget(args) => Ok(axel::cli::forget::run(args, brain)?),
+        Commands::Stats => cmd_stats(cli),
+        Commands::Excitability { limit } => cmd_excitability(cli, *limit),
+        Commands::Suggest { query, limit } => cmd_suggest(cli, query, *limit),
+        Commands::Memories(args) => Ok(axel::cli::memories::run(args, brain)?),
+        Commands::Consolidate { phase, dry_run, verbose, sources, history, report, json } =>
+            if *history {
+                cmd_consolidate_history(cli)
+            } else {
+                cmd_consolidate(cli, phase.as_deref(), *dry_run, *verbose, sources.as_deref(), report.as_deref(), *json)
+            },
+        Commands::Extension => {
+            let path = brain_path(cli);
+            axel::extension::run(&path).map(|_| ExitCode::SUCCESS)
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+        }
+        Commands::Migrate(args) => Ok(axel::cli::migrate::run(args, brain)?),
+        Commands::Plugin(args) => Ok(axel::cli::plugin::run(args, brain)?),
+        Commands::Status(args) => Ok(axel::cli::status::run(args, brain)?),
+        Commands::Why(args) => Ok(axel::cli::why::run(args, brain)?),
+        Commands::Show(args) => Ok(axel::cli::show::run(args, brain)?),
+        Commands::Pause(args) => Ok(axel::cli::pause::run(args, brain)?),
+        Commands::Resume(args) => Ok(axel::cli::resume::run(args, brain)?),
+        Commands::Restore(args) => Ok(axel::cli::restore::run(args, brain)?),
+        Commands::Model(args) => Ok(axel::cli::model::run(args, brain)?),
+        Commands::SynapsExport(args) => Ok(axel::cli::synaps_export::run(args, brain)?),
     }
 }
 
@@ -217,9 +250,20 @@ fn cmd_init(cli: &Cli, name: Option<&str>) -> Result<ExitCode, Box<dyn std::erro
         return Ok(ExitCode::FAILURE);
     }
 
-    let brain = Brain::create(&path, name)?;
+    // SPEC: 4834-4835, "`Init` calls `brain_v2::open_v2`, so a brain made by hand is a v2
+    // brain from the start", and 4751-4753: the stub of `open_v2` returns
+    // `Err(BrainNotReady)`. So from commit 3 until commit 4 is on the branch `axel init`
+    // fails with that error and creates nothing. The check above (an existing file is
+    // kept) is today's and is not in the document.
+    let opts = OpenOpts {
+        agent: name,
+        model: axel::r8::DEFAULT_EMBEDDER,
+        dim: axel::r8::EMBEDDING_DIM,
+        upgrade_v1: false,
+    };
+    brain_v2::open_v2(&path, &opts)?;
     println!("✓ Brain created: {}", path.display());
-    if let Some(n) = brain.meta().agent_name.as_deref() {
+    if let Some(n) = name {
         println!("  Agent: {n}");
     }
     Ok(ExitCode::SUCCESS)
@@ -581,74 +625,6 @@ fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Er
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_search(
-    cli: &Cli,
-    query_parts: &[String],
-    limit: usize,
-    json_mode: bool,
-) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let query = query_parts.join(" ");
-    if query.is_empty() {
-        eprintln!("Please provide a search query.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    let path = brain_path(cli);
-    ensure_brain(&path)?;
-
-    let mut search = BrainSearch::open(&path)?;
-    let start = Instant::now();
-    let limit = limit.min(100); // cap to prevent OOM on large brains
-    let response = search.search(&query, limit)?;
-    let ms = start.elapsed().as_millis();
-
-    // Record search feedback for consolidation
-    search.record_search_feedback(&query, &response.results);
-
-    if json_mode {
-        let results: Vec<serde_json::Value> = response.results.iter().map(|r| {
-            serde_json::json!({
-                "doc_id": r.doc_id,
-                "score": r.score,
-                "content": strip_frontmatter(&r.content),
-            })
-        }).collect();
-        println!("{}", serde_json::json!({
-            "query": query,
-            "count": results.len(),
-            "ms": ms,
-            "results": results,
-        }));
-        return if results.is_empty() {
-            Ok(ExitCode::FAILURE)
-        } else {
-            Ok(ExitCode::SUCCESS)
-        };
-    }
-
-    if response.results.is_empty() {
-        eprintln!("No results for \"{query}\"");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    println!("🔍 \"{}\" — {} results ({ms}ms)\n", query, response.results.len());
-    for (i, result) in response.results.iter().enumerate() {
-        let clean = strip_frontmatter(&result.content);
-        let preview: String = clean
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .take(3)
-            .collect::<Vec<_>>()
-            .join(" ")
-            .chars()
-            .take(120)
-            .collect();
-        println!("  {}. [{}] (score: {:.3})", i + 1, result.doc_id, result.score);
-        println!("     {preview}…\n");
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 fn cmd_remember(
     cli: &Cli,
     content_parts: &[String],
@@ -700,60 +676,6 @@ fn cmd_remember(
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_recall(cli: &Cli, query_parts: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let path = brain_path(cli);
-    ensure_brain(&path)?;
-
-    if query_parts.is_empty() {
-        // Boot context
-        let storage = MemoryStorage::open_existing(&path)?;
-        let stats = storage.stats()?;
-        let mut has_content = false;
-
-        if let Some(handoff) = storage.get_context("handoff")? {
-            if !handoff.is_empty() {
-                println!("[Handoff]\n{handoff}\n");
-                has_content = true;
-            }
-        }
-
-        let memories = storage.list_memories(5)?;
-        if !memories.is_empty() {
-            println!("[Recent Memories]");
-            for mem in &memories {
-                println!("  • [{:?}] {}: {}", mem.category, mem.title, mem.abstract_text);
-            }
-            has_content = true;
-        }
-
-        if !has_content {
-            eprintln!("Brain is empty. Use `axel remember` or `axel index` to add content.");
-        }
-
-        println!("\n[Stats] {} memories, {} staged, {} events",
-            stats.total_memories, stats.staged_count, stats.event_count);
-        Ok(ExitCode::SUCCESS)
-    } else {
-        // Query-based recall
-        let query = query_parts.join(" ");
-        let mut search = BrainSearch::open(&path)?;
-        let response = search.search(&query, 5)?;
-
-        if response.results.is_empty() {
-            eprintln!("No results for \"{query}\"");
-            return Ok(ExitCode::FAILURE);
-        }
-
-        println!("🔍 \"{}\" — {} results\n", query, response.results.len());
-        for result in &response.results {
-            let clean = strip_frontmatter(&result.content);
-            let preview: String = clean.chars().take(200).collect();
-            println!("[{}] {preview}…\n", result.doc_id);
-        }
-        Ok(ExitCode::SUCCESS)
-    }
-}
-
 fn cmd_handoff(cli: &Cli, action: &str, content_parts: &[String]) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let path = brain_path(cli);
     ensure_brain(&path)?;
@@ -803,20 +725,6 @@ fn cmd_handoff(cli: &Cli, action: &str, content_parts: &[String]) -> Result<Exit
         }
     }
     Ok(ExitCode::SUCCESS)
-}
-
-fn cmd_forget(cli: &Cli, id: &str) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let path = brain_path(cli);
-    ensure_brain(&path)?;
-
-    let storage = MemoryStorage::open_existing(&path)?;
-    if storage.delete_memory(id)? {
-        println!("✓ Forgotten: {id}");
-        Ok(ExitCode::SUCCESS)
-    } else {
-        eprintln!("Memory not found: {id}");
-        Ok(ExitCode::FAILURE)
-    }
 }
 
 fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
@@ -1096,48 +1004,7 @@ fn cmd_excitability(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::er
     Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_memories(cli: &Cli, limit: usize) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let path = brain_path(cli);
-    ensure_brain(&path)?;
-
-    let brain = Brain::open(&path)?;
-    let signer = brain.signer();
-    drop(brain);
-
-    let storage = MemoryStorage::open_existing(&path)?;
-    let memories = storage.list_memories(limit)?;
-
-    if memories.is_empty() {
-        eprintln!("No memories stored yet. Use `axel remember` to add some.");
-        return Ok(ExitCode::FAILURE);
-    }
-
-    for mem in &memories {
-        let sig_status = match (&signer, &mem.signature) {
-            (Some(s), Some(_)) => if s.verify(mem) { "✓" } else { "⚠ TAMPERED" },
-            (Some(_), None) => "⚠ UNSIGNED",
-            (None, _) => "",
-        };
-
-        println!("[{}] {} (importance: {:.1}) {}", mem.id, mem.title, mem.importance, sig_status);
-        println!("  category: {:?} | topic: {} | tags: {:?}", mem.category, mem.topic, mem.tags);
-        if !mem.abstract_text.is_empty() {
-            println!("  {}", mem.abstract_text);
-        }
-        println!();
-    }
-    Ok(ExitCode::SUCCESS)
-}
-
 // ── Helpers ─────────────────────────────────────────────────────────────────
-
-fn ensure_brain(path: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    if !path.exists() {
-        eprintln!("No brain at {}. Run `axel init` first.", path.display());
-        std::process::exit(1);
-    }
-    Ok(())
-}
 
 fn parse_category(s: &str) -> Result<MemoryCategory, Box<dyn std::error::Error>> {
     match s.to_lowercase().as_str() {
@@ -1153,15 +1020,4 @@ fn parse_category(s: &str) -> Result<MemoryCategory, Box<dyn std::error::Error>>
             ).into())
         }
     }
-}
-
-/// Strip YAML frontmatter (--- ... ---) from markdown content.
-fn strip_frontmatter(content: &str) -> String {
-    let trimmed = content.trim_start();
-    if let Some(after) = trimmed.strip_prefix("---") {
-        if let Some(end) = after.find("---") {
-            return after[end + 3..].trim_start().to_string();
-        }
-    }
-    content.to_string()
 }

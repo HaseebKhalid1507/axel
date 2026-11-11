@@ -44,6 +44,20 @@ const W_RECENCY: f64 = 0.5;
 /// is exhausted.
 pub const LOCAL_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(250);
 
+// SPEC: 2457 says this file exports `ScoreParts { lexical, semantic, session, class,
+// recency, total }`, and `recall::Pick` (2327) has a field of it, so commit 3 declares the
+// struct here, in a file that is commit 15's. The field type is not written; `f64` is
+// assumed. `score_parts` (2458) is commit 15's.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
+pub struct ScoreParts {
+    pub lexical: f64,
+    pub semantic: f64,
+    pub session: f64,
+    pub class: f64,
+    pub recency: f64,
+    pub total: f64,
+}
+
 /// Machine-readable reason a record was selected (spec §10.4). Every
 /// selected record carries at least one. Never free text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]

@@ -140,6 +140,16 @@ fn truncate_to_budget(text: &str, max_chars: usize) -> &str {
     }
 }
 
+/// The `on_session_start` hook (called by `ext::hooks::handle`). The stub answers
+/// `HookOut::Continue`; from commit 15 on this file is that commit's.
+pub fn on_session_start(
+    st: &mut crate::ext::types::FrontState,
+    ev: &crate::ext::types::HookEvent,
+) -> crate::ext::types::HookOut {
+    let _ = (st, ev);
+    crate::ext::types::HookOut::Continue
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

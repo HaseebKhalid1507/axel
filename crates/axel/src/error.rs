@@ -1,5 +1,7 @@
 //! Error types for the Axel crate.
 
+use std::path::PathBuf;
+
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -36,6 +38,30 @@ pub enum AxelError {
 
     #[error("{0}")]
     Other(String),
+
+    // The brain kinds of v2 (B3-3b). Nobody edits this file after commit 3.
+    // SPEC: the document gives the text of NoBrain (893) and of V1Brain (879-881) only; the
+    // other five messages are commit 3's wording.
+    #[error("no v2 brain at {}. \"axel-v2 init\" makes an empty one; \"axel-v2 migrate init --from-axel <axel.r8>\" makes one from the old brain.", .0.display())]
+    NoBrain(PathBuf),
+
+    #[error("this is a version 1 brain (axel.r8). It is the rollback copy and axel-v2 does not change it. \"axel-v2 migrate init --from-axel <it>\" makes a v2 copy.")]
+    V1Brain(PathBuf),
+
+    #[error("the brain is at version {file} and this binary knows version {binary}; it is not written")]
+    BrainTooNew { file: i64, binary: i64 },
+
+    #[error("the brain is not ready")]
+    BrainNotReady,
+
+    #[error("the brain was changed by another binary; restart Synaps")]
+    BrainChanged,
+
+    #[error("the brain is damaged: {0}")]
+    BrainDamaged(String),
+
+    #[error("the brain belongs to another Synaps base: {}", .0.display())]
+    OtherBase(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, AxelError>;

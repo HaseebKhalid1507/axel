@@ -370,11 +370,11 @@ fn consolidation_log_in_progress_marker() {
 #[test]
 fn search_limit_cap_cli() {
     let src = std::fs::read_to_string(
-        concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs")
-    ).expect("read main.rs");
+        concat!(env!("CARGO_MANIFEST_DIR"), "/src/cli/search.rs")
+    ).expect("read cli/search.rs");
 
     // Find cmd_search and inspect ~40 lines for any explicit cap.
-    let idx = src.find("fn cmd_search").expect("cmd_search defined");
+    let idx = src.find("fn run").expect("cli::search::run defined");
     let window: String = src[idx..].lines().take(40).collect::<Vec<_>>().join("\n");
 
     let has_cap = window.contains(".min(50")
