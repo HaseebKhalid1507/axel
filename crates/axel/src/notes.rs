@@ -2,7 +2,7 @@
 //!
 //! A reading of core's `store.rs` (`MemoryRecord`, `TombstoneLine`, the line scan of
 //! `load_live_project_records`), with the newer core's `"tags": null` as no tags. Its
-//! contract test is `tests/notes_tests.rs` with `tests/fixtures/notes/`.
+//! contract test is `tests/notes_reader_tests.rs` with `tests/fixtures/notes/`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
