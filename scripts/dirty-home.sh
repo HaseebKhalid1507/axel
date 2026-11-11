@@ -33,6 +33,17 @@ set -uo pipefail
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
+# For scripts/dirty-home-selftest.sh only, which proves each failure of this
+# gate with a stub in place of cargo and temp folders in place of the rest:
+#   CARGO            the cargo command (default: cargo)
+#   DIRTY_HOME_REAL  the folder checked as the real HOME (default: $HOME)
+#   DIRTY_HOME_SRC   the folder searched for environment overrides (default: crates)
+# A gate run with any of them set is not the gate, and says so.
+cargo="${CARGO:-cargo}"
+if [ -n "${CARGO:-}${DIRTY_HOME_REAL:-}${DIRTY_HOME_SRC:-}" ]; then
+    echo "dirty-home: NOT THE GATE: overrides are set (CARGO='${CARGO:-}' DIRTY_HOME_REAL='${DIRTY_HOME_REAL:-}' DIRTY_HOME_SRC='${DIRTY_HOME_SRC:-}')"
+fi
+
 # Keep the toolchain reachable once HOME moves.
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
@@ -43,7 +54,7 @@ export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
 # lands where the checks below may not look. env_clear() removes HOME
 # whatever else its line says, so it is refused on any line. Checked first:
 # it needs no build.
-src=crates
+src="${DIRTY_HOME_SRC:-crates}"
 calls="$(grep -rnE --include='*.rs' '(set_var|remove_var|env_clear|env_remove)' "$src")"
 rc=$?
 if [ ! -d "$src" ] || [ "$rc" -gt 1 ]; then
@@ -59,13 +70,13 @@ if [ -n "$overrides" ]; then
 fi
 
 # Build under the real HOME, so the moved HOME sees only test runs.
-cargo test --locked --no-run "$@" || exit $?
+"$cargo" test --locked --no-run "$@" || exit $?
 
 # The real HOME, and the folders in it that this code base reads or writes.
 # Not the whole .synaps-cli: a live Synaps session writes its session files
 # there all the time, and the gate would fail for a reason that is not the
 # tests.
-real="$HOME"
+real="${DIRTY_HOME_REAL:-$HOME}"
 watched=(.config/axel .cache/axel .cache/velocirag .synaps-cli/memory .synaps-cli/plugins/axel)
 
 home="$(mktemp -d "${TMPDIR:-/tmp}/axel-dirty-home.XXXXXX")" || exit 1
@@ -89,7 +100,7 @@ env -u AXEL_BRAIN \
     XDG_DATA_HOME="$home/.local/share" \
     XDG_STATE_HOME="$home/.local/state" \
     XDG_RUNTIME_DIR="$home/.runtime" \
-    cargo test --locked "$@" || status=$?
+    "$cargo" test --locked "$@" || status=$?
 
 # The gate must fail when it could not look: a moved HOME that is gone, or a
 # `find` that failed, is not "still empty".
