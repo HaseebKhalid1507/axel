@@ -523,7 +523,9 @@ pub fn signer(conn: &Connection) -> Result<Option<MemorySigner>> {
 // SPEC: 1134 takes `created_ms` from `m.created` and says nothing of a value that is not
 // a time. The row is still adopted (verify needs a `memory_ext` row per memory), with the
 // time of adoption and `observed`.
-fn created_ms(created: &Value) -> (i64, &'static str) {
+// RULING: v2 c19 round, foreman item 1: `pub(crate)`, so that `import`'s catch-up reads
+// `created` by this function and not by a copy of it.
+pub(crate) fn created_ms(created: &Value) -> (i64, &'static str) {
     if let Value::Text(s) = created {
         if let Ok(t) = DateTime::parse_from_rfc3339(s) {
             return (t.timestamp_millis(), "exact");
@@ -600,6 +602,21 @@ pub(crate) fn text_at(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Opt
     })
 }
 
+/// `memories.created` as `created_ms` takes it: a text that is not valid UTF-8 is `Null`,
+/// every other value as SQLite holds it.
+// RULING: v2 c19 round, foreman item 1: read with `get_ref`, never `get::<Value>`: rusqlite
+// 0.32 panics on a text that is not UTF-8. Such a `created` is not a time: `created_ms`
+// gives it the time of adoption and `observed`.
+pub(crate) fn created_at(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Value> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(bytes) => match std::str::from_utf8(bytes) {
+            Ok(s) => Value::Text(s.to_string()),
+            Err(_) => Value::Null,
+        },
+        other => Value::from(other),
+    })
+}
+
 fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<Adoption> {
     let model: Option<String> = conn
         .query_row(
@@ -630,7 +647,8 @@ fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<Adoption> {
                 ValueRef::Blob(bytes) => Some(bytes.to_vec()),
                 _ => None,
             };
-            orphans.push(Orphan { id, content, created: r.get(2)?, shadow: r.get(3)?, embedding });
+            // RULING: v2 c19 round, foreman item 1: `created_at`, not `r.get(2)`.
+            orphans.push(Orphan { id, content, created: created_at(r, 2)?, shadow: r.get(3)?, embedding });
         }
     }
 

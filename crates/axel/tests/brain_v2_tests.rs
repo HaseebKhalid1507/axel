@@ -1086,6 +1086,51 @@ fn f5_an_unreadable_memory_is_skipped_and_counted_and_the_rest_are_adopted() {
     assert_eq!(brain_v2::open_v2(&path, &opts(false)).unwrap().unreadable_memories, 3);
 }
 
+// RULING: v2 c19 round, foreman item 1: a `created` that is text but not UTF-8 is not a
+// time. `open_v2` adopts the row, with the time of adoption and `observed`, and does not panic.
+#[test]
+fn c19_a_created_that_is_not_utf8_is_adopted_as_observed() {
+    let dir = TempDir::new().unwrap();
+    let (path, a, b) = legacy_file(&dir);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute("UPDATE memories SET created = CAST(x'FF' AS TEXT) WHERE id = ?1", [&a.id]).unwrap();
+    let created = |c: &Connection| -> (String, String) {
+        c.query_row("SELECT typeof(created), hex(created) FROM memories WHERE id = ?1", [&a.id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap()
+    };
+    assert_eq!(created(&conn), ("text".to_string(), "FF".to_string()));
+    drop(conn);
+
+    let now_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let started_ms = now_ms();
+    let opened = std::panic::catch_unwind(|| brain_v2::open_v2(&path, &opts(true)));
+    let brain = match opened {
+        Ok(Ok(brain)) => brain,
+        Ok(Err(e)) => panic!("the upgrade failed: {e:?}"),
+        Err(_) => panic!("open_v2 panicked on a created that is not UTF-8"),
+    };
+    let ended_ms = now_ms();
+    let conn = &brain.conn;
+    assert_eq!(count(conn, "PRAGMA user_version"), 1);
+    assert_eq!(brain.unreadable_memories, 0);
+    assert_eq!(origins(conn), vec![("legacy".to_string(), 2)]);
+    let (ms, source): (i64, String) = conn
+        .query_row("SELECT created_ms, time_source FROM memory_ext WHERE mem_id = ?1", [&a.id], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(source, "observed");
+    assert!((started_ms..=ended_ms).contains(&ms), "{ms}");
+    assert_eq!(count_id(conn, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = ?1", &a.id), 1);
+    assert_eq!(
+        count_id(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = ?1 AND time_source = 'exact'", &b.id),
+        1
+    );
+    assert_eq!(created(conn), ("text".to_string(), "FF".to_string()), "memories.created was changed");
+}
+
 // ── Review findings 7 and 8 ──────────────────────────────────────────────
 
 /// A source file in SQLite's default journal mode: one table, one row, no side file.
