@@ -1219,6 +1219,7 @@ fn reply(mark: &str) -> String {
 }
 
 /// An archive file of chat `session`, as core writes it.
+#[derive(Clone)]
 struct Arch {
     id: String,
     logical: String,
@@ -2259,13 +2260,14 @@ fn forget_now_deletes_nothing_when_a_row_it_would_hide_changes_while_it_asks() {
     let row: String = world.db().query_row("SELECT id FROM memories WHERE content LIKE '%and more%'", [], |r| r.get(0)).unwrap();
     assert_eq!(visible_with(world.db(), "and more"), 1);
     let run = forget_now_meanwhile(&world.path(), &[&id], || {
-        tx(world.db(), || store::hide(world.db(), &row, "model:other").unwrap());
+        // A person's hide (round 4, item 4: a model's would give way to `cli:unproven`).
+        tx(world.db(), || store::hide(world.db(), &row, "cli").unwrap());
     });
     let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{}", run.out));
     assert!(run.out[doubt..].contains(&format!("m:{row}")), "the row was not listed to be hidden: the test proves nothing: {}", run.out);
     assert_eq!(run.code, 75, "{}{}", run.out, run.err);
     assert!(world.has_row(&id));
-    assert_eq!(hidden_by_with(world.db(), "EVENTFIRST"), [Some("model:other".to_string()), Some("cli".to_string())]);
+    assert_eq!(hidden_by_with(world.db(), "EVENTFIRST"), [Some("cli".to_string()), Some("cli".to_string())]);
 }
 
 /// v2 c18b review round 3, item 2: an archived row deleted by its own id (a model hid it)
@@ -2475,4 +2477,43 @@ fn the_rest_of_a_long_split_turn_is_hidden_when_its_first_half_is_taken() {
     let world = split_case_with(Order::BeforeHide, &more);
     assert_eq!(rows_with(world.db(), "SPLITFIRST"), 0, "the first half was not proven and taken: the test proves nothing");
     assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "the second half stayed visible");
+}
+
+/// v2 c18b review round 4, item 4: a same-key row a model hid (or a pause) is taken over as
+/// `cli:unproven` at `forget --now`, listed first; and a replaced file's carried hide by a
+/// model gives way to `cli:unproven` too.
+#[test]
+fn a_model_or_pause_hide_of_a_same_key_row_gives_way_to_cli_unproven() {
+    const PROMPT: &str = "continue with the plan we made for the ledger migration";
+    for by in ["model:s-row", "pause"] {
+        let mut world = Indexed::new();
+        let old = Arch::new(61, "s-yield", T0).turn(PROMPT, &reply("YIELDOTHER")).about("deploy window");
+        world.file(&old);
+        world.scan();
+        let other = model_hid(&world, "YIELDOTHER");
+        world.db().execute("UPDATE memory_ext SET hidden_by = ?1 WHERE mem_id = ?2", params![by, other]).unwrap();
+        let mut cap = capture("mem_cap_yield", "s-yield", &key_of(PROMPT));
+        cap.project = scope();
+        // Within the file's mark stretch, so that its re-read sees the mark as near.
+        cap.created_ms = T0 + 5_000;
+        cap.content = format!("User: {PROMPT}\nAssistant: {}", reply("YIELDGONE"));
+        cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+        world.put(&cap);
+        let run = forget_cmd(&world.path(), &["mem_cap_yield"], true, false, "y\n");
+        assert_eq!(run.code, 0, "{by}: {}{}", run.out, run.err);
+        let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{by}: {}", run.out));
+        assert!(run.out[doubt..].contains(&format!("m:{other}")), "{by}: not listed: {}", run.out);
+        assert_eq!(hidden_by_with(world.db(), "YIELDOTHER"), [Some("cli:unproven".to_string())], "{by}");
+
+        // Index time: the row brought back and hidden by a model, its file replaced.
+        let back = restore_ids(&world.path(), &[&other]);
+        assert_eq!(back.code, 0, "{}", back.err);
+        model_hid(&world, "YIELDOTHER");
+        world.db().execute("UPDATE memory_ext SET hidden_by = ?1 WHERE mem_id = ?2", params![by, other]).unwrap();
+        world.file(&old.clone().about("lunch order"));
+        world.scan();
+        assert!(rows_with(world.db(), "lunch order") > 0, "{by}: the file was not read again: the test proves nothing");
+        let unproven: i64 = world.db().query_row("SELECT cli_unproven FROM archive_index", [], |r| r.get(0)).unwrap();
+        assert_eq!(hidden_by_with(world.db(), "YIELDOTHER"), [Some("cli:unproven".to_string())], "{by}: replaced file {unproven}");
+    }
 }

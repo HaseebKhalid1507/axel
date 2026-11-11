@@ -910,9 +910,13 @@ fn index_archive(
                 // RULING: v2 c18b review round 3, item 1. A unit with the key of a deleted
                 // turn that its text does not prove that turn is born hidden: a miss of the
                 // hash never brings deleted text back into recall.
-                hidden: carried.get(&pos).cloned().or_else(|| twin_of(unit)).or_else(|| {
-                    unproven[at_unit].then(|| (now, UNPROVEN.to_string()))
-                }),
+                // RULING: v2 c18b review round 4, item 4: a carried hide by a model or a pause
+                // gives way to `cli:unproven`.
+                hidden: match carried.get(&pos) {
+                    Some((_, by)) if unproven[at_unit] && yields_to_unproven(by) => Some((now, UNPROVEN.to_string())),
+                    Some(hide) => Some(hide.clone()),
+                    None => twin_of(unit).or_else(|| unproven[at_unit].then(|| (now, UNPROVEN.to_string()))),
+                },
             };
             match store::insert_row(conn, ctx.signer.as_ref(), &new)? {
                 Inserted::New { .. } | Inserted::Exists => rows_indexed += 1,
@@ -2479,23 +2483,41 @@ pub fn rest_of_turn(conn: &Connection, id: &str) -> Result<Option<String>> {
     rest_of(conn, &scope_dir, &files, &archive_id, id)
 }
 
-/// Hides as `cli:unproven` each of `ids` that is a visible archive row and is not in
-/// `taken`, counts it in its archive's `cli_unproven`, and adds it to `hidden`.
+/// Whether a hide gives way to `cli:unproven`: one by a model or a pause, which
+/// `restore --by-model` or `resume` would lift without a word about the deleted turn.
+// RULING: v2 c18b review round 4, item 4.
+pub fn yields_to_unproven(hidden_by: &str) -> bool {
+    hidden_by == "pause" || hidden_by.starts_with("model:")
+}
+
+/// Hides as `cli:unproven` each of `ids` that is an archive row, visible or hidden by a
+/// model or a pause (`yields_to_unproven`), and is not in `taken`; counts it in its
+/// archive's `cli_unproven`, and adds it to `hidden`.
 pub fn hide_unproven(conn: &Connection, ids: &[String], taken: &[String], hidden: &mut Vec<String>) -> Result<()> {
     for id in ids {
         if taken.contains(id) || hidden.contains(id) {
             continue;
         }
-        let row: Option<(String, String)> = conn
+        let row: Option<(String, String, Option<String>)> = conn
             .query_row(
-                "SELECT e.origin_ref, m.project_key FROM memory_ext e JOIN memories m ON m.id = e.mem_id
-                  WHERE e.mem_id = ?1 AND e.origin_kind = 'archive' AND e.hidden_ms IS NULL",
+                "SELECT e.origin_ref, m.project_key, CASE WHEN e.hidden_ms IS NULL THEN NULL ELSE COALESCE(e.hidden_by, '') END
+                   FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                  WHERE e.mem_id = ?1 AND e.origin_kind = 'archive'",
                 [id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        let Some((archive_id, scope_dir)) = row else { continue };
-        if store::hide(conn, id, UNPROVEN)? > 0 {
+        let Some((archive_id, scope_dir, by)) = row else { continue };
+        let done = match by {
+            None => store::hide(conn, id, UNPROVEN)?,
+            // Already hidden, its shadow already marked: only who hid it, and when, change.
+            Some(by) if yields_to_unproven(&by) => conn.execute(
+                "UPDATE memory_ext SET hidden_by = ?1, hidden_ms = ?2 WHERE mem_id = ?3 AND hidden_by = ?4",
+                params![UNPROVEN, chrono::Utc::now().timestamp_millis(), id, by],
+            )?,
+            Some(_) => 0,
+        };
+        if done > 0 {
             conn.execute(
                 "UPDATE archive_index SET cli_unproven = cli_unproven + 1
                   WHERE scope_dir = ?1 AND archive_id = ?2 AND state = 'indexed'",
