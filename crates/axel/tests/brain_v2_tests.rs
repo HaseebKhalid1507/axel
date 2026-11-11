@@ -466,6 +466,42 @@ fn t04_upgrade_v1_keeps_every_row_and_adopts_the_memories_with_their_vectors() {
     let dir = TempDir::new().unwrap();
     let (path, a, b) = legacy_file(&dir);
 
+    // More memories, with no shadow document: a content whose hash differs with and without
+    // `normalise`, and every way a `created` can be written, with one that is not a time.
+    let spaced = remember_plain(&path, "spaced note", "two  spaces\tand a tab");
+    const INSTANT_MS: i64 = 1_709_618_828_000; // 2024-03-05T06:07:08Z
+    let times: [(&str, Option<i64>); 6] = [
+        ("2024-03-05T06:07:08Z", Some(INSTANT_MS)),
+        ("2024-03-05T08:07:08+02:00", Some(INSTANT_MS)),
+        ("2024-03-05T06:07:08.123456789+00:00", Some(INSTANT_MS + 123)),
+        ("2024-03-05T06:07:08.5Z", Some(INSTANT_MS + 500)),
+        ("2024-03-05 06:07:08", Some(INSTANT_MS)),
+        ("last tuesday", None),
+    ];
+    let raw = Connection::open(&path).unwrap();
+    let timed: Vec<Memory> = times
+        .iter()
+        .enumerate()
+        .map(|(i, (created, _))| {
+            let m = remember_plain(&path, &format!("time {i}"), &format!("time format number {i}"));
+            raw.execute("UPDATE memories SET created = ?1 WHERE id = ?2", params![created, m.id]).unwrap();
+            m
+        })
+        .collect();
+    raw.execute("INSERT INTO context_data(key, value, layer) VALUES ('kept', 'x', 'axel')", []).unwrap();
+
+    // The vectors and the row counts as the file has them before the upgrade.
+    let vector_before = |id: &str| -> Vec<u8> {
+        raw.query_row("SELECT embedding FROM documents WHERE doc_id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    let vectors = [vector_before(&a.id), vector_before(&b.id)];
+    assert_eq!(vectors[0].len(), velocirag::EMBEDDING_DIM * 4);
+    assert_ne!(vectors[0], vectors[1]);
+    let counts_before = table_counts(&raw);
+    drop(raw);
+    let now_ms = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as i64;
+    let started_ms = now_ms();
+
     let brain = brain_v2::open_v2(&path, &opts(true)).unwrap();
     let conn = &brain.conn;
     assert_eq!(brain.embedder_model, DEFAULT_EMBEDDER, "the model the old brain recorded");
@@ -473,7 +509,15 @@ fn t04_upgrade_v1_keeps_every_row_and_adopts_the_memories_with_their_vectors() {
     assert_eq!(count(conn, "SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'"), 2);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM documents"), 3);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM chunks_fts"), 3);
-    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 2);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 9);
+    // Every table the old file had keeps its number of rows. (The tables a word index keeps
+    // for itself are merged by `optimize`; `chunks_fts` is counted above.)
+    let counts_after = table_counts(conn);
+    assert!(counts_before.iter().any(|(name, rows)| name == "context_data" && *rows == 1));
+    for (name, before) in counts_before.iter().filter(|(name, _)| !name.contains("_fts")) {
+        let after = counts_after.iter().find(|(n, _)| n == name).map(|(_, rows)| *rows);
+        assert_eq!(after, Some(*before), "table {name}");
+    }
     for table in V2_TABLES {
         assert_eq!(
             count_id(conn, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", table),
@@ -528,9 +572,61 @@ fn t04_upgrade_v1_keeps_every_row_and_adopts_the_memories_with_their_vectors() {
 
         assert_eq!(word_hits(conn, word), vec![memory.id.clone()], "word {word}");
     }
-    // The two vectors are different ones: each memory got its own.
+    // The two vectors are different ones: each memory got its own, and it is the bytes the
+    // old file had, in `memory_ext` and still in the shadow document.
     assert_eq!(count(conn, "SELECT COUNT(DISTINCT embedding) FROM memory_ext"), 2);
-    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 2);
+    for (memory, before) in [&a, &b].into_iter().zip(&vectors) {
+        let (ext, doc): (Vec<u8>, Vec<u8>) = conn
+            .query_row(
+                "SELECT e.embedding, d.embedding FROM memory_ext e JOIN documents d ON d.doc_id = e.mem_id
+                 WHERE e.mem_id = ?1",
+                [&memory.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert!(ext == *before, "memory_ext's vector is not the bytes the old file had");
+        assert!(doc == *before, "the shadow document's vector changed");
+    }
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 9);
+
+    // The hash is of the normalised content; the content itself is kept as it was. With no
+    // shadow document there is no vector and no model.
+    let (stored, hash, vectorless): (String, String, bool) = conn
+        .query_row(
+            "SELECT m.content, e.content_hash, e.embedding IS NULL AND e.embed_model IS NULL
+             FROM memories m JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
+            [&spaced.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(stored, "two  spaces\tand a tab");
+    assert_eq!(hash, hex::encode(Sha256::digest(b"two spaces and a tab")));
+    assert_ne!(hash, hex::encode(Sha256::digest(stored.as_bytes())));
+    assert!(vectorless);
+
+    // Every format of `created`.
+    let ended_ms = now_ms();
+    for ((created, expected), memory) in times.iter().zip(&timed) {
+        let (kept, ms, source): (String, i64, String) = conn
+            .query_row(
+                "SELECT m.created, e.created_ms, e.time_source
+                 FROM memories m JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
+                [&memory.id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(kept, *created, "memories.created was changed");
+        match expected {
+            Some(expected) => {
+                assert_eq!(ms, *expected, "created {created:?}");
+                assert_eq!(source, "exact", "created {created:?}");
+            }
+            None => {
+                assert!((started_ms..=ended_ms).contains(&ms), "created {created:?}: {ms}");
+                assert_eq!(source, "observed", "created {created:?}");
+            }
+        }
+    }
 }
 
 // ── Review finding 1: migration 1 adopts what it finds, as `legacy` ─────
@@ -847,6 +943,11 @@ fn t18_the_indexer_stands_aside_for_the_front() {
                 brain_v2::stand_aside(&writing);
                 brain_v2::begin_write(&conn).unwrap();
                 conn.execute(put, params!["indexer", rounds.to_string()]).unwrap();
+                // The indexer holds the write lock for 30 ms and asks for it again at once.
+                // The gap between its transactions is far shorter than the steps in which a
+                // waiting connection asks again, so without `stand_aside` the front's busy
+                // timeout (1,500 ms) runs out and `begin_write_front` below fails.
+                std::thread::sleep(Duration::from_millis(30));
                 conn.execute_batch("COMMIT").unwrap();
                 rounds += 1;
             }
@@ -876,6 +977,8 @@ fn t18_the_indexer_stands_aside_for_the_front() {
             let took = start.elapsed();
             assert!(took < Duration::from_millis(1_500), "front write {i} took {took:?}");
             assert!(!writing.load(Ordering::SeqCst), "the flag after write {i}");
+            // The indexer gets a turn between two front writes.
+            std::thread::sleep(Duration::from_millis(5));
         }
 
         // The closure returned an error: the guard still clears the flag.
@@ -1021,6 +1124,80 @@ fn f8_open_source_refuses_a_log_it_cannot_rule_out() {
     std::fs::write(side(&hot, "-journal"), b"not empty").unwrap();
     let message = refused(&hot, "a non-empty -journal");
     assert!(message.contains("non-empty -journal"), "{message}");
+}
+
+/// The names and sizes in a folder, sorted.
+fn listing(folder: &Path) -> Vec<(String, u64)> {
+    let mut entries: Vec<(String, u64)> = std::fs::read_dir(folder)
+        .unwrap()
+        .map(|e| {
+            let e = e.unwrap();
+            (e.file_name().to_string_lossy().into_owned(), e.metadata().unwrap().len())
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn open_source_cannot_write_lock_or_make_a_side_file() {
+    let dir = TempDir::new().unwrap();
+
+    // A brain as the old binary leaves it: WAL mode, closed, no side file.
+    let folder = dir.path().join("old");
+    std::fs::create_dir(&folder).unwrap();
+    let path = folder.join("brain.r8");
+    drop(Brain::create(&path, Some("old")).unwrap());
+    let memory = remember_plain(&path, "kept", "the source row is read and not touched");
+    assert!(side_files(&path).is_empty(), "{:?}", side_files(&path));
+    let (hash, before) = (main_hash(&path), listing(&folder));
+    let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+    assert_eq!(before.len(), 1);
+
+    let source = brain_v2::open_source(&path).unwrap();
+    let content: String =
+        source.query_row("SELECT content FROM memories WHERE id = ?1", [&memory.id], |r| r.get(0)).unwrap();
+    assert_eq!(content, memory.content);
+    assert_eq!(listing(&folder), before, "a read made a side file");
+    // It cannot write.
+    assert!(source.execute("INSERT INTO context_data(key, value, layer) VALUES ('k', 'v', 'axel')", []).is_err());
+    assert!(source.execute_batch("CREATE TABLE made(x)").is_err());
+    assert!(source.execute_batch("PRAGMA user_version = 5").is_err());
+    assert_eq!(listing(&folder), before, "a refused write made a side file");
+    drop(source);
+    assert_eq!(listing(&folder), before);
+    assert_eq!(main_hash(&path), hash);
+    assert_eq!(std::fs::metadata(&path).unwrap().modified().unwrap(), modified);
+
+    // The file itself may not be a link.
+    let link = dir.path().join("link.r8");
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(brain_v2::open_source(&link).is_err(), "a source that is a link was opened");
+
+    // It holds no lock. A file in rollback-journal mode shows it: there a reader in the
+    // middle of a read keeps every other connection from the exclusive lock.
+    let plain = plain_source(dir.path(), "plain.db");
+    let (hash, before) = (main_hash(&plain), listing(dir.path()));
+    let other = Connection::open(&plain).unwrap();
+    other.busy_timeout(Duration::ZERO).unwrap();
+    {
+        // The control: an ordinary read-only connection does hold a lock.
+        let reader = Connection::open_with_flags(&plain, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let mut stmt = reader.prepare("SELECT body FROM notes").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        assert!(other.execute_batch("BEGIN EXCLUSIVE").is_err(), "the control reader held no lock");
+    }
+    {
+        let source = brain_v2::open_source(&plain).unwrap();
+        let mut stmt = source.prepare("SELECT body FROM notes").unwrap();
+        let mut rows = stmt.query([]).unwrap();
+        assert!(rows.next().unwrap().is_some());
+        other.execute_batch("BEGIN EXCLUSIVE; ROLLBACK;").expect("open_source held a lock in the middle of a read");
+    }
+    drop(other);
+    assert_eq!(listing(dir.path()), before);
+    assert_eq!(main_hash(&plain), hash);
 }
 
 #[test]
@@ -1217,6 +1394,10 @@ fn t20_the_word_index_fill_inserts_only_the_missing_rows() {
     conn.execute("UPDATE memories SET sensitivity = 'secret' WHERE id = ?1", [&secret.id]).unwrap();
     let words = |id: &str| count_id(conn, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = ?1", id);
     assert_eq!(words(&fourth.id), 0);
+    // A word row that no longer says what its memory says: a rebuild from `memories` would
+    // put "with words" back, the fill must leave it.
+    conn.execute("UPDATE memories_fts SET title = 'marked sentinel' WHERE mem_id = ?1", [&with_words[0].id]).unwrap();
+    assert_eq!(rowid(&with_words[0].id), rowids[0]);
     assert!(word_hits(conn, "wombat").is_empty());
 
     // No row here has a memory_ext row yet: all five are adopted.
@@ -1229,6 +1410,11 @@ fn t20_the_word_index_fill_inserts_only_the_missing_rows() {
         assert_eq!(words(&m.id), 1);
     }
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 5);
+    let title: String = conn
+        .query_row("SELECT title FROM memories_fts WHERE mem_id = ?1", [&with_words[0].id], |r| r.get(0))
+        .unwrap();
+    assert_eq!(title, "marked sentinel", "the fill rebuilt a word row that was there");
+    assert_eq!(word_hits(conn, "sentinel"), vec![with_words[0].id.clone()]);
 
     // The secret row: a title-only row.
     let (title, abstract_text, content): (String, String, String) = conn
