@@ -201,7 +201,6 @@ fn levenshtein(a: &str, b: &str) -> usize {
 mod tests {
     use super::*;
     use crate::memory::{Memory, MemoryCategory};
-    use std::collections::HashSet;
 
     fn valid_memory() -> Memory {
         Memory::new(
