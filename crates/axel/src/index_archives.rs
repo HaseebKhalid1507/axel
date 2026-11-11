@@ -3,8 +3,52 @@
 
 use rusqlite::Connection;
 
+use crate::brain_v2;
 use crate::error::Result;
 use crate::ext::types::{IndexerCtx, Job};
+
+/// A purge in this transaction forgot text: the write-ahead log still holds the frames
+/// written when the row was inserted, and an automatic checkpoint does not shorten it.
+/// Called INSIDE the transaction of every purge that forgets, on any thread, before its
+/// `COMMIT`; the indexer then truncates the log at its next idle turn
+/// ([`checkpoint_after_purge`]). A row and not a field, so that a purge made by the front
+/// thread or the command line, or just before a crash, is seen too (section 2.7).
+pub fn mark_purged(conn: &Connection) -> Result<()> {
+    conn.execute(
+        "INSERT OR REPLACE INTO context_data(key, layer, value) VALUES('purge_pending', 'axel', '1')",
+        [],
+    )?;
+    Ok(())
+}
+
+/// The indexer's idle turn (called by `indexer::run` through `guarded`): when a purge is
+/// pending, `wal_checkpoint(TRUNCATE)`; when the checkpoint was not blocked, the mark is
+/// deleted in one small transaction, whose frame holds no text. When it was blocked
+/// (`busy` is 1) the mark stays and the next idle turn tries again (section 2.7).
+pub fn checkpoint_after_purge(ctx: &mut IndexerCtx) -> Result<()> {
+    let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+    let pending: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM context_data WHERE key = 'purge_pending' AND layer = 'axel')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !pending {
+        return Ok(());
+    }
+    let busy: i64 = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get(0))?;
+    if busy != 0 {
+        return Ok(());
+    }
+    brain_v2::begin_write(conn)?;
+    let cleared = conn
+        .execute("DELETE FROM context_data WHERE key = 'purge_pending' AND layer = 'axel'", [])
+        .and_then(|_| conn.execute_batch("COMMIT"));
+    if let Err(e) = cleared {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(e.into());
+    }
+    Ok(())
+}
 
 // SPEC: 4789-4792 name `index_archives::on_job`, `on_forgotten` and `scan` without
 // signatures (1780 writes `index_archives::scan(base)`, but a scan writes rows and needs

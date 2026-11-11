@@ -29,7 +29,10 @@ pub fn run(mut ctx: IndexerCtx, rx: Receiver<Job>) {
                     return;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
+            // No job for a second: the idle turn. A purge that forgot text left a mark;
+            // the log is truncated now (section 2.7; the one edit commit 13a's part makes
+            // in this file).
+            Err(RecvTimeoutError::Timeout) => guarded(&mut ctx, index_archives::checkpoint_after_purge),
             Err(RecvTimeoutError::Disconnected) => return,
         }
         tick(&mut ctx);
