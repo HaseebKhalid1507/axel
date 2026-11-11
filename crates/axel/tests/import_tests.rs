@@ -1859,24 +1859,47 @@ fn f13_catch_up_adopts_by_adoptions_rules() {
     assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-blob-title'"), "exact");
 }
 
-/// A `created` that is text but not UTF-8 would stop `brain_v2`'s adoption with a panic:
-/// `init` refuses the source first, naming the row, and puts nothing at the destination.
+/// A `created` that is text but not UTF-8 is not a time: `init` imports the row, adoption
+/// gives it the time of adoption and `observed`, and the source is not touched. `catch-up`
+/// reads such a `created` by the same function.
+// RULING: v2 c19 round, foreman item 2: was `f13_init_refuses_a_created_that_adoption_cannot_read`.
 #[test]
-fn f13_init_refuses_a_created_that_adoption_cannot_read() {
+fn f13_init_adopts_a_created_that_is_not_utf8_as_observed() {
     let fx = fx();
     make_axel(&fx.old);
     change_axel(&fx.old, |conn| {
         conn.execute_batch("UPDATE memories SET created = CAST(x'c328' AS TEXT) WHERE id = 'mem-aaaa0001'").unwrap();
     });
+    let hash = sha(&fx.old);
     let before = state(&fx.old);
     let out = fx.init(&fx.old);
     show("init, a created that is not UTF-8", &out);
-    assert_eq!(out.code, 3, "{}", out.report);
-    let error = out.report["error"].as_str().unwrap();
-    assert!(error.contains("has 1 memories whose created is text that is not UTF-8 (mem-aaaa0001)"), "{error}");
-    assert!(out.report["temporary_copy_deleted"].is_string(), "{}", out.report);
-    assert!(listing(fx.new.parent().unwrap()).is_empty());
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["unreadable_memories"], 0, "{}", out.report);
+    assert_eq!(sha(&fx.old), hash, "the source was changed");
     assert_eq!(state(&fx.old), before);
+    let new = Connection::open(&fx.new).unwrap();
+    assert_eq!(text(&new, "SELECT hex(created) FROM memories WHERE id = 'mem-aaaa0001'"), "C328");
+    assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-aaaa0001'"), "observed");
+    assert_eq!(text(&new, "SELECT origin_kind FROM memory_ext WHERE mem_id = 'mem-aaaa0001'"), "legacy");
+    assert_eq!(count(&new, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = 'mem-aaaa0001'"), 1);
+    assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-bbbb0002'"), "exact");
+    drop(new);
+
+    change_axel(&fx.old, |conn| {
+        conn.execute_batch(
+            "INSERT INTO memories(id, category, topic, title, content, created)
+                  VALUES ('mem-late-ff', 'events', 'sea', 'late', 'the grebe dove under the pier', CAST(x'ff' AS TEXT));",
+        )
+        .unwrap();
+    });
+    let out = fx.catch_up();
+    show("catch-up, a created that is not UTF-8", &out);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["memories"]["brought"], 1);
+    let new = Connection::open(&fx.new).unwrap();
+    assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-late-ff'"), "observed");
+    assert_eq!(word_hits(&new, "grebe"), ["mem-late-ff"]);
 }
 
 // ── Guards the review found untested (its answer 6) ─────────────────────────
