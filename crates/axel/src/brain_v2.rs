@@ -268,6 +268,16 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
             {
                 return Err(AxelError::V1Brain(path.to_path_buf()))
             }
+            // RULING: wave2-c4-review finding 3: the spec leaves this file to `Brain::open`,
+            // which sets `journal_mode=WAL` before it reads the version and then answers
+            // `SchemaMismatch`. A `brain_meta` version that is neither 1 nor 2 is refused
+            // here, before any pragma, as `BrainDamaged` so that `degrade_on` acts on it.
+            Some(v) if v != i64::from(SCHEMA_VERSION) && v != i64::from(V2_SCHEMA_VERSION) => {
+                return Err(AxelError::BrainDamaged(format!(
+                    "{} says brain_meta schema version {v}; this binary reads {SCHEMA_VERSION} and {V2_SCHEMA_VERSION}",
+                    path.display()
+                )))
+            }
             Some(_) => {}
         }
     }

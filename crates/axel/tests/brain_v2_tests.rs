@@ -101,6 +101,25 @@ fn checkpoint_truncate(conn: &Connection, path: &Path) {
     assert_eq!(wal, 0, "TRUNCATE must leave an empty log");
 }
 
+/// The side files that exist beside `path`.
+fn side_files(path: &Path) -> Vec<&'static str> {
+    ["-wal", "-shm", "-journal"]
+        .into_iter()
+        .filter(|suffix| Path::new(&format!("{}{suffix}", path.display())).exists())
+        .collect()
+}
+
+/// Takes the file out of WAL mode. On a WAL file every pragma of an opener is a no-op, so
+/// only a file in `delete` mode shows a `journal_mode=WAL` that was set before a refusal:
+/// it rewrites the header and leaves `-wal` and `-shm`.
+fn to_delete_mode(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    let mode: String = conn.query_row("PRAGMA journal_mode=DELETE", [], |r| r.get(0)).unwrap();
+    assert_eq!(mode, "delete");
+    drop(conn);
+    assert!(side_files(path).is_empty(), "{:?}", side_files(path));
+}
+
 /// A version 1 brain as `Brain::create` makes it: no rows, no velocirag tables.
 fn v1_empty(dir: &TempDir, name: &str) -> PathBuf {
     let path = dir.path().join(name);
@@ -232,6 +251,7 @@ fn t03_a_newer_or_unreadable_file_is_refused_unwritten() {
     let conn = Connection::open(&newer).unwrap();
     conn.execute_batch("PRAGMA user_version = 99").unwrap();
     drop(conn);
+    to_delete_mode(&newer);
     let hash = main_hash(&newer);
     match brain_v2::open_v2(&newer, &opts(false)) {
         Err(AxelError::BrainTooNew { file: 99, binary: 1 }) => {}
@@ -239,8 +259,11 @@ fn t03_a_newer_or_unreadable_file_is_refused_unwritten() {
         Ok(_) => panic!("expected BrainTooNew, got a brain"),
     }
     assert!(matches!(brain_v2::require_v2(&newer), Err(AxelError::BrainTooNew { file: 99, binary: 1 })));
-    assert!(matches!(brain_v2::connect(&newer, Role::Cli), Err(AxelError::BrainNotReady)));
+    for role in [Role::Indexer, Role::Front, Role::Cli] {
+        assert!(matches!(brain_v2::connect(&newer, role), Err(AxelError::BrainNotReady)), "{role:?}");
+    }
     assert_eq!(main_hash(&newer), hash);
+    assert!(side_files(&newer).is_empty(), "{:?}", side_files(&newer));
 
     // Random bytes: a fixed generator, so the file is the same on every run.
     let noise = dir.path().join("noise.r8");
@@ -260,8 +283,73 @@ fn t03_a_newer_or_unreadable_file_is_refused_unwritten() {
     }
     assert!(matches!(brain_v2::open_v2(&noise, &opts(true)), Err(AxelError::BrainDamaged(_))));
     assert!(matches!(brain_v2::require_v2(&noise), Err(AxelError::BrainDamaged(_))));
+    for role in [Role::Indexer, Role::Front, Role::Cli] {
+        match brain_v2::connect(&noise, role) {
+            Err(AxelError::BrainDamaged(_)) => {}
+            Err(e) => panic!("connect {role:?}: expected BrainDamaged, got {e:?}"),
+            Ok(_) => panic!("connect {role:?}: expected BrainDamaged, got a connection"),
+        }
+    }
     assert_eq!(main_hash(&noise), hash);
     assert_eq!(std::fs::read(&noise).unwrap(), bytes);
+    assert!(side_files(&noise).is_empty(), "{:?}", side_files(&noise));
+
+    // A file SQLite reads that is not a brain, in SQLite's own default journal mode.
+    let plain = dir.path().join("plain.db");
+    let conn = Connection::open(&plain).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE notes(id INTEGER PRIMARY KEY, body TEXT);
+         INSERT INTO notes(body) VALUES ('not a brain');",
+    )
+    .unwrap();
+    drop(conn);
+    assert!(side_files(&plain).is_empty());
+    let hash = main_hash(&plain);
+    for upgrade in [false, true] {
+        match brain_v2::open_v2(&plain, &opts(upgrade)) {
+            Err(AxelError::BrainDamaged(_)) => {}
+            Err(e) => panic!("open_v2: expected BrainDamaged, got {e:?}"),
+            Ok(_) => panic!("open_v2: expected BrainDamaged, got a brain"),
+        }
+    }
+    assert!(matches!(brain_v2::require_v2(&plain), Err(AxelError::BrainNotReady)));
+    for role in [Role::Indexer, Role::Front, Role::Cli] {
+        assert!(matches!(brain_v2::connect(&plain, role), Err(AxelError::BrainNotReady)), "{role:?}");
+    }
+    assert_eq!(main_hash(&plain), hash);
+    assert!(side_files(&plain).is_empty(), "{:?}", side_files(&plain));
+}
+
+// ── Review finding 3: a brain_meta version that is neither 1 nor 2 ──────
+
+#[test]
+fn f3_an_unknown_brain_meta_version_is_refused_before_any_pragma() {
+    for version in [0, 3, 7] {
+        let dir = TempDir::new().unwrap();
+        let path = v1_empty(&dir, "odd.r8");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute(
+            "UPDATE brain_meta SET value = json_set(value, '$.schema_version', ?1) WHERE key = 'meta'",
+            [version],
+        )
+        .unwrap();
+        drop(conn);
+        to_delete_mode(&path);
+        let bytes = std::fs::read(&path).unwrap();
+
+        for upgrade in [false, true] {
+            let err = match brain_v2::open_v2(&path, &opts(upgrade)) {
+                Err(e) => e,
+                Ok(_) => panic!("version {version}: expected a refusal, got a brain"),
+            };
+            assert!(matches!(err, AxelError::BrainDamaged(_)), "version {version}: {err:?}");
+            let (status, mode) = (Status::default(), AtomicU8::new(Mode::Ready as u8));
+            assert!(brain_v2::degrade_on(&err, &status, &mode), "version {version}: {err:?}");
+            assert_eq!(Mode::from_u8(mode.load(Ordering::SeqCst)), Some(Mode::Degraded));
+        }
+        assert!(std::fs::read(&path).unwrap() == bytes, "version {version}: the refused file was written");
+        assert!(side_files(&path).is_empty(), "version {version}: {:?}", side_files(&path));
+    }
 }
 
 // ── 4 ───────────────────────────────────────────────────────────────────
@@ -463,11 +551,13 @@ fn t05_connect_refuses_version_0_and_begin_write_sees_a_changed_version() {
     let dir = TempDir::new().unwrap();
 
     let old = v1_empty(&dir, "v0.r8");
+    to_delete_mode(&old);
     let hash = main_hash(&old);
     for role in [Role::Indexer, Role::Front, Role::Cli] {
         assert!(matches!(brain_v2::connect(&old, role), Err(AxelError::BrainNotReady)), "{role:?}");
     }
     assert_eq!(main_hash(&old), hash, "connect wrote to a brain it refused");
+    assert!(side_files(&old).is_empty(), "{:?}", side_files(&old));
 
     // A missing file is an error and is not created.
     let missing = dir.path().join("missing.r8");
