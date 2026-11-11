@@ -1995,3 +1995,21 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
     assert!(answer.starts_with(&format!("Hidden m:{id}.")), "{answer}");
     assert_eq!(hidden_by(lab.conn(), &id), Some("model:S".to_string()));
 }
+
+// ── The second look at 18a (v2 c18a review round 2, items 1 to 5) ──────────
+
+// RULING: v2 c18a review round 2, item 2: a hidden row of any origin keeps R-9g's answer.
+#[test]
+fn rr2_a_hidden_note_file_row_is_not_brought_back_by_saying_it_again() {
+    let mut lab = Lab::new();
+    let (a, dir_a) = (lab.a.clone(), lab.dir_a.clone());
+    let s = lab.chat(&a, "S");
+    let n = "the key to the boathouse hangs behind the tide clock";
+    lab.put(&row("mem_notefilehidden01", "note", &dir_a, "note_file", n));
+    lab.hide("mem_notefilehidden01", "user");
+    let rows = count(lab.conn(), "SELECT COUNT(*) FROM memories");
+    let answer = lab.ok("remember", json!({ "content": n }), &s);
+    assert!(answer.starts_with("This was hidden on ") && answer.contains("mem_notefilehidden01"), "{answer}");
+    assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows, "a new row was stored");
+    assert_eq!(hidden_by(lab.conn(), "mem_notefilehidden01").as_deref(), Some("user"));
+}

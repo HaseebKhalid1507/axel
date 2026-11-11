@@ -490,20 +490,22 @@ fn remember(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<Strin
 
     let saved = write(st, |conn| {
         let read = sql(st, true);
-        // The same text, kind and project, saved by a model, the command line or the old
-        // binary: a hidden row stays hidden (R-9g) and is the answer; a row that is recalled
-        // now is the answer. A superseded, invalidated, expired or secret one is not: a new
-        // row is stored. A hidden one is looked at first.
+        // The same text, kind and project. A hidden row stays hidden (R-9g) and is the answer,
+        // whatever made it; a row saved by a model, the command line or the old binary that is
+        // recalled now is the answer. A superseded, invalidated or expired one is not: a new
+        // row is stored. A hidden one is looked at first. A secret or not standard row is
+        // neither: it is never named.
         // RULING: v2 c18a review, item 2.
+        // RULING: v2 c18a review round 2, item 2: the origin filter is the live branch's only.
         let same: Option<(String, Option<i64>)> = conn
             .query_row(
                 "SELECT m.id, e.hidden_ms FROM memory_ext e JOIN memories m ON m.id = e.mem_id
                   WHERE e.content_hash = :hash AND m.category = :class AND m.project_key = :key
-                    AND e.origin_kind IN ('tool', 'cli', 'legacy')
+                    AND m.sensitivity = 'normal' AND m.retention = 'standard'
                     AND (e.hidden_ms IS NOT NULL
-                         OR (m.superseded_by IS NULL AND m.invalidated_at IS NULL
-                             AND (m.expires_at IS NULL OR m.expires_at > :now)
-                             AND m.sensitivity = 'normal' AND m.retention = 'standard'))
+                         OR (e.origin_kind IN ('tool', 'cli', 'legacy')
+                             AND m.superseded_by IS NULL AND m.invalidated_at IS NULL
+                             AND (m.expires_at IS NULL OR m.expires_at > :now)))
                   ORDER BY e.hidden_ms IS NULL, e.vid LIMIT 1",
                 named_params! { ":hash": content_hash, ":class": class, ":key": project_key, ":now": expiry_text(now) },
                 |r| Ok((r.get(0)?, r.get(1)?)),
