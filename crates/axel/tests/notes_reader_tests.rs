@@ -291,3 +291,60 @@ fn a_missing_file_or_a_link_is_an_io_error() {
     std::os::unix::fs::symlink(fixture(), &link).unwrap();
     assert!(matches!(notes::read_file(&link, KEY), Err(NotesError::Io(_))));
 }
+
+/// Runs `read_file` on another thread: a read that blocks is a failure, not a hung test.
+fn read_within(path: PathBuf, secs: u64) -> Result<notes::NotesFile, NotesError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(notes::read_file(&path, KEY)));
+    rx.recv_timeout(std::time::Duration::from_secs(secs))
+        .expect("read_file returned at once")
+}
+
+/// RULING: wave2-c7 review B3: refused from its size, before anything is read.
+#[test]
+fn a_sparse_file_above_64_mib_is_refused_at_once() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join(format!("project-{KEY}.jsonl"));
+    let size = 65 * 1024 * 1024;
+    fs::File::create(&path).unwrap().set_len(size).unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(read_within(path, 5), Err(NotesError::TooLarge { size }));
+    assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    assert_eq!(notes::MAX_FILE_BYTES, 64 * 1024 * 1024);
+}
+
+/// RULING: wave2-c7 review B4: a FIFO in place of the file neither blocks nor is read.
+#[test]
+fn a_fifo_in_place_of_the_file_returns_at_once() {
+    let tmp = TempDir::new().unwrap();
+    let path = tmp.path().join(format!("project-{KEY}.jsonl"));
+    let made = std::process::Command::new("mkfifo").arg(&path).status();
+    if !made.is_ok_and(|status| status.success()) {
+        eprintln!("mkfifo failed: case skipped");
+        return;
+    }
+    assert!(matches!(read_within(path, 5), Err(NotesError::Io(_))));
+}
+
+/// RULING: wave2-c7 review B4: a symlink in place of the file is not followed, also when it
+/// points at a good notes file.
+#[test]
+fn a_symlink_in_place_of_the_file_is_not_followed() {
+    let tmp = TempDir::new().unwrap();
+    let real = temp_file(&tmp, three().as_bytes());
+    let path = tmp.path().join("project-p2222222222222222.jsonl");
+    std::os::unix::fs::symlink(&real, &path).unwrap();
+    assert!(matches!(read_within(path, 5), Err(NotesError::Io(_))));
+}
+
+/// RULING: wave2-c7 review B4: at most size + 1 bytes are read, and more than the size is a
+/// change. A proc file says 0 bytes and holds more: the case of a file that grew.
+#[test]
+fn more_bytes_than_the_size_is_changed() {
+    let path = PathBuf::from("/proc/self/status");
+    if fs::symlink_metadata(&path).map(|m| m.len()).ok() != Some(0) {
+        eprintln!("no /proc with empty sizes: case skipped");
+        return;
+    }
+    assert_eq!(read_within(path, 5), Err(NotesError::Changed));
+}

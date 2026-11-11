@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
@@ -61,6 +61,9 @@ pub enum NotesError {
     /// The size moved under the read: try next tick.
     #[error("notes file changed during the read")]
     Changed,
+    /// Above [`MAX_FILE_BYTES`]: refused before anything is read.
+    #[error("notes file of {size} bytes is above the limit")]
+    TooLarge { size: u64 },
     #[error("notes file: {0}")]
     Io(String),
 }
@@ -130,6 +133,29 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
         .saturating_add(meta.mtime_nsec())
 }
 
+// RULING: wave2-c7 review B3: over 4,000 notes at core's 16 KiB limit (`store.rs:96`).
+pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
+
+// `O_NOFOLLOW | O_NONBLOCK`. The crate has no `libc`; these are the values of the targets
+// it is built for, and any other target does not compile rather than open without them.
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
+))]
+const OPEN_FLAGS: i32 = 0o400000 | 0o4000;
+#[cfg(all(
+    target_os = "linux",
+    any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc64")
+))]
+const OPEN_FLAGS: i32 = 0o100000 | 0o4000;
+#[cfg(target_os = "macos")]
+const OPEN_FLAGS: i32 = 0x0100 | 0x0004;
+
+/// The same file, unchanged: device, inode, size and time.
+fn same(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
+    a.dev() == b.dev() && a.ino() == b.ino() && a.len() == b.len() && mtime_ns(a) == mtime_ns(b)
+}
+
 /// Steps 1 and 2 of section 2.6, and nothing of step 3: no database.
 pub fn read_file(path: &Path, project_key: &str) -> Result<NotesFile, NotesError> {
     let io = |e: std::io::Error| NotesError::Io(e.to_string());
@@ -137,17 +163,33 @@ pub fn read_file(path: &Path, project_key: &str) -> Result<NotesFile, NotesError
     if !before.file_type().is_file() {
         return Err(NotesError::Io("not a regular file".into()));
     }
-    let mut file = std::fs::File::open(path).map_err(io)?;
+    if before.len() > MAX_FILE_BYTES {
+        return Err(NotesError::TooLarge { size: before.len() });
+    }
+    // RULING: wave2-c7 review B4: a link or a FIFO swapped in after the lstat neither is
+    // followed nor blocks, and the handle is checked against the lstat BEFORE the read.
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(OPEN_FLAGS)
+        .open(path)
+        .map_err(io)?;
+    let opened = file.metadata().map_err(io)?;
+    // SPEC: 1899-1900 names the size only; a different device or inode (the path replaced
+    // between the lstat and the open) or time is treated as a change too.
+    if !same(&opened, &before) {
+        return Err(NotesError::Changed);
+    }
+    if !opened.file_type().is_file() {
+        return Err(NotesError::Io("not a regular file".into()));
+    }
     let mut bytes = Vec::with_capacity(before.len() as usize);
-    file.read_to_end(&mut bytes).map_err(io)?;
+    (&file)
+        .take(before.len() + 1)
+        .read_to_end(&mut bytes)
+        .map_err(io)?;
+    // RULING: wave2-c7 review B6: the time is compared after the read too.
     let after = file.metadata().map_err(io)?;
-    // SPEC: 1899-1900 names the size only; a different inode (the path replaced between the
-    // lstat and the open) is treated as a change too.
-    if bytes.len() as u64 != before.len()
-        || after.len() != before.len()
-        || after.ino() != before.ino()
-        || after.dev() != before.dev()
-    {
+    if bytes.len() as u64 != before.len() || !same(&after, &before) {
         return Err(NotesError::Changed);
     }
     Ok(parse(&bytes, project_key, before.len(), mtime_ns(&before)))
