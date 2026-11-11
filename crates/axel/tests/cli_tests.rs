@@ -173,8 +173,7 @@ fn put_on(conn: &Connection, signer: Option<&MemorySigner>, row: &R) {
     tx(conn, || store::insert_row(conn, signer, &new).unwrap());
 }
 
-/// A capture of chat `session` and, when `archive` is given, its twin: the archived form
-/// of the same turn, born hidden as `twin:<capture id>`.
+/// A capture of chat `session`.
 fn capture(id: &str, session: &str, key: &str) -> R {
     let mut row = r(id, "capture", &format!("User: the prompt of {id}\nAssistant: the reply of {id}"));
     row.origin_ref = session.to_string();
@@ -183,8 +182,9 @@ fn capture(id: &str, session: &str, key: &str) -> R {
     row
 }
 
+/// The archived row of the same turn as `cap` (the same text), born hidden as its twin.
 fn twin_of(cap: &R, twin_id: &str, archive_id: &str) -> R {
-    let mut row = r(twin_id, "archive", &format!("User: the prompt of {}\nAssistant: archived", cap.id));
+    let mut row = r(twin_id, "archive", &cap.content);
     row.origin_ref = archive_id.to_string();
     row.unit_pos = Some("x0.0".to_string());
     row.session = cap.session.clone();
@@ -332,8 +332,8 @@ fn t10_forget_now_deletes_what_was_hidden_a_day_ago_with_its_shadow_and_twin_and
     assert!(out.contains("m:mem_young: hidden 2 h ago; can be deleted after"), "{out}");
     // The twin is counted and listed before the question.
     let asked = out.find("Delete 3 memories for good? [y/N]").unwrap_or_else(|| panic!("{out}"));
-    let counted = out.find("1 of the 3 are archived forms").unwrap_or_else(|| panic!("{out}"));
-    let listed = out.find("with it: m:mem_twin").unwrap_or_else(|| panic!("{out}"));
+    let counted = out.find("1 of the 3 are archived rows with the same text").unwrap_or_else(|| panic!("{out}"));
+    let listed = out.find("with it, its archived row (the same text): m:mem_twin").unwrap_or_else(|| panic!("{out}"));
     assert!(counted < asked && listed < asked, "{out}");
     assert!(!has_control(out), "a control character reached the terminal: {out:?}");
     assert!(out.contains("Deleted 3 memories for good."), "{out}");
@@ -559,9 +559,93 @@ fn a_forgotten_turn_comes_back_with_its_twin() {
     assert_eq!(w.memories(), 2, "a forget without --now deleted a row");
 
     let back = restore_ids(&w.path, &["mem_live"]);
-    assert!(back.out.contains("the turn is back as its archived form"), "{}", back.out);
+    assert!(back.out.contains("the turn is back as its archived row"), "{}", back.out);
     assert_eq!(w.hidden_by("mem_archived"), None, "the twin stayed hidden");
     assert_eq!(dump(w.db(), "SELECT * FROM memories WHERE id = 'mem_archived'"), text_before);
+}
+
+/// v2 c18b review, item 1: a "continue" turn, hidden; the chat's archive holds its own
+/// row (the same text) and another "continue" exchange of another day (the same prompt,
+/// so the same key, another reply).
+fn two_continues(w: &World, with_same: bool) -> String {
+    let archive_id = "5".repeat(32);
+    let mut cap = capture("mem_cont", "s-cont", "c0c0c0c0c0c0c0c0");
+    cap.content = "User: continue\nAssistant: the migration of the ledger finished at noon".to_string();
+    w.put(&cap);
+    let mut same = twin_of(&cap, "mem_cont_same", &archive_id);
+    same.hidden = None;
+    // Its archived row also lists the tools the turn called.
+    same.content = format!("{}\n\n[tools]\nbash: cargo run", cap.content);
+    if with_same {
+        w.put(&same);
+    }
+    let mut other = twin_of(&cap, "mem_cont_other", &archive_id);
+    other.hidden = None;
+    other.unit_pos = Some("x9.0".to_string());
+    other.content = "User: continue\nAssistant: the PARROTFISH invoice was paid on Friday".to_string();
+    other.created_ms = now_ms() - 40 * DAY_MS;
+    w.put(&other);
+    tx(w.db(), || {
+        w.db()
+            .execute(
+                "INSERT INTO archive_index(scope_dir, rel_name, archive_id, logical, digest, state, cover_ms,
+                                           time_source, first_seen_ms, session_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'indexed', ?6, 'archive', ?6, 's-cont')",
+                params![PROJECT, format!("s000001/{archive_id}.json"), archive_id, project::logical("s-cont"), "6".repeat(64), now_ms()],
+            )
+            .unwrap()
+    });
+    archive_id
+}
+
+#[test]
+fn forget_now_deletes_only_the_twin_proven_the_same_turn_and_leaves_another_turn_with_its_prompt() {
+    let w = World::new();
+    two_continues(&w, true);
+    let hid = forget_cmd(&w.path, &["mem_cont"], false, false, "");
+    assert_eq!(hid.code, 0, "{}", hid.err);
+    assert_eq!(w.hidden_by("mem_cont_same").as_deref(), Some("twin:mem_cont"));
+    assert_eq!(w.hidden_by("mem_cont_other").as_deref(), Some("twin:mem_cont"));
+    // Each row hidden with it is shown with its date and first line; none is called "the same turn".
+    let day = chrono::DateTime::from_timestamp_millis(now_ms() - 40 * DAY_MS).unwrap().format("%Y-%m-%d").to_string();
+    assert!(hid.out.contains("m:mem_cont_other · ") && hid.out.contains(&day), "{}", hid.out);
+    assert!(hid.out.contains("User: continue"), "{}", hid.out);
+    assert!(!hid.out.contains("the same turn"), "{}", hid.out);
+    w.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE hidden_ms IS NOT NULL", [now_ms() - 25 * HOUR_MS]).unwrap();
+
+    let run = forget_cmd(&w.path, &["mem_cont"], true, false, "y\n");
+    assert_eq!(run.code, 0, "{}", run.err);
+    let asked = run.out.find("Delete 2 memories for good? [y/N]").unwrap_or_else(|| panic!("{}", run.out));
+    let left = run
+        .out
+        .find("not proven the same turn; left hidden (\"axel-v2 restore mem_cont_other\" brings it back): m:mem_cont_other")
+        .unwrap_or_else(|| panic!("{}", run.out));
+    assert!(left < asked, "{}", run.out);
+    assert!(run.out.contains("Deleted 2 memories for good."), "{}", run.out);
+    assert!(!w.has("mem_cont") && !w.has("mem_cont_same"));
+    // The other turn is neither deleted nor tombstoned, by the purge or by the forget mark.
+    assert!(w.has("mem_cont_other"), "another turn with the same prompt was deleted: {}", run.out);
+    assert_eq!(w.hidden_by("mem_cont_other").as_deref(), Some("twin:mem_cont"));
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_cont_other'"), 0);
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem_cont_other' AND turn_key = 'c0c0c0c0c0c0c0c0'"), 1);
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_cont_same'"), 1);
+    // And it comes back by its id.
+    restore_ids(&w.path, &["mem_cont_other"]);
+    assert_eq!(w.hidden_by("mem_cont_other"), None);
+}
+
+#[test]
+fn restoring_a_capture_whose_only_twin_is_another_turn_keeps_the_capture() {
+    let w = World::new();
+    two_continues(&w, false);
+    forget_cmd(&w.path, &["mem_cont"], false, false, "");
+    assert_eq!(w.hidden_by("mem_cont_other").as_deref(), Some("twin:mem_cont"));
+    let back = restore_ids(&w.path, &["mem_cont"]);
+    assert_eq!(back.code, 0, "{}", back.err);
+    assert!(w.has("mem_cont"), "the capture was purged for a twin that is another turn: {}", back.out);
+    assert_eq!(w.hidden_by("mem_cont"), None);
+    assert_eq!(w.hidden_by("mem_cont_other"), None);
+    assert!(!back.out.contains("stand-in row is gone"), "{}", back.out);
 }
 
 #[test]

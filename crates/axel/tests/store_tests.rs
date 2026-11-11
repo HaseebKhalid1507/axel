@@ -2055,3 +2055,22 @@ fn purge_many_with_ids_that_name_each_other_in_their_link_arrays() {
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 2);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
 }
+
+/// v2 c18b review, item 1: what proves an archived row the same turn as a capture.
+#[test]
+fn same_turn_is_the_same_text_after_normalisation_and_nothing_else() {
+    let capture = "User: continue\nAssistant: the ledger  migration\nfinished at noon";
+    // Whitespace, the tools part the archive adds, a body cut at its limit.
+    assert!(store::same_turn(capture, "User: continue\nAssistant: the ledger migration finished at noon"));
+    assert!(store::same_turn(capture, "User: continue\nAssistant: the ledger migration finished at noon\n\n[tools]\nbash: ls"));
+    let long_reply = "word ".repeat(2000);
+    let long = format!("User: continue\nAssistant: {long_reply}");
+    let mut cut = format!("User: continue\nAssistant: {long_reply}");
+    cut.truncate(4096);
+    assert!(store::same_turn(&long, &cut));
+    // The same prompt and another reply; a short archived body that is only a head.
+    assert!(!store::same_turn(capture, "User: continue\nAssistant: the invoice was paid on Friday"));
+    assert!(!store::same_turn(capture, "User: continue\nAssistant: the ledger"));
+    assert!(!store::same_turn(capture, "User: continue\nAssistant: the ledger migration finished at noon, and more"));
+    assert!(!store::same_turn("", ""));
+}

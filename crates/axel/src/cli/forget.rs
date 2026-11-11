@@ -11,7 +11,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::cli::show::{self, find_all, now_ms, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
 use crate::error::Result;
@@ -104,13 +104,50 @@ fn hide_all(conn: &Connection, rows: &[RowInfo], term: &mut Term) -> Result<u8> 
             writeln!(term.out, "m:{id} was hidden already ({}); nothing changed.", show::state(row))?;
             continue;
         }
-        let twins = if n > 1 { format!(" with {} archived forms of the same turn", n - 1) } else { String::new() };
         writeln!(
             term.out,
-            "Hidden m:{id}{twins}. It is no longer recalled. Nothing was deleted: restore it with \"axel-v2 restore {id}\"."
+            "Hidden m:{id}. It is no longer recalled. Nothing was deleted: restore it with \"axel-v2 restore {id}\"."
         )?;
+        // RULING: v2 c18b review, item 1. What was hidden with it is shown, with its date
+        // and first line: rows with the same prompt are not always the same turn.
+        let twins = twins_of(conn, row)?;
+        if !twins.is_empty() {
+            writeln!(
+                term.out,
+                "  Hidden with it, archived rows of the chat with the same prompt (\"axel-v2 restore {id}\" brings them back too):"
+            )?;
+            for twin in &twins {
+                writeln!(term.out, "    {}", twin_line(&twin.row))?;
+            }
+        }
     }
     Ok(OK)
+}
+
+/// A row hidden as the twin of a capture, and whether its text proves it the same turn.
+struct Twin {
+    row: RowInfo,
+    proven: bool,
+}
+
+/// The rows hidden as `twin:<row>`, oldest first.
+fn twins_of(conn: &Connection, row: &RowInfo) -> Result<Vec<Twin>> {
+    let rows = rows_where(conn, "WHERE e.hidden_by = ?1 ORDER BY e.vid", [format!("twin:{}", row.id)])?;
+    Ok(rows
+        .into_iter()
+        .map(|twin| Twin { proven: row.origin == "capture" && store::same_turn(&row.content, &twin.content), row: twin })
+        .collect())
+}
+
+/// `m:<id> · 2026-11-10 14:05 UTC · ctx-<archive> · <first line of its text>`.
+fn twin_line(row: &RowInfo) -> String {
+    let when = row.created_ms.map(show::date).unwrap_or_else(|| "no date".to_string());
+    let text = if row.secret {
+        "(a secret memory; its text is not shown)".to_string()
+    } else {
+        screen::show(row.content.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), 120)
+    };
+    format!("m:{} · {when} · ctx-{} · {text}", one(&row.id), one(&row.origin_ref))
 }
 
 // ── --now ───────────────────────────────────────────────────────────────────
@@ -218,33 +255,34 @@ fn forget_now(
         return Ok(OK);
     }
 
-    // 3. The archived forms of each hidden turn go with it.
-    let mut twins: Vec<(String, Vec<RowInfo>)> = Vec::new();
+    // 3. The rows hidden with each hidden capture: those proven the same turn go with it,
+    // every other one stays hidden (v2 c18b review, item 1).
+    let mut twins: Vec<Vec<Twin>> = Vec::new();
     for row in &ripe {
-        let of = rows_where(conn, "WHERE e.hidden_by = ?1 ORDER BY e.vid", [format!("twin:{}", row.id)])?;
-        let of: Vec<RowInfo> = of.into_iter().filter(|t| !ripe.iter().any(|r| r.id == t.id)).collect();
-        twins.push((row.id.clone(), of));
+        let of = twins_of(conn, row)?;
+        twins.push(of.into_iter().filter(|t| !ripe.iter().any(|r| r.id == t.row.id)).collect());
     }
-    let twin_count: usize = twins.iter().map(|(_, t)| t.len()).sum();
+    let twin_count = twins.iter().flatten().filter(|t| t.proven).count();
     let total = ripe.len() + twin_count;
 
     writeln!(term.out, "These will be deleted for good:")?;
-    for (row, (_, its)) in ripe.iter().zip(&twins) {
+    for (row, its) in ripe.iter().zip(&twins) {
         print_row(term.out, row, now)?;
         for twin in its {
-            writeln!(
-                term.out,
-                "    with it: m:{} (the archived form of the same turn, in ctx-{})",
-                one(&twin.id),
-                one(&twin.origin_ref)
-            )?;
+            if twin.proven {
+                writeln!(term.out, "    with it, its archived row (the same text): {}", twin_line(&twin.row))?;
+            } else {
+                writeln!(
+                    term.out,
+                    "    not proven the same turn; left hidden (\"axel-v2 restore {}\" brings it back): {}",
+                    one(&twin.row.id),
+                    twin_line(&twin.row)
+                )?;
+            }
         }
     }
     if twin_count > 0 {
-        writeln!(
-            term.out,
-            "{twin_count} of the {total} are archived forms (twin rows) of hidden turns, deleted with their turn."
-        )?;
+        writeln!(term.out, "{twin_count} of the {total} are archived rows with the same text as a hidden turn.")?;
     }
     write!(term.out, "Delete {total} memories for good? [y/N] ")?;
     term.out.flush()?;
@@ -323,12 +361,14 @@ fn hidden_ms_of(conn: &Connection, id: &str) -> Result<Option<Option<i64>>> {
 
 /// Inside the caller's transaction. A row that changed since it was listed (restored,
 /// gone) is left as it is.
-fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[(String, Vec<RowInfo>)]) -> Result<Purged> {
+fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Purged> {
     let mut ids: Vec<String> = Vec::new();
     let mut changed = Vec::new();
     // `(logical, session_id, turn_key, created_ms)` of each turn deleted by its own id.
     let mut marks: Vec<(String, Option<String>, String, i64)> = Vec::new();
-    for (row, (_, its)) in ripe.iter().zip(twins) {
+    // The twins left hidden, with their key: the forget mark below must not take them.
+    let mut kept: Vec<(String, Option<String>)> = Vec::new();
+    for (row, its) in ripe.iter().zip(twins) {
         if hidden_ms_of(conn, &row.id)? != Some(row.hidden_ms) {
             changed.push(row.id.clone());
             continue;
@@ -336,10 +376,16 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[(String, Vec<RowInfo>)]) 
         ids.push(row.id.clone());
         for twin in its {
             let still: Option<Option<String>> = conn
-                .query_row("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", [&twin.id], |r| r.get(0))
+                .query_row("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", [&twin.row.id], |r| r.get(0))
                 .optional()?;
-            if still.flatten().as_deref() == Some(format!("twin:{}", row.id).as_str()) && !ids.contains(&twin.id) {
-                ids.push(twin.id.clone());
+            if still.flatten().as_deref() != Some(format!("twin:{}", row.id).as_str()) || ids.contains(&twin.row.id) {
+                continue;
+            }
+            // Proven again inside the transaction, on the rows as they are now.
+            if row.origin == "capture" && store::proven_twin(conn, &row.id, &twin.row.id)? {
+                ids.push(twin.row.id.clone());
+            } else {
+                kept.push((twin.row.id.clone(), twin.row.turn_key.clone()));
             }
         }
         // A hidden turn, deleted: the archive of its window must not bring it back (B3-1.7).
@@ -371,6 +417,12 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[(String, Vec<RowInfo>)]) 
     }
 
     let deleted = store::purge_many(conn, &ids, true, true)?;
+    // RULING: v2 c18b review, item 1: a twin not proven the same turn is never purged. The
+    // forget mark takes the chat's archived rows by key, hidden ones too, so for the length
+    // of the calls below the kept twins have no key; it is put back before the commit.
+    for (id, _) in &kept {
+        conn.execute("UPDATE memory_ext SET turn_key = NULL WHERE mem_id = ?1", [id])?;
+    }
     let mut left_out = Vec::new();
     for (logical, session_id, key, at) in &marks {
         left_out.extend(index_archives::mark_forgotten_turn(
@@ -382,6 +434,9 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[(String, Vec<RowInfo>)]) 
             *at,
             Some(key.as_str()),
         )?);
+    }
+    for (id, key) in &kept {
+        conn.execute("UPDATE memory_ext SET turn_key = ?2 WHERE mem_id = ?1", params![id, key])?;
     }
     // RULING: wave 4, rules for wave 5: every caller that forgets text writes the purge
     // mark in its own transaction. `checkpoint` below takes it away again when it could

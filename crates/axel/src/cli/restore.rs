@@ -83,14 +83,22 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
         )?);
     }
     let backs = write(&conn, || ids.iter().map(|id| store::restore(&conn, id)).collect::<Result<Vec<usize>>>())?;
-    for ((id, n), twins) in ids.iter().zip(backs).zip(twins) {
-        let id = one(id);
+    for ((full, n), twins) in ids.iter().zip(backs).zip(twins) {
+        let id = one(full);
+        let stays: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)", [full], |r| r.get(0))?;
         if n == 0 {
             writeln!(term.out, "m:{id} was neither hidden nor superseded; nothing to undo.")?;
-        } else if twins > 0 {
+        } else if twins > 0 && !stays {
             writeln!(
                 term.out,
-                "Restored m:{id}: the turn is back as its archived form ({n} rows); the stand-in row is gone."
+                "Restored m:{id}: the turn is back as its archived row; the stand-in row is gone ({n} archived rows with its prompt are visible again)."
+            )?;
+        } else if twins > 0 {
+            // RULING: v2 c18b review, item 1: no archived row proved the same turn.
+            writeln!(
+                term.out,
+                "Restored m:{id}, and the {twins} archived rows with its prompt hidden with it (none has its text, so it stays)."
             )?;
         } else {
             writeln!(term.out, "Restored m:{id}.")?;

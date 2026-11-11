@@ -567,9 +567,51 @@ pub fn supersede(conn: &Connection, id: &str, by: &str) -> Result<usize> {
     })
 }
 
+/// The archive unit body is cut at this many bytes (`archive::BODY_BYTES`).
+const ARCHIVE_BODY_BYTES: usize = 4096;
+
+/// True when an archived row's text proves it the same turn as a capture's: the two texts
+/// are equal after the normalisation both sides already apply (`archive::normalise`, the
+/// one `content_hash` is of), the tools part the archive adds after its body left aside. An
+/// archived body cut at its size limit proves it when the capture's text starts with it.
+// RULING: v2 c18b review, item 1. An archived unit carries no time of its own (its
+// `created_ms` is the archive's), so the turn's interval cannot decide; both rows hold
+// "User: <prompt>\nAssistant: <reply>" as redacted, so the reply text can. Anything that is
+// not proven is not the same turn: a twin is purged with its capture only when proven.
+pub fn same_turn(capture: &str, archived: &str) -> bool {
+    use crate::archive::normalise;
+    let capture = normalise(capture);
+    if capture.is_empty() {
+        return false;
+    }
+    let mut ends: Vec<usize> = archived.match_indices("\n\n[tools]\n").map(|(at, _)| at).collect();
+    ends.push(archived.len());
+    ends.into_iter().any(|end| {
+        let body = &archived[..end];
+        let normal = normalise(body);
+        normal == capture
+            || (body.len() + 4 > ARCHIVE_BODY_BYTES && !normal.is_empty() && capture.starts_with(normal.as_str()))
+    })
+}
+
+/// `same_turn` of two rows by id; false when either is missing or not text.
+pub fn proven_twin(conn: &Connection, capture_id: &str, twin_id: &str) -> Result<bool> {
+    let text = |id: &str| -> Result<Option<String>> {
+        Ok(conn
+            .query_row("SELECT content FROM memories WHERE id = ?1", [id], |r| crate::brain_v2::text_at(r, 0))
+            .optional()?
+            .flatten())
+    };
+    Ok(match (text(capture_id)?, text(twin_id)?) {
+        (Some(capture), Some(twin)) => same_turn(&capture, &twin),
+        _ => false,
+    })
+}
+
 /// Undoes a hide and a supersede of one id; no text changes. A hidden capture: its
-/// `twin:` rows become visible and, when there was one, the capture is purged (the
-/// archive's rows now stand for the turn); with none the capture itself is visible again.
+/// `twin:` rows become visible and, when one of them is proven the same turn
+/// (`same_turn`), the capture is purged (the archive's row now stands for the turn);
+/// otherwise the capture itself is visible again beside them.
 /// Returns the number of rows that are back (0: nothing to undo).
 pub fn restore(conn: &Connection, id: &str) -> Result<usize> {
     atomic(conn, || restore_one(conn, id))
@@ -616,21 +658,32 @@ fn restore_one(conn: &Connection, id: &str) -> Result<usize> {
         [id],
     )?;
     if hidden {
-        let twins = if origin == "capture" && twin_of.is_none() {
+        let twins: Vec<String> = if origin == "capture" && twin_of.is_none() {
+            let mut stmt = conn.prepare("SELECT mem_id FROM memory_ext WHERE hidden_by = ?1")?;
+            let rows = stmt.query_map([format!("twin:{id}")], |r| r.get(0))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        } else {
+            Vec::new()
+        };
+        // RULING: v2 c18b review, item 1. Every twin comes back (it was hidden only with
+        // the capture); the capture is purged only for a twin proven the same turn.
+        let mut proven = false;
+        for twin in &twins {
+            proven |= proven_twin(conn, id, twin)?;
+        }
+        if !twins.is_empty() {
             conn.execute(
                 "UPDATE memory_ext SET hidden_ms = NULL, hidden_by = NULL WHERE hidden_by = ?1",
                 [format!("twin:{id}")],
-            )?
-        } else {
-            0
-        };
-        if twins > 0 {
+            )?;
+        }
+        if proven {
             // Replaced, not forgotten: no tombstone, and the log rows stay.
             purge_many(conn, &[id.to_string()], false, false)?;
-            back = twins;
+            back = twins.len();
         } else {
             conn.execute("UPDATE memory_ext SET hidden_ms = NULL, hidden_by = NULL WHERE mem_id = ?1", [id])?;
-            back = back.max(1);
+            back = back.max(1) + twins.len();
         }
     }
     clear_shadow(conn, id)?;
