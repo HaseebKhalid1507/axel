@@ -603,7 +603,19 @@ fn named_value(s: &str, i: usize, memo: &mut Memo) -> Option<Span> {
             end = start + off;
             break;
         }
-        if matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>') || (c == ':' && colon) {
+        // RULING: screen measurement, ruling 8: a closing bracket ends an unquoted value, as
+        // whitespace does: `{password: abcd1234efgh}`. The value so far holds no opening
+        // bracket, or the scan would have stopped there as code. In a quoted value a
+        // closing bracket is code as before, and is NOT remembered in `memo.code`: an
+        // unquoted value that starts inside this one would end at that bracket, not be code.
+        if matches!(c, ')' | ']' | '}' | '>') {
+            if quote.is_some() {
+                return None;
+            }
+            end = start + off;
+            break;
+        }
+        if matches!(c, '(' | '[' | '{' | '<') || (c == ':' && colon) {
             memo.code = Some((start, start + off));
             return None;
         }
@@ -932,6 +944,41 @@ mod tests {
         }
     }
 
+    // RULING: screen measurement, ruling 8, third point.
+    #[test]
+    fn a_closing_bracket_ends_an_unquoted_value() {
+        let value = mk(&["abcd1234", "efgh"]);
+        // (case, text, what is left, blanked)
+        let cases: Vec<(&str, String, String, usize)> = vec![
+            ("braces", format!("{{password: {value}}}"), format!("{{password: {BLANK}}}"), 1),
+            ("parentheses", "(password: hunter2abc)".into(), format!("(password: {BLANK})"), 1),
+            ("square", format!("[token={value}] next"), format!("[token={BLANK}] next"), 1),
+            ("angle", format!("<secret={value}>"), format!("<secret={BLANK}>"), 1),
+            ("two in braces, the comma is in the first value", format!("{{password: {value}, token: {value}}}"), format!("{{password: {BLANK} token: {BLANK}}}"), 2),
+            (
+                "unquoted inside a quoted value that is code",
+                format!("password=\"token={value}}}\""),
+                format!("password=\"token={BLANK}}}\""),
+                1,
+            ),
+            ("string new", "password: String::new()".into(), "password: String::new()".into(), 0),
+            ("environ", "api_key=os.environ[\"X\"]".into(), "api_key=os.environ[\"X\"]".into(), 0),
+            ("already redacted", "secret: [REDACTED]".into(), "secret: [REDACTED]".into(), 0),
+            ("short in a call", "f(token: short)".into(), "f(token: short)".into(), 0),
+            ("lexer call", "next_token = self.lexer.next_token()?;".into(), "next_token = self.lexer.next_token()?;".into(), 0),
+            ("no digit, short, in braces", "{password: required}".into(), "{password: required}".into(), 0),
+            ("closing after opening", "token=call(abcd1234efgh)".into(), "token=call(abcd1234efgh)".into(), 0),
+            ("fat arrow", "token => abcd1234efgh".into(), "token => abcd1234efgh".into(), 0),
+            ("quoted with a closing bracket", "token=\"abcd1234}efgh\"".into(), "token=\"abcd1234}efgh\"".into(), 0),
+        ];
+        for (case, text, left, blanked) in &cases {
+            let r = redact(text);
+            assert!(r.text == *left, "case {case}: wrong text");
+            assert!(r.blanked == *blanked, "case {case}: blanked {}", r.blanked);
+            assert!(r.hits.iter().all(|h| h.rule == "named_value"), "case {case}: another rule");
+        }
+    }
+
     #[test]
     fn redact_spans_are_what_redact_blanks() {
         let token = format!("{}{LOW_A}\u{200B}{LOW_B}", mk(&["sk", "-"]));
@@ -1150,6 +1197,9 @@ mod tests {
             ("url heads", fill("a://b:", ""), 0),
             ("prefix heads", fill("sk-a ", ""), 0),
             ("one long name chain", fill("token=", ""), 1),
+            ("names before a closing bracket", fill("token=", ")"), 1),
+            ("quoted names before a closing bracket", fill("token=\"", "}"), 0),
+            ("names in brackets", fill("token=)", ""), 0),
             ("long flags", fill("--token ", ""), 0),
             ("one long flag word", fill("-token", " hunter2abc"), 0),
         ];
