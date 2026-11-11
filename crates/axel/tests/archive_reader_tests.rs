@@ -1695,3 +1695,90 @@ fn r5_a_steer_after_the_forget_call_keeps_the_turn_forgotten() {
     assert_eq!(positions(&units_of(&a)), vec!["x4.0"]);
     assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
 }
+
+// ------------------------------------------------- v2 archives round 6, item 1 (ruling)
+
+/// Guards what the owner would lose: a prompt he never forgot, taken by a steer he sent
+/// inside a turn core started from an event.
+#[test]
+fn r6_a_steer_inside_a_turn_an_event_started_takes_no_prompt_before_it() {
+    let p = policy();
+    // A final reply, an event that starts a turn, a tool round, a steer that asks to forget:
+    // the steer opens a turn of its own, and Q1's exchange stays.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, REPORT),
+        asst_tool(3, WORK, "bash"),
+        result(4),
+        user(5, STEER),
+        asst_tool(6, A2, "axel_forget"),
+        result(7),
+        asst(8, A2B),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "r2.0"], "the prompt before the event's turn was taken");
+    assert!(holds(&units, "Q1MARK") && holds(&units, "A1MARK"));
+    assert!(!holds(&units, "STEERMARK"));
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(STEER)), false, true)]);
+
+    // The first steer ends the event's turn and opens one of the person's: a second steer
+    // after its tool round is mid-turn and takes it.
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, REPORT),
+        asst_tool(3, WORK, "bash"),
+        result(4),
+        user(5, Q3),
+        asst_tool(6, A3, "bash"),
+        result(7),
+        user(8, STEER),
+        asst_tool(9, A2, "axel_forget"),
+        result(10),
+        asst(11, A2B),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "r2.0"], "a steer of the person's turn left its prompt");
+    assert!(!holds(&units, "Q3MARK"));
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q3)), false, true)]);
+
+    // The event arrives inside the person's own turn (after a tool round, no final reply):
+    // it starts no turn, and the steer still takes Q1.
+    let a = arch(vec![
+        user(0, Q1),
+        asst_tool(1, A1, "bash"),
+        result(2),
+        user(3, REPORT),
+        asst_tool(4, WORK, "bash"),
+        result(5),
+        user(6, STEER),
+        asst_tool(7, A2, "axel_forget"),
+        result(8),
+        asst(9, A2B),
+    ]);
+    assert!(positions(&units_of(&a)).is_empty());
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q1)), false, true)]);
+}
+
+/// Guards what the owner would lose: a turn he steered after an event, taken with an
+/// earlier forget turn, and the next file's lead with it.
+#[test]
+fn r6_a_steer_in_an_event_turn_after_a_forget_turn_is_kept_and_clears_tail() {
+    let p = policy();
+    let a = arch(vec![
+        user(0, P1),
+        asst_tool(1, A2, "axel_forget"),
+        result(2),
+        asst(3, A2B),
+        user(4, REPORT),
+        asst_tool(5, WORK, "bash"),
+        result(6),
+        user(7, Q3),
+        asst(8, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x7.0"], "the steer in the event's turn went with the forget turn");
+    assert!(holds(&units, "Q3MARK") && holds(&units, "A3MARK"));
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
+}

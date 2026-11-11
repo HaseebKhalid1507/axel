@@ -643,6 +643,52 @@ enum Before {
     Other,
 }
 
+/// What the walk through a file knows about the turn that is running: what stands before
+/// the next text, and whether core started the turn from an event.
+// RULING: v2 archives round 6, item 1. Core starts a turn from an event with no human prompt
+// (`TurnTrigger::EventAuto`), and the reader opens no span at an event: such a turn sits in
+// the span of the person's previous prompt. A human text sent while it ran steers the event's
+// turn, not that prompt's, so it is no mid-turn text: it opens a turn of its own, and a
+// forget it asks for takes neither the prompt before it nor, after an earlier forget call,
+// is taken with that call's turn. An event starts a turn when it arrives while `before` is
+// `Other` (no turn running); a human text that opens a span ends the event's turn.
+#[derive(Clone, Copy)]
+struct Walk {
+    before: Before,
+    event_turn: bool,
+}
+
+impl Walk {
+    fn new() -> Self {
+        Walk { before: Before::Other, event_turn: false }
+    }
+
+    /// A human text here was sent while a turn the person started was still running.
+    fn mid_turn(&self) -> bool {
+        self.before == Before::Tools && !self.event_turn
+    }
+
+    /// After one block of a user message.
+    fn block(&mut self, block: &Block) {
+        if let Block::Text(text) = block {
+            match classify(text) {
+                UserText::Event { .. } if self.before == Before::Other => self.event_turn = true,
+                UserText::Human => self.event_turn = false,
+                _ => {}
+            }
+        }
+        self.before = after_block(self.before, block);
+    }
+
+    /// After a whole message.
+    fn message(&mut self, message: &ArchivedMessage) {
+        match message.role {
+            Role::User => message.blocks.iter().for_each(|b| self.block(b)),
+            Role::Assistant => self.before = after_message(self.before, message),
+        }
+    }
+}
+
 struct Event<'a> {
     source: &'a str,
     kind: &'a str,
@@ -680,10 +726,10 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
         );
     }
     let mut out = Vec::new();
-    let mut before = Before::Other;
+    let mut walk = Walk::new();
     // The carried head yields no span, but says what stands before the file's first text.
     for message in &a.messages[..head.map_or(0, |h| h + 1)] {
-        before = after_message(before, message);
+        walk.message(message);
     }
     for message in &a.messages[head.map_or(0, |h| h + 1)..] {
         for (at, block) in message.blocks.iter().enumerate() {
@@ -705,7 +751,7 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
                         out.push(std::mem::replace(&mut current, Span::new(Opener::Withheld)))
                     }
                     UserText::Human => {
-                        let mid_turn = before == Before::Tools;
+                        let mid_turn = walk.mid_turn();
                         let opener = Opener::Human { text, source_index, block_index, mid_turn };
                         out.push(std::mem::replace(&mut current, Span::new(opener)))
                     }
@@ -714,11 +760,11 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
                 _ => {}
             }
             if message.role == Role::User {
-                before = after_block(before, block);
+                walk.block(block);
             }
         }
         if message.role == Role::Assistant {
-            before = after_message(before, message);
+            walk.message(message);
         }
     }
     out.push(current);
