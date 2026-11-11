@@ -19,7 +19,7 @@ use crate::error::{Result, VelociError};
 
 // ── Schema version ──────────────────────────────────────────────────────────
 
-const SCHEMA_VERSION: i32 = 2;
+const SCHEMA_VERSION: i32 = 3;
 use crate::EMBEDDING_DIM;
 
 // ── Types ───────────────────────────────────────────────────────────────────

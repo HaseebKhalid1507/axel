@@ -565,12 +565,9 @@ fn row_to_memory(row: &Row<'_>) -> rusqlite::Result<std::result::Result<Memory, 
     Ok((|| -> std::result::Result<Memory, MemkoshiError> {
         Ok(Memory {
             id,
-            category: MemoryCategory::parse(&category).ok_or_else(|| {
-                MemkoshiError::InvalidEnum {
-                    field: "category",
-                    value: category.clone(),
-                }
-            })?,
+            // A category that is not one of the five is a v2 record class: it reads as
+            // `Events`, the enum the row was signed with.
+            category: MemoryCategory::parse(&category).unwrap_or(MemoryCategory::Events),
             topic,
             title,
             abstract_text,

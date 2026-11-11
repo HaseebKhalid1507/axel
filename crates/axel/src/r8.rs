@@ -35,6 +35,10 @@ use crate::error::{AxelError, Result};
 /// Current schema version. Bump on any table/column change.
 pub const SCHEMA_VERSION: i32 = 1;
 
+/// `brain_meta.schema_version` of a v2 brain. Only migration 1 (`brain_v2.rs`) writes it;
+/// `Brain::create*` still writes [`SCHEMA_VERSION`].
+pub const V2_SCHEMA_VERSION: i32 = 2;
+
 /// Default embedding model name (recorded in brain_meta).
 pub const DEFAULT_EMBEDDER: &str = "all-MiniLM-L6-v2";
 
@@ -143,7 +147,7 @@ impl Brain {
 
         let meta = Self::load_meta(&conn)?;
 
-        if meta.schema_version != SCHEMA_VERSION {
+        if meta.schema_version != SCHEMA_VERSION && meta.schema_version != V2_SCHEMA_VERSION {
             return Err(AxelError::SchemaMismatch {
                 file: meta.schema_version,
                 expected: SCHEMA_VERSION,
