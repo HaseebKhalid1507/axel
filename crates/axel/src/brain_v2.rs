@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use axel_memkoshi::security::MemorySigner;
 use chrono::{DateTime, NaiveDateTime, Utc};
-use rusqlite::types::Value;
+use rusqlite::types::{Value, ValueRef};
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use sha2::{Digest, Sha256};
 use velocirag::db::Database;
@@ -35,6 +35,9 @@ pub struct V2Brain {
     pub signer: Option<MemorySigner>,
     pub embedder_model: String,
     pub path: PathBuf,
+    /// Memories this open could not adopt because their `id` or `content` is not readable
+    /// text (finding 5). They are still in `memories`, untouched.
+    pub unreadable_memories: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -339,9 +342,10 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
 
     // 7. Adoption and the word index, for rows written after migration 1 without a
     // `memory_ext` row. What migration 1 found it adopted itself, as `legacy`.
-    adopt_orphans(&conn, if opts.upgrade_v1 { "legacy" } else { "cli" })?;
+    let unreadable_memories =
+        adopt_orphans_counted(&conn, if opts.upgrade_v1 { "legacy" } else { "cli" })?.skipped;
 
-    Ok(V2Brain { conn, signer, embedder_model, path: path.to_path_buf() })
+    Ok(V2Brain { conn, signer, embedder_model, path: path.to_path_buf(), unreadable_memories })
 }
 
 /// One migration in one transaction. Another process may have won: the version is read
@@ -518,23 +522,42 @@ fn created_ms(created: &Value) -> (i64, &'static str) {
 /// `origin` is "legacy" or "cli"; also fills the word index (B-1b). Returns the number of
 /// memories adopted. Takes the write lock only when there is something to do.
 pub fn adopt_orphans(conn: &Connection, origin: &str) -> Result<usize> {
+    adopt_orphans_counted(conn, origin).map(|a| a.adopted)
+}
+
+/// What one adoption did.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Adoption {
+    /// Memories that got their `memory_ext` row in this call.
+    pub adopted: usize,
+    /// Memories without a `memory_ext` row whose `id` or `content` is not text, or not valid
+    /// UTF-8. They are left as they are, and counted again by every call.
+    pub skipped: usize,
+}
+
+/// `adopt_orphans`, with the number of rows it could not read.
+// RULING: wave2-c4-review finding 5: one unreadable `memories` row no longer blocks the
+// adoption of all the others; it is skipped and counted. The same holds inside migration 1.
+// Such a row stays pending, so a brain that has one takes the write lock at every call.
+pub fn adopt_orphans_counted(conn: &Connection, origin: &str) -> Result<Adoption> {
     if origin != "legacy" && origin != "cli" {
         return Err(AxelError::Other(format!("adopt_orphans: origin {origin:?}")));
     }
     let pending: i64 = conn.query_row(
-        "SELECT (SELECT COUNT(*) FROM memories WHERE id NOT IN (SELECT mem_id FROM memory_ext))
+        "SELECT (SELECT COUNT(*) FROM memories m
+                 WHERE NOT EXISTS (SELECT 1 FROM memory_ext e WHERE e.mem_id = m.id))
               + (SELECT COUNT(*) FROM memories WHERE id NOT IN (SELECT mem_id FROM memories_fts))",
         [],
         |r| r.get(0),
     )?;
     if pending == 0 {
-        return Ok(0);
+        return Ok(Adoption::default());
     }
     begin_write(conn)?;
     // RULING: wave2-c4-review finding 2: any error after the `BEGIN`, a failed `COMMIT`
     // included, rolls back: this is the indexer's long-lived connection.
     match adopt_in_transaction(conn, origin) {
-        Ok(n) => commit(conn).map(|()| n),
+        Ok(done) => commit(conn).map(|()| done),
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
@@ -551,7 +574,15 @@ struct Orphan {
     embedding: Option<Vec<u8>>,
 }
 
-fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<usize> {
+/// The column as a string; `None` when it is not text or not valid UTF-8.
+fn text_at(row: &rusqlite::Row, index: usize) -> rusqlite::Result<Option<String>> {
+    Ok(match row.get_ref(index)? {
+        ValueRef::Text(bytes) => std::str::from_utf8(bytes).ok().map(str::to_string),
+        _ => None,
+    })
+}
+
+fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<Adoption> {
     let model: Option<String> = conn
         .query_row(
             "SELECT json_extract(value, '$.embedder_model') FROM brain_meta WHERE key = 'meta'",
@@ -562,23 +593,28 @@ fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<usize> {
         .flatten();
 
     // The vector comes from the shadow `documents` row `index_memory` wrote; it stays.
-    let orphans: Vec<Orphan> = {
+    let mut orphans: Vec<Orphan> = Vec::new();
+    let mut skipped = 0;
+    {
         let mut stmt = conn.prepare(
             "SELECT m.id, m.content, m.created, d.doc_id IS NOT NULL, d.embedding
              FROM memories m LEFT JOIN documents d ON d.doc_id = m.id
-             WHERE m.id NOT IN (SELECT mem_id FROM memory_ext)",
+             WHERE NOT EXISTS (SELECT 1 FROM memory_ext e WHERE e.mem_id = m.id)",
         )?;
-        let rows = stmt.query_map([], |r| {
-            Ok(Orphan {
-                id: r.get(0)?,
-                content: r.get(1)?,
-                created: r.get(2)?,
-                shadow: r.get(3)?,
-                embedding: r.get(4)?,
-            })
-        })?;
-        rows.collect::<rusqlite::Result<_>>()?
-    };
+        let mut rows = stmt.query([])?;
+        while let Some(r) = rows.next()? {
+            let (Some(id), Some(content)) = (text_at(r, 0)?, text_at(r, 1)?) else {
+                skipped += 1;
+                continue;
+            };
+            // A shadow vector that is not a blob is not a vector: the row is adopted without.
+            let embedding = match r.get_ref(4)? {
+                ValueRef::Blob(bytes) => Some(bytes.to_vec()),
+                _ => None,
+            };
+            orphans.push(Orphan { id, content, created: r.get(2)?, shadow: r.get(3)?, embedding });
+        }
+    }
 
     let mut adopted = 0;
     {
@@ -603,10 +639,11 @@ fn adopt_in_transaction(conn: &Connection, origin: &str) -> Result<usize> {
          SELECT m.id, m.title,
                 CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.abstract_text END,
                 CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.content END
-         FROM memories m WHERE m.id NOT IN (SELECT mem_id FROM memories_fts)",
+         FROM memories m WHERE m.id NOT IN (SELECT mem_id FROM memories_fts)
+           AND typeof(m.id) = 'text' AND typeof(m.content) = 'text'",
         [],
     )?;
-    Ok(adopted)
+    Ok(Adoption { adopted, skipped })
 }
 
 // ── Degrading ───────────────────────────────────────────────────────────────

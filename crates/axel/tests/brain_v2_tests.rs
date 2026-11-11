@@ -898,6 +898,75 @@ fn t18_the_indexer_stands_aside_for_the_front() {
     assert!(start.elapsed() < Duration::from_millis(100));
 }
 
+// ── Review finding 5: an unreadable memory does not block the others ────
+
+#[test]
+fn f5_an_unreadable_memory_is_skipped_and_counted_and_the_rest_are_adopted() {
+    let dir = TempDir::new().unwrap();
+    let (path, a, b) = legacy_file(&dir);
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "INSERT INTO memories (id, category, topic, title, content, created)
+         VALUES ('mem_blob', 'events', 'test', 'a blob', x'FFFE0001', '2024-01-01T00:00:00+00:00')",
+        [],
+    )
+    .unwrap();
+    let bad_row = |c: &Connection| -> (String, String, String, String) {
+        c.query_row(
+            "SELECT typeof(content), hex(content), title, created FROM memories WHERE id = 'mem_blob'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .unwrap()
+    };
+    let before = bad_row(&conn);
+    assert_eq!(before.0, "blob");
+    drop(conn);
+
+    // The upgrade passes: migration 1 skips the row.
+    let brain = match brain_v2::open_v2(&path, &opts(true)) {
+        Ok(brain) => brain,
+        Err(e) => panic!("one unreadable row failed the upgrade: {e:?}"),
+    };
+    let conn = &brain.conn;
+    assert_eq!(brain.unreadable_memories, 1);
+    assert_eq!(count(conn, "PRAGMA user_version"), 1);
+    assert_eq!(origins(conn), vec![("legacy".to_string(), 2)]);
+    for memory in [&a, &b] {
+        assert_eq!(count_id(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = ?1", &memory.id), 1);
+    }
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 3);
+    assert_eq!(bad_row(conn), before, "the unreadable row was changed");
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem_blob'"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories_fts"), 2);
+
+    // Every later call counts it again and adopts nothing; the old signature still answers.
+    let again = brain_v2::adopt_orphans_counted(conn, "cli").unwrap();
+    assert_eq!((again.adopted, again.skipped), (0, 1));
+    assert_eq!(brain_v2::adopt_orphans(conn, "cli").unwrap(), 0);
+    assert!(conn.is_autocommit());
+
+    // Text that is not valid UTF-8, and an id that is not text, are skipped the same way,
+    // and a good row written beside them is adopted.
+    conn.execute_batch(
+        "INSERT INTO memories (id, category, topic, title, content, created)
+         VALUES ('mem_badtext', 'events', 'test', 'bad text', CAST(x'C328' AS TEXT), '2024-01-01T00:00:00+00:00');
+         INSERT INTO memories (id, category, topic, title, content, created)
+         VALUES (x'00FF', 'events', 'test', 'bad id', 'fine', '2024-01-01T00:00:00+00:00');",
+    )
+    .unwrap();
+    let good = Memory::new(MemoryCategory::Events, "test", "good", "a wren sang on the sluice");
+    project_memory::store_scoped(conn, &good, &scope()).unwrap();
+    let third = brain_v2::adopt_orphans_counted(conn, "cli").unwrap();
+    assert_eq!((third.adopted, third.skipped), (1, 3));
+    assert_eq!(origins(conn), vec![("cli".to_string(), 1), ("legacy".to_string(), 2)]);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 6);
+    drop(brain);
+
+    // A later open reports all three.
+    assert_eq!(brain_v2::open_v2(&path, &opts(false)).unwrap().unreadable_memories, 3);
+}
+
 // ── Review finding 2: nobody leaves a transaction open ───────────────────
 
 #[test]
