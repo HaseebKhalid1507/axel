@@ -116,6 +116,16 @@ impl VectorIndex {
             });
         }
 
+        // A key it already holds is replaced, not refused: a document updated in place keeps
+        // its row id (`db::upsert_document`).
+        if self.index.contains(key) {
+            let removed = self
+                .index
+                .remove(key)
+                .map_err(|e| VelociError::Index(format!("Failed to remove vector: {}", e)))?;
+            self.count = self.count.saturating_sub(removed);
+        }
+
         // Auto-expand capacity
         if self.count >= self.index.capacity() {
             let new_cap = (self.index.capacity() * 2).max(10_000);
@@ -204,5 +214,30 @@ impl VectorIndex {
 impl Default for VectorIndex {
     fn default() -> Self {
         Self::new().expect("Failed to create default vector index")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn unit(i: usize) -> Vec<f32> {
+        let mut v = vec![0.0f32; EMBEDDING_DIM];
+        v[i] = 1.0;
+        v
+    }
+
+    #[test]
+    fn adding_a_key_twice_replaces_its_vector() {
+        let mut index = VectorIndex::new().unwrap();
+        index.add(7, &unit(0)).unwrap();
+        index.add(8, &unit(5)).unwrap();
+        index.add(7, &unit(1)).unwrap();
+        assert_eq!(index.len(), 2);
+        let hits = index.search(&unit(1), 1).unwrap();
+        assert_eq!(hits[0].id, 7);
+        assert!(hits[0].score > 0.99, "{}", hits[0].score);
+        let hits = index.search(&unit(0), 2).unwrap();
+        assert!(hits.iter().all(|h| h.score < 0.5), "the first vector of 7 is gone");
     }
 }

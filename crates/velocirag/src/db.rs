@@ -412,7 +412,8 @@ impl Database {
 
     // ── Document CRUD ───────────────────────────────────────────────────
 
-    /// Insert a document chunk with its embedding.
+    /// Insert a document chunk with its embedding, or update the row of the same `doc_id` in
+    /// place: same row id ([`upsert_document`]).
     pub fn insert_document(
         &self,
         doc_id: &str,
@@ -421,34 +422,7 @@ impl Database {
         embedding: &[f32],
         file_path: Option<&str>,
     ) -> Result<i64> {
-        if embedding.len() != EMBEDDING_DIM {
-            return Err(VelociError::DimensionMismatch {
-                expected: EMBEDDING_DIM,
-                got: embedding.len(),
-            });
-        }
-
-        let metadata_json = serde_json::to_string(metadata)?;
-        let embedding_blob = embedding_to_blob(embedding);
-
-        let _id = self.conn.execute(
-            "INSERT OR REPLACE INTO documents (doc_id, content, metadata, embedding, file_path, indexed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)",
-            params![doc_id, content, metadata_json, embedding_blob, file_path],
-        )?;
-        let rowid = self.conn.last_insert_rowid();
-
-        // Sync FTS5
-        self.conn.execute(
-            "DELETE FROM chunks_fts WHERE doc_id = ?1",
-            params![doc_id],
-        )?;
-        self.conn.execute(
-            "INSERT INTO chunks_fts (doc_id, content, file_path) VALUES (?1, ?2, ?3)",
-            params![doc_id, content, file_path.unwrap_or("")],
-        )?;
-
-        Ok(rowid)
+        upsert_document(&self.conn, doc_id, content, metadata, embedding, file_path)
     }
 
     /// Get a document by doc_id.
@@ -1092,11 +1066,6 @@ impl Database {
 /// content, metadata, embedding, file path and `indexed_at` change, and the row id,
 /// `hidden`, `source_mtime_ms`, the access count, the last access and the excitability are
 /// kept, so nothing that points at the row breaks. Returns the row's `id`.
-// SPEC: 2642-2643 make `Database::insert_document` a call to this function. Not done here:
-// the command line's `BrainSearch::index_document` adds the returned id to its usearch
-// index, which refuses a key it holds ("Duplicate keys not allowed"), so every re-index of
-// a changed file would fail. `insert_document` stays `INSERT OR REPLACE` until the vector
-// index takes a key it already has.
 pub fn upsert_document(
     conn: &Connection,
     doc_id: &str,

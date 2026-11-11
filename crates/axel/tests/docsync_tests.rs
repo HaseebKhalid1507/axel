@@ -218,8 +218,9 @@ fn t22_upsert_document_on_an_existing_doc_id_keeps_the_row_and_its_marks() {
     assert!(velocirag::db::upsert_document(conn, "bad", "x", &json!({}), &[0.0; 3], None).is_err());
 }
 
-/// `Database::insert_document` is left as it was (see the SPEC mark on `upsert_document`):
-/// the command line's re-index of a changed file must keep working.
+/// `Database::insert_document` is `upsert_document` (spec 2642, wave 4 ruling R-22.4): the
+/// command line's re-index of a changed file works and keeps the row id; the vector index
+/// takes the key again.
 #[test]
 fn t22_the_command_line_still_reindexes_a_changed_document() {
     let tmp = TempDir::new().unwrap();
@@ -227,9 +228,13 @@ fn t22_the_command_line_still_reindexes_a_changed_document() {
     axel::r8::Brain::create_with_model(&path, Some("test"), velocirag::embedder::HASH_MODEL_ID, 384).unwrap();
     let mut search = axel::search::BrainSearch::open_with_embedder(&path, Embedder::hashing()).unwrap();
     search.index_document("notes::a", "the first text of the note", None, Some("/n/a.md")).unwrap();
+    let first = search.db().get_document("notes::a").unwrap().unwrap();
     search.index_document("notes::a", "the second text of the note", None, Some("/n/a.md")).unwrap();
     let doc = search.db().get_document("notes::a").unwrap().unwrap();
     assert_eq!(doc.content, "the second text of the note");
+    assert_eq!(doc.id, first.id, "the row id is kept");
+    let hits = search.search("the second text of the note", 5).unwrap();
+    assert_eq!(hits.results.iter().filter(|r| r.doc_id == "notes::a").count(), 1);
 }
 
 // ── Test 22: the sync ───────────────────────────────────────────────────────
