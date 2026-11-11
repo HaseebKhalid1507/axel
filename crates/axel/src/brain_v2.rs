@@ -128,6 +128,8 @@ struct Peek {
     meta_version: Option<i64>,
     /// A row in `memories` or `documents`.
     has_rows: bool,
+    /// Nothing in `sqlite_master`: a crash before the creation committed leaves such a file.
+    empty: bool,
 }
 
 fn peek(path: &Path) -> Result<Peek> {
@@ -136,7 +138,12 @@ fn peek(path: &Path) -> Result<Peek> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(damaged)?;
+    // Another process may be creating or recovering the file at this moment (finding 8).
+    conn.busy_timeout(Duration::from_secs(5))?;
     let version = user_version(&conn).map_err(damaged)?;
+    let empty: bool = conn
+        .query_row("SELECT NOT EXISTS(SELECT 1 FROM sqlite_master)", [], |r| r.get(0))
+        .map_err(damaged)?;
     let meta_version = if table_exists(&conn, "brain_meta").map_err(damaged)? {
         conn.query_row(
             "SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'",
@@ -158,7 +165,7 @@ fn peek(path: &Path) -> Result<Peek> {
             has_rows = has_rows || any;
         }
     }
-    Ok(Peek { user_version: version, meta_version, has_rows })
+    Ok(Peek { user_version: version, meta_version, has_rows, empty })
 }
 
 fn too_new(file: i32) -> AxelError {
@@ -244,13 +251,17 @@ pub fn open_source(path: &Path) -> Result<Connection> {
 /// May create, may migrate.
 pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     // 1. Look, read-only. Nothing is written to the main file when this refuses.
-    let exists = path.exists();
-    if exists {
+    let mut fresh = !path.exists();
+    if !fresh {
         let seen = peek(path)?;
         if seen.user_version > LATEST {
             return Err(too_new(seen.user_version));
         }
         match seen.meta_version {
+            // RULING: wave2-c4-review finding 4: a SQLite file with no tables at all is what
+            // a creation that did not finish leaves, or what another process is creating at
+            // this moment. It is treated as missing, not as damaged.
+            None if seen.empty => fresh = true,
             // SPEC: 960-964 names no answer for a file SQLite reads that is not an Axel
             // brain (no `brain_meta` row). `Brain::open` would set WAL on it and then fail:
             // refused here, unwritten.
@@ -283,17 +294,17 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
     }
 
     // 2. The old tables, the signer and the model name.
-    let brain = if exists {
-        Brain::open(path)?
-    } else {
+    let brain = if fresh {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() && !parent.exists() {
                 std::fs::DirBuilder::new().recursive(true).mode(0o700).create(parent)?;
             }
         }
-        let brain = Brain::create_with_model(path, opts.agent, opts.model, opts.dim)?;
+        let brain = Brain::create_or_join(path, opts.agent, opts.model, opts.dim)?;
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         brain
+    } else {
+        Brain::open(path)?
     };
     let signer = brain.signer();
     let embedder_model = brain.meta().embedder_model.clone();
@@ -301,8 +312,21 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
 
     // 3 to 5. Our connection, JR's layer, velocirag's tables.
     let conn = connect_raw(path, Role::Indexer, false)?;
-    crate::project_memory::migrate(&conn)?;
-    drop(Database::from_connection(connect_raw(path, Role::Indexer, false)?, path.to_path_buf())?);
+    // RULING: wave2-c4-review finding 4: both layers look for a column and add it later, so
+    // of two processes on a file that lacks the columns one fails with "duplicate column
+    // name". Steps 4 and 5 run again, once, when they fail. Velocirag's statements run in
+    // one transaction of ours, so a second opener waits for the whole of step 5 and a
+    // second run never meets a step 5 that is half done.
+    let layers = || -> Result<()> {
+        crate::project_memory::migrate(&conn)?;
+        let own = connect_raw(path, Role::Indexer, false)?;
+        own.execute_batch("BEGIN IMMEDIATE")?;
+        let db = Database::from_connection(own, path.to_path_buf())?;
+        commit(db.conn())
+    };
+    if layers().is_err() {
+        layers()?;
+    }
 
     // 6. The ledger.
     for n in (user_version(&conn)? + 1)..=LATEST {
@@ -321,8 +345,8 @@ pub fn open_v2(path: &Path, opts: &OpenOpts) -> Result<V2Brain> {
 }
 
 /// One migration in one transaction. Another process may have won: the version is read
-/// again under the write lock.
-fn migrate_step(conn: &Connection, n: i32) -> Result<()> {
+/// again under the write lock. True when this call ran the migration.
+fn migrate_step(conn: &Connection, n: i32) -> Result<bool> {
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let run = (|| -> Result<bool> {
         if user_version(conn)? >= n {
@@ -343,8 +367,11 @@ fn migrate_step(conn: &Connection, n: i32) -> Result<()> {
         Ok(true)
     })();
     match run {
-        Ok(true) => commit(conn),
-        Ok(false) => Ok(conn.execute_batch("ROLLBACK")?),
+        Ok(true) => commit(conn).map(|()| true),
+        Ok(false) => {
+            conn.execute_batch("ROLLBACK")?;
+            Ok(false)
+        }
         Err(e) => {
             let _ = conn.execute_batch("ROLLBACK");
             Err(e)
@@ -603,4 +630,35 @@ pub fn degrade_on(err: &AxelError, status: &Status, mode: &AtomicU8) -> bool {
     status.reason.store(reason as u8, Ordering::SeqCst);
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The "another process won the migration" branch, set up directly: the version this
+    /// connection read before it asked for the write lock is no longer the file's.
+    #[test]
+    fn migrate_step_does_nothing_when_another_opener_won() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.r8");
+        let opts = OpenOpts { agent: None, model: "hash-384", dim: 384, upgrade_v1: false };
+        let brain = open_v2(&path, &opts).unwrap();
+        let conn = &brain.conn;
+        let ledger = |c: &Connection| -> (i64, String) {
+            c.query_row("SELECT COUNT(*), MAX(applied_at) FROM axel_migrations", [], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+        };
+        let before = ledger(conn);
+        assert_eq!(before.0, 1);
+
+        assert!(!migrate_step(conn, 1).unwrap(), "migration 1 ran a second time");
+        assert!(conn.is_autocommit());
+        assert_eq!(ledger(conn), before);
+        assert_eq!(user_version(conn).unwrap(), 1);
+        // It left no lock behind.
+        let other = Connection::open(&path).unwrap();
+        other.busy_timeout(Duration::ZERO).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+    }
 }

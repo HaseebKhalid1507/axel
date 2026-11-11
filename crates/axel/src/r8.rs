@@ -102,6 +102,88 @@ impl Brain {
         let conn = Connection::open(path)?;
         Self::init_schema(&conn)?;
 
+        let meta = Self::new_meta(agent_name, model, dim)?;
+        conn.execute(
+            "INSERT INTO brain_meta (key, value) VALUES (?1, ?2)",
+            params!["meta", serde_json::to_string(&meta)?],
+        )?;
+
+        Ok(Self { conn, meta })
+    }
+
+    /// `brain_v2::open_v2`'s creation, safe for two processes at once: the tables and the
+    /// `brain_meta` row are written in one transaction, so another opener sees a file with
+    /// no tables or a whole brain, never a part. The path may be missing or a file with no
+    /// tables. The opener that loses the race joins the brain the other one made.
+    // RULING: wave2-c4-review finding 4.
+    pub(crate) fn create_or_join(
+        path: &Path,
+        agent_name: Option<&str>,
+        model: &str,
+        dim: usize,
+    ) -> Result<Self> {
+        let conn = Connection::open(path)?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        // Two connections that switch an empty file to WAL at the same moment: one of them
+        // gets `busy` at once, without the timeout. It asks again.
+        let start = std::time::Instant::now();
+        loop {
+            match conn.execute_batch("PRAGMA journal_mode=WAL") {
+                Err(e)
+                    if matches!(
+                        e.sqlite_error_code(),
+                        Some(rusqlite::ErrorCode::DatabaseBusy) | Some(rusqlite::ErrorCode::DatabaseLocked)
+                    ) && start.elapsed() < std::time::Duration::from_secs(5) =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(5))
+                }
+                other => break other?,
+            }
+        }
+        conn.execute_batch("PRAGMA synchronous=NORMAL; BEGIN IMMEDIATE;")?;
+        let made = (|| -> Result<Option<BrainMeta>> {
+            let there: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'brain_meta')",
+                [],
+                |r| r.get(0),
+            )?;
+            if there && conn.query_row("SELECT EXISTS(SELECT 1 FROM brain_meta WHERE key = 'meta')", [], |r| r.get(0))? {
+                return Ok(None);
+            }
+            Self::init_tables(&conn)?;
+            let meta = Self::new_meta(agent_name, model, dim)?;
+            conn.execute(
+                "INSERT INTO brain_meta (key, value) VALUES (?1, ?2)",
+                params!["meta", serde_json::to_string(&meta)?],
+            )?;
+            Ok(Some(meta))
+        })();
+        let meta = match made {
+            Ok(Some(meta)) => match conn.execute_batch("COMMIT") {
+                Ok(()) => meta,
+                Err(e) => {
+                    let _ = conn.execute_batch("ROLLBACK");
+                    return Err(e.into());
+                }
+            },
+            Ok(None) => {
+                conn.execute_batch("ROLLBACK")?;
+                let meta = Self::load_meta(&conn)?;
+                if meta.schema_version != SCHEMA_VERSION && meta.schema_version != V2_SCHEMA_VERSION {
+                    return Err(AxelError::SchemaMismatch { file: meta.schema_version, expected: SCHEMA_VERSION });
+                }
+                meta
+            }
+            Err(e) => {
+                let _ = conn.execute_batch("ROLLBACK");
+                return Err(e);
+            }
+        };
+        Ok(Self { conn, meta })
+    }
+
+    /// The metadata of a new brain, with a fresh signing key.
+    fn new_meta(agent_name: Option<&str>, model: &str, dim: usize) -> Result<BrainMeta> {
         let now = Utc::now().to_rfc3339();
 
         // Generate a random 32-byte signing key for HMAC-SHA256
@@ -114,7 +196,7 @@ impl Brain {
             hex::encode(key)
         };
 
-        let meta = BrainMeta {
+        Ok(BrainMeta {
             schema_version: SCHEMA_VERSION,
             embedder_model: model.to_string(),
             embedding_dim: dim as i32,
@@ -124,14 +206,7 @@ impl Brain {
             document_count: 0,
             memory_count: 0,
             signing_key: Some(signing_key),
-        };
-
-        conn.execute(
-            "INSERT INTO brain_meta (key, value) VALUES (?1, ?2)",
-            params!["meta", serde_json::to_string(&meta)?],
-        )?;
-
-        Ok(Self { conn, meta })
+        })
     }
 
     /// Open an existing `.r8` brain file.
@@ -225,7 +300,11 @@ impl Brain {
     /// when a `velocirag::db::Database` is constructed via `from_connection()`.
     fn init_schema(conn: &Connection) -> Result<()> {
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;")?;
+        Self::init_tables(conn)
+    }
 
+    /// The tables of `init_schema` without its pragmas: this can run inside a transaction.
+    fn init_tables(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             "
             -- Brain metadata (key-value, single row for 'meta')

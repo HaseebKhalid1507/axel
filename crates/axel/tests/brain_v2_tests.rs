@@ -241,6 +241,104 @@ fn t02_open_v2_twice_migrates_once_and_changes_no_count() {
     assert_eq!(table_counts(&second.conn), before);
 }
 
+// ── Review finding 4: two openers at once; a file with no tables ────────
+
+#[test]
+fn f4_two_openers_of_a_missing_path_both_get_the_one_brain() {
+    for round in 0..20 {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("made").join("brain.r8");
+        let barrier = std::sync::Barrier::new(2);
+        let results: Vec<Result<bool, AxelError>> = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        barrier.wait();
+                        brain_v2::open_v2(&path, &opts(false)).map(|brain| brain.signer.is_some())
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        for (opener, result) in results.iter().enumerate() {
+            match result {
+                Ok(signer) => assert!(signer, "round {round}, opener {opener}: no signer"),
+                Err(e) => panic!("round {round}, opener {opener}: {e:?}"),
+            }
+        }
+
+        // One valid version 2 brain.
+        let conn = Connection::open(&path).unwrap();
+        assert_eq!(count(&conn, "PRAGMA user_version"), 1, "round {round}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM axel_migrations"), 1, "round {round}");
+        assert_eq!(count(&conn, "SELECT COUNT(*) FROM brain_meta"), 1, "round {round}");
+        assert_eq!(
+            count(&conn, "SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'"),
+            2,
+            "round {round}"
+        );
+        for table in V2_TABLES {
+            assert_eq!(
+                count_id(&conn, "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1", table),
+                1,
+                "round {round}, table {table}"
+            );
+        }
+        for column in ["project_key", "invalidated_at"] {
+            assert_eq!(
+                count_id(&conn, "SELECT COUNT(*) FROM pragma_table_info('memories') WHERE name = ?1", column),
+                1,
+                "round {round}, memories.{column}"
+            );
+        }
+        for column in ["indexed_at", "excitability", "source_mtime_ms", "hidden"] {
+            assert_eq!(
+                count_id(&conn, "SELECT COUNT(*) FROM pragma_table_info('documents') WHERE name = ?1", column),
+                1,
+                "round {round}, documents.{column}"
+            );
+        }
+        let check: String = conn.query_row("PRAGMA integrity_check", [], |r| r.get(0)).unwrap();
+        assert_eq!(check, "ok", "round {round}");
+        drop(conn);
+        assert!(brain_v2::require_v2(&path).is_ok(), "round {round}");
+        assert!(brain_v2::connect(&path, Role::Cli).is_ok(), "round {round}");
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "round {round}: file mode {mode:o}");
+    }
+}
+
+#[test]
+fn f4_a_file_with_no_tables_is_opened_as_a_new_brain() {
+    let dir = TempDir::new().unwrap();
+    // No bytes at all: what a creation leaves that died before its first write.
+    let zero = dir.path().join("zero.r8");
+    std::fs::write(&zero, b"").unwrap();
+    // A SQLite header and no table: what a creation leaves that died before its commit.
+    let bare = dir.path().join("bare.r8");
+    let conn = Connection::open(&bare).unwrap();
+    conn.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE gone(x); DROP TABLE gone;").unwrap();
+    drop(conn);
+    assert!(std::fs::metadata(&bare).unwrap().len() > 0);
+
+    for path in [zero, bare] {
+        assert!(matches!(brain_v2::require_v2(&path), Err(AxelError::BrainNotReady)), "{}", path.display());
+        let brain = match brain_v2::open_v2(&path, &opts(false)) {
+            Ok(brain) => brain,
+            Err(e) => panic!("{}: {e:?}", path.display()),
+        };
+        assert_eq!(count(&brain.conn, "PRAGMA user_version"), 1);
+        assert_eq!(count(&brain.conn, "SELECT COUNT(*) FROM brain_meta"), 1);
+        assert_eq!(count(&brain.conn, "SELECT COUNT(*) FROM axel_migrations"), 1);
+        assert_eq!(brain.embedder_model, "hash-384");
+        assert!(brain.signer.is_some());
+        drop(brain);
+        assert!(brain_v2::require_v2(&path).is_ok());
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "file mode {mode:o}");
+    }
+}
+
 // ── 3 ───────────────────────────────────────────────────────────────────
 
 #[test]
