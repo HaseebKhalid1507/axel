@@ -110,6 +110,8 @@ pub enum DegradedReason {
     BrainNotReady = 6,
     OtherBase = 7,
     IndexerStopped = 8,
+    /// The front thread died or hung before the first `Ready` (wave 3, 12b ruling 2).
+    FrontStopped = 9,
 }
 
 impl DegradedReason {
@@ -124,6 +126,7 @@ impl DegradedReason {
             6 => Self::BrainNotReady,
             7 => Self::OtherBase,
             8 => Self::IndexerStopped,
+            9 => Self::FrontStopped,
             _ => Self::None,
         }
     }
@@ -141,6 +144,7 @@ impl DegradedReason {
             Self::BrainNotReady => "BrainNotReady",
             Self::OtherBase => "OtherBase",
             Self::IndexerStopped => "IndexerStopped",
+            Self::FrontStopped => "FrontStopped",
         }
     }
 }
@@ -232,6 +236,12 @@ pub struct TestHooks {
     pub indexer_stop_after_jobs: Option<u64>,
     /// Replaces the 30 s of section 7.
     pub front_hang_limit_ms: Option<u64>,
+    /// The front thread panics before it has made anything.
+    pub panic_front_start: bool,
+    /// The front thread waits for the end of `serve` before it has made anything.
+    pub hang_front_start: bool,
+    /// Replaces the 60 s a front thread has to hand over the indexer's queue.
+    pub front_start_limit_ms: Option<u64>,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.

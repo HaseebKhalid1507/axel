@@ -14,7 +14,7 @@ use crate::brain_v2::{self, OpenOpts};
 use crate::embed::EmbedService;
 use crate::error::{AxelError, Result};
 use crate::ext::config::{base_config_value, ExtConfig};
-use crate::ext::server::{self, degrade, log_line, JOB_QUEUE};
+use crate::ext::server::{degrade, log_line, JOB_QUEUE};
 use crate::ext::types::{Boot, DegradedReason, IndexerCtx, Job, Mode};
 use crate::r8::{DEFAULT_EMBEDDER, EMBEDDING_DIM};
 use crate::vindex::{VecDelta, VecItem, VecKey, VecScope};
@@ -85,12 +85,12 @@ pub fn ensure_open(ctx: &mut IndexerCtx) {
         return;
     }
     if degraded {
-        // RULING: wave3-c12b ruling 2. A process whose front thread stopped opens nothing.
-        if ctx.status.reason.load(Ordering::SeqCst) == server::FRONT_STOPPED {
-            return;
-        }
         match DegradedReason::from_u8(ctx.status.reason.load(Ordering::SeqCst)) {
-            DegradedReason::BrainChanged | DegradedReason::BrainDamaged | DegradedReason::IndexerStopped => return,
+            // RULING: wave3-c12b ruling 2. A process whose front thread stopped opens nothing.
+            DegradedReason::BrainChanged
+            | DegradedReason::BrainDamaged
+            | DegradedReason::IndexerStopped
+            | DegradedReason::FrontStopped => return,
             _ => {}
         }
     }

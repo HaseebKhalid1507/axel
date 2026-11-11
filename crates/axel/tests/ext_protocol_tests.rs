@@ -1177,8 +1177,7 @@ const FRONT_STOPPED_TEXT: &str = "Axel is unavailable: FrontStopped. Synaps itse
 /// After `initialize`: the process is alive, says why in its status file and to a tool, and
 /// answers every hook.
 fn assert_serves_without_a_front_thread(host: &mut Host, dirs: &Dirs) {
-    assert_eq!(host.status.reason.load(Ordering::SeqCst), server::FRONT_STOPPED);
-    assert_eq!(server::reason_name(server::FRONT_STOPPED), "FrontStopped");
+    assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::FrontStopped);
     for kind in HOOKS {
         assert_eq!(host.hook(kind, "s1"), continues(), "{kind}");
     }
@@ -1196,7 +1195,7 @@ fn assert_serves_without_a_front_thread(host: &mut Host, dirs: &Dirs) {
 #[test]
 fn r2_a_front_thread_that_panics_before_its_loop_degrades_the_process_which_stays() {
     let dirs = Dirs::new();
-    let test = TestHooks { panic_tool: Some(server::TEST_FRONT_START_PANIC.to_string()), ..TestHooks::default() };
+    let test = TestHooks { panic_front_start: true, ..TestHooks::default() };
     let mut host = Host::start(None, test);
     host.call("initialize", json!({"config": dirs.config("off")}));
     let said = wait_status_file(&dirs, "degraded", Duration::from_secs(1));
@@ -1215,12 +1214,7 @@ fn r2_a_front_thread_that_panics_before_its_loop_degrades_the_process_which_stay
 #[test]
 fn r2_a_front_thread_that_never_hands_over_the_queue_degrades_the_process_which_stays() {
     let dirs = Dirs::new();
-    // The limit is twice the hook's value: 300 ms.
-    let test = TestHooks {
-        panic_tool: Some(server::TEST_FRONT_START_HANG.to_string()),
-        front_hang_limit_ms: Some(150),
-        ..TestHooks::default()
-    };
+    let test = TestHooks { hang_front_start: true, front_start_limit_ms: Some(300), ..TestHooks::default() };
     let mut host = Host::start(None, test);
     let start = Instant::now();
     host.call("initialize", json!({"config": dirs.config("off")}));

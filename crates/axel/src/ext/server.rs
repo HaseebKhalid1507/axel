@@ -40,15 +40,8 @@ const TOOL_WAIT_MS: u64 = 2_000;
 /// A front thread still inside one call after this long ends the process (R-5).
 const FRONT_HANG_MS: u64 = 30_000;
 /// A front thread that has not handed over the indexer's queue this long after `initialize`
-/// has hung at its start. `TestHooks.front_hang_limit_ms` replaces the 30 s above, and with
-/// it this limit, which is twice that.
-const FRONT_START_MS: u64 = 2 * FRONT_HANG_MS;
-/// `TestHooks.panic_tool` with one of these two names (no tool can have them) makes the
-/// front thread panic, or wait for the end of `serve`, before it has made anything.
-// RULING: wave3-c12b ruling 2. `TestHooks` is in `ext/types.rs`, which this commit may not
-// change; two switches of their own there would replace these names.
-pub const TEST_FRONT_START_PANIC: &str = "@front-start-panic";
-pub const TEST_FRONT_START_HANG: &str = "@front-start-hang";
+/// has hung at its start (wave 3, 12b ruling 2).
+const FRONT_START_MS: u64 = 60_000;
 /// `before_message` calls in a row that missed the budget before recall is switched off.
 const TRIP_AFTER_MISSES: u32 = 3;
 /// How long the breaker stays open.
@@ -88,37 +81,13 @@ pub fn degrade(status: &Status, mode: &AtomicU8, reason: DegradedReason, at: Opt
     mode.store(Mode::Degraded as u8, Ordering::SeqCst);
 }
 
-/// `Status.reason` of a front thread that died or hung before the first `Ready`.
-// RULING: wave3-c12b ruling 2. The reason is `FrontStopped`. `DegradedReason` is in
-// `ext/types.rs`, which this commit may not change, so the number is kept here until the
-// variant `FrontStopped = 9` exists; `DegradedReason::from_u8` reads it as `None`, and
-// every reader of this file's goes through `reason_name`.
-pub const FRONT_STOPPED: u8 = 9;
-
-/// The name of a value of `Status.reason`.
-pub fn reason_name(reason: u8) -> &'static str {
-    match reason {
-        FRONT_STOPPED => "FrontStopped",
-        other => DegradedReason::from_u8(other).as_str(),
-    }
-}
-
-/// `degrade` for `FrontStopped`: the reason first, then the mode.
-fn degrade_front_stopped(status: &Status, mode: &AtomicU8, at: Option<String>) {
-    if let Some(at) = at {
-        let _ = status.reason_at.set(at);
-    }
-    status.reason.store(FRONT_STOPPED, Ordering::SeqCst);
-    mode.store(Mode::Degraded as u8, Ordering::SeqCst);
-}
-
 /// The `<reason>` of the tool sentence: the variant's name when the mode is `Degraded`.
 // SPEC: 990 says a tool answers "Axel is starting" before the brain is open and 3865 gives
 // one sentence for everything outside `Ready`. The sentence of 3865 is used, with
 // `starting` as its reason while the mode is `Starting` (there is no `DegradedReason` yet).
 pub fn unavailable_reason(status: &Status, mode: &AtomicU8) -> &'static str {
     match Mode::from_u8(mode.load(Ordering::SeqCst)) {
-        Some(Mode::Degraded) => reason_name(status.reason.load(Ordering::SeqCst)),
+        Some(Mode::Degraded) => DegradedReason::from_u8(status.reason.load(Ordering::SeqCst)).as_str(),
         _ => "starting",
     }
 }
@@ -546,9 +515,9 @@ impl<W: Write> Pump<W> {
         if self.front_gone {
             // The indexer may have stored `Ready` in the same instant: the reason stands.
             let held = self.mode.load(Ordering::SeqCst) == Mode::Degraded as u8
-                && self.status.reason.load(Ordering::SeqCst) == FRONT_STOPPED;
+                && self.status.reason.load(Ordering::SeqCst) == DegradedReason::FrontStopped as u8;
             if !held {
-                degrade_front_stopped(&self.status, &self.mode, None);
+                degrade(&self.status, &self.mode, DegradedReason::FrontStopped, None);
             }
             return false;
         }
@@ -567,7 +536,7 @@ impl<W: Write> Pump<W> {
                 Err(TryRecvError::Disconnected) => break true,
             }
         };
-        let limit = Duration::from_millis(self.test.front_hang_limit_ms.map_or(FRONT_START_MS, |ms| 2 * ms));
+        let limit = Duration::from_millis(self.test.front_start_limit_ms.unwrap_or(FRONT_START_MS));
         let hung = !ended && live.jobs.is_none() && self.started.is_some_and(|t| t.elapsed() >= limit);
         if !ended && !hung {
             return false;
@@ -577,7 +546,7 @@ impl<W: Write> Pump<W> {
             return true;
         }
         self.front_gone = true;
-        degrade_front_stopped(&self.status, &self.mode, at);
+        degrade(&self.status, &self.mode, DegradedReason::FrontStopped, at);
         false
     }
 
@@ -598,7 +567,7 @@ impl<W: Write> Pump<W> {
         let body = json!({
             "pid": std::process::id(),
             "mode": mode_name(mode),
-            "reason": reason_name(reason),
+            "reason": DegradedReason::from_u8(reason).as_str(),
             "reason_at": if degraded { self.status.reason_at.get().cloned() } else { None },
             "written_ms": (self.clock)(),
             "started_ms": self.status.started_ms.load(Ordering::Relaxed),
@@ -746,15 +715,14 @@ impl<W: Write> Pump<W> {
             let panics = boot.status.clone();
             let ran = catch_unwind(AssertUnwindSafe(move || {
                 let Boot { embedder, clock, test, status } = boot;
-                match test.panic_tool.as_deref() {
-                    Some(TEST_FRONT_START_PANIC) => panic!("test switch: front start"),
-                    Some(TEST_FRONT_START_HANG) => {
-                        while !stop.load(Ordering::SeqCst) {
-                            thread::sleep(Duration::from_millis(20));
-                        }
-                        return;
+                if test.panic_front_start {
+                    panic!("test switch: panic_front_start");
+                }
+                if test.hang_front_start {
+                    while !stop.load(Ordering::SeqCst) {
+                        thread::sleep(Duration::from_millis(20));
                     }
-                    _ => {}
+                    return;
                 }
                 let embedder = embedder.or_else(|| load_embedder(&cfg));
                 let boot = Boot { embedder, clock, test, status };
@@ -789,7 +757,7 @@ impl<W: Write> Pump<W> {
         });
         if spawned.is_err() {
             self.front_gone = true;
-            degrade_front_stopped(&status, &self.mode, Some(here(line!())));
+            degrade(&status, &self.mode, DegradedReason::FrontStopped, Some(here(line!())));
             self.log("front thread not started");
             return None;
         }
@@ -1112,7 +1080,7 @@ impl<W: Write> Pump<W> {
         self.log(&format!("serve ends: {end:?}"));
         // A front thread that ended the process: the file that stays says so.
         if end == ServeEnd::FrontStuck {
-            degrade_front_stopped(&self.status, &self.mode, None);
+            degrade(&self.status, &self.mode, DegradedReason::FrontStopped, None);
             self.status_file_when_due();
         }
         // A clean end leaves no status file behind.

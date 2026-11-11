@@ -223,7 +223,7 @@ fn every_stub_gives_its_fixed_answer() {
     assert!(out.picks.is_empty());
 
     // types
-    for v in 0..=8u8 {
+    for v in 0..=9u8 {
         assert_eq!(DegradedReason::from_u8(v) as u8, v);
     }
     assert_eq!(DegradedReason::from_u8(200), DegradedReason::None);
