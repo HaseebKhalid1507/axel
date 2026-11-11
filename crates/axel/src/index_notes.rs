@@ -43,6 +43,9 @@ pub struct PassReport {
     pub files_gone: usize,
     pub inserted: usize,
     pub purged: usize,
+    /// Notes whose record changed under the same id: the old row purged, the new one
+    /// inserted. Counted here only, not in `inserted` or `purged`.
+    pub rewritten: usize,
     /// False: `<base>/memory` could not be listed, and nothing was changed.
     pub listed: bool,
 }
@@ -240,19 +243,80 @@ fn one_file(
     };
 
     brain_v2::begin_write(conn)?;
-    let (inserted, purged) = mirror(conn, signer, &path_text, name, key, &file, stored.as_ref(), now)
-        .and_then(|counts| {
+    let done = mirror(conn, signer, &path_text, name, key, &file, stored.as_ref(), now)
+        .and_then(|done| {
             conn.execute_batch("COMMIT")?;
-            Ok(counts)
+            Ok(done)
         })
         .inspect_err(|_| rollback(conn))?;
     report.files_read += 1;
-    report.inserted += inserted;
-    report.purged += purged;
+    report.inserted += done.inserted;
+    report.purged += done.purged;
+    report.rewritten += done.rewritten;
     Ok(())
 }
 
-/// Step 3, inside the caller's transaction. Returns (rows inserted, rows purged).
+/// What [`mirror`] did to the rows of one file.
+#[derive(Default)]
+struct Mirrored {
+    inserted: usize,
+    purged: usize,
+    rewritten: usize,
+}
+
+/// The row an id already has, whatever made it.
+struct Existing {
+    origin_kind: Option<String>,
+    origin_ref: Option<String>,
+    hidden_ms: Option<i64>,
+    hidden_by: Option<String>,
+    title: String,
+    content: String,
+    sensitivity: String,
+    tags: String,
+    expires_at: Option<String>,
+}
+
+fn existing_row(conn: &Connection, id: &str) -> Result<Option<Existing>> {
+    Ok(conn
+        .query_row(
+            "SELECT e.origin_kind, e.origin_ref, e.hidden_ms, e.hidden_by,
+                    m.title, m.content, m.sensitivity, m.tags, m.expires_at
+               FROM memories m LEFT JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
+            [id],
+            |r| {
+                Ok(Existing {
+                    origin_kind: r.get(0)?,
+                    origin_ref: r.get(1)?,
+                    hidden_ms: r.get(2)?,
+                    hidden_by: r.get(3)?,
+                    title: r.get(4)?,
+                    content: r.get(5)?,
+                    sensitivity: r.get(6)?,
+                    tags: r.get(7)?,
+                    expires_at: r.get(8)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// Is the stored row what `insert_row` would store for `row` today? The text as the row
+/// writer stores it (title and content through `screen::redact`), the sensitivity, the
+/// expiry and the tags. A stored value that cannot be read back is a difference.
+fn same_as_stored(old: &Existing, row: &NewRow) -> bool {
+    let expires_ms = match old.expires_at.as_deref() {
+        None => Some(None),
+        Some(text) => DateTime::parse_from_rfc3339(text).ok().map(|t| Some(t.timestamp_millis())),
+    };
+    old.content == crate::screen::redact(&row.content).text
+        && old.title == crate::screen::redact(&row.title).text
+        && old.sensitivity == row.sensitivity.as_str()
+        && serde_json::from_str::<Vec<String>>(&old.tags).is_ok_and(|tags| tags == row.tags)
+        && expires_ms == Some(row.expires_ms)
+}
+
+/// Step 3, inside the caller's transaction.
 #[allow(clippy::too_many_arguments)]
 fn mirror(
     conn: &Connection,
@@ -263,7 +327,7 @@ fn mirror(
     file: &NotesFile,
     stored: Option<&Stored>,
     now: i64,
-) -> Result<(usize, usize)> {
+) -> Result<Mirrored> {
     let scope_dir = project::project_dir(key);
     let mirrored = rows_of(conn, name)?;
     let live: HashSet<&str> = file.live.iter().map(|n| n.id.as_str()).collect();
@@ -289,13 +353,35 @@ fn mirror(
     }
     let purged = store::purge_many(conn, &leave, false, true)?;
 
-    // Inserts.
+    // Inserts, and notes whose record changed under the same id.
     let mut inserted = 0usize;
+    let mut rewritten = 0usize;
     let mut ids_skipped = 0usize;
     for note in &file.live {
         if !valid_note_id(&note.id) {
             ids_skipped += 1;
             continue;
+        }
+        let mut row = new_row(note, &scope_dir, name);
+        let mut rewrote = false;
+        if let Some(old) = existing_row(conn, &note.id)? {
+            // A row of another origin or of another notes file is not mirrored and not
+            // touched.
+            if old.origin_kind.as_deref() != Some("note_file") || old.origin_ref.as_deref() != Some(name) {
+                ids_skipped += 1;
+                continue;
+            }
+            if same_as_stored(&old, &row) {
+                continue;
+            }
+            // RULING: wave 4, R-14 item 2: the record changed under the same id (the owner
+            // edited the note, or made it secret). The old row is forgotten, with its word
+            // rows and its vector, and the new one is written in this transaction. A hide
+            // someone set on the row is carried over: an edit never unhides.
+            store::purge_many(conn, std::slice::from_ref(&note.id), false, true)?;
+            rewritten += 1;
+            rewrote = true;
+            row.hidden = old.hidden_ms.map(|ms| (ms, old.hidden_by.unwrap_or_default()));
         }
         // SPEC: 2346 "`created_ms` = `timestamp_ms`": a time the row writer cannot store
         // (the reader saturates core's u64 at i64::MAX) would fail the whole transaction
@@ -305,23 +391,8 @@ fn mirror(
             ids_skipped += 1;
             continue;
         }
-        let origin: Option<(Option<String>, Option<String>)> = conn
-            .query_row(
-                "SELECT e.origin_kind, e.origin_ref FROM memories m
-                   LEFT JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
-                [&note.id],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
-            .optional()?;
-        if let Some((kind, origin_ref)) = origin {
-            // Already a row: this file's own mirror, or a row of another origin or of
-            // another notes file, which is not mirrored and not touched.
-            if kind.as_deref() != Some("note_file") || origin_ref.as_deref() != Some(name) {
-                ids_skipped += 1;
-            }
-            continue;
-        }
-        match store::insert_row(conn, signer, &new_row(note, &scope_dir, name))? {
+        match store::insert_row(conn, signer, &row)? {
+            Inserted::New { .. } if rewrote => {}
             Inserted::New { .. } => inserted += 1,
             // SPEC: 2356-2361 names `Exists` only. An id with a `memory_tombstones` row (an
             // id Axel itself forgot for good) is not mirrored either, and is counted.
@@ -329,7 +400,7 @@ fn mirror(
         }
     }
 
-    if purged > 0 {
+    if purged > 0 || rewritten > 0 {
         index_archives::mark_purged(conn)?;
     }
 
@@ -359,7 +430,7 @@ fn mirror(
                 last_seen_ms = MAX(projects.last_seen_ms, excluded.last_seen_ms)",
         params![scope_dir, key, now],
     )?;
-    Ok((inserted, purged))
+    Ok(Mirrored { inserted, purged, rewritten })
 }
 
 /// The ids this file has mirrored: `origin_kind = 'note_file'`, `origin_ref` = its name.

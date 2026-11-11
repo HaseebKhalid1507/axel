@@ -930,3 +930,106 @@ fn a_record_with_a_time_no_row_can_hold_is_skipped_and_the_rest_of_the_file_is_m
     assert_eq!(w.nf_text(KEY, "reason").unwrap(), "ids_skipped: 1");
     assert_eq!(w.nf_int(KEY, "ok"), Some(1));
 }
+
+// ── Wave 4, R-14 item 2: a note rewritten under the same id ─────────────────
+
+/// One record line with every field a note can change.
+fn rec_full(id: &str, ts: i64, content: &str, tags: &[&str], sensitivity: Option<&str>, days: Option<u32>) -> String {
+    let mut value = json!({
+        "namespace": format!("project-{KEY}"), "timestamp_ms": ts, "content": content,
+        "tags": tags, "id": id, "project": KEY
+    });
+    if let Some(s) = sensitivity {
+        value["sensitivity"] = json!(s);
+    }
+    if let Some(days) = days {
+        value["retention"] = json!({ "max_age_days": days });
+    }
+    format!("{value}\n")
+}
+
+fn fts(w: &World, word: &str) -> i64 {
+    w.count(&format!("SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '{word}'"))
+}
+
+/// Guards what the owner would see: he edits a note to take something out, and the model
+/// goes on being shown the old text.
+#[test]
+fn a_note_rewritten_under_the_same_id_loses_its_old_text_and_keeps_its_hide() {
+    let mut w = three_mirrored();
+    w.conn()
+        .execute("UPDATE memory_ext SET hidden_ms = 1234, hidden_by = 'cli' WHERE mem_id = ?1", [N2])
+        .unwrap();
+    let (one, three) = (w.saved(N1), w.saved(N3));
+    let vid_one = w.count(&format!("SELECT vid FROM memory_ext WHERE mem_id = '{N1}'"));
+    assert_eq!(fts(&w, "beta"), 1);
+
+    w.write(KEY, &format!("{}{}{}", n1(), rec(N2, 1_700_000_000_100, "the second note is about delta"), n3()));
+    let report = w.pass();
+    assert_eq!((report.rewritten, report.purged, report.inserted), (1, 0, 0));
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
+    assert_eq!(w.content(N2).unwrap(), "the second note is about delta");
+    assert_eq!(w.text("SELECT title FROM memories WHERE id = ?1", N2).unwrap(), "the second note is about delta");
+    assert_eq!((fts(&w, "beta"), fts(&w, "delta")), (0, 1), "the word index holds the old text");
+    assert_eq!(w.count("SELECT count(*) FROM memories WHERE content LIKE '%beta%'"), 0);
+    assert_eq!(w.purge_pending(), 1, "old text was forgotten: the log is to be truncated");
+    assert_eq!(w.tombstones(), 0);
+    // An edit never unhides.
+    assert_eq!(w.count(&format!("SELECT hidden_ms FROM memory_ext WHERE mem_id = '{N2}'")), 1234);
+    assert_eq!(w.text("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", N2).unwrap(), "cli");
+    // The notes that did not change are the rows they were.
+    assert_eq!((w.saved(N1), w.saved(N3)), (one, three));
+    assert_eq!(w.count(&format!("SELECT vid FROM memory_ext WHERE mem_id = '{N1}'")), vid_one);
+    assert_eq!(w.nf_int(KEY, "live_count"), Some(3));
+    assert_eq!(w.nf_text(KEY, "reason"), None);
+
+    // The same file with a new time: read, and nothing is rewritten.
+    w.write(KEY, &format!("{}{}{}", n1(), rec(N2, 1_700_000_000_100, "the second note is about delta"), n3()));
+    let report = w.pass();
+    assert_eq!((report.files_read, report.rewritten, report.purged, report.inserted), (1, 0, 0, 0));
+    assert_eq!(w.count(&format!("SELECT hidden_ms FROM memory_ext WHERE mem_id = '{N2}'")), 1234);
+}
+
+/// Guards what the owner would lose: he makes a note secret, and its body stays in the
+/// word index.
+#[test]
+fn a_note_made_secret_under_the_same_id_leaves_the_word_index() {
+    let mut w = three_mirrored();
+    assert_eq!(fts(&w, "alpha"), 1);
+    let secret = rec_full(N1, 1_700_000_000_000, "the first note is about alpha", &[], Some("secret"), None);
+    w.write(KEY, &format!("{secret}{}{}", n2(), n3()));
+    let report = w.pass();
+    assert_eq!((report.rewritten, report.purged, report.inserted), (1, 0, 0));
+    assert_eq!(w.text("SELECT sensitivity FROM memories WHERE id = ?1", N1).unwrap(), "secret");
+    assert_eq!(w.content(N1).unwrap(), "the first note is about alpha");
+    assert_eq!(fts(&w, "alpha"), 0, "a secret body is in the word index");
+    assert_eq!(w.text("SELECT title FROM memories WHERE id = ?1", N1).unwrap(), "Secret note");
+    assert_eq!(w.count(&format!("SELECT count(*) FROM memory_ext WHERE mem_id = '{N1}' AND embedding IS NULL")), 1);
+    assert_eq!(w.purge_pending(), 1);
+}
+
+#[test]
+fn a_change_of_tags_or_of_expiry_rewrites_the_row_too() {
+    let mut w = three_mirrored();
+    let text = "the first note is about alpha";
+    let expiry = |w: &World| w.text("SELECT expires_at FROM memories WHERE id = ?1", N1);
+
+    w.write(KEY, &format!("{}{}{}", rec_full(N1, 1_700_000_000_000, text, &["kept"], None, None), n2(), n3()));
+    assert_eq!(w.pass().rewritten, 1);
+    assert_eq!(w.text("SELECT tags FROM memories WHERE id = ?1", N1).unwrap(), r#"["kept"]"#);
+    assert_eq!(expiry(&w), None);
+
+    w.write(KEY, &format!("{}{}{}", rec_full(N1, 1_700_000_000_000, text, &["kept"], None, Some(7)), n2(), n3()));
+    assert_eq!(w.pass().rewritten, 1);
+    let expires_ms = chrono::DateTime::parse_from_rfc3339(&expiry(&w).unwrap()).unwrap().timestamp_millis();
+    assert_eq!(expires_ms, 1_700_000_000_000 + 7 * 86_400_000);
+
+    // `sensitive` is a tag: a change too. And back to the same record: nothing.
+    w.write(KEY, &format!("{}{}{}", rec_full(N1, 1_700_000_000_000, text, &["kept"], Some("sensitive"), Some(7)), n2(), n3()));
+    assert_eq!(w.pass().rewritten, 1);
+    assert_eq!(w.text("SELECT tags FROM memories WHERE id = ?1", N1).unwrap(), r#"["kept","sensitive"]"#);
+    w.write(KEY, &format!("{}{}{}", rec_full(N1, 1_700_000_000_000, text, &["kept"], Some("sensitive"), Some(7)), n2(), n3()));
+    let report = w.pass();
+    assert_eq!((report.files_read, report.rewritten), (1, 0));
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
+}
