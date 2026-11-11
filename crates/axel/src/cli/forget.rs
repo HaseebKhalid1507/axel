@@ -176,15 +176,29 @@ fn twins_of(conn: &Connection, row: &RowInfo) -> Result<Vec<Twin>> {
         .collect())
 }
 
-/// `m:<id> · 2026-11-10 14:05 UTC · ctx-<archive> · <first line of its text>`.
+/// `m:<id> · 2026-11-10 14:05 UTC · ctx-<archive> · <first line of its reply>`.
+// RULING: v2 c18b review round 2, item 4. Every row listed here has the same prompt and,
+// in one archive, the same date: the first line of the reply is what tells them apart.
 fn twin_line(row: &RowInfo) -> String {
     let when = row.created_ms.map(show::date).unwrap_or_else(|| "no date".to_string());
     let text = if row.secret {
         "(a secret memory; its text is not shown)".to_string()
     } else {
-        screen::show(row.content.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), 120)
+        screen::show(reply_line(&row.content), 120)
     };
     format!("m:{} · {when} · ctx-{} · {text}", one(&row.id), one(&row.origin_ref))
+}
+
+/// The first line of a turn's reply: the line that starts with `Assistant`; else the first
+/// non-empty line after the prompt's first; else the first line.
+fn reply_line(content: &str) -> &str {
+    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
+    let first = lines.next().unwrap_or("");
+    content
+        .lines()
+        .find(|l| l.starts_with("Assistant"))
+        .or_else(|| lines.next())
+        .unwrap_or(first)
 }
 
 // ── --now ───────────────────────────────────────────────────────────────────
@@ -356,7 +370,12 @@ fn forget_now(
             "  No command brings these copies back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too. Other turns with the same prompt stay."
         )?;
     }
-    write!(term.out, "Delete {total} memories for good? [y/N] ")?;
+    // RULING: v2 c18b review round 2, item 4: the question counts all that goes.
+    if taken.is_empty() {
+        write!(term.out, "Delete {total} memories for good? [y/N] ")?;
+    } else {
+        write!(term.out, "Delete {total} memories for good and take {} archived rows out of the brain? [y/N] ", taken.len())?;
+    }
     term.out.flush()?;
     let mut answer = String::new();
     term.input.read_line(&mut answer)?;

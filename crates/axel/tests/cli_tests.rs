@@ -722,7 +722,9 @@ fn forget_now_deletes_only_the_twin_proven_the_same_turn_and_leaves_another_turn
     // Each row hidden with it is shown with its date and first line; none is called "the same turn".
     let day = chrono::DateTime::from_timestamp_millis(now_ms() - 40 * DAY_MS).unwrap().format("%Y-%m-%d").to_string();
     assert!(hid.out.contains("m:mem_cont_other · ") && hid.out.contains(&day), "{}", hid.out);
-    assert!(hid.out.contains("User: continue"), "{}", hid.out);
+    // Round 2, item 4: by the first line of the reply, which tells them apart.
+    assert!(hid.out.contains("· Assistant: the PARROTFISH invoice was paid on Friday"), "{}", hid.out);
+    assert!(!hid.out.contains("· User: continue"), "{}", hid.out);
     assert!(!hid.out.contains("the same turn"), "{}", hid.out);
     w.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE hidden_ms IS NOT NULL", [now_ms() - 25 * HOUR_MS]).unwrap();
 
@@ -1370,7 +1372,7 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let before = all(&world);
     let no = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "n\n");
     let out = &no.out;
-    let asked = out.find("[y/N]").unwrap_or_else(|| panic!("{out}"));
+    let asked = out.find("Delete 1 memories for good and take 1 archived rows out of the brain? [y/N]").unwrap_or_else(|| panic!("{out}"));
     let listed = out.find(&format!("m:{old_row} \u{b7} ")).unwrap_or_else(|| panic!("the taken row is not listed: {out}"));
     let archive = out.find(&format!("  ctx-{}:", old.id)).unwrap_or_else(|| panic!("{out}"));
     assert!(archive < listed && listed < asked, "{out}");
