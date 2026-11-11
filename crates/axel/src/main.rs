@@ -632,6 +632,24 @@ fn cmd_remember(
     category_str: &str,
     topic: &str,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    // RULING: wave3-c11 ruling 4: this command writes `memories` through memkoshi, past the
+    // row writer (no redaction, no project, a second copy of the text in `documents`). On a
+    // version 2 brain it refuses before anything is opened for writing. The version is read
+    // by the gate's own read-only look, `brain_v2::require_v2`.
+    let path = brain_path(cli);
+    match brain_v2::require_v2(&path) {
+        Ok(()) => {
+            return Err(format!(
+                "this brain is version 2 and this command does not write to it ({}); save a memory with \"axel-v2 remember\".",
+                path.display()
+            )
+            .into());
+        }
+        // A version 1 brain: as before.
+        Err(axel::error::AxelError::V1Brain(_)) => {}
+        Err(e) => return Err(e.into()),
+    }
+
     let content = content_parts.join(" ");
     if content.is_empty() {
         eprintln!("Please provide memory content.");
@@ -640,7 +658,6 @@ fn cmd_remember(
 
     let category = parse_category(category_str)?;
 
-    let path = brain_path(cli);
     ensure_brain(&path)?;
 
     let title: String = content.chars().take(60).collect();
