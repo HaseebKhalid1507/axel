@@ -404,13 +404,15 @@ fn forget_now(
     // after it can turn the result into an error (a retry would only find "not found").
     // The "Deleted" line comes first; every later write, the cache file and the checkpoint
     // can fail without changing the answer, which is exit 0.
-    let _ = after_purge(conn, path, &purged, term);
+    after_purge(conn, path, &purged, term);
     Ok(OK)
 }
 
-/// What is said and done after the purge's COMMIT. Its error is ignored by the caller.
-fn after_purge(conn: &Connection, path: &Path, purged: &Purged, term: &mut Term) -> Result<()> {
-    writeln!(term.out, "Deleted {} memories for good.", purged.deleted)?;
+/// What is said and done after the purge's COMMIT. Nothing here can fail the command.
+// RULING: v2 c18b review round 2, item 6. No output after the COMMIT uses `?`: a closed
+// stdout must not skip the cleanup (the `.hnsw` file, the checkpoint), which always runs.
+fn after_purge(conn: &Connection, path: &Path, purged: &Purged, term: &mut Term) {
+    let _ = writeln!(term.out, "Deleted {} memories for good.", purged.deleted);
     let _ = term.out.flush();
     let hnsw_failed = if purged.shadows > 0 {
         // The old search's vector cache is keyed by `documents` rows; the next `search`
@@ -427,49 +429,47 @@ fn after_purge(conn: &Connection, path: &Path, purged: &Purged, term: &mut Term)
     if let Some(failed) = hnsw_failed {
         let _ = writeln!(term.err, "could not remove {failed}; delete it by hand");
     }
-    let _ = said_after(purged, log_clear, term);
-    Ok(())
+    said_after(purged, log_clear, term);
 }
 
-fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) -> Result<()> {
+fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) {
     // RULING: v2 c18b review, item 4: a deleted turn is still in Synaps's own archive.
     for (id, archive) in &purged.in_synaps {
-        match archive {
+        let _ = match archive {
             Some(archive) => writeln!(
                 term.out,
                 "  m:{}: the turn is still in Synaps's archive ctx-{a}. To forget it there, ask the assistant in that project to call memory_forget with the id \"ctx-{a}\" (that forgets the whole archive, every turn in it).",
                 one(id),
                 a = one(archive)
-            )?,
+            ),
             None => writeln!(
                 term.out,
                 "  m:{}: if Synaps archived this chat, the turn is still in that archive (none is indexed yet). To forget it there, ask the assistant to call memory_forget with its id (ctx-…).",
                 one(id)
-            )?,
-        }
+            ),
+        };
     }
     if !purged.left_out.is_empty() {
-        writeln!(
+        let _ = writeln!(
             term.out,
             "The forget mark took {} archived copies of the deleted turns out of the brain, as listed above.",
             purged.left_out.len()
-        )?;
+        );
     }
     if purged.back > 0 {
         // RULING: wave 4, rules for wave 5: nothing tells the vector index; say what to expect.
-        writeln!(
+        let _ = writeln!(
             term.out,
             "{} memories that a deleted row had replaced are recalled again; a running extension finds them by meaning after its next resync (about a minute).",
             purged.back
-        )?;
+        );
     }
     if !log_clear {
-        writeln!(
+        let _ = writeln!(
             term.out,
             "The brain's log file still holds the deleted text: it was in use. The running extension clears it when it is next idle."
-        )?;
+        );
     }
-    Ok(())
 }
 
 fn print_row(out: &mut dyn Write, row: &RowInfo, now: i64) -> Result<()> {

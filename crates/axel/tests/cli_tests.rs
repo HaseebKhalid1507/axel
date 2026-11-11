@@ -565,7 +565,15 @@ impl std::io::Write for Closing {
 fn after_the_purge_is_committed_a_failed_write_is_not_an_error() {
     let w = World::new();
     w.put(&r("mem_done", "tool", "a decision hidden yesterday"));
+    w.shadow("mem_done", "a decision hidden yesterday");
+    w.put(&r("mem_stays", "tool", "another decision that stays"));
     w.hide("mem_done", "cli", 25 * HOUR_MS);
+    let hnsw = w.path.with_extension("r8.hnsw");
+    {
+        let mut engine = BrainSearch::open_with_embedder(&w.path, Embedder::hashing()).unwrap();
+        engine.search("another decision", 5).unwrap();
+    }
+    assert!(hnsw.exists(), "the test needs the cache file");
     let args = forget::Args { ids: strings(&["mem_done"]), now: true, hidden: false };
     let mut out = Closing { seen: Vec::new() };
     let mut err = Closing { seen: b"[y/N] ".to_vec() };
@@ -577,6 +585,9 @@ fn after_the_purge_is_committed_a_failed_write_is_not_an_error() {
     assert_eq!(code.unwrap_or_else(|e| panic!("the purge is done and the answer is an error: {e}")), 0);
     assert!(String::from_utf8_lossy(&out.seen).contains("Delete 1 memories for good? [y/N] "));
     assert!(!w.has("mem_done"));
+    // v2 c18b review round 2, item 6: the cleanup ran though nothing could be printed.
+    assert!(!hnsw.exists(), "a closed stdout skipped the removal of the vector cache");
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM context_data WHERE key = 'purge_pending'"), 0, "the checkpoint did not run");
 }
 
 #[test]
