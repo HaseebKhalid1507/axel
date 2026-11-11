@@ -15,6 +15,7 @@ use axel::ext::config::ExtConfig;
 use axel::ext::front::{self, FrontAnswer, FrontCall, FrontReply, FrontWork, MarkEnd};
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{self, degrade, recover, serve, BUSY_TEXT};
+use axel::ext::tools_forum::NO_CALLER;
 use axel::ext::types::{
     Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, Job, Mode, ServeEnd, Status, TestHooks,
 };
@@ -440,9 +441,10 @@ fn t03_every_hook_kind_and_an_unknown_one_answer_continue() {
     let none = host.call("hook.handle", Value::Null);
     assert_eq!(none["result"], continues());
 
-    // The mode is Ready: a tool reaches the dispatch, whose stub knows no name.
+    // The mode is Ready: a tool reaches the dispatch. The test host sends no `caller`, so
+    // the real tool answers NO_CALLER (commit 18a), which only the dispatch can say.
     let tool = host.tool("search");
-    assert_eq!(tool["error"]["code"], -32602, "{tool}");
+    assert_eq!(tool["result"]["content"], NO_CALLER, "{tool}");
     assert_eq!(host.status.hook_misses.load(Ordering::Relaxed), 0);
     assert_eq!(host.status.panics.load(Ordering::Relaxed), 0);
 
@@ -606,7 +608,7 @@ fn t09_a_handler_that_panics_is_an_error_answer_and_the_next_call_works() {
 
     // The next calls work: another tool reaches the dispatch, a hook is answered.
     let other = host.tool("remember");
-    assert_eq!(other["error"]["code"], -32602, "{other}");
+    assert_eq!(other["result"]["content"], NO_CALLER, "{other}");
     assert_eq!(host.hook("before_message", "s1"), continues());
     assert_eq!(host.status.hook_misses.load(Ordering::Relaxed), 0);
 
@@ -688,7 +690,7 @@ fn t13_an_indexer_that_ends_degrades_the_process_and_every_frame_is_still_answer
     let dirs = Dirs::new();
     let test = TestHooks { indexer_stop_after_jobs: Some(1), ..TestHooks::default() };
     let mut host = Host::ready(&dirs, None, test);
-    assert_eq!(host.tool("search")["error"]["code"], -32602, "the mode is Ready before the job");
+    assert_eq!(host.tool("search")["result"]["content"], NO_CALLER, "the mode is Ready before the job");
 
     assert_eq!(host.hook("on_context_archived", "s1"), continues());
     let text = host.wait_degraded();
@@ -727,7 +729,7 @@ fn t13_a_job_that_panics_does_not_end_the_indexer() {
     }
     assert_eq!(host.hook("on_memory_forgotten", "s1"), continues());
     host.wait_until("the second job has panicked", |h| h.status.panics.load(Ordering::Relaxed) == 2);
-    assert_eq!(host.tool("search")["error"]["code"], -32602, "the mode is still Ready");
+    assert_eq!(host.tool("search")["result"]["content"], NO_CALLER, "the mode is still Ready");
     assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::None);
     assert!(!read_log(&dirs).contains("indexer stopped"));
     assert_eq!(host.close(), ServeEnd::InputClosed);
@@ -801,7 +803,7 @@ fn t15_a_dead_embed_thread_answers_none_at_once_and_the_status_says_so() {
     for kind in HOOKS {
         assert_eq!(host.hook(kind, "s1"), continues(), "{kind}");
     }
-    assert_eq!(host.tool("search")["error"]["code"], -32602, "the mode is still Ready");
+    assert_eq!(host.tool("search")["result"]["content"], NO_CALLER, "the mode is still Ready");
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
 
@@ -1646,7 +1648,7 @@ fn r12_a_retry_opens_a_brain_that_has_become_ready() {
     assert_eq!((&said["reason"], &said["reason_at"]), (&json!("None"), &Value::Null), "{said}");
     assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::None);
     host.wait_until("the status row is written", |h| h.status.status_written_ms.load(Ordering::Relaxed) > 0);
-    host.wait_until("a tool is forwarded", |h| h.tool("search")["error"]["code"] == -32602);
+    host.wait_until("a tool is forwarded", |h| h.tool("search")["result"]["content"] == NO_CALLER);
     assert_eq!(read_log(&dirs).matches("brain open").count(), 1);
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
