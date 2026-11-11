@@ -693,6 +693,76 @@ fn t07_a_turn_captured_from_a_session_is_not_returned_to_it_and_is_returned_to_a
     assert_eq!(inject::who(&search.picks[0], &fx.cfg, Some("T")), "earlier chat in this project");
 }
 
+#[test]
+fn t07b_a_live_turn_of_the_same_chat_under_another_session_id_is_still_in_the_window() {
+    let mut fx = Fx::new();
+    // The chat is `S`; this turn was captured when the same chat ran under the id `S-before`.
+    let logical = project::logical("S");
+    let mut turn = row(
+        "mem_live",
+        "where is the retry limit set",
+        "User: where is the retry limit set?\nAssistant: MAX_RETRIES is five in the net module",
+    );
+    turn.class = "episodic_turn";
+    turn.origin_kind = "capture";
+    turn.origin_ref = "S-before";
+    turn.session_id = Some("S-before");
+    turn.logical = Some(&logical);
+    fx.put(&turn);
+
+    let own = fx.recall("where is the retry limit set", &chat("S"), true);
+    assert!(own.picks.is_empty(), "{:?}", own.picks);
+    assert_eq!(whys(&own, "in_window"), ["m:mem_live"]);
+    // Another chat gets it,
+    let other = fx.recall("where is the retry limit set", &chat("T"), true);
+    assert_eq!(ids(&other), ["mem_live"]);
+    // a worker (no chat at all) gets it, whatever the row's ids are,
+    let worker = View { own_session: None, ..chat("unused") };
+    assert_eq!(ids(&fx.recall("where is the retry limit set", &worker, true)), ["mem_live"]);
+    // and an archive row of the chat itself is not "in the window": only live captures are.
+    let mut archived = row("mem_arch", "retry limit earlier", "User: what was the retry limit before?\nAssistant: the retry limit was three until march");
+    archived.class = "episodic_turn";
+    archived.origin_kind = "archive";
+    archived.origin_ref = ARCHIVE_1;
+    archived.session_id = Some("S-before");
+    archived.logical = Some(&logical);
+    fx.put(&archived);
+    let own = fx.recall("where is the retry limit set", &chat("S"), true);
+    assert_eq!(ids(&own), ["mem_arch"], "{:?}", own.trace);
+}
+
+#[test]
+fn t04b_a_file_under_an_excluded_folder_is_excluded_by_either_name_of_the_folder() {
+    // `link` is a symlink to `real`. The config names one of them; a file is stored under
+    // the other (the scanner resolved the path, or the config's author did).
+    let dir = TempDir::new().unwrap();
+    let root = std::fs::canonicalize(dir.path()).unwrap();
+    let (real, link) = (root.join("real"), root.join("link"));
+    std::fs::create_dir_all(&real).unwrap();
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let under = |folder: &std::path::Path, name: &str| folder.join(name).to_string_lossy().into_owned();
+
+    let mut fx = Fx::new();
+    fx.cfg.model_loaded = false;
+    fx.put_doc("notes::by-real", "the puffin colony survey by real", Some(&under(&real, "a.md")), "{}");
+    fx.put_doc("notes::by-link", "the puffin colony survey by link", Some(&under(&link, "b.md")), "{}");
+    fx.put_doc("notes::open", "the puffin colony survey in the open", Some(&under(&root, "c.md")), "{}");
+    let all = ["doc:notes::by-link", "doc:notes::by-real", "doc:notes::open"];
+    assert_eq!(sorted(ids(&fx.recall("puffin colony survey", &chat("s1"), true))), all);
+
+    // The config names the symlink: `from_ext` lists it as typed and as resolved.
+    let ext = ext_cfg(&dir, json!({ "recall_exclude_paths": link.to_string_lossy() }));
+    let cfg = RecallConfig::from_ext(&ext, NOW);
+    assert_eq!(cfg.exclude_paths, [link.clone(), real.clone()]);
+    fx.cfg.exclude_paths = cfg.exclude_paths;
+    assert_eq!(ids(&fx.recall("puffin colony survey", &chat("s1"), true)), ["doc:notes::open"]);
+
+    // A folder that is no symlink is listed once; one that does not exist stays as typed.
+    let gone = root.join("gone");
+    let ext = ext_cfg(&dir, json!({ "recall_exclude_paths": format!("{}, {}", real.display(), gone.display()) }));
+    assert_eq!(RecallConfig::from_ext(&ext, NOW).exclude_paths, [real, gone]);
+}
+
 // ── Section 3, test 8 ───────────────────────────────────────────────────────
 
 #[test]

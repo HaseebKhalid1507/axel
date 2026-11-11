@@ -134,16 +134,38 @@ pub struct RecallConfig {
     pub max_items: usize,
     pub max_chars: usize,
     /// Config `recall_exclude_paths`: a document under one of these is never a candidate.
+    /// `from_ext` lists each folder as it was typed and, when that differs, as the file
+    /// system resolves it (through symlinks); a stored path that starts with either form
+    /// is excluded.
     pub exclude_paths: Vec<PathBuf>,
     /// `Status.model_loaded`, set by the caller. `from_ext` leaves it false, and with it
     /// false no `embed_query` is made: recall runs on words alone.
     pub model_loaded: bool,
-    // SPEC: 3181 shows a file's folder as `~/Jawz/mikoshi/Notes`. `ExtConfig` does not keep
-    // the home folder it was read with, so this is `$HOME` when the process has one; with
-    // none (the host starts the extension with an empty environment) the folder is shown
-    // as its absolute path. Display only: nothing is found or scoped by it.
+    // RULING: wave 4 ruling R-15 item 5: the home is `ExtConfig.home` once that field
+    // exists (R-12b adds it). Until then this is `$HOME` when the process has one; with
+    // none (the host starts the extension with an empty environment) a file's folder is
+    // shown as its absolute path. Display only: nothing is found or scoped by it.
     /// What `~` stands for in a label.
     pub home: Option<PathBuf>,
+}
+
+/// Each folder as typed, then as the file system resolves it when that is another path.
+/// One look at the file system per folder, here and not per row: a folder that does not
+/// exist (or cannot be read) stays as typed.
+fn both_forms(folders: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::with_capacity(folders.len());
+    for folder in folders {
+        if folder.as_os_str().is_empty() {
+            continue;
+        }
+        let resolved = std::fs::canonicalize(folder).ok();
+        for form in std::iter::once(folder.clone()).chain(resolved) {
+            if !out.contains(&form) {
+                out.push(form);
+            }
+        }
+    }
+    out
 }
 
 impl RecallConfig {
@@ -154,7 +176,7 @@ impl RecallConfig {
             min_lex: cfg.recall_min_lex,
             max_items: cfg.recall_max_items,
             max_chars: cfg.recall_max_chars,
-            exclude_paths: cfg.recall_exclude_paths.clone(),
+            exclude_paths: both_forms(&cfg.recall_exclude_paths),
             model_loaded: false,
             home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
         }
@@ -382,7 +404,7 @@ const MEM_COLUMNS: &str = "m.id, m.project_key, m.title, substr(m.content, 1, 65
             m.sensitivity, m.retention, m.provenance, m.supersedes, m.contradicts,
             m.confirmed_by, m.invalidated_at, m.superseded_by,
             e.vid, e.origin_kind, e.origin_ref, e.session_id, e.content_hash,
-            e.created_ms, e.time_source";
+            e.created_ms, e.time_source, e.logical";
 
 /// The conditions of generator a that are not the word match: visible, in the caller's
 /// scope, not expired. With no project `:scope_dir` is NULL, which equals no row's key.
@@ -411,6 +433,7 @@ struct MemRow {
     content_hash: String,
     created_ms: i64,
     time_source: String,
+    logical: Option<String>,
 }
 
 struct DocRow {
@@ -462,6 +485,7 @@ fn mem_row(r: &Row) -> Option<MemRow> {
             content_hash: r.get(19)?,
             created_ms: r.get(20)?,
             time_source: r.get(21)?,
+            logical: r.get(22)?,
         })
     }
     read(r).ok()
@@ -1135,10 +1159,16 @@ pub fn recall(
     };
 
     // 4. Still in the window: this chat's own live captures are in its context already.
+    // RULING: wave 4 ruling R-15 item 5 (review finding 7): "this chat" is the session id
+    // or the logical id. A chat that goes on under a new session id keeps its logical id,
+    // and its live turns must not come back to it as an earlier chat.
     if req.ambient && view.own_session.is_some() {
+        let own_logical = trace.logical.as_deref();
         cands.retain(|c| {
             let own = matches!(&c.source, Source::Mem(m)
-                if m.origin == Origin::Capture && m.session_id.as_deref() == view.own_session.as_deref());
+                if m.origin == Origin::Capture
+                    && (m.session_id.as_deref() == view.own_session.as_deref()
+                        || (m.logical.is_some() && m.logical.as_deref() == own_logical)));
             if own {
                 note_drop(c, "in_window");
             }
