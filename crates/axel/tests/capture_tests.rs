@@ -1297,3 +1297,64 @@ fn r16_3_a_turn_that_ends_withheld_takes_its_recall_log_row() {
     assert_eq!(write(&b, &off, &CompletedTurn { withheld: true, ..turn }), Written::Skipped);
     assert_eq!(log_rows(&b.conn, "S", PROMPT), 1);
 }
+
+/// Item 4: the tokens blanked in a turn's text are counted when the turn is sent, and
+/// only then.
+#[test]
+fn r16_4_tokens_blanked_are_counted_when_the_turn_is_sent() {
+    let blanked = |status: &Status| status.tokens_blanked.load(Ordering::Relaxed);
+    let lab = Lab::new();
+    let (_ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let token = gitlab_token();
+    let prompt = format!("please rotate the gitlab key {token} before the release on friday");
+    let part = format!("I am rotating {token} on the runner now.");
+    let last = format!("I rotated {token} and updated the runner configuration for the release.");
+
+    // One in the prompt, one in each of two replies: nothing until the turn ends, then 3.
+    user(&mut st, "S", &cwd, &prompt, 1_000);
+    assistant(&mut st, "S", &cwd, &part, true, 2_000);
+    assert_eq!(blanked(&status), 0, "counted before the turn was sent");
+    assistant(&mut st, "S", &cwd, &last, false, 3_000);
+    let turn = next_capture(&jobs).unwrap();
+    assert!(!turn.prompt.contains(&token) && !turn.reply.contains(&token));
+    assert_eq!(blanked(&status), 3);
+
+    // A turn with no token adds nothing.
+    user(&mut st, "S", &cwd, PROMPT, 4_000);
+    assistant(&mut st, "S", &cwd, REPLY, false, 5_000);
+    assert!(next_capture(&jobs).is_some());
+    assert_eq!(blanked(&status), 3);
+
+    // A withheld turn and a marked turn carry no text: nothing was blanked in anything kept.
+    user(&mut st, "S", &cwd, &prompt, 6_000);
+    assistant(&mut st, "S", &cwd, "the secret is out", false, 7_000);
+    assert!(next_capture(&jobs).unwrap().withheld);
+    user(&mut st, "S", &cwd, &prompt, 8_000);
+    assert!(st.capture.suppress("S").is_some());
+    assistant(&mut st, "S", &cwd, &last, false, 9_000);
+    assert!(next_capture(&jobs).unwrap().suppressed);
+    assert_eq!(blanked(&status), 3);
+
+    // A turn that is let go, and one the queue refuses, were not sent. Neither count is
+    // carried into the next turn.
+    user(&mut st, "S", &cwd, &prompt, 10_000);
+    st.capture.drop_session("S");
+    while st.jobs.try_send(Job::Tick).is_ok() {}
+    user(&mut st, "S", &cwd, &prompt, 11_000);
+    assistant(&mut st, "S", &cwd, &last, false, 12_000);
+    assert!(next_capture(&jobs).is_none());
+    assert_eq!(blanked(&status), 3);
+    user(&mut st, "S", &cwd, PROMPT, 13_000);
+    assistant(&mut st, "S", &cwd, REPLY, false, 14_000);
+    assert!(next_capture(&jobs).is_some());
+    assert_eq!(blanked(&status), 3);
+
+    // Capture off: nothing is stored, nothing is counted.
+    let off = Lab::new();
+    let (_ctx, mut st, jobs, status, _kept) = threads(&off, "off");
+    user(&mut st, "S", &cwd, &prompt, 1_000);
+    assistant(&mut st, "S", &cwd, &last, false, 2_000);
+    assert!(next_capture(&jobs).is_some());
+    assert_eq!(blanked(&status), 0);
+}

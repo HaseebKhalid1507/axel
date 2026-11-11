@@ -39,6 +39,8 @@ pub struct CaptureState {
     pending: HashMap<String, TurnBuffer>,
     /// Turns let go since `take_dropped` was last called.
     dropped: u64,
+    /// Tokens blanked in the turns completed since `take_blanked` was last called.
+    blanked: u64,
 }
 
 struct TurnBuffer {
@@ -50,6 +52,8 @@ struct TurnBuffer {
     assistant: String,
     suppressed: bool,
     withheld: bool,
+    /// Tokens `screen::redact` blanked in the text this buffer holds.
+    blanked: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +124,15 @@ impl CaptureState {
         std::mem::take(&mut self.dropped)
     }
 
+    /// Tokens blanked in the text of the turns `on_assistant` has completed since this was
+    /// last called. A turn that carries no text (marked, withheld) adds nothing.
+    // RULING: wave4 R-16 item 4. `CompletedTurn` keeps its fields; `on_assistant_event`
+    // takes this right after a turn completes and adds it to `Status.tokens_blanked` when
+    // the turn is sent.
+    pub fn take_blanked(&mut self) -> u64 {
+        std::mem::take(&mut self.blanked)
+    }
+
     /// Removes the chat's buffer and counts the turn that goes with it.
     fn let_go(&mut self, session_id: &str) {
         if let Some(buf) = self.pending.remove(session_id) {
@@ -168,6 +181,7 @@ impl CaptureState {
                 assistant: String::new(),
                 suppressed: false,
                 withheld,
+                blanked: if withheld { 0 } else { redacted.blanked as u64 },
             },
         );
     }
@@ -206,8 +220,10 @@ impl CaptureState {
             if buf.withheld {
                 buf.prompt.clear();
                 buf.assistant.clear();
+                buf.blanked = 0;
             } else {
                 let redacted = screen::redact(text);
+                buf.blanked += redacted.blanked as u64;
                 // SPEC: 3407 says "append" and not what stands between two responses: a
                 // line break.
                 if !buf.assistant.is_empty() && !redacted.text.is_empty() && buf.assistant.len() < MAX_TEXT_BYTES {
@@ -221,6 +237,7 @@ impl CaptureState {
             return None;
         }
         let buf = self.pending.remove(session_id)?;
+        self.blanked += buf.blanked;
         Some(CompletedTurn {
             session_id: session_id.to_string(),
             cwd: buf.cwd,
@@ -243,6 +260,7 @@ impl CaptureState {
         // kept either, here or on the queue. The buffer stays for its interval.
         buf.prompt.clear();
         buf.assistant.clear();
+        buf.blanked = 0;
         Some((buf.started_ms, buf.turn_key.clone()))
     }
 
@@ -454,6 +472,7 @@ fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
         return;
     };
     let storable = st.cfg.capture && !turn.suppressed && !turn.withheld;
+    let blanked = st.capture.take_blanked();
     // `write_turn` is given no `Status`: the count is made here, where the turn ends.
     if turn.withheld && !turn.suppressed && st.cfg.capture {
         st.status.turns_withheld.fetch_add(1, Ordering::Relaxed);
@@ -463,6 +482,9 @@ fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
     let sent = front::send_job(st, Job::Capture(turn));
     if !sent && storable {
         st.status.turns_dropped.fetch_add(1, Ordering::Relaxed);
+    }
+    if sent && storable {
+        st.status.tokens_blanked.fetch_add(blanked, Ordering::Relaxed);
     }
 }
 
