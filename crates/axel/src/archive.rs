@@ -359,29 +359,26 @@ fn parse_record(
     if expect_id.is_some_and(|e| e != id) {
         return skip("the id is not the expected id");
     }
-    let logical = str_field(obj, "logical")?;
-    let digest = str_field(obj, "digest")?;
     let Some(body) = obj.get("body").and_then(Value::as_object) else {
         return skip("body is not an object");
     };
     match body.get("state").and_then(Value::as_str) {
         Some("tombstone") => {
-            // Core's page: a tombstone keeps version, scope, logical, id and digest, and
-            // nothing else; its body is `{"state": "tombstone"}`.
-            if obj.contains_key("created_ms") {
-                return skip("a tombstone with created_ms");
-            }
-            const KEPT: [&str; 6] = ["version", "scope", "logical", "id", "digest", "body"];
-            if body.len() != 1 || obj.keys().any(|k| !KEPT.contains(&k.as_str())) {
-                return skip("a tombstone with other fields");
-            }
+            // RULING: wave2-c6-review finding 1: a file that passed the version, scope and id
+            // checks and says `tombstone` is a forget, whatever else it holds (`created_ms`,
+            // other top-level fields, other `body` fields): core treats exactly such a file
+            // as forgotten. Nothing else is read from it; a `logical` or `digest` that is
+            // not a string is the empty string, which names no archive.
+            let text = |key: &str| obj.get(key).and_then(Value::as_str).unwrap_or("").to_string();
             Ok(ArchiveFile::Tombstone {
                 id: id.to_string(),
-                logical: logical.to_string(),
-                digest: digest.to_string(),
+                logical: text("logical"),
+                digest: text("digest"),
             })
         }
         Some("live") => {
+            let logical = str_field(obj, "logical")?;
+            let digest = str_field(obj, "digest")?;
             // SPEC: 1482 reads a `created_ms` that is not an integer as `None`; core's page
             // (the authority for the format) says such a file is not a record. Refused.
             let created_ms = match obj.get("created_ms") {

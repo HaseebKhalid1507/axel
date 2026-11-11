@@ -430,19 +430,7 @@ fn t02_a_file_that_is_not_valid_is_refused_whole() {
     let tombstone = || record(&scope, &id(1), json!({"state": "tombstone"}));
     assert!(matches!(read_shelf(&tombstone(), &id(1)), Ok(ArchiveFile::Tombstone { .. })));
 
-    // A tombstone keeps version, scope, logical, id and digest, and nothing else.
-    let mut t = tombstone();
-    t["created_ms"] = json!(1_777_650_000_000u64);
-    assert_eq!(reason(read_shelf(&t, &id(1))), "a tombstone with created_ms");
-    let mut t = tombstone();
-    t["body"]["note"] = json!("");
-    assert_eq!(reason(read_shelf(&t, &id(1))), "a tombstone with other fields");
-    let mut t = tombstone();
-    t["body"]["messages"] = json!([]);
-    assert_eq!(reason(read_shelf(&t, &id(1))), "a tombstone with other fields");
-    let mut t = tombstone();
-    t["carried"] = json!(0);
-    assert_eq!(reason(read_shelf(&t, &id(1))), "a tombstone with other fields");
+    // What a tombstone holds beside its state is in `f1_a_file_that_says_tombstone_is_a_forget`.
 
     let good = || record(&scope, &id(1), live_body());
     assert!(matches!(read_shelf(&good(), &id(1)), Ok(ArchiveFile::Live(_))));
@@ -502,6 +490,65 @@ fn t02_a_file_that_is_not_valid_is_refused_whole() {
     // A file that is gone.
     fs::remove_file(&path).unwrap();
     assert!(reason(archive::read_archive(&path, &scope, Some(&id(1)))).starts_with("cannot stat"));
+}
+
+// ------------------------------------------------- wave2-c6-review, finding 1 (ruling)
+
+#[test]
+fn f1_a_file_that_says_tombstone_is_a_forget() {
+    let scope = "ab".repeat(32);
+    let tombstone = || record(&scope, &id(1), json!({"state": "tombstone"}));
+    type Change = Box<dyn Fn(&mut Value)>;
+    let extras: Vec<(&str, Change)> = vec![
+        ("created_ms", Box::new(|t| t["created_ms"] = json!(1_777_650_000_000u64))),
+        ("created_ms that is no number", Box::new(|t| t["created_ms"] = json!("soon"))),
+        ("carried", Box::new(|t| t["carried"] = json!(0))),
+        ("a later top-level field", Box::new(|t| t["some_later_field"] = json!({"x": 1}))),
+        ("a note in the body", Box::new(|t| t["body"]["note"] = json!(""))),
+        ("messages in the body", Box::new(|t| t["body"]["messages"] = json!([1, 2, 3]))),
+        ("a count in the body", Box::new(|t| t["body"]["source_message_count"] = json!(9999))),
+    ];
+    for (what, change) in &extras {
+        let mut t = tombstone();
+        change(&mut t);
+        match read_shelf(&t, &id(1)) {
+            Ok(ArchiveFile::Tombstone { id: got, logical, digest }) => {
+                assert_eq!(got, id(1), "{what}");
+                assert_eq!(logical, "a".repeat(64), "{what}");
+                assert_eq!(digest, "b".repeat(64), "{what}");
+            }
+            other => panic!("{what}: not a tombstone: {other:?}"),
+        }
+    }
+    // In a slot file too, where the id is the record's.
+    let (_tmp, dir, scope) = project();
+    let mut t = record(&scope, &id(100), json!({"state": "tombstone", "note": "x"}));
+    t["carried"] = json!(3);
+    put(&dir.join("007.json"), &t);
+    assert!(matches!(
+        archive::read_archive(&dir.join("007.json"), &scope, None),
+        Ok(ArchiveFile::Tombstone { id: got, .. }) if got == id(100)
+    ));
+    // A tombstone that lost its digest is still a forget of its id.
+    let mut t = tombstone();
+    t.as_object_mut().unwrap().remove("digest");
+    t["logical"] = json!(7);
+    assert!(matches!(
+        read_shelf(&t, &id(1)),
+        Ok(ArchiveFile::Tombstone { id: got, logical, digest })
+            if got == id(1) && logical.is_empty() && digest.is_empty()
+    ));
+
+    // The version, scope and id checks still come first.
+    let mut t = tombstone();
+    t["version"] = json!(2);
+    assert_eq!(reason(read_shelf(&t, &id(1))), "version 2 is not 1");
+    let other = record(&"cd".repeat(32), &id(1), json!({"state": "tombstone"}));
+    assert_eq!(reason(read_shelf(&other, &id(1))), "a record of another project");
+    assert_eq!(reason(read_shelf(&tombstone(), &id(2))), "the id is not the file's name");
+    // And a state that is not `tombstone` is not one.
+    let odd = record(&scope, &id(1), json!({"state": "Tombstone"}));
+    assert_eq!(reason(read_shelf(&odd, &id(1))), "unknown state");
 }
 
 // ------------------------------------------------------------------------------ test 3
