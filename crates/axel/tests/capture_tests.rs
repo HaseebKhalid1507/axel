@@ -13,7 +13,9 @@ use axel::capture::{self, CaptureState, CompletedTurn, Written};
 use axel::ext::config::ExtConfig;
 use axel::ext::front;
 use axel::ext::server::serve;
-use axel::ext::types::{Boot, FrontState, HookEvent, IndexerCtx, Job, Mode, ServeEnd, Status, TestHooks};
+use axel::ext::tools_core;
+use axel::ext::types::{Boot, Caller, FrontState, HookEvent, IndexerCtx, Job, Mode, ServeEnd, Status, TestHooks};
+use axel::forum::Author;
 use axel::vindex::VecDelta;
 use axel::{archive, indexer, indexer_start, project, recall, screen, store};
 use rusqlite::{params, Connection};
@@ -867,10 +869,25 @@ fn t08_after_the_server_has_started_the_process_is_offline() {
 
 // ── 9. A pause hides ────────────────────────────────────────────────────────
 
-// NOTE (wave4 R-16 item 5): the spec's test 9 says the chat's rows are "in no search". Here
-// that is read from `hidden_ms`, because the search tool is commit 18a's. When 18a is
-// merged this test is to ask the search itself, before the pause, during it and after
-// the resume.
+/// What the search tool (`ext::tools_core`, commit 18a) shows a caller in `cwd` of the rows
+/// `ids`: those whose `m:<id>` is in its answer.
+fn found_by_search(st: &mut FrontState, cwd: &str, ids: &[String]) -> Vec<String> {
+    let caller = Caller {
+        session_id: Some("U".to_string()),
+        cwd: Some(cwd.to_string()),
+        author: Some(Author::fresh()),
+    };
+    let input = json!({ "query": "newest window files unit project directory", "limit": 20 });
+    let answer = tools_core::call(st, "search", &input, &caller).unwrap();
+    let mut found: Vec<String> = ids.iter().filter(|id| answer.contains(&format!("m:{id}"))).cloned().collect();
+    found.sort();
+    found
+}
+
+// RULING: v2 capture/recall review, item 7 (R-16 item 5): the spec's test 9 says the chat's
+// rows are "in no search": the search tool itself is asked, by another chat of the project
+// (which finds them) and by a chat of another project (which never does), before the
+// pause, during it and after the resume.
 #[test]
 fn t09_a_pause_hides_the_chats_captures_and_resume_brings_them_back() {
     let lab = Lab::new();
@@ -898,6 +915,15 @@ fn t09_a_pause_hides_the_chats_captures_and_resume_brings_them_back() {
     let of_t = id_of(&turn_t);
     assert_eq!(visible(conn).len(), 5);
 
+    // The search: a front state on the same brain, words only (no model).
+    let (b, _) = boot(None);
+    let (mut st, _jobs, _vec_tx) = front::open_state(cfg.clone(), b);
+    let elsewhere = lab.project("beta");
+    let mut all: Vec<String> = of_s.iter().cloned().chain([of_t.clone()]).collect();
+    all.sort();
+    assert_eq!(found_by_search(&mut st, &cwd, &all), all, "a caller of the project");
+    assert!(found_by_search(&mut st, &elsewhere, &all).is_empty(), "a caller of another project");
+
     // S's model hid one row before the pause.
     assert_eq!(tx(conn, || store::hide(conn, &of_s[3], "model:S").unwrap()), 1);
 
@@ -910,6 +936,8 @@ fn t09_a_pause_hides_the_chats_captures_and_resume_brings_them_back() {
     assert_eq!(hidden_by(conn, &of_s[3]).as_deref(), Some("model:S"));
     assert_eq!(hidden_by(conn, &of_t), None, "T's capture was touched");
     assert_eq!(visible(conn), vec![of_t.clone()], "S's captures are in a search from another chat");
+    assert_eq!(found_by_search(&mut st, &cwd, &all), vec![of_t.clone()], "S's captures are in a search");
+    assert!(found_by_search(&mut st, &elsewhere, &all).is_empty());
 
     // A turn that completes after the pause is not written: nothing of S comes after it.
     let late = pair("S", &cwd, "one more question about the archive reader", REPLY, 1_700_000_900_000);
@@ -922,6 +950,8 @@ fn t09_a_pause_hides_the_chats_captures_and_resume_brings_them_back() {
     expected.push(of_t);
     expected.sort();
     assert_eq!(visible(conn), expected, "the three are visible again");
+    assert_eq!(found_by_search(&mut st, &cwd, &all), expected, "the three are found again");
+    assert!(found_by_search(&mut st, &elsewhere, &all).is_empty());
     assert_eq!(hidden_by(conn, &of_s[3]).as_deref(), Some("model:S"), "the row S's model hid is still hidden");
 }
 
