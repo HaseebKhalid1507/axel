@@ -1385,6 +1385,8 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
     assert!(!has(&old_row));
     assert!(has(&other_row), "the mark took another turn with the same prompt");
+    // Round 2, item 2: the row the mark took is counted apart from the forget tool's span.
+    assert_eq!(left_counts(world.db(), &old), (1, 1));
 
     // As said: a kept archive obeys the mark (item 4), so the row does not come back.
     restore_turns(&world.path(), &format!("ctx-{}", old.id));
@@ -1409,6 +1411,42 @@ fn deleted_capture(world: &mut Indexed, id: &str, session: &str, prompt: &str, a
     });
     let run = forget_cmd(&world.path(), &[id], true, false, "y\n");
     assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+}
+
+/// `(forget_units, cli_units)` of an archive.
+fn left_counts(conn: &Connection, a: &Arch) -> (i64, i64) {
+    conn.query_row("SELECT forget_units, cli_units FROM archive_index WHERE archive_id = ?1", [&a.id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+}
+
+/// v2 c18b review round 2, item 2: what a `cli` mark leaves out is counted in `cli_units`,
+/// not in `forget_units`, so a kept archive is read again once, not at every scan.
+#[test]
+fn a_kept_archive_that_leaves_out_a_deleted_turn_is_read_again_once() {
+    const GONE: &str = "please tell me again what the doctor said on Tuesday afternoon";
+    let mut world = Indexed::new();
+    deleted_capture(&mut world, "mem_cap_once", "s-once", GONE, &reply("DOCTORANSWER"), T0 - 100_000);
+    let a = Arch::new(23, "s-once", T0)
+        .turn(GONE, &reply("DOCTORANSWER"))
+        .forget_call("forget the thing about the landlord from this morning please", "TOOLFORGET")
+        .about("upload queue");
+    world.file(&a);
+    world.scan();
+    assert_eq!(left_counts(world.db(), &a), (1, 1));
+    let kept = restore_turns(&world.path(), &format!("ctx-{}", a.id));
+    assert_eq!(kept.code, 0, "{}", kept.err);
+
+    let mut reads = Vec::new();
+    for _ in 0..3 {
+        world.db().execute("UPDATE archive_index SET indexed_ms = 1 WHERE archive_id = ?1", [&a.id]).unwrap();
+        world.scan();
+        let at: i64 = world.db().query_row("SELECT indexed_ms FROM archive_index WHERE archive_id = ?1", [&a.id], |r| r.get(0)).unwrap();
+        reads.push(at == NOW);
+    }
+    assert_eq!(reads, [true, false, false], "the kept archive is read again at every scan");
+    assert_eq!(left_counts(world.db(), &a), (0, 1));
+    let texts = world.rows(&a).into_iter().map(|(_, text)| text).collect::<Vec<_>>().join("\n");
+    assert!(texts.contains("TOOLFORGET") && !texts.contains("DOCTORANSWER"), "{texts}");
 }
 
 /// v2 c18b review round 2, item 1: a `cli` mark takes only the deleted turn. An archive of

@@ -407,6 +407,7 @@ struct RowOut<'a> {
     message_count: Option<i64>,
     rows_indexed: i64,
     forget_units: i64,
+    cli_units: i64,
     unmatched_hidden: i64,
     first_seen_ms: i64,
     indexed_ms: Option<i64>,
@@ -430,6 +431,7 @@ impl<'a> RowOut<'a> {
             message_count: None,
             rows_indexed: 0,
             forget_units: 0,
+            cli_units: 0,
             unmatched_hidden: 0,
             first_seen_ms,
             indexed_ms: None,
@@ -447,9 +449,9 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
         "INSERT INTO archive_index(scope_dir, rel_name, archive_id, logical, digest, state, skip_reason,
                                    file_size, created_ms, time_source, cover_ms, session_id, win_no, part_no,
                                    source_message_count, message_count, rows_indexed, forget_units,
-                                   indexer_version, first_seen_ms, indexed_ms, unmatched_hidden)
+                                   indexer_version, first_seen_ms, indexed_ms, unmatched_hidden, cli_units)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21,
-                 ?22)
+                 ?22, ?23)
          ON CONFLICT(scope_dir, rel_name) DO UPDATE SET
             archive_id = excluded.archive_id,
             logical = COALESCE(excluded.logical, archive_index.logical),
@@ -467,6 +469,7 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
             message_count = excluded.message_count,
             rows_indexed = excluded.rows_indexed,
             forget_units = excluded.forget_units,
+            cli_units = excluded.cli_units,
             unmatched_hidden = CASE WHEN excluded.state = 'indexed' THEN excluded.unmatched_hidden
                                     ELSE archive_index.unmatched_hidden END,
             indexer_version = excluded.indexer_version,
@@ -494,6 +497,7 @@ fn upsert_row(conn: &Connection, at: &FileAt, row: &RowOut) -> Result<()> {
             row.first_seen_ms,
             row.indexed_ms,
             row.unmatched_hidden,
+            row.cli_units,
         ],
     )?;
     Ok(())
@@ -792,6 +796,7 @@ fn index_archive(
         // then every row of the chat, of any source, says which units of this file are
         // left out.
         let mut out = vec![false; units.len()];
+        let mut by_cli = vec![false; units.len()];
         if takes_marks {
             for mark in own {
                 conn.execute(
@@ -818,7 +823,15 @@ fn index_archive(
                 marks.retain(|m| m.source == "cli");
             }
             let place = Place { scope_dir: at.scope_dir, cover_ms, window_from, stretch: mark_stretch, prev, next };
-            out = left_out(&units, &marks, &place);
+            // RULING: v2 c18b review round 2, item 2. What `cli` marks leave out is counted
+            // apart (`cli_units`): no `restore --forget-turns` brings it back, so it is not
+            // in `forget_units`, and a kept archive is not read again for it at every scan.
+            let (cli, rest): (Vec<Forgot>, Vec<Forgot>) = marks.into_iter().partition(|m| m.source == "cli");
+            by_cli = left_out(&units, &cli, &place);
+            out = left_out(&units, &rest, &place);
+            for (left, by_cli) in out.iter_mut().zip(&by_cli) {
+                *left |= *by_cli;
+            }
 
             // RULING: wave4 R-13 round 2, item 2. A unit that is left out was never a row,
             // so no purge takes the recall-log row of its turn: the log rows of this chat
@@ -972,7 +985,8 @@ fn index_archive(
             source_message_count: Some(i64::from(a.source_message_count)),
             message_count: Some(a.messages.len() as i64),
             rows_indexed,
-            forget_units: forget_spans + out.iter().filter(|left| **left).count() as i64,
+            forget_units: forget_spans + out.iter().zip(&by_cli).filter(|(left, cli)| **left && !**cli).count() as i64,
+            cli_units: by_cli.iter().filter(|cli| **cli).count() as i64,
             unmatched_hidden,
             indexed_ms: Some(now),
             ..base
@@ -2317,6 +2331,18 @@ fn turn_rows(conn: &Connection, scope_dir: &str, archive_id: &str) -> Result<Vec
 /// is in the `WHERE`), and none that is not an archive row of this directory. Inside the
 /// caller's transaction. Returns the ids that went.
 fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut Vec<i64>) -> Result<Vec<String>> {
+    purge_left_out_by(conn, scope_dir, ids, false, gone)
+}
+
+/// `purge_left_out`; with `cli`, what went is counted in `cli_units`, not `forget_units`
+/// (v2 c18b review round 2, item 2).
+fn purge_left_out_by(
+    conn: &Connection,
+    scope_dir: &str,
+    ids: &[String],
+    cli: bool,
+    gone: &mut Vec<i64>,
+) -> Result<Vec<String>> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -2349,8 +2375,13 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut
     purge(conn, &going, false, true, gone)?;
     for (archive_id, n) in &per_archive {
         conn.execute(
-            "UPDATE archive_index SET forget_units = forget_units + ?1
-              WHERE scope_dir = ?2 AND archive_id = ?3 AND state = 'indexed'",
+            if cli {
+                "UPDATE archive_index SET cli_units = cli_units + ?1
+                  WHERE scope_dir = ?2 AND archive_id = ?3 AND state = 'indexed'"
+            } else {
+                "UPDATE archive_index SET forget_units = forget_units + ?1
+                  WHERE scope_dir = ?2 AND archive_id = ?3 AND state = 'indexed'"
+            },
             params![n, scope_dir, archive_id],
         )?;
     }
@@ -2556,7 +2587,7 @@ fn mark_turn(
                 }
             }
         }
-        purged.extend(purge_left_out(conn, scope_dir, &targets, &mut vids)?);
+        purged.extend(purge_left_out_by(conn, scope_dir, &targets, source == "cli", &mut vids)?);
     }
 
     // The turn's own trace in the recall log: its row was written at the start of the turn,
