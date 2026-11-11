@@ -20,6 +20,10 @@
 # below) changed during the run. Another program that writes those folders
 # while the gate runs triggers this too.
 #
+# Before anything is built it fails, with file and line, if a .rs file under
+# crates/ calls set_var, remove_var or env_remove on a line that names HOME,
+# XDG_ or TMPDIR, or calls env_clear at all.
+#
 # Never writes to the real HOME: the moved HOME is a fresh temp directory,
 # removed on exit. Not caught: a write that is undone before the run ends,
 # and writes outside the moved HOME and the watched folders. Needs GNU find
@@ -32,6 +36,27 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 # Keep the toolchain reachable once HOME moves.
 export CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}"
 export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+
+# No Rust source may re-point or remove HOME, an XDG directory or TMPDIR:
+# set_var moves them for every thread of a test binary, and a child without
+# HOME falls back to the passwd entry, the real home. Either way the write
+# lands where the checks below may not look. env_clear() removes HOME
+# whatever else its line says, so it is refused on any line. Checked first:
+# it needs no build.
+src=crates
+calls="$(grep -rnE --include='*.rs' '(set_var|remove_var|env_clear|env_remove)' "$src")"
+rc=$?
+if [ ! -d "$src" ] || [ "$rc" -gt 1 ]; then
+    echo "dirty-home: FAIL: could not search $src for environment overrides" >&2
+    exit 1
+fi
+overrides="$(printf '%s\n' "$calls" | grep -E '^[^:]+:[0-9]+:.*(env_clear|HOME|XDG_|TMPDIR)')"
+if [ -n "$overrides" ]; then
+    echo "dirty-home: FAIL: these lines change HOME, an XDG directory or TMPDIR of the process or of a child (file:line):" >&2
+    printf '%s\n' "$overrides" >&2
+    echo "dirty-home: pass the folder to the code under test instead; nothing was built or run" >&2
+    exit 1
+fi
 
 # Build under the real HOME, so the moved HOME sees only test runs.
 cargo test --locked --no-run "$@" || exit $?

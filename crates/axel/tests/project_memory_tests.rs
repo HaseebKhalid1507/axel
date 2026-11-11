@@ -354,20 +354,33 @@ fn stored_memories_survive_reopen() {
 
 #[test]
 fn lexical_search_is_offline_and_never_touches_the_model_cache() {
-    // Point the model cache at an empty temp dir; a lexical store+search run
-    // must not create anything under it (no download, no embedder init).
-    let cache = TempDir::new().unwrap();
-    std::env::set_var("XDG_CACHE_HOME", cache.path());
+    // The embedder is given its own cache folder, which does not exist yet:
+    // nothing in the process environment is changed. A lexical store+search
+    // run must not create that folder (nothing was embedded, so there is no
+    // cache to save) and must not create the models folder either (no
+    // download, no model load).
     let dir = TempDir::new().unwrap();
-    let mut brain = AxelBrain::open_or_create(dir.path().join("b.r8"), Some("t")).unwrap();
-    brain
-        .store_scoped(mk_memory("Offline note", "offline lexical body"), &scope("proj_a"))
-        .unwrap();
-    let hits = brain.search_scoped(&text_query("proj_a", "offline", 5)).unwrap();
-    assert_eq!(hits.len(), 1);
-    let velocirag_dir = cache.path().join("velocirag");
+    let embedding_cache = dir.path().join("embeddings");
+    let models = velocirag::download::models_cache_dir();
+    let models_existed = models.exists();
+    {
+        let embedder = velocirag::embedder::Embedder::new(Some(embedding_cache.clone()), None, true);
+        let mut brain =
+            AxelBrain::open_or_create_with(dir.path().join("b.r8"), Some("t"), embedder).unwrap();
+        brain
+            .store_scoped(mk_memory("Offline note", "offline lexical body"), &scope("proj_a"))
+            .unwrap();
+        let hits = brain.search_scoped(&text_query("proj_a", "offline", 5)).unwrap();
+        assert_eq!(hits.len(), 1);
+        // Dropping the brain drops the embedder, which is when it would save.
+    }
     assert!(
-        !velocirag_dir.exists(),
+        !embedding_cache.exists(),
+        "lexical search must not embed, so no embedding cache may be written"
+    );
+    assert_eq!(
+        models.exists(),
+        models_existed,
         "lexical search must not initialise the embedding model cache"
     );
 }
