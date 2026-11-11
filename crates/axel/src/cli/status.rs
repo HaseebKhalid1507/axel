@@ -17,7 +17,7 @@ use chrono::{TimeZone, Utc};
 use rusqlite::{Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde_json::{json, Map, Value};
 
-use crate::brain_v2::LATEST;
+use crate::brain_v2::{text_at, LATEST};
 use crate::error::{AxelError, Result};
 use crate::ext::config::{default_model_dir, ExtConfig};
 use crate::ext::types::BrainArg;
@@ -514,6 +514,24 @@ fn grouped(conn: &Connection, sql: &str, p: &[&dyn rusqlite::ToSql]) -> Result<M
     Ok(out)
 }
 
+/// The memories adoption skips: no `memory_ext` row, and an `id` or a `content` that
+/// `brain_v2::text_at` does not read (not text, or not UTF-8). RULING: wave 5 fix round of
+/// 21, finding 3: the same test as adoption, never `typeof`.
+fn unreadable(conn: &Connection) -> Result<i64> {
+    let mut stmt = conn.prepare(
+        "SELECT m.id, m.content FROM memories m
+          WHERE NOT EXISTS (SELECT 1 FROM memory_ext e WHERE e.mem_id = m.id)",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut n = 0;
+    while let Some(r) = rows.next()? {
+        if text_at(r, 0)?.is_none() || text_at(r, 1)?.is_none() {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 fn status_row(conn: &Connection) -> Result<Option<Map<String, Value>>> {
     let text: Option<String> = conn
         .query_row("SELECT value FROM context_data WHERE key = 'status' AND layer = 'axel'", [], |r| r.get(0))
@@ -639,10 +657,7 @@ fn brain_report(
           WHERE e.embedding IS NULL AND m.sensitivity <> 'secret'",
     )?;
     let unreadable_memories = match r("unreadable_memories") {
-        Value::Null => json!(count(
-            conn,
-            "SELECT COUNT(*) FROM memories WHERE typeof(id) <> 'text' OR typeof(content) <> 'text'"
-        )?),
+        Value::Null => json!(unreadable(conn)?),
         v => v,
     };
     // RULING: wave 4 rulings, the line for 21: the age of the purge mark, read now (the
@@ -909,7 +924,7 @@ fn run_check(conn: &Connection, row: Option<&Map<String, Value>>, model: Option<
     // SPEC: 4839 compares the two counts with `memories`; a memory whose id or content is
     // not text is never adopted and gets no word row (W2-4.5, R-12b item 3), so both are
     // compared with the readable ones.
-    let unreadable = count(conn, "SELECT COUNT(*) FROM memories WHERE typeof(id) <> 'text' OR typeof(content) <> 'text'")?;
+    let unreadable = unreadable(conn)?;
     let counts_ok = fts == memories - unreadable && ext == memories - unreadable;
     bad |= !counts_ok;
     let vectors = match model {

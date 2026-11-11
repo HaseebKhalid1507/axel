@@ -667,6 +667,33 @@ fn check_on_a_sound_brain_exits_0() {
     assert_eq!(v["check"]["counts_ok"], json!(true));
 }
 
+// RULING: wave 5 fix round of 21, finding 3: a memory whose `content` is not UTF-8 is
+// text to `typeof` but is skipped by adoption; `--check` counts it the way adoption does.
+#[test]
+fn a_memory_whose_content_is_not_utf8_does_not_make_a_sound_brain_mismatch() {
+    let dir = TempDir::new().unwrap();
+    let path = new_brain(&dir);
+    sql(
+        &path,
+        "INSERT INTO memories (id, category, topic, title, abstract_text, content, confidence, importance,
+           source_sessions, tags, related_topics, created, trust_level)
+         VALUES ('mem_bad', 'events', 't', 'x', '', CAST(X'66FF6F' AS TEXT), 'high', 0.5, '[]', '[]', '[]',
+           '2025-01-01T00:00:00Z', 1.0)",
+    );
+    let typeof_: String = Connection::open(&path)
+        .unwrap()
+        .query_row("SELECT typeof(content) FROM memories WHERE id = 'mem_bad'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(typeof_, "text");
+    drop(open(&path)); // adoption runs, and skips it
+    let out = axel(&path, &["status", "--json", "--check"]);
+    let v: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["check"]["unreadable"], json!(1), "{v:#}");
+    assert_eq!(v["check"]["counts_ok"], json!(true), "{v:#}");
+    assert_eq!(v["unreadable_memories"], json!(1), "{v:#}");
+    assert_eq!(out.status.code(), Some(0), "{v:#}");
+}
+
 // RULING: wave 4 rulings, the line for 21: what came from a row passes `screen::show`.
 #[test]
 fn what_status_prints_from_a_row_is_shown_on_one_line() {
