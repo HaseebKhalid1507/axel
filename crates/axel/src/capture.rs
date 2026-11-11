@@ -78,13 +78,26 @@ fn cut(s: &str, max: usize) -> &str {
 }
 
 /// A message the host wrote, not the person.
-fn host_message(text: &str) -> bool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HostMessage {
+    /// `<event `: something else begins. What was pending is over.
+    Event,
+    /// `[Context continuation`, `[Host context advisory`: the host speaks in the middle of
+    /// a turn, which goes on.
+    Aside,
+}
+
+fn host_message(text: &str) -> Option<HostMessage> {
     // SPEC: 3395-3397 say "starts"; white space before the mark is skipped, so that such a
-    // message is dropped rather than paired.
+    // message is never paired as a prompt.
     let head = text.trim_start();
-    head.starts_with("<event ")
-        || head.starts_with("[Context continuation")
-        || head.starts_with("[Host context advisory")
+    if head.starts_with("<event ") {
+        Some(HostMessage::Event)
+    } else if head.starts_with("[Context continuation") || head.starts_with("[Host context advisory") {
+        Some(HostMessage::Aside)
+    } else {
+        None
+    }
 }
 
 impl CaptureState {
@@ -120,9 +133,18 @@ impl CaptureState {
         let Some(session_id) = session_id.filter(|s| !s.is_empty()) else {
             return;
         };
-        if host_message(text) {
-            self.let_go(session_id);
-            return;
+        // RULING: wave4 R-16 item 2. The host calls the prompt hook before each request to
+        // the model, so an advisory or a continuation may arrive inside a person's turn:
+        // it starts no turn and ends none. Only an event clears what is pending. A second
+        // prompt of the person in one turn (steering) replaces the first, below: the turn
+        // is then stored under the newer prompt.
+        match host_message(text) {
+            Some(HostMessage::Event) => {
+                self.let_go(session_id);
+                return;
+            }
+            Some(HostMessage::Aside) => return,
+            None => {}
         }
         // Core's test is on the text as given, the whole of it. The key is of the whole
         // redacted text, before the cut (B-2f). The text is redacted before it is cut, so

@@ -294,31 +294,91 @@ fn t01_the_reply_of_a_turn_is_cut_at_4096_bytes() {
 // ── 2. Host messages ────────────────────────────────────────────────────────
 
 #[test]
-fn t02_host_messages_give_no_turn_and_clear_the_buffer() {
-    for host in [
-        "<event id=\"7\" kind=\"worker_done\">the worker finished</event>",
-        "[Context continuation: the earlier part of this chat was archived]",
-        "[Host context advisory: the window is nearly full]",
-        "\n  <event id=\"8\">after white space</event>",
-    ] {
-        // Alone: nothing is pending, and the reply that follows gives no turn.
+fn t02_host_messages_give_no_turn_and_only_an_event_clears_the_buffer() {
+    let event = "<event id=\"7\" kind=\"worker_done\">the worker finished</event>";
+    let event_after_space = "\n  <event id=\"8\">after white space</event>";
+    let continuation = "[Context continuation: the earlier part of this chat was archived]";
+    let advisory = "[Host context advisory: the window is nearly full]";
+    let advisory_after_space = "  [Host context advisory: after white space]";
+
+    // Alone: nothing is pending, and the reply that follows gives no turn.
+    for host in [event, event_after_space, continuation, advisory, advisory_after_space] {
         let mut cap = CaptureState::default();
         cap.on_user(Some("s"), None, host, 1_000);
         assert_eq!(cap.pending_len(), 0, "{host}");
         assert_eq!(cap.on_assistant(Some("s"), "a reply to the host", false, 2_000), None, "{host}");
+        assert_eq!(cap.take_dropped(), 0, "{host}");
+    }
 
-        // In the middle of a human turn: that turn is dropped, another chat's is not.
+    // An event in the middle of a human turn: that turn is dropped, another chat's is not.
+    for host in [event, event_after_space] {
+        let mut cap = CaptureState::default();
         cap.on_user(Some("s"), None, "a human prompt", 3_000);
         cap.on_user(Some("t"), None, "another chat", 3_000);
         cap.on_user(Some("s"), None, host, 3_500);
         assert!(!cap.is_pending("s"), "{host}");
         assert_eq!(cap.on_assistant(Some("s"), "a reply", false, 4_000), None, "{host}");
         assert!(cap.on_assistant(Some("t"), "a reply", false, 4_000).is_some());
+        assert_eq!(cap.take_dropped(), 1, "{host}");
     }
+
+    // R-16 item 2: an advisory or a continuation in the middle of a human turn leaves it
+    // alone. The turn keeps its prompt, its start, and what was said before and after.
+    for host in [continuation, advisory, advisory_after_space] {
+        let mut cap = CaptureState::default();
+        cap.on_user(Some("s"), Some("/work"), "a human prompt", 3_000);
+        assert_eq!(cap.on_assistant(Some("s"), "part one", true, 3_200), None);
+        cap.on_user(Some("s"), Some("/elsewhere"), host, 3_500);
+        assert!(cap.is_pending("s"), "{host}");
+        let turn = cap.on_assistant(Some("s"), "part two", false, 4_000).unwrap();
+        assert_eq!(turn.prompt, "a human prompt", "{host}");
+        assert_eq!(turn.turn_key, archive::turn_key("a human prompt"));
+        assert_eq!(turn.reply, "part one\npart two", "{host}");
+        assert_eq!(turn.cwd.as_deref(), Some("/work"));
+        assert_eq!((turn.started_ms, turn.at_ms), (3_000, 4_000));
+        assert_eq!(cap.take_dropped(), 0, "{host}");
+    }
+
     // A prompt that only mentions such a mark is a prompt.
     let mut cap = CaptureState::default();
     cap.on_user(Some("s"), None, "what does <event mean in the host log", 1);
     assert!(cap.is_pending("s"));
+}
+
+/// R-16 item 2, accepted as it is: the host calls the prompt hook again when the person
+/// steers in the middle of a turn. The second prompt replaces the first; the turn is
+/// stored under the second, with only what the model said after it. The first prompt and
+/// the reply so far are not captured live (they come with the archive), and the turn is
+/// not counted as dropped.
+#[test]
+fn r16_2_a_second_prompt_in_one_turn_replaces_the_first() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, status, _kept) = threads(&lab, "on");
+    let cwd = lab.project("alpha");
+    let first = "look at the indexer and tell me why the newest window is read first";
+    let second = "no, wait: look at the reader of the archive files instead, the slot files";
+
+    user(&mut st, "S", &cwd, first, 1_000);
+    assistant(&mut st, "S", &cwd, "I am opening the indexer to see how it orders the windows.", true, 2_000);
+    // An advisory between the two changes nothing.
+    user(&mut st, "S", &cwd, "[Host context advisory: the window is nearly full]", 2_500);
+    user(&mut st, "S", &cwd, second, 3_000);
+    assistant(&mut st, "S", &cwd, "The reader takes the slot files in the order of their numbers.", false, 4_000);
+
+    let turn = next_capture(&jobs).unwrap();
+    assert!(next_capture(&jobs).is_none(), "one turn, one job");
+    assert_eq!(turn.prompt, second);
+    assert_eq!(turn.turn_key, archive::turn_key(second));
+    assert_eq!(turn.reply, "The reader takes the slot files in the order of their numbers.");
+    assert_eq!((turn.started_ms, turn.at_ms), (3_000, 4_000));
+    assert_eq!(dropped(&status), 0);
+
+    indexer::dispatch(&mut ctx, Job::Capture(turn.clone()));
+    let conn = ctx_conn(&ctx);
+    assert_eq!(captures_of(conn, "S"), 1);
+    let content = content_of(conn, &id_of(&turn));
+    assert!(content.starts_with(&format!("User: {second}\n")), "{content}");
+    assert!(!content.contains("newest window") && !content.contains("opening the indexer"), "{content}");
 }
 
 // ── 3. The row ──────────────────────────────────────────────────────────────
