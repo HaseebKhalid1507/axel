@@ -1448,10 +1448,14 @@ fn t28_the_carried_head() {
     messages[3] = user(4, WITHHELD);
     assert_eq!(archive::forgotten_keys(&arch(messages), &policy()), vec![mark(None, true, false)]);
     // Read whole, the same call is in the exchange of message 4, which is no leading span.
+    // RULING: v2 archives round 6, item 2. P2 and P4 follow a prompt with no reply: they
+    // were sent while P1's turn ran, so the turn began at P1, and the report inside it goes
+    // with it.
     let mut a = arch(nine(1, "axel_forget"));
     a.start = Start::Whole;
-    assert_eq!(positions(&units_of(&a)), vec!["r3.0", "x8.0"]);
-    assert_eq!(archive::forgotten_keys(&a, &policy()), vec![mark(Some(key_of(P4)), false, false)]);
+    assert_eq!(positions(&units_of(&a)), vec!["x8.0"]);
+    let p1 = pad("P1MARK the chat's first request ", 80);
+    assert_eq!(archive::forgotten_keys(&a, &policy()), vec![mark(Some(key_of(&p1)), false, false)]);
 }
 
 #[test]
@@ -1781,4 +1785,64 @@ fn r6_a_steer_in_an_event_turn_after_a_forget_turn_is_kept_and_clears_tail() {
     assert_eq!(positions(&units), vec!["x7.0"], "the steer in the event's turn went with the forget turn");
     assert!(holds(&units, "Q3MARK") && holds(&units, "A3MARK"));
     assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, false)]);
+}
+
+// ------------------------------------------------- v2 archives round 6, item 2 (ruling)
+
+const HARNESS: &str = "[Host harness note, not a new user request] You said you would act; do it now.";
+
+/// Guards what the owner would see: the prompt he asked to forget, kept because core's
+/// nudge between the model's promise and its call was read as a prompt.
+#[test]
+fn r6_a_harness_note_is_no_prompt_and_the_call_after_it_takes_the_turn() {
+    let p = policy();
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, Q2),
+        asst(3, A2),
+        user(4, HARNESS),
+        asst_tool(5, A2B, "axel_forget"),
+        result(6),
+        asst(7, "done."),
+        user(8, Q3),
+        asst(9, A3),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x8.0"], "the prompt before the nudge was kept");
+    for marker in ["Q2MARK", "A2MARK", "A2MORE", "Host harness"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(Q2)), false, false)]);
+}
+
+/// Guards what the owner would see: a steer core took before the turn's first request,
+/// stored right after the prompt, leaving the prompt it steered.
+#[test]
+fn r6_a_human_text_right_after_a_prompt_is_mid_turn_and_a_marker_ends_the_turn() {
+    let p = policy();
+    let a = arch(vec![user(0, Q1), asst(1, A1), user(2, P1), user(3, STEER), asst_tool(4, A2, "axel_forget"), result(5), asst(6, A2B)]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0"], "the prompt the steer followed was kept");
+    for marker in ["P1MARK", "STEERMARK", "A2MARK"] {
+        assert!(!holds(&units, marker), "{marker}");
+    }
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(P1)), false, true)]);
+
+    // An interruption marker between them ends the turn: the text after it is a new one,
+    // and the mark has its key (the interrupted prompt, with no reply, is no unit either way).
+    let a = arch(vec![
+        user(0, Q1),
+        asst(1, A1),
+        user(2, P1),
+        user(3, "[Request interrupted by user]"),
+        user(4, STEER),
+        asst_tool(5, A2, "axel_forget"),
+        result(6),
+        asst(7, A2B),
+    ]);
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0"]);
+    assert!(!holds(&units, "STEERMARK"));
+    assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(STEER)), false, true)]);
 }

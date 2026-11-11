@@ -600,6 +600,10 @@ fn classify(text: &str) -> UserText<'_> {
     if text.starts_with("[Request interrupted")
         || text.starts_with(CONTINUATION)
         || text.starts_with("[Host context advisory")
+        // RULING: v2 archives round 6, item 2. Core's nudge, "not a new user request", is
+        // no prompt (capture's `host_message` lists it): it opens no span, and a forget call
+        // that answers it goes with the prompt of the turn.
+        || text.starts_with("[Host harness note")
         || text.trim().is_empty()
     {
         return UserText::Skip;
@@ -636,10 +640,16 @@ enum Opener<'a> {
 // event or a withheld text between them does not change that: core delivers events the same
 // way, and a withheld text proves nothing. Any other user text (an interruption marker
 // among them) does.
+// RULING: v2 archives round 6, item 2. A human text with no reply after it yet is a third
+// state: core drains a steer that arrives before the turn's first request right after the
+// prompt (stream.rs:1087, first pass), so a human text right after it was sent while that
+// turn ran too. An interruption marker still ends the turn.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Before {
     /// An assistant message that asked for tools, or a tool result.
     Tools,
+    /// A human text, with no assistant message or marker after it yet.
+    Prompt,
     Other,
 }
 
@@ -665,7 +675,7 @@ impl Walk {
 
     /// A human text here was sent while a turn the person started was still running.
     fn mid_turn(&self) -> bool {
-        self.before == Before::Tools && !self.event_turn
+        matches!(self.before, Before::Tools | Before::Prompt) && !self.event_turn
     }
 
     /// After one block of a user message.
@@ -777,7 +787,8 @@ fn after_block(before: Before, block: &Block) -> Before {
         Block::ToolResult { .. } => Before::Tools,
         Block::Text(text) => match classify(text) {
             UserText::Event { .. } | UserText::Withheld => before,
-            UserText::Human | UserText::Skip => Before::Other,
+            UserText::Human => Before::Prompt,
+            UserText::Skip => Before::Other,
         },
         Block::ToolUse { .. } | Block::Other => before,
     }
