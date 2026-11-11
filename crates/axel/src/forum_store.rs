@@ -254,7 +254,9 @@ pub fn post(conn: &Connection, project: &str, author: &Author, post: &Post, cloc
             envelope.retention_days,
             envelope.digest,
             now,
-            now.saturating_add(i64::from(envelope.retention_days) * DAY_MS),
+            // From the clock, not from `now`: one row dated in the future moves every later
+            // timestamp past it, and must not move every later expiry with it.
+            clock_ms.saturating_add(i64::from(envelope.retention_days) * DAY_MS),
         ],
     )?;
     Ok(receipt(Status::Created, Some(timestamp)))

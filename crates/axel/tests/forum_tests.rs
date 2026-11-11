@@ -1263,7 +1263,8 @@ fn test_12_a_timestamp_never_goes_back() {
     assert_eq!(ids(&fx.entries(json!({"after": cursor}), &me)), vec![id_of(&second)]);
     let expires: i64 =
         fx.db().query_row("SELECT expires_ms FROM forum_posts WHERE id = ?1", [id_of(&second)], |r| r.get(0)).unwrap();
-    assert_eq!(expires, T0 + 1 + 30 * DAY_MS);
+    // Ruling R-17.3: the expiry is counted from the clock, not from the bumped timestamp.
+    assert_eq!(expires, T0 - 60_000 + 30 * DAY_MS);
 
     // The rule is per project: another project starts from its own clock.
     let cwd = fx.project("b");
@@ -1800,4 +1801,37 @@ fn a_read_stopped_by_a_bound_says_so_in_a_note() {
     assert_eq!(got["result"]["entries"].as_array().unwrap().len(), 2);
     assert_eq!(got["result"]["next"]["id"], rows[1].id.as_str());
     assert!(got.get("note").is_none(), "{got}");
+}
+
+fn times(fx: &Fx, id: &str) -> (i64, i64) {
+    fx.db()
+        .query_row("SELECT timestamp_ms, expires_ms FROM forum_posts WHERE id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+}
+
+/// R-17.3: a row dated far in the future moves the next timestamp past it (the order stays
+/// strict) and does not move the next expiry.
+#[test]
+fn expiry_is_counted_from_the_clock_not_from_a_bumped_timestamp() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let key = project::resolve(Some(&cwd)).unwrap().key;
+    let me = chat(&cwd, "s-exp", &who("a", "ga", None));
+    let far = T0 + 50 * 365 * DAY_MS;
+    insert_row(&fx.db(), &key, &key, &who("old", "old-group", None), &a_post("far", "Far", "dated in the future"), far, "brain.r8", 1);
+
+    let got = fx.ok("forum_post", json!({"request_key": "k1", "title": "Now", "body": "x", "retention_days": 7}), &me);
+    assert_eq!(got["result"]["status"], "created");
+    assert_eq!(got["result"]["timestamp_ms"], far + 1, "after the newest row");
+    assert_eq!(times(&fx, &id_of(&got)), (far + 1, T0 + 7 * DAY_MS), "7 days from the clock");
+
+    let next = fx.root(&me, "k2", "Next", "y");
+    assert_eq!(times(&fx, &id_of(&next)), (far + 2, T0 + 30 * DAY_MS));
+
+    // It is live now and gone when its own retention has passed.
+    assert!(ids(&fx.entries(json!({}), &me)).contains(&id_of(&got)));
+    fx.clock.store(T0 + 7 * DAY_MS, Ordering::SeqCst);
+    let live = ids(&fx.entries(json!({}), &me));
+    assert!(!live.contains(&id_of(&got)), "expired after 7 days");
+    assert!(live.contains(&id_of(&next)));
 }
