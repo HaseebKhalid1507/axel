@@ -2564,3 +2564,33 @@ fn forget_now_hides_the_same_key_rows_of_a_file_timed_by_its_mtime() {
     assert_eq!(visible_with(world.db(), "UNTIMED"), 0, "{}", run.out);
     assert_eq!(hidden_by_with(world.db(), "UNTIMED"), [Some("cli:unproven".to_string()), Some("cli:unproven".to_string())]);
 }
+
+/// v2 c18b review round 5, item 5: the chat is its `logical` or its session, for the rows
+/// with the key as for the files: an `mtime` file known by the session only (its record's
+/// `logical` is another) has its rows with the key hidden too.
+#[test]
+fn forget_now_finds_the_same_key_rows_of_a_file_known_by_its_session_only() {
+    const PROMPT: &str = "continue with the plan we made for the ledger migration";
+    let mut world = Indexed::new();
+    let old = Arch::new(72, "s-other-logical", T0).turn(PROMPT, &reply("SESSIONOTHER")).about("deploy window");
+    let mut record: Value = serde_json::from_str(&old.json(&scope())).unwrap();
+    record.as_object_mut().unwrap().remove("created_ms");
+    let dir = world.tmp.path().join("base").join("context-archives").join(scope()).join("s000001");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{}.json", old.id)), record.to_string()).unwrap();
+    world.scan();
+    // The event that announced it named the session of the chat.
+    world.db().execute("UPDATE archive_index SET session_id = 's-session'", []).unwrap();
+    assert_eq!(visible_with(world.db(), "SESSIONOTHER"), 1);
+
+    let mut cap = capture("mem_cap_session", "s-session", &key_of(PROMPT));
+    cap.project = scope();
+    cap.created_ms = T0 + 5_000;
+    cap.content = format!("User: {PROMPT}\nAssistant: {}", reply("SESSIONGONE"));
+    cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+    world.put(&cap);
+    let run = forget_cmd(&world.path(), &["mem_cap_session"], true, false, "y\n");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    assert_eq!(visible_with(world.db(), "SESSIONOTHER"), 0, "{}", run.out);
+    assert_eq!(hidden_by_with(world.db(), "SESSIONOTHER"), [Some("cli:unproven".to_string())]);
+}

@@ -964,7 +964,7 @@ fn index_archive(
             let mut elsewhere: Vec<String> = Vec::new();
             let near = near_archives(&files, cover_ms, cover_ms);
             for key in own.iter().filter_map(|m| m.turn_key.as_deref()).filter(|k| !k.is_empty()) {
-                for (id, archive_id) in key_rows(conn, &a.logical, key)? {
+                for (id, archive_id) in key_rows(conn, &a.logical, session_id, key)? {
                     if archive_id != a.id && near.contains(archive_id.as_str()) {
                         elsewhere.push(id);
                     }
@@ -2356,14 +2356,25 @@ fn hidden_captures(
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
-/// The archive rows of a chat with one turn key: `(id, archive id)`. One lookup in
-/// `idx_memory_ext_turn`.
-fn key_rows(conn: &Connection, logical: &str, turn_key: &str) -> Result<Vec<(String, String)>> {
+/// The archive rows of a chat with one turn key: `(id, archive id)`. The chat is what it
+/// is everywhere else (`chat_files`, the `mtime` files of `mark_turn`): the `logical`, or
+/// the session an event named for the file. By `logical`, one lookup in
+/// `idx_memory_ext_turn`; by session, the chat's `archive_index` rows, then each file's
+/// rows by `idx_memory_ext_origin`.
+// RULING: v2 c18b review round 5, item 5. `logical OR session_id` for both, not `logical`
+// alone: a row's `logical` is its record's, and a file the event tied to the session may
+// carry another; what a cli mark finds there is hidden or proven, never missed.
+fn key_rows(conn: &Connection, logical: &str, session_id: Option<&str>, turn_key: &str) -> Result<Vec<(String, String)>> {
     let mut stmt = conn.prepare(
         "SELECT mem_id, origin_ref FROM memory_ext
-          WHERE logical = ?1 AND turn_key = ?2 AND origin_kind = 'archive'",
+          WHERE ?1 <> '' AND logical = ?1 AND turn_key = ?3 AND origin_kind = 'archive'
+         UNION
+         SELECT e.mem_id, e.origin_ref FROM archive_index a
+           JOIN memory_ext e ON e.origin_kind = 'archive' AND e.origin_ref = a.archive_id
+           JOIN memories m ON m.id = e.mem_id AND m.project_key = a.scope_dir
+          WHERE ?2 IS NOT NULL AND a.session_id = ?2 AND e.turn_key = ?3",
     )?;
-    let rows = stmt.query_map(params![logical, turn_key], |r| Ok((r.get(0)?, r.get(1)?)))?;
+    let rows = stmt.query_map(params![logical, session_id, turn_key], |r| Ok((r.get(0)?, r.get(1)?)))?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
 }
 
@@ -2697,7 +2708,7 @@ fn mark_turn(
           WHERE (?1 <> '' AND logical = ?1) OR (?2 IS NOT NULL AND session_id = ?2)",
         params![logical, session_id],
     )?;
-    let mut keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
+    let mut keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, session_id, key)? };
     // Every row with the key, proven or not: the files whose last turn may go on in the next.
     let all_keyed = keyed.clone();
     // RULING: v2 c18b review round 2, item 1: a `cli` row takes only the rows whose own
