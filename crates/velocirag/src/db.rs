@@ -1088,6 +1088,53 @@ impl Database {
     }
 }
 
+/// Writes one document. A new `doc_id` gets a new row; an existing one is updated in place:
+/// content, metadata, embedding, file path and `indexed_at` change, and the row id,
+/// `hidden`, `source_mtime_ms`, the access count, the last access and the excitability are
+/// kept, so nothing that points at the row breaks. Returns the row's `id`.
+// SPEC: 2642-2643 make `Database::insert_document` a call to this function. Not done here:
+// the command line's `BrainSearch::index_document` adds the returned id to its usearch
+// index, which refuses a key it holds ("Duplicate keys not allowed"), so every re-index of
+// a changed file would fail. `insert_document` stays `INSERT OR REPLACE` until the vector
+// index takes a key it already has.
+pub fn upsert_document(
+    conn: &Connection,
+    doc_id: &str,
+    content: &str,
+    metadata: &serde_json::Value,
+    embedding: &[f32],
+    file_path: Option<&str>,
+) -> Result<i64> {
+    if embedding.len() != EMBEDDING_DIM {
+        return Err(VelociError::DimensionMismatch {
+            expected: EMBEDDING_DIM,
+            got: embedding.len(),
+        });
+    }
+
+    let metadata_json = serde_json::to_string(metadata)?;
+    let embedding_blob = embedding_to_blob(embedding);
+
+    conn.execute(
+        "INSERT INTO documents (doc_id, content, metadata, embedding, file_path, indexed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, CURRENT_TIMESTAMP)
+         ON CONFLICT(doc_id) DO UPDATE SET content = excluded.content, metadata =
+         excluded.metadata, embedding = excluded.embedding, file_path = excluded.file_path,
+         indexed_at = CURRENT_TIMESTAMP",
+        params![doc_id, content, metadata_json, embedding_blob, file_path],
+    )?;
+
+    // Sync FTS5
+    conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?1", params![doc_id])?;
+    conn.execute(
+        "INSERT INTO chunks_fts (doc_id, content, file_path) VALUES (?1, ?2, ?3)",
+        params![doc_id, content, file_path.unwrap_or("")],
+    )?;
+
+    let rowid = conn.query_row("SELECT id FROM documents WHERE doc_id = ?1", params![doc_id], |row| row.get(0))?;
+    Ok(rowid)
+}
+
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Escape SQLite LIKE metacharacters so user input cannot alter the pattern.

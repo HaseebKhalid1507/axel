@@ -1,15 +1,384 @@
-//! The owner's note folders. Commit 22 writes this file.
+//! The owner's note folders (section 2.8). Every 900 s the folders `load_sources` names are
+//! compared with their `documents` rows: a changed or new file is read, embedded and written
+//! in place (`velocirag::db::upsert_document`, same row id), a row whose file is gone is
+//! hidden as `missing_source`, and a hidden row whose file is back is shown again. Nothing
+//! is ever deleted here, and nothing outside the named folders is read: the walk follows no
+//! link, and a file is read only through a handle that is the regular file the walk saw.
+//! The files are stored whole, as the command line stores them; they are screened when shown.
 
+use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant, UNIX_EPOCH};
+
+use rusqlite::{params, Connection, OptionalExtension};
+
+use crate::brain_v2;
+use crate::consolidate::{load_sources, SourceDir};
 use crate::error::Result;
-use crate::ext::types::IndexerCtx;
+use crate::ext::types::{IndexerCtx, Mode};
+use crate::vindex::{VecDelta, VecItem, VecKey, VecScope};
 
-// SPEC: 4792 names `docsync::tick` without a signature; like every indexer handler the
-// document gives no signature for, it takes the `IndexerCtx` and returns `Result<()>`.
-// `docsync::plan(conn, sources) -> Plan` (2014) is not declared: `Plan` is defined nowhere
-// and only this file calls it.
+/// Files embedded per tick (B-2e).
+const FILES_PER_TICK: usize = 8;
+/// The deadline of one file's `embed_wait`.
+const EMBED_DEADLINE: Duration = Duration::from_secs(5);
+/// Smaller files are not indexed, as today.
+const MIN_BYTES: u64 = 50;
+/// The one mark this file writes and clears.
+const MISSING: &str = "missing_source";
+
+/// What one sync did. `waiting` is the number of files that need a vector and did not get
+/// one this tick (no model, `embed_wait` gave nothing, or past the 8 of this tick).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SyncReport {
+    pub indexed: usize,
+    pub waiting: usize,
+    pub hidden: usize,
+    pub restored: usize,
+    /// Files that could not be read, or whose write failed; their rows are untouched.
+    pub skipped: usize,
+}
+
+/// A file the walk found that needs its row written.
+struct ToIndex {
+    path: PathBuf,
+    doc_id: String,
+    /// Device and inode the walk saw; the handle that is read must be the same file.
+    file_id: Option<(u64, u64)>,
+}
+
+/// The cheap half: what the folders say, before anything is read or written.
+struct Plan {
+    index: Vec<ToIndex>,
+    /// Visible rows whose file is not there (the name is not found).
+    gone: Vec<i64>,
+    /// Rows hidden as `missing_source` whose file the walk found again.
+    back: Vec<i64>,
+}
 
 /// Every 900 s (called by `indexer::tick`).
 pub fn tick(ctx: &mut IndexerCtx) -> Result<()> {
-    let _ = ctx;
-    Ok(())
+    sync(ctx).map(|_| ())
+}
+
+/// One whole sync: plan, hide, restore, then at most 8 files embedded and written, each in
+/// its own transaction. Returns `Ok` with nothing done when there is no brain, and stops
+/// between two items as soon as the mode is not `Ready`.
+pub fn sync(ctx: &mut IndexerCtx) -> Result<SyncReport> {
+    let mut report = SyncReport::default();
+    if ctx.conn.is_none() || !ready(ctx) {
+        return Ok(report);
+    }
+    // SPEC: 2676: sources the configuration cannot give (no file and no HOME for the default
+    // six) are no folders at all: nothing is planned, so nothing is hidden.
+    let Ok(sources) = load_sources(ctx.cfg.sources.as_deref()) else { return Ok(report) };
+    let plan = match ctx.conn.as_ref() {
+        Some(conn) => plan(conn, &sources)?,
+        None => return Ok(report),
+    };
+    let model_loaded = ctx.status.model_loaded.load(Ordering::Relaxed);
+
+    for id in plan.gone {
+        if !ready(ctx) {
+            return Ok(report);
+        }
+        match write(ctx, |conn| set_hidden(conn, id, true)) {
+            Some(true) => {
+                report.hidden += 1;
+                let _ = ctx.vec_tx.send(VecDelta::Remove(vec![VecKey::Doc(id)]));
+            }
+            Some(false) => {}
+            None => report.skipped += 1,
+        }
+    }
+
+    for id in plan.back {
+        if !ready(ctx) {
+            return Ok(report);
+        }
+        match write(ctx, |conn| set_hidden(conn, id, false)) {
+            Some(true) => {
+                report.restored += 1;
+                if model_loaded {
+                    send_stored(ctx, id);
+                }
+            }
+            Some(false) => {}
+            None => report.skipped += 1,
+        }
+    }
+
+    let mut embedded = 0usize;
+    for file in &plan.index {
+        // RULING: W3-12b.9: with no usable model `embed_wait` is not called at all.
+        if !model_loaded || embedded >= FILES_PER_TICK {
+            report.waiting += 1;
+            continue;
+        }
+        if !ready(ctx) {
+            return Ok(report);
+        }
+        let Some((text, mtime_ms)) = read_file(file) else {
+            report.skipped += 1;
+            continue;
+        };
+        embedded += 1;
+        let vector = ctx
+            .embed
+            .embed_wait(vec![text.clone()], Instant::now() + EMBED_DEADLINE)
+            .and_then(|mut v| v.pop());
+        let Some(vector) = vector else {
+            report.waiting += 1;
+            continue;
+        };
+        // RULING: W3-12b.8: the mode is read again after the wait, before the write.
+        if !ready(ctx) {
+            return Ok(report);
+        }
+        let path = file.path.to_string_lossy().into_owned();
+        let written = write(ctx, |conn| {
+            let id = velocirag::db::upsert_document(conn, &file.doc_id, &text, &serde_json::json!({}), &vector, Some(&path))?;
+            conn.execute(
+                "UPDATE documents SET source_mtime_ms = ?2,
+                        hidden = CASE WHEN hidden = ?3 THEN NULL ELSE hidden END
+                  WHERE id = ?1",
+                params![id, mtime_ms, MISSING],
+            )?;
+            let hidden: Option<String> = conn.query_row("SELECT hidden FROM documents WHERE id = ?1", [id], |r| r.get(0))?;
+            Ok((id, hidden.is_none()))
+        });
+        match written {
+            Some((id, visible)) => {
+                report.indexed += 1;
+                if visible {
+                    let item = VecItem { key: VecKey::Doc(id), scope: VecScope::Documents, v: vector };
+                    let _ = ctx.vec_tx.send(VecDelta::Upsert(vec![item]));
+                }
+            }
+            None => report.skipped += 1,
+        }
+    }
+    Ok(report)
+}
+
+fn ready(ctx: &IndexerCtx) -> bool {
+    ctx.mode.load(Ordering::SeqCst) == Mode::Ready as u8 && !ctx.stop.load(Ordering::SeqCst)
+}
+
+/// One transaction: stand aside, `begin_write`, `f`, `COMMIT`. Any error rolls back, is
+/// counted in `write_errors` and may degrade the process; the caller goes on with the next
+/// item (`None`), and the next mode check stops it if the process degraded.
+fn write<T>(ctx: &IndexerCtx, f: impl FnOnce(&Connection) -> Result<T>) -> Option<T> {
+    let conn = ctx.conn.as_ref()?;
+    brain_v2::stand_aside(&ctx.writing);
+    let done = brain_v2::begin_write(conn).and_then(|()| {
+        let value = f(conn)?;
+        conn.execute_batch("COMMIT")?;
+        Ok(value)
+    });
+    match done {
+        Ok(value) => Some(value),
+        Err(e) => {
+            if !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
+            ctx.status.write_errors.fetch_add(1, Ordering::Relaxed);
+            brain_v2::degrade_on(&e, &ctx.status, &ctx.mode);
+            None
+        }
+    }
+}
+
+/// Hides a visible row as `missing_source`, or clears that mark. Any other mark is left
+/// alone. True when the row changed.
+fn set_hidden(conn: &Connection, id: i64, hide: bool) -> Result<bool> {
+    let n = if hide {
+        conn.execute("UPDATE documents SET hidden = ?2 WHERE id = ?1 AND hidden IS NULL", params![id, MISSING])?
+    } else {
+        conn.execute("UPDATE documents SET hidden = NULL WHERE id = ?1 AND hidden = ?2", params![id, MISSING])?
+    };
+    Ok(n > 0)
+}
+
+/// A restored row's stored vector goes back to the front thread.
+fn send_stored(ctx: &IndexerCtx, id: i64) {
+    let Some(conn) = ctx.conn.as_ref() else { return };
+    let blob: Option<Vec<u8>> = conn
+        .query_row("SELECT embedding FROM documents WHERE id = ?1", [id], |r| r.get(0))
+        .optional()
+        .ok()
+        .flatten();
+    if let Some(blob) = blob {
+        let v: Vec<f32> = blob.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        if v.len() == velocirag::EMBEDDING_DIM {
+            let item = VecItem { key: VecKey::Doc(id), scope: VecScope::Documents, v };
+            let _ = ctx.vec_tx.send(VecDelta::Upsert(vec![item]));
+        }
+    }
+}
+
+/// Walks every source and compares it with the brain. Reads no file's content.
+fn plan(conn: &Connection, sources: &[SourceDir]) -> Result<Plan> {
+    // SPEC: 2649-2654 do not say what a source that is missing, unreadable or not a folder
+    // gives. It gives nothing: its rows are neither hidden nor restored, so a folder whose
+    // mount point is gone loses nothing and shows nothing new.
+    let mut roots: Vec<(PathBuf, &SourceDir)> = Vec::new();
+    for source in sources {
+        let Ok(root) = std::fs::canonicalize(&source.path) else { continue };
+        if !root.is_dir() || roots.iter().any(|(r, _)| *r == root) {
+            continue;
+        }
+        roots.push((root, source));
+    }
+    let all_roots: HashSet<PathBuf> = roots.iter().map(|(r, _)| r.clone()).collect();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut index: BTreeMap<String, ToIndex> = BTreeMap::new();
+    for (root, source) in &roots {
+        let walk = walkdir::WalkDir::new(root).follow_links(false).into_iter().filter_entry(|e| {
+            // A folder that is another source's root is walked as that source only.
+            e.depth() == 0 || !(e.file_type().is_dir() && all_roots.contains(e.path()))
+        });
+        // An entry the walk cannot read is skipped; what is under it is not "gone" for that
+        // (absence is decided by the name alone, below).
+        for entry in walk.filter_map(|e| e.ok()) {
+            // `file_type` is the entry's own: a link is a link, never what it points at.
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let path = entry.path();
+            if !path.extension().is_some_and(|ext| ext == "md" || ext == "txt") {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else { continue };
+            let abs = path.to_string_lossy().into_owned();
+            seen.insert(abs.clone());
+            if meta.len() < MIN_BYTES {
+                continue;
+            }
+            let doc_id = doc_id(source, root, path);
+            if needs_index(conn, &doc_id, &abs, mtime_ms(&meta))? {
+                index.insert(abs, ToIndex { path: path.to_path_buf(), doc_id, file_id: file_id(&meta) });
+            }
+        }
+    }
+
+    let mut gone = BTreeSet::new();
+    let mut back = BTreeSet::new();
+    let mut stmt = conn.prepare(
+        "SELECT id, file_path, hidden FROM documents
+          WHERE file_path IS NOT NULL AND substr(file_path, 1, length(?1)) = ?1
+            AND (hidden IS NULL OR hidden = ?2)
+            AND COALESCE(json_extract(metadata, '$.type'), '') <> 'memory'",
+    )?;
+    for (root, _) in &roots {
+        let mut prefix = root.to_string_lossy().into_owned();
+        if !prefix.ends_with('/') {
+            prefix.push('/');
+        }
+        let rows = stmt
+            .query_map(params![prefix, MISSING], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for (id, file_path, hidden) in rows {
+            if seen.contains(&file_path) {
+                if hidden.is_some() {
+                    back.insert(id);
+                }
+            } else if hidden.is_none() && is_gone(Path::new(&file_path)) {
+                gone.insert(id);
+            }
+        }
+    }
+    Ok(Plan { index: index.into_values().collect(), gone: gone.into_iter().collect(), back: back.into_iter().collect() })
+}
+
+/// Only "not found" says a file is gone. Any other answer (no permission, an I/O error, a
+/// link where the file was) keeps the row as it is.
+fn is_gone(path: &Path) -> bool {
+    matches!(std::fs::symlink_metadata(path), Err(e) if e.kind() == std::io::ErrorKind::NotFound)
+}
+
+/// `doc_id` as the command line makes it: `<source name>::<path under the source>`, with
+/// `/` as `::` and `.md` and `.txt` taken out.
+fn doc_id(source: &SourceDir, root: &Path, path: &Path) -> String {
+    let relative = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .replace('/', "::")
+        .replace(".md", "")
+        .replace(".txt", "");
+    format!("{}::{}", source.name, relative)
+}
+
+/// The file is newer than its row, or has no row.
+fn needs_index(conn: &Connection, doc_id: &str, abs: &str, mtime_ms: i64) -> Result<bool> {
+    let row: Option<(Option<String>, Option<i64>, Option<f64>)> = conn
+        .query_row(
+            "SELECT hidden, source_mtime_ms, CAST(strftime('%s', indexed_at) AS REAL) FROM documents WHERE doc_id = ?1",
+            [doc_id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    match row {
+        // A row someone else hid (not this file's mark) is left as it is.
+        Some((Some(mark), _, _)) if mark != MISSING => Ok(false),
+        Some((_, Some(stored), _)) => Ok(mtime_ms > stored),
+        // As today: `indexed_at` has whole seconds, so half a second of slack.
+        Some((_, None, indexed)) => Ok(mtime_ms as f64 / 1000.0 > indexed.unwrap_or(0.0) + 0.5),
+        None => {
+            // SPEC: 2652-2653 compare with "documents.source_mtime_ms": the row of this
+            // doc_id. A file the command line indexed under another doc_id has a visible
+            // row with its path; when that row is as new as the file, no second row is made.
+            let newest: Option<f64> = conn.query_row(
+                "SELECT MAX(COALESCE(source_mtime_ms / 1000.0, CAST(strftime('%s', indexed_at) AS REAL) + 0.5))
+                   FROM documents WHERE file_path = ?1 AND hidden IS NULL",
+                [abs],
+                |r| r.get(0),
+            )?;
+            Ok(match newest {
+                Some(t) => mtime_ms as f64 / 1000.0 > t,
+                None => true,
+            })
+        }
+    }
+}
+
+/// The file's content and modification time, read through a handle that is the regular
+/// file the walk saw (no link is followed, a FIFO does not block). `None` skips the file.
+fn read_file(file: &ToIndex) -> Option<(String, i64)> {
+    let handle = crate::fs_open::open_no_wait(&file.path).ok()?;
+    let meta = handle.metadata().ok()?;
+    if !meta.file_type().is_file() || file_id(&meta) != file.file_id || meta.len() < MIN_BYTES {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(meta.len() as usize);
+    (&handle).take(meta.len()).read_to_end(&mut bytes).ok()?;
+    let text = String::from_utf8(bytes).ok()?;
+    if (text.len() as u64) < MIN_BYTES {
+        return None;
+    }
+    Some((text, mtime_ms(&meta)))
+}
+
+fn mtime_ms(meta: &std::fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |d| d.as_millis() as i64)
+}
+
+#[cfg(unix)]
+fn file_id(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
