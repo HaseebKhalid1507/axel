@@ -62,29 +62,35 @@ impl ExactIndex {
         ExactIndex { dim, data: Vec::new(), keys: Vec::new(), scopes: Vec::new(), pos: HashMap::new() }
     }
 
-    /// `Upsert` of a key already there replaces it.
+    /// `Upsert` of a key already there replaces it. Returns how many items were skipped.
     // SPEC: 2422: an item whose vector is not `dim` wide is skipped (it cannot be a row).
-    pub fn apply(&mut self, delta: VecDelta) {
+    // RULING: wave2-c9 review finding 6: so is an item with a value that is not finite, and
+    // `apply` returns the count, so that an index left empty by a model change is not silent.
+    pub fn apply(&mut self, delta: VecDelta) -> usize {
         match delta {
             VecDelta::Replace(items) => {
                 self.data.clear();
                 self.keys.clear();
                 self.scopes.clear();
                 self.pos.clear();
-                self.upsert(items);
+                self.upsert(items)
             }
             VecDelta::Upsert(items) => self.upsert(items),
             VecDelta::Remove(keys) => {
                 for key in keys {
                     self.remove(&key);
                 }
+                0
             }
         }
     }
 
-    fn upsert(&mut self, items: Vec<VecItem>) {
+    /// An item that is skipped leaves a row already under its key as it was.
+    fn upsert(&mut self, items: Vec<VecItem>) -> usize {
+        let mut skipped = 0;
         for item in items {
-            if item.v.len() != self.dim {
+            if item.v.len() != self.dim || !item.v.iter().all(|x| x.is_finite()) {
+                skipped += 1;
                 continue;
             }
             match self.pos.get(&item.key) {
@@ -100,6 +106,7 @@ impl ExactIndex {
                 }
             }
         }
+        skipped
     }
 
     fn remove(&mut self, key: &VecKey) {
@@ -117,13 +124,18 @@ impl ExactIndex {
 
     /// One pass of dot products over the rows `allow` admits, keeping the best `k`, best first.
     pub fn search(&self, q: &[f32], k: usize, allow: &dyn Fn(&VecScope) -> bool) -> Vec<(VecKey, f32)> {
-        if k == 0 || q.len() != self.dim {
+        // RULING: wave2-c9 review finding 6: a query with a value that is not finite finds nothing.
+        if k == 0 || q.len() != self.dim || !q.iter().all(|x| x.is_finite()) {
             return Vec::new();
         }
         let mut hits: Vec<(VecKey, f32)> = Vec::new();
         for (i, key) in self.keys.iter().enumerate() {
             if allow(&self.scopes[i]) {
-                hits.push((*key, dot(q, &self.data[i * self.dim..(i + 1) * self.dim])));
+                // Finite rows and query can still overflow to a score that is not; it is no hit.
+                let s = dot(q, &self.data[i * self.dim..(i + 1) * self.dim]);
+                if s.is_finite() {
+                    hits.push((*key, s));
+                }
             }
         }
         if hits.len() > k {
@@ -275,5 +287,38 @@ mod tests {
         assert_eq!(idx.get(&VecKey::Mem(2)), None);
         assert_eq!(idx.search(&[0.0, 1.0, 0.0], 10, &|_| true), vec![(VecKey::Doc(5), 1.0)]);
         assert!(idx.search(&[0.0, 1.0, 0.0], 0, &|_| true).is_empty());
+    }
+
+    #[test]
+    fn values_that_are_not_finite_are_skipped_and_counted() {
+        let mut idx = ExactIndex::new(3);
+        let item = |id, v: [f32; 3]| VecItem { key: VecKey::Mem(id), scope: VecScope::Global, v: v.to_vec() };
+        let skipped = idx.apply(VecDelta::Replace(vec![
+            item(1, [1.0, 0.0, 0.0]),
+            item(2, [f32::NAN, 0.0, 0.0]),
+            item(3, [0.0, f32::INFINITY, 0.0]),
+            item(4, [0.0, 0.0, f32::NEG_INFINITY]),
+            VecItem { key: VecKey::Doc(5), scope: VecScope::Documents, v: vec![1.0; 4] },
+            item(6, [0.0, 1.0, 0.0]),
+        ]));
+        assert_eq!(skipped, 4);
+        assert_eq!(idx.len(), 2);
+        // A NaN row is never a hit, for any query.
+        for q in [[1.0, 0.0, 0.0], [-1.0, -1.0, -1.0], [0.0, 0.0, 0.0]] {
+            let hits = idx.search(&q, 10, &|_| true);
+            assert_eq!(hits.len(), 2);
+            assert!(hits.iter().all(|(k, s)| s.is_finite() && *k != VecKey::Mem(2)), "{hits:?}");
+        }
+        // A NaN (or infinite) query finds nothing.
+        assert!(idx.search(&[f32::NAN, 1.0, 0.0], 10, &|_| true).is_empty());
+        assert!(idx.search(&[f32::INFINITY, 0.0, 0.0], 10, &|_| true).is_empty());
+        // An Upsert that is skipped leaves the row under its key as it was, and is counted.
+        assert_eq!(idx.apply(VecDelta::Upsert(vec![item(1, [f32::NAN, 0.0, 0.0]), item(7, [0.0, 0.0, 1.0])])), 1);
+        assert_eq!(idx.get(&VecKey::Mem(1)), Some(&[1.0, 0.0, 0.0][..]));
+        assert_eq!(idx.len(), 3);
+        assert_eq!(idx.apply(VecDelta::Remove(vec![VecKey::Mem(7)])), 0);
+        // Finite values whose product overflows give no hit either.
+        idx.apply(VecDelta::Replace(vec![item(8, [3e38, 3e38, 0.0])]));
+        assert!(idx.search(&[3e38, 3e38, 0.0], 10, &|_| true).is_empty());
     }
 }
