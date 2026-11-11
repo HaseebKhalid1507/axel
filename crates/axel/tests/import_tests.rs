@@ -526,7 +526,8 @@ fn t09_every_failure_of_init_deletes_the_temporary_copy_and_says_so() {
     let fx = fx();
     make_axel(&fx.old);
 
-    // The integrity check fails: every page after the first is overwritten.
+    // A copy that is not a database past its first page: every page after it is
+    // overwritten. (`f2_…` is the copy that only its integrity check refuses.)
     let broken = fx.root().join("broken.r8");
     let mut bytes = fs::read(&fx.old).unwrap();
     assert!(bytes.len() > 3 * 4096);
@@ -1531,4 +1532,46 @@ fn f1_a_stop_before_the_link_leaves_nothing_at_the_destination() {
     assert_eq!(out.report["destination_made"], true);
     assert_eq!(out.report["placed_by"], "hard link");
     assert_eq!(listing(&folder).iter().filter(|n| n.starts_with("brain.r8") && !n.contains(".replaced-")).collect::<Vec<_>>(), ["brain.r8"]);
+}
+
+/// Points `idx_memories_category` at another column: every row is still read, `COUNT(*)`
+/// works, and only `integrity_check` sees that the index does not match its table.
+fn damage_an_index(path: &Path) {
+    let conn = Connection::open(path).unwrap();
+    conn.execute_batch("PRAGMA writable_schema=ON").unwrap();
+    let n = conn
+        .execute(
+            "UPDATE sqlite_master SET sql = 'CREATE INDEX idx_memories_category ON memories(topic)'
+              WHERE name = 'idx_memories_category'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(n, 1);
+    let version: i64 = conn.query_row("PRAGMA schema_version", [], |r| r.get(0)).unwrap();
+    conn.execute_batch(&format!("PRAGMA schema_version = {}; PRAGMA writable_schema=OFF;", version + 1)).unwrap();
+    conn.close().unwrap();
+    let conn = Connection::open(path).unwrap();
+    assert_eq!(count(&conn, "SELECT COUNT(*) FROM memories"), 3);
+    assert_ne!(text(&conn, "PRAGMA integrity_check"), "ok");
+    conn.close().unwrap();
+}
+
+/// Finding 2: a copy whose only fault is one an integrity check finds stops the import.
+#[test]
+fn f2_a_copy_that_fails_only_its_integrity_check_is_refused() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let broken = fx.root().join("index.r8");
+    fs::copy(&fx.old, &broken).unwrap();
+    damage_an_index(&broken);
+    let before = state(&broken);
+    let out = fx.init(&broken);
+    show("init, an index does not match its table", &out);
+    assert_eq!(out.code, 3, "{}", out.report);
+    let error = out.report["error"].as_str().unwrap();
+    assert!(error.starts_with("the integrity check of the copy did not answer ok: "), "{error}");
+    assert_eq!(out.report["destination_made"], false);
+    assert!(out.report["temporary_copy_deleted"].as_str().unwrap().contains(".init-"), "{}", out.report);
+    assert!(listing(fx.new.parent().unwrap()).is_empty(), "{:?}", listing(fx.new.parent().unwrap()));
+    assert_eq!(state(&broken), before);
 }
