@@ -1176,6 +1176,97 @@ fn f3_no_working_note_from_a_file_with_a_forget_span() {
     assert_eq!(positions(&units), vec!["x0.0", "x2.0", "x6.0", "n0.0"]);
 }
 
+// ---------------------------------------------------------- wave2-c6-review, finding 4
+
+#[test]
+fn f4_every_text_of_a_unit_is_redacted() {
+    const BLANK: &str = "(redacted)";
+    // Joined from parts, so no key-shaped literal is in the repository.
+    let key = ["sk", "-", "abcdefghij0123456789", "klmnopqrst9876543210"].concat();
+    assert_eq!(screen::redact(&key).text, BLANK, "the shape `screen::redact` blanks");
+
+    // A tool input with the key before character 160, and one in which it straddles it:
+    // cut first, 12 characters of the key would be left, which no rule knows.
+    let filler = format!("{} ", "ab ".repeat(45));
+    let straddling = json!({"text": format!("{filler}{key}")});
+    let at = straddling.to_string().find(&key).unwrap();
+    assert!(at < 160 && at + 3 + 15 >= 160 && at + key.len() > 160, "the key straddles 160: {at}");
+    let scope = "ab".repeat(32);
+    let body = json!({
+        "state": "live",
+        "source_message_count": 4,
+        "messages": [
+            {"source_index": 0, "block_indices": [],
+             "message": {"role": "assistant", "content": format!(
+                "LEADRED so {key} is what the file holds, and I had begun to say so in the part before this one.")}},
+            {"source_index": 1, "block_indices": [],
+             "message": {"role": "user", "content": format!(
+                "ASKRED is {key} still the one in use, or was it changed last week by somebody?")}},
+            {"source_index": 2, "block_indices": [0, 1, 2],
+             "message": {"role": "assistant", "content": [
+                {"type": "text", "text": format!("REPLYRED it is still {key} and nobody has changed it.")},
+                {"type": "tool_use", "id": "t1", "name": "early", "input": {"value": key.clone()}},
+                {"type": "tool_use", "id": "t2", "name": "late", "input": straddling}
+             ]}},
+            {"source_index": 3, "block_indices": [],
+             "message": {"role": "user", "content": format!(
+                "<event id=\"e9\" type=\"subagent_completion\" severity=\"low\" source=\"worker-9\">REPORTRED found {key} in the env file of the old service</event>")}}
+        ],
+        "note": format!("NOTERED the value {key} was checked; next: nothing.")
+    });
+    let a = live(read_shelf(&record(&scope, &id(1), body), &id(1)));
+
+    // The tool inputs are redacted when the file is read, before the cut.
+    let heads: Vec<&str> = a.messages[2]
+        .blocks
+        .iter()
+        .filter_map(|b| match b {
+            Block::ToolUse { input_head, .. } => Some(input_head.as_str()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(heads.len(), 2);
+    for head in &heads {
+        assert!(!head.contains("sk-") && head.contains(BLANK), "{head}");
+        assert!(head.chars().count() <= 160);
+    }
+    assert_eq!(heads[0], format!("{{\"value\":\"{BLANK}\"}}"));
+
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["c0.0", "x1.0", "r3.0", "n0.0"]);
+    // The key, or its head, is in no field of any unit.
+    for u in &units {
+        for (field, text) in [("title", &u.title), ("body", &u.body), ("aux", &u.aux)] {
+            assert!(!text.contains("sk-"), "{} {field}: {text}", pos(u));
+            assert!(!text.contains("klmnopqrst"), "{} {field}: {text}", pos(u));
+        }
+    }
+    // And the blank is where it was: the rest of each text is kept.
+    let blanks = |text: &str| text.matches(BLANK).count();
+    let (c, x, r, n) = (&units[0], &units[1], &units[2], &units[3]);
+    assert!(c.body.contains("LEADRED") && blanks(&c.body) == 1 && blanks(&c.title) == 1);
+    assert!(x.title.starts_with("ASKRED is (redacted) still"), "{}", x.title);
+    assert!(x.body.contains("ASKRED") && x.body.contains("REPLYRED"));
+    assert_eq!(blanks(&x.body), 2, "the prompt and the reply: {}", x.body);
+    assert_eq!(blanks(&x.aux), 2, "both inputs: {}", x.aux);
+    assert!(x.aux.starts_with("early: ") && x.aux.contains("\nlate: "));
+    assert_eq!(r.body, "REPORTRED found (redacted) in the env file of the old service");
+    assert_eq!(r.title, r.body);
+    assert_eq!(n.body, "NOTERED the value (redacted) was checked; next: nothing.");
+    // The key of the turn is the key of the redacted prompt.
+    assert_eq!(
+        x.turn_key,
+        Some(archive::turn_key("ASKRED is (redacted) still the one in use, or was it changed last week by somebody?"))
+    );
+
+    // A tool input given to `extract_units` unredacted (an archive not made by
+    // `read_archive`) is redacted in `aux` all the same.
+    let mut raw = arch(vec![user(0, Q1), asst(1, A1)]);
+    raw.messages[1].blocks.push(Block::ToolUse { name: "raw".to_string(), input_head: key.clone() });
+    let units = units_of(&raw);
+    assert_eq!(units[0].aux, "raw: (redacted)");
+}
+
 // ----------------------------------------------------------------------------- test 28
 
 /// The nine stored messages of a window as `successor_from_parts` builds one, the first at
