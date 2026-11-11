@@ -33,7 +33,8 @@ use crate::retrieval::{
 };
 use crate::store::GLOBAL_KEY;
 use crate::vindex::{ExactIndex, VecKey, VecScope};
-use crate::{archive, brain_v2, inject, project, screen};
+use crate::capture::HostMessage;
+use crate::{archive, brain_v2, capture, inject, project, screen};
 
 /// What this caller may see (section 5 fills it). Built by `front::view_for` from
 /// `session_id` and `cwd` alone.
@@ -366,13 +367,6 @@ const STOP_WORDS: [&str; 60] = [
 /// of that text.
 pub fn query_hash(prompt: &str) -> String {
     archive::turn_key(&screen::redact(prompt).text)
-}
-
-/// A message the host wrote, not the person (capture's rule: white space before the mark
-/// is skipped). No text of one is ever stored, so none is logged.
-fn host_message(text: &str) -> bool {
-    let head = text.trim_start();
-    head.starts_with("<event ") || head.starts_with("[Context continuation") || head.starts_with("[Host context advisory")
 }
 
 /// The query tokens of a text that has ALREADY passed `screen::redact`: lowercase
@@ -1445,6 +1439,9 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
     let deadline = until.checked_sub(HEADROOM).unwrap_or(until);
 
     let prompt = ev.message.as_deref().unwrap_or("");
+    // A message the host wrote: capture's one list (white space before the mark skipped).
+    // No text of one is ever stored, so none is logged.
+    let host = capture::host_message(prompt);
     let redacted = screen::redact(prompt);
     let text: &str = &redacted.text;
     let session_id = ev.session_id.as_deref();
@@ -1477,9 +1474,8 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         Some(Some("skipped:breaker"))
     } else if !ready {
         Some(Some("skipped:not_ready"))
-    } else if (prompt.starts_with("<event ") && !st.cfg.recall_on_events)
-        || prompt.starts_with("[Context continuation")
-        || prompt.starts_with("[Host context advisory")
+    } else if (host == Some(HostMessage::Event) && !st.cfg.recall_on_events)
+        || host == Some(HostMessage::Aside)
         || prompt.chars().count() < 12
         || word_count(text) < 3
     {
@@ -1525,7 +1521,7 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         // never captured, so the log keeps no text of them. A turn that ends withheld or
         // marked is known only later: capture then calls `drop_logged_turn`.
         let never_captured = session_id.is_none_or(str::is_empty)
-            || host_message(prompt)
+            || host.is_some()
             || elsewhere
             || view.project.is_none();
         let mut cfg = RecallConfig::from_ext(&st.cfg, now);

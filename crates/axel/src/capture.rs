@@ -82,22 +82,30 @@ fn cut(s: &str, max: usize) -> &str {
 }
 
 /// A message the host wrote, not the person.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum HostMessage {
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum HostMessage {
     /// `<event `: something else begins. What was pending is over.
     Event,
     /// `[Context continuation`, `[Host context advisory`: the host speaks in the middle of
-    /// a turn, which goes on.
+    /// a turn, which goes on. `[Host harness note` (core's nudge, "not a new user request",
+    /// sent after a turn has ended): it starts no turn.
     Aside,
 }
 
-fn host_message(text: &str) -> Option<HostMessage> {
+/// The marks a host message starts with, other than an event's.
+const ASIDES: [&str; 3] = ["[Context continuation", "[Host context advisory", "[Host harness note"];
+
+/// What is a host message, for capture and for recall's hook (`recall::on_before_message`
+/// asks here): ONE list.
+// RULING: v2 capture/recall review, item 6 (finding 8). The function is capture's; recall
+// calls it. Core's Muse nudge `[Host harness note, not a new user request]` is one.
+pub fn host_message(text: &str) -> Option<HostMessage> {
     // SPEC: 3395-3397 say "starts"; white space before the mark is skipped, so that such a
     // message is never paired as a prompt.
     let head = text.trim_start();
     if head.starts_with("<event ") {
         Some(HostMessage::Event)
-    } else if head.starts_with("[Context continuation") || head.starts_with("[Host context advisory") {
+    } else if ASIDES.iter().any(|mark| head.starts_with(mark)) {
         Some(HostMessage::Aside)
     } else {
         None

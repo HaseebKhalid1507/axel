@@ -1905,3 +1905,25 @@ fn review_4_the_excluded_folders_are_resolved_once() {
     }
     assert_eq!(recall::times_resolved(&folder), 1, "the folder was resolved at more than one prompt");
 }
+
+/// Item 6 (finding 8): core's Muse nudge is a host message for the hook too, by capture's
+/// one list: no recall, no log row. The same words from the person are recalled.
+#[test]
+fn review_6_the_hook_takes_the_host_harness_note_for_a_host_message() {
+    let mut h = Hook::new(json!({}));
+    let scope = h.scope_dir.clone();
+    let mut new = row("mem_deploy", "staging deploy note", "the staging server deploy uses the blue pipeline");
+    new.project_key = &scope;
+    h.put(&new);
+    let words = "which pipeline does the staging server deploy use";
+
+    for nudge in [
+        format!("[Host harness note, not a new user request] {words}"),
+        format!("  [Host harness note, not a new user request] {words}"),
+    ] {
+        assert_eq!(h.before("s1", &nudge), HookOut::Continue, "{nudge}");
+        h.no_log();
+    }
+    assert!(matches!(h.before("s1", words), HookOut::Inject(_)));
+    assert_eq!(h.trace().outcome, "injected");
+}

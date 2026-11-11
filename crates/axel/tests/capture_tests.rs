@@ -1563,3 +1563,27 @@ fn review_5_a_hook_answered_without_work_lets_the_pending_turn_go() {
     assistant(&mut st, "T", &cwd, REPLY, false, 3_000);
     assert_eq!(next_capture(&jobs).unwrap().session_id, "T");
 }
+
+/// Item 6 (finding 8): core's Muse nudge is a host message. Alone it starts no turn and its
+/// reply is not paired; in the middle of a turn it changes nothing.
+#[test]
+fn review_6_the_host_harness_note_is_a_host_message() {
+    let nudge = "[Host harness note, not a new user request] the reader of archive files has unfinished work";
+    let after_space = format!("\n  {nudge}");
+    assert_eq!(capture::host_message(nudge), Some(capture::HostMessage::Aside));
+    assert_eq!(capture::host_message(&after_space), Some(capture::HostMessage::Aside));
+    assert_eq!(capture::host_message("what is a [Host harness note in core"), None);
+
+    for text in [nudge, after_space.as_str()] {
+        let mut cap = CaptureState::default();
+        cap.on_user(Some("S"), Some("/work"), text, 1_000);
+        assert_eq!(cap.pending_len(), 0, "{text}");
+        assert_eq!(cap.on_assistant(Some("S"), "I picked up the unfinished work on the reader.", false, 2_000), None);
+        assert_eq!(cap.take_dropped(), 0);
+    }
+    let mut cap = CaptureState::default();
+    cap.on_user(Some("S"), Some("/work"), PROMPT, 1_000);
+    cap.on_user(Some("S"), Some("/work"), nudge, 1_500);
+    let turn = cap.on_assistant(Some("S"), REPLY, false, 2_000).unwrap();
+    assert_eq!((turn.prompt.as_str(), turn.started_ms), (PROMPT, 1_000));
+}
