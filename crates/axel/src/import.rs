@@ -879,6 +879,27 @@ fn init_steps(brain: &BrainArg, opts: &InitOpts, rep: &mut Report, temp: &mut Op
         }
     }
 
+    // A log or an index of a brain that is no longer there would be taken for the new
+    // brain's own when it is put at `D`: refused, naming them.
+    if existing.is_none() {
+        let mut beside: Vec<String> = SIDES.iter().map(|s| side(&dest, s)).chain([hnsw_of(&dest)])
+            .filter(|p| fs::symlink_metadata(p).is_ok())
+            .map(|p| shown(&p))
+            .collect();
+        if !beside.is_empty() {
+            beside.sort();
+            return Err(stop(
+                EXIT_REFUSED,
+                format!(
+                    "{} is not there, but {} beside it would be taken for the new brain's own; move them \
+                     away and run this again. Nothing was done.",
+                    dest.display(),
+                    beside.join(", ")
+                ),
+            ));
+        }
+    }
+
     // What 7b and 8 will record is settled before anything is copied.
     let (base, base_from) = match &opts.synaps_base {
         Some(dir) => (dir.clone(), "--synaps-base"),

@@ -1575,3 +1575,27 @@ fn f2_a_copy_that_fails_only_its_integrity_check_is_refused() {
     assert!(listing(fx.new.parent().unwrap()).is_empty(), "{:?}", listing(fx.new.parent().unwrap()));
     assert_eq!(state(&broken), before);
 }
+
+/// Finding 3: the destination is absent but a log or an index is beside it: refused,
+/// naming it, and nothing is done.
+#[test]
+fn f3_files_beside_an_absent_destination_are_refused() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let folder = fx.new.parent().unwrap().to_path_buf();
+    let source_before = state(&fx.old);
+    for name in ["brain.r8-wal", "brain.r8-shm", "brain.r8-journal", "brain.r8.hnsw"] {
+        let stray = folder.join(name);
+        fs::write(&stray, b"from a brain that is gone").unwrap();
+        let out = fx.init(&fx.old);
+        show(&format!("init, {name} beside an absent destination"), &out);
+        assert_eq!(out.code, 2, "{name}: {}", out.report);
+        let error = out.report["error"].as_str().unwrap();
+        assert!(error.contains(&format!("but {} beside it", stray.display())), "{error}");
+        assert!(error.ends_with("Nothing was done."), "{error}");
+        assert_eq!(listing(&folder), [name], "{name}");
+        assert!(out.report.get("source").is_none(), "{}", out.report);
+        fs::remove_file(&stray).unwrap();
+    }
+    assert_eq!(state(&fx.old), source_before);
+}
