@@ -1054,7 +1054,18 @@ fn pause_hides_the_chats_captures_and_resume_brings_them_back_and_catch_up_drops
             )
             .unwrap()
     });
-    let args = pause::Args { session_id: "s-pause".to_string(), what: "both".to_string() };
+    // v2 c18b review, item 8: a chat id the brain does not know is refused, unless forced.
+    let typo = pause::Args { session_id: "s-pasue".to_string(), what: "both".to_string(), force: false };
+    let refused = ran("", |t| pause::run_with(&typo, &w.path, t));
+    assert_eq!(refused.code, 1, "{}", refused.out);
+    assert!(refused.err.contains("check the session id") && !refused.out.contains("paused"), "{}", refused.err);
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM chat_pauses"), 0);
+    let forced = pause::Args { force: true, ..typo };
+    assert_eq!(ran("", |t| pause::run_with(&forced, &w.path, t)).code, 0);
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM chat_pauses WHERE session_id = 's-pasue'"), 2);
+    tx(w.db(), || w.db().execute("DELETE FROM chat_pauses", []).unwrap());
+
+    let args = pause::Args { session_id: "s-pause".to_string(), what: "both".to_string(), force: false };
     let run = ran("", |t| pause::run_with(&args, &w.path, t));
     assert_eq!(run.code, 0, "{}", run.err);
     assert!(run.out.contains("1 recent turns were hidden"), "{}", run.out);

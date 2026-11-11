@@ -6,7 +6,7 @@
 use std::path::Path;
 use std::process::ExitCode;
 
-use crate::cli::show::{self, open, write, Term, OK, USAGE};
+use crate::cli::show::{self, open, write, Term, FAILED, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
 use crate::{project, store};
@@ -20,6 +20,9 @@ pub struct Args {
     // `Option` is now required.
     #[arg(value_parser = ["learning", "recall", "both"])]
     pub what: String,
+    /// Pause a chat the brain knows nothing of yet (no capture, archive or recall)
+    #[arg(long)]
+    pub force: bool,
 }
 
 pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
@@ -48,6 +51,23 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     }
     let conn = open(path)?;
     let logical = project::logical(session_id);
+    // RULING: v2 c18b review, item 8. A chat id no capture, archive or recall-log row knows
+    // is most likely mistyped: it is not paused unless `--force` says so.
+    let known: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM memory_ext WHERE session_id = ?2 OR logical = ?1)
+             OR EXISTS(SELECT 1 FROM archive_index WHERE session_id = ?2 OR logical = ?1)
+             OR EXISTS(SELECT 1 FROM recall_log WHERE session_id = ?2 OR logical = ?1)",
+        rusqlite::params![logical, session_id],
+        |r| r.get(0),
+    )?;
+    if !known && !args.force {
+        writeln!(
+            term.err,
+            "no capture, archive or recall of chat {} is in the brain: check the session id (\"axel-v2 pause --force …\" pauses it anyway). Nothing was changed.",
+            show::one(session_id)
+        )?;
+        return Ok(FAILED);
+    }
     let hidden = write(&conn, || {
         let mut hidden = 0;
         for what in kinds {
