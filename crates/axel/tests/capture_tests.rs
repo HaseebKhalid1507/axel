@@ -1617,3 +1617,52 @@ fn review_6_the_host_harness_note_is_a_host_message() {
     let turn = cap.on_assistant(Some("S"), REPLY, false, 2_000).unwrap();
     assert_eq!((turn.prompt.as_str(), turn.started_ms), (PROMPT, 1_000));
 }
+
+// ── v2 final small round ────────────────────────────────────────────────────
+
+/// The model's `forget` in chat `chat`, as the tool call makes it.
+fn forget_call(st: &mut FrontState, chat: &str, cwd: &str) -> Result<String, axel::ext::types::ToolError> {
+    let caller = Caller { session_id: Some(chat.to_string()), cwd: Some(cwd.to_string()), author: Some(Author::fresh()) };
+    tools_core::call(st, "forget", &json!({ "id": "m:mem_0000000000000000" }), &caller)
+}
+
+/// Item 2: a forget mark that waited for the write lock past the end of its turn is
+/// written ending at the turn's end, not at the call: the part of the turn after the call
+/// is covered too. The job of the turn's end ran before the mark was written.
+// RULING: v2 final small round, item 2
+#[test]
+fn small_2_a_waiting_forget_mark_ends_with_its_turn() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, _status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    st.clock = Arc::new(|| 1_600);
+    user(&mut st, "S", &cwd, "forget the phone number of Bob that I gave you this morning", 1_000);
+    assistant(&mut st, "S", &cwd, "I will call the forget tool for that number.", true, 1_500);
+
+    // The brain's write lock is held: the mark is kept, ending at the call.
+    ctx_conn(&ctx).execute_batch("BEGIN IMMEDIATE").unwrap();
+    let answer = forget_call(&mut st, "S", &cwd);
+    assert!(matches!(answer, Err(axel::ext::types::ToolError::Busy)), "{answer:?}");
+    assert_eq!(st.forget_marks.len(), 1, "the mark was not kept");
+    assert_eq!((st.forget_marks[0].from_ms, st.forget_marks[0].to_ms), (1_000, 1_600));
+    // Another chat's waiting mark with the same start is not this turn's.
+    let other = axel::ext::types::ForgetMark { session_id: "T".to_string(), from_ms: 1_000, to_ms: 1_600, turn_key: None };
+    st.forget_marks.push(other);
+
+    // The turn ends while the mark waits.
+    assistant(&mut st, "S", &cwd, "Done: the number of Bob is forgotten, nothing of it is kept.", false, 5_000);
+    let turn = next_capture(&jobs).unwrap();
+    assert!(turn.suppressed);
+    ctx_conn(&ctx).execute_batch("ROLLBACK").unwrap();
+    // Its job runs first and finds no row to move.
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    assert_eq!(count(ctx_conn(&ctx), "SELECT COUNT(*) FROM forgotten_turns"), 0);
+
+    // The front's next try writes the marks.
+    assert_eq!(front::retry_written(&mut st), 2);
+    assert!(st.forget_marks.is_empty());
+    let conn = ctx_conn(&ctx);
+    assert_eq!(to_ms(conn, "S"), 5_000, "the mark ends at the call, not at the turn's end");
+    assert_eq!(to_ms(conn, "T"), 1_600, "another chat's mark was moved");
+    nothing_stored(conn);
+}

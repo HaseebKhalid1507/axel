@@ -510,6 +510,15 @@ fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
     if turn.withheld && !turn.suppressed && st.cfg.capture {
         st.status.turns_withheld.fetch_add(1, Ordering::Relaxed);
     }
+    // RULING: v2 final small round, item 2: a forget mark of this turn that is still
+    // waiting for the write lock ends where the turn ends, whenever it is written.
+    if turn.suppressed {
+        for mark in st.forget_marks.iter_mut() {
+            if mark.session_id == turn.session_id && mark.from_ms == turn.started_ms {
+                mark.to_ms = mark.to_ms.max(turn.at_ms);
+            }
+        }
+    }
     // A full queue drops the turn (the job is counted there, the turn here); it arrives
     // with its archive.
     let sent = front::send_job(st, Job::Capture(turn));
