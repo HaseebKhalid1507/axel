@@ -45,6 +45,21 @@ pub fn redact(text: &str) -> Redacted<'_> {
     Redacted { text: Cow::Owned(out), blanked: hits.len(), hits }
 }
 
+/// Where `redact` blanks: the byte range of each blanked token in `text`, in order, with its
+/// hit. For measuring what the rules do to real text (`examples/screen_measure.rs`); a
+/// caller that stores or shows text uses `redact`.
+// RULING: wave2-c8 review A1: measure first. `Hit` already names the rule; this adds where.
+pub fn redact_spans(text: &str) -> Vec<(std::ops::Range<usize>, Hit)> {
+    let view = View::new(text);
+    scan(view.as_str(), false)
+        .into_iter()
+        .map(|span| {
+            let (start, end) = view.original(span.start, span.end);
+            (start..end, span.hit)
+        })
+        .collect()
+}
+
 /// The first hit of the four certain rules (the forum's test).
 pub fn certain_hit(text: &str) -> Option<Hit> {
     let view = View::new(text);
@@ -698,6 +713,26 @@ mod tests {
             assert!(r.text == *expected, "case {case}: wrong text");
             assert!(r.blanked == *blanked && r.hits.len() == *blanked, "case {case}: blanked {}", r.blanked);
         }
+    }
+
+    #[test]
+    fn redact_spans_are_what_redact_blanks() {
+        let token = format!("{}{LOW_A}\u{200B}{LOW_B}", mk(&["sk", "-"]));
+        let value = mk(&["abcdef", "123456"]);
+        let text = format!("é before {token} and token={value} after é");
+        let spans = redact_spans(&text);
+        let r = redact(&text);
+        assert_eq!(spans.len(), 2);
+        assert!(text[spans[0].0.clone()] == token, "case prefix: wrong range");
+        assert!(text[spans[1].0.clone()] == value, "case named value: wrong range");
+        let hits: Vec<Hit> = spans.iter().map(|(_, h)| h.clone()).collect();
+        assert_eq!(hits, r.hits);
+        let mut rebuilt = text.clone();
+        for (range, _) in spans.iter().rev() {
+            rebuilt.replace_range(range.clone(), BLANK);
+        }
+        assert!(rebuilt == r.text, "the ranges do not rebuild what redact returns");
+        assert!(redact_spans("nothing to blank here").is_empty());
     }
 
     // Test 3.
