@@ -1178,7 +1178,11 @@ impl Indexed {
             )
             .unwrap();
         let rows = stmt.query_map([&a.id], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
-        rows.collect::<rusqlite::Result<_>>().unwrap()
+        let mut rows: Vec<(String, String)> = rows.collect::<rusqlite::Result<_>>().unwrap();
+        // By number: `x12.0` comes after `x6.0`.
+        let at = |p: &str| p.trim_start_matches('x').split('.').map(|n| n.parse::<u32>().unwrap_or(0)).collect::<Vec<_>>();
+        rows.sort_by_key(|(p, _)| at(p));
+        rows
     }
 }
 
@@ -1223,14 +1227,19 @@ impl Arch {
             &format!("we decided that the {topic} stays as it is until the next release is out"),
         )
     }
-    /// A user prompt and an assistant message that calls a forget tool.
+    /// A user prompt, an assistant message that calls a forget tool, the tool's result and
+    /// a short last reply: the turn of the call ends, as core stores it (a human text right
+    /// after the call would be a steer sent while the turn ran).
     fn forget_call(mut self, prompt: &str, mark: &str) -> Arch {
         self = self.user(prompt);
         self.items.push(json!({"role": "assistant", "content": [
             {"type": "text", "text": reply(mark)},
             {"type": "tool_use", "id": "toolu_01", "name": "axel_forget", "input": {"id": "m:mem_0000000000000000"}},
         ]}));
-        self
+        self.items.push(json!({"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "toolu_01", "content": "ok"},
+        ]}));
+        self.says("Done.")
     }
     fn json(&self, scope: &str) -> String {
         let messages: Vec<Value> = self
@@ -1410,12 +1419,12 @@ fn t19_t22_restore_forget_turns_says_what_it_brings_back_and_the_turns_come_back
     assert_eq!(forget_units(world.db(), &a), (2, 0));
     assert!(forget_units(world.db(), &b).0 > 0, "the neighbour leaves nothing out: the test proves nothing");
     let positions = |world: &Indexed| world.rows(&a).into_iter().map(|(p, _)| p).collect::<Vec<_>>();
-    assert_eq!(positions(&world), ["x0.0", "x4.0", "x8.0"]);
+    assert_eq!(positions(&world), ["x0.0", "x6.0", "x12.0"]);
     let all = |conn: &Connection| dump(conn, "SELECT * FROM memories ORDER BY id");
 
     // Without the flag nothing brings them back: a scan, or a restore by id.
     world.scan();
-    assert_eq!(positions(&world), ["x0.0", "x4.0", "x8.0"]);
+    assert_eq!(positions(&world), ["x0.0", "x6.0", "x12.0"]);
     let by_id = restore_ids(&world.path(), &[format!("ctx-{}", a.id).as_str()]);
     assert_eq!(by_id.code, 1);
     assert_eq!(forget_units(world.db(), &a), (2, 0));
@@ -1437,7 +1446,7 @@ fn t19_t22_restore_forget_turns_says_what_it_brings_back_and_the_turns_come_back
 
     // The next scan adds the rows.
     world.scan();
-    assert_eq!(positions(&world), ["x0.0", "x2.0", "x4.0", "x6.0", "x8.0"]);
+    assert_eq!(positions(&world), ["x0.0", "x2.0", "x6.0", "x8.0", "x12.0"]);
     assert_eq!(forget_units(world.db(), &a), (0, 1));
 
     // `show` gives the count and the rows.
