@@ -454,6 +454,7 @@ fn t03_every_hook_kind_and_an_unknown_one_answer_continue() {
     assert_eq!(row["forum"]["core_owns"], false);
     assert_eq!(row["embed_stopped"], false);
     assert_eq!(row["model_loaded"], false);
+    assert_eq!(row["model_matches"], Value::Null, "no model is running: {row}");
 
     host.send(&json!({"jsonrpc": "2.0", "id": 900, "method": "shutdown"}));
     assert_eq!(host.read()["id"], 900);
@@ -926,6 +927,7 @@ fn open_state_and_open_ctx_hand_back_the_other_ends_of_their_channels() {
     }
     assert_eq!(row["model"], "hash-384");
     assert_eq!(row["model_loaded"], true);
+    assert_eq!((&row["brain_model"], &row["model_matches"]), (&json!("hash-384"), &json!(true)), "{row}");
 
     // Now there is a brain: a front state connects to it and is Ready.
     let (b, _) = boot(None, TestHooks::default());
@@ -1090,7 +1092,12 @@ fn a_model_that_is_not_the_brains_runs_on_words_alone() {
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert!(!ctx.bulk_out);
     assert!(jobs_rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is embedded");
-    assert_eq!(status_row(&dirs.brain()).unwrap()["model_loaded"], false);
+    let row = status_row(&dirs.brain()).unwrap();
+    assert_eq!(row["model_loaded"], false);
+    // Wave 3 ruling 9: the row says which two models, and that they differ.
+    assert_eq!((&row["model"], &row["brain_model"]), (&json!("hash-384"), &json!("all-MiniLM-L6-v2")), "{row}");
+    assert_eq!(row["model_matches"], false, "{row}");
+    assert_eq!(row["embed_stuck"], false, "{row}");
 }
 
 // ── Wave 3 ruling 1: the status file, one per process ───────────────────────
@@ -1464,4 +1471,48 @@ fn r7_a_forget_mark_that_could_not_get_the_write_lock_is_written_when_it_is_free
     assert_eq!(log.matches("forget mark not written, kept").count(), 1, "{log}");
     assert!(!log.contains("session-S"), "{log}");
     assert_eq!(host.close(), ServeEnd::InputClosed);
+}
+
+// ── Wave 3 ruling 9: an embed thread held inside a batch ────────────────────
+
+#[test]
+fn r9_an_embed_thread_held_inside_a_batch_is_stuck_and_a_query_gets_none_at_once() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        insert_memory(&conn, "mem_waiting", None, None, false);
+    }
+    // Every batch takes 1.5 s; one that has run 200 ms counts as hung.
+    let test = TestHooks { embed_sleep_ms: 1500, embed_stuck_limit_ms: Some(200), ..TestHooks::default() };
+    let (b, status) = boot(Some(Embedder::hashing()), test);
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    assert!(!ctx.embed.stuck());
+    assert_eq!(status_row(&dirs.brain()).unwrap()["embed_stuck"], false);
+
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert!(status.model_loaded.load(Ordering::Relaxed));
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(ctx.embed.stuck() && !ctx.embed.stopped());
+
+    // The query path: no model, at once, with five seconds of deadline left.
+    let start = Instant::now();
+    assert_eq!(ctx.embed.embed_query("retry limit", Instant::now() + Duration::from_secs(5)), None);
+    assert!(start.elapsed() < Duration::from_millis(100), "the query waited: {:?}", start.elapsed());
+
+    // The status tick says so, and the pump offers nothing.
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert!(!status.model_loaded.load(Ordering::Relaxed));
+    indexer_start::write_status(&mut ctx).unwrap();
+    let row = status_row(&dirs.brain()).unwrap();
+    assert_eq!((&row["embed_stuck"], &row["embed_stopped"], &row["model_loaded"]), (&json!(true), &json!(false), &json!(false)), "{row}");
+    assert_eq!(row["model_matches"], true, "{row}");
+
+    // The batch returns after all: the model is back.
+    let start = Instant::now();
+    while ctx.embed.stuck() {
+        assert!(start.elapsed() < Duration::from_secs(10), "the batch never returned");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert!(status.model_loaded.load(Ordering::Relaxed));
 }

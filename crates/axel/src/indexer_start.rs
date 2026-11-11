@@ -256,9 +256,15 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
 /// words alone: no vector is loaded, asked for or written.
 fn model_usable(ctx: &IndexerCtx) -> Result<bool> {
     let (Some(conn), Some(model)) = (ctx.conn.as_ref(), ctx.embed.model_id()) else { return Ok(false) };
-    if ctx.embed.stopped() {
+    // RULING: wave3-c12b ruling 9. A thread hung inside the model is no model.
+    if ctx.embed.stopped() || ctx.embed.stuck() {
         return Ok(false);
     }
+    Ok(model_matches(&brain_model(conn)?, model))
+}
+
+/// The model and the dimension `brain_meta` records.
+fn brain_model(conn: &Connection) -> Result<(Option<String>, Option<i64>)> {
     let recorded: Option<(Option<String>, Option<i64>)> = conn
         .query_row(
             "SELECT json_extract(value, '$.embedder_model'), json_extract(value, '$.embedding_dim')
@@ -267,7 +273,11 @@ fn model_usable(ctx: &IndexerCtx) -> Result<bool> {
             |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?;
-    Ok(matches!(recorded, Some((Some(m), Some(d))) if m == model && d == EMBEDDING_DIM as i64))
+    Ok(recorded.unwrap_or((None, None)))
+}
+
+fn model_matches(recorded: &(Option<String>, Option<i64>), model: &str) -> bool {
+    matches!(recorded, (Some(m), Some(d)) if m == model && *d == EMBEDDING_DIM as i64)
 }
 
 fn blob_to_vec(blob: &[u8]) -> Vec<f32> {
@@ -492,6 +502,10 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
         return Ok(());
     }
+    // RULING: wave3-c12b ruling 9. What the brain was made for, beside what is running:
+    // `model_matches` is null when no model is running, so there is nothing to compare.
+    let recorded = brain_model(conn)?;
+    let matches = ctx.embed.model_id().map(|model| model_matches(&recorded, model));
     let s = &ctx.status;
     let now = (ctx.clock)();
     let n = |a: &std::sync::atomic::AtomicU64| a.load(Ordering::Relaxed);
@@ -506,8 +520,11 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "scan": match s.scan.load(Ordering::Relaxed) { 0 => "pending", 1 => "running", _ => "done" },
         "indexer_running": true,
         "embed_stopped": ctx.embed.stopped(),
+        "embed_stuck": ctx.embed.stuck(),
         "model_loaded": s.model_loaded.load(Ordering::Relaxed),
         "model": ctx.embed.model_id(),
+        "brain_model": recorded.0,
+        "model_matches": matches,
         "model_dir": ctx.cfg.model_dir.to_string_lossy(),
         "embedder": ctx.cfg.embedder.to_string(),
         "vectors_waiting": n(&s.vectors_waiting),

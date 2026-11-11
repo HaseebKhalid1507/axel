@@ -3,7 +3,7 @@
 //! every caller then gets `None` at once, and every wait has a deadline.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError, TrySendError};
 use std::sync::Arc;
 use std::thread;
@@ -19,12 +19,44 @@ const BATCH: usize = 4;
 /// How long the thread waits between attempts to hand a finished bulk to a full indexer queue.
 const RETRY_SEND: Duration = Duration::from_millis(5);
 
+/// A batch still inside the model after this long has hung there (wave 3, 12b ruling 9).
+const STUCK_MS: u64 = 60_000;
+
+// RULING: wave3-c12b ruling 9. When the embed thread began the batch it is inside. A thread
+// that hangs in the model has not ended, so `stopped()` stays false; this is what says so.
+struct BatchClock {
+    epoch: Instant,
+    /// 0 when no batch is running; else milliseconds from `epoch` to its start, plus 1.
+    began: AtomicU64,
+    limit: Duration,
+}
+
+impl BatchClock {
+    fn new(test: &TestHooks) -> Arc<BatchClock> {
+        let limit = Duration::from_millis(test.embed_stuck_limit_ms.unwrap_or(STUCK_MS));
+        Arc::new(BatchClock { epoch: Instant::now(), began: AtomicU64::new(0), limit })
+    }
+    fn begin(&self) {
+        self.began.store(self.epoch.elapsed().as_millis() as u64 + 1, Ordering::SeqCst);
+    }
+    fn end(&self) {
+        self.began.store(0, Ordering::SeqCst);
+    }
+    fn stuck(&self) -> bool {
+        match self.began.load(Ordering::SeqCst) {
+            0 => false,
+            began => self.epoch.elapsed().saturating_sub(Duration::from_millis(began - 1)) >= self.limit,
+        }
+    }
+}
+
 /// A field of both `FrontState` and `IndexerCtx`, so it is `Clone` (B-2c).
 #[derive(Clone)]
 pub struct EmbedService {
     tx: Option<Sender<Req>>,
     stopped: Arc<AtomicBool>,
     backlog: Arc<AtomicUsize>,
+    batch: Arc<BatchClock>,
     model: Option<String>,
 }
 
@@ -72,7 +104,7 @@ impl EmbedService {
     pub fn start(embedder: Option<Embedder>, jobs: SyncSender<Job>, test: Arc<TestHooks>) -> Self {
         let Some(mut embedder) = embedder else {
             let (stopped, backlog) = Default::default();
-            return EmbedService { tx: None, stopped, backlog, model: None };
+            return EmbedService { tx: None, stopped, backlog, batch: BatchClock::new(&test), model: None };
         };
         let model = embedder.model_id().to_string();
         Self::spawn(move |texts: &[&str]| embedder.embed(texts).ok(), model, jobs, test)
@@ -85,6 +117,8 @@ impl EmbedService {
     {
         let stopped = Arc::new(AtomicBool::new(false));
         let backlog = Arc::new(AtomicUsize::new(0));
+        let batch = BatchClock::new(&test);
+        let thread_batch = batch.clone();
         let (tx, rx) = mpsc::channel();
         let guard = StopGuard { stopped: stopped.clone(), backlog: backlog.clone() };
         let thread_model = model.clone();
@@ -93,11 +127,11 @@ impl EmbedService {
             .spawn(move || {
                 let backlog = guard.backlog.clone();
                 let _guard = guard;
-                run(embed, rx, jobs, test, thread_model, &backlog);
+                run(embed, rx, jobs, test, thread_model, &backlog, &thread_batch);
             });
         // A thread that could not be spawned has ended before it began (its guard is dropped).
         let tx = spawned.ok().map(|_| tx);
-        EmbedService { tx, stopped, backlog, model: Some(model) }
+        EmbedService { tx, stopped, backlog, batch, model: Some(model) }
     }
 
     pub fn model_id(&self) -> Option<&str> {
@@ -148,10 +182,16 @@ impl EmbedService {
         self.stopped.load(Ordering::SeqCst)
     }
 
+    /// The embed thread has been inside one batch for longer than the limit (60 s): it has
+    /// hung in the model. Every caller gets `None` at once until that batch returns.
+    pub fn stuck(&self) -> bool {
+        self.batch.stuck()
+    }
+
     /// The channel to a running thread, when the deadline is still ahead.
     fn live(&self, deadline: Instant) -> Option<&Sender<Req>> {
         let tx = self.tx.as_ref()?;
-        if self.stopped() || Instant::now() >= deadline {
+        if self.stopped() || self.stuck() || Instant::now() >= deadline {
             return None;
         }
         Some(tx)
@@ -164,10 +204,28 @@ fn wait<T>(answer: &Receiver<T>, deadline: Instant) -> Option<T> {
     answer.recv_timeout(left).ok()
 }
 
-fn run<E>(mut embed: E, rx: Receiver<Req>, jobs: SyncSender<Job>, test: Arc<TestHooks>, model: String, backlog: &AtomicUsize)
-where
+fn run<E>(
+    mut inner: E,
+    rx: Receiver<Req>,
+    jobs: SyncSender<Job>,
+    test: Arc<TestHooks>,
+    model: String,
+    backlog: &AtomicUsize,
+    batch: &BatchClock,
+) where
     E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>>,
 {
+    // Every call into the model is clocked.
+    let sleep_ms = test.embed_sleep_ms;
+    let mut embed = |texts: &[&str]| {
+        batch.begin();
+        if sleep_ms > 0 {
+            thread::sleep(Duration::from_millis(sleep_ms));
+        }
+        let out = inner(texts);
+        batch.end();
+        out
+    };
     let mut queries: VecDeque<(String, Instant, Sender<Vec<f32>>)> = VecDeque::new();
     let mut bulks: VecDeque<Bulk> = VecDeque::new();
     // RULING: wave2-c9 review finding 3: finished bulks wait here for room on the indexer's

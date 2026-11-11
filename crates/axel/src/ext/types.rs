@@ -257,6 +257,10 @@ pub struct TestHooks {
     pub front_start_limit_ms: Option<u64>,
     /// Replaces the 30 s between two status ticks of the indexer.
     pub status_tick_ms: Option<u64>,
+    /// The embed thread sleeps this long inside every batch, before the model is called.
+    pub embed_sleep_ms: u64,
+    /// Replaces the 60 s after which a batch still running is a hang.
+    pub embed_stuck_limit_ms: Option<u64>,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.
