@@ -1055,6 +1055,44 @@ fn f2_a_withheld_text_inside_a_forget_turn_does_not_shield_the_prompt() {
     );
 }
 
+// ------------------------------------------------- wave2-c6-review, finding 3 (ruling)
+
+#[test]
+fn f3_no_working_note_from_a_file_with_a_forget_span() {
+    let note = "NOTEMARK the user asked me to drop the Acme offer; next: the scan test.";
+    let with_note = |mut a: LiveArchive| {
+        a.note = note.to_string();
+        a
+    };
+
+    // Without a forget span the note is a unit, after the others.
+    let a = with_note(three(Q2, "bash"));
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x2.0", "x6.0", "n0.0"]);
+    assert_eq!(units[3].body, note);
+
+    // With one, there is none, and nothing else holds its text.
+    let a = with_note(three(Q2, "axel_forget"));
+    let units = units_of(&a);
+    assert_eq!(positions(&units), vec!["x0.0", "x6.0"]);
+    assert!(!holds(&units, "NOTEMARK") && !holds(&units, "Acme"));
+    // Wherever the span is: the last one, one a placeholder opened, the carried tail.
+    let last = arch(vec![user(0, Q1), asst(1, A1), user(2, Q2), asst_tool(3, A2, "memory_forget_2")]);
+    assert_eq!(positions(&units_of(&with_note(last))), vec!["x0.0"]);
+    assert_eq!(positions(&units_of(&with_note(three(WITHHELD, "axel_forget")))), vec!["x6.0"]);
+    assert_eq!(positions(&units_of(&with_note(arch(nine(1, "axel_forget"))))), vec!["x8.0"]);
+    assert_eq!(positions(&units_of(&with_note(arch(nine(1, "bash"))))), vec!["c7.0", "x8.0", "n0.0"]);
+    // A file that is nothing but the call and a note yields nothing.
+    let only = with_note(arch(vec![asst_tool(0, A2, "axel_forget")]));
+    assert!(units_of(&only).is_empty());
+
+    // `keep_forget_turns` brings the note back with the turn.
+    let mut keep = policy();
+    keep.keep_forget_turns = true;
+    let units = archive::extract_units(&with_note(three(Q2, "axel_forget")), &keep);
+    assert_eq!(positions(&units), vec!["x0.0", "x2.0", "x6.0", "n0.0"]);
+}
+
 // ----------------------------------------------------------------------------- test 28
 
 /// The nine stored messages of a window as `successor_from_parts` builds one, the first at

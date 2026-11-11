@@ -798,7 +798,11 @@ pub fn extract_units(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<Unit> {
         units.append(&mut of_span);
     }
     // Rule 6: the working note.
-    if !a.note.trim().is_empty() && a.note.trim() != WITHHELD {
+    // RULING: wave2-c6-review finding 3: no note unit from a file in which rule 9 dropped a
+    // span. The note is text the model wrote at the rollover, and it can restate what was
+    // forgotten in this window.
+    let forgot = !policy.keep_forget_turns && dropped.iter().any(|d| *d);
+    if !forgot && !a.note.trim().is_empty() && a.note.trim() != WITHHELD {
         units.push(Unit {
             kind: UnitKind::Note,
             source_index: 0,
