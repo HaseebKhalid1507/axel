@@ -30,8 +30,8 @@ use crate::{capture, index_archives, project, recall};
 const FORGET_MARKS_KEPT: usize = 256;
 /// How long the last try of the kept forget marks waits for the write lock. It must fit
 /// inside `server::EXIT_WAIT` (200 ms), what `serve` waits for this thread at the end;
-/// change the two together.
-const LAST_TRY_WAIT: Duration = Duration::from_millis(150);
+/// change the two together (`server.rs` asserts it when the crate compiles).
+pub(crate) const LAST_TRY_WAIT: Duration = Duration::from_millis(150);
 /// How long the loop waits for a call before it looks after its own state.
 const IDLE: Duration = Duration::from_millis(250);
 

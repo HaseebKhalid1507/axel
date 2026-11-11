@@ -2312,3 +2312,26 @@ fn f5_kept_marks_on_a_locked_brain_are_reported_lost_inside_serves_wait() {
     assert!(took < Duration::from_millis(1_000), "{took:?}");
     holder.execute_batch("ROLLBACK").unwrap();
 }
+
+// ── DegradedReason::COUNT ───────────────────────────────────────────────────
+
+#[test]
+fn every_degraded_reason_has_its_own_place_in_status() {
+    assert_eq!(DegradedReason::ALL.len(), DegradedReason::COUNT);
+    let status = Status::default();
+    assert_eq!(status.reason_at.len(), DegradedReason::COUNT);
+    let mut names = std::collections::HashSet::new();
+    for (i, reason) in DegradedReason::ALL.into_iter().enumerate() {
+        assert_eq!(reason as usize, i);
+        assert_eq!(DegradedReason::from_u8(i as u8), reason, "from_u8 does not read {reason:?} back");
+        assert!(names.insert(reason.as_str()), "{} twice", reason.as_str());
+        status.set_reason_place(reason, format!("place-{i}"));
+        status.reason.store(reason as u8, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(status.reason_place(), Some(format!("place-{i}").as_str()), "{reason:?} has no place");
+    }
+    // A value past the last reason names none: the enum has exactly `COUNT` variants that
+    // `from_u8` reads.
+    for v in DegradedReason::COUNT..=usize::from(u8::MAX) {
+        assert_eq!(DegradedReason::from_u8(v as u8), DegradedReason::None, "{v} names a reason past COUNT");
+    }
+}

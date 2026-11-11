@@ -106,7 +106,7 @@ pub struct Status {
     pub reason: AtomicU8,
     /// "file:line", kept with the reason it belongs to: one place per `DegradedReason`, the
     /// first writer of each wins. Read it with `reason_place` (wave 4, R-12b item 6).
-    pub reason_at: [OnceLock<String>; 10],
+    pub reason_at: [OnceLock<String>; DegradedReason::COUNT],
 }
 
 impl Status {
@@ -142,6 +142,23 @@ pub enum DegradedReason {
 }
 
 impl DegradedReason {
+    /// How many reasons there are: `Status.reason_at` has one place for each.
+    pub const COUNT: usize = 10;
+
+    /// Every reason, in the order of its value (checked when the crate compiles, below).
+    pub const ALL: [DegradedReason; Self::COUNT] = [
+        Self::None,
+        Self::NoBrain,
+        Self::V1Brain,
+        Self::BrainTooNew,
+        Self::BrainDamaged,
+        Self::BrainChanged,
+        Self::BrainNotReady,
+        Self::OtherBase,
+        Self::IndexerStopped,
+        Self::FrontStopped,
+    ];
+
     /// A value that names no reason reads as `None`.
     pub fn from_u8(v: u8) -> Self {
         match v {
@@ -173,6 +190,32 @@ impl DegradedReason {
             Self::IndexerStopped => "IndexerStopped",
             Self::FrontStopped => "FrontStopped",
         }
+    }
+}
+
+// `ALL` holds `COUNT` reasons, each at its own value: the values are exactly `0..COUNT`,
+// so every reason in it has its place in `Status.reason_at`.
+const _: () = {
+    let mut i = 0;
+    while i < DegradedReason::COUNT {
+        assert!(DegradedReason::ALL[i] as usize == i, "DegradedReason::ALL is not in the order of the values");
+        i += 1;
+    }
+};
+
+// No wildcard: a new reason stops the build here. Add it to `ALL` and raise `COUNT`.
+const fn _every_reason_is_in_all(r: DegradedReason) {
+    match r {
+        DegradedReason::None
+        | DegradedReason::NoBrain
+        | DegradedReason::V1Brain
+        | DegradedReason::BrainTooNew
+        | DegradedReason::BrainDamaged
+        | DegradedReason::BrainChanged
+        | DegradedReason::BrainNotReady
+        | DegradedReason::OtherBase
+        | DegradedReason::IndexerStopped
+        | DegradedReason::FrontStopped => {}
     }
 }
 

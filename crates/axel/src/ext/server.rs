@@ -49,7 +49,14 @@ const TRIP_OPEN_FOR: Duration = Duration::from_secs(600);
 /// The log is renamed to `extension.log.1` when it passes this.
 const LOG_LIMIT: u64 = 4 * 1024 * 1024;
 /// How long `serve` waits for its threads after `shutdown` or end of input.
-const EXIT_WAIT: Duration = Duration::from_millis(200);
+pub(crate) const EXIT_WAIT: Duration = Duration::from_millis(200);
+// The front thread's last try of its kept forget marks waits `front::LAST_TRY_WAIT` for the
+// write lock before it returns; that wait must end inside this one, or `serve` returns
+// first and the marks and their log line are lost (v2 front follow-up, item 5).
+const _: () = assert!(
+    front::LAST_TRY_WAIT.as_nanos() < EXIT_WAIT.as_nanos(),
+    "front::LAST_TRY_WAIT must be shorter than server::EXIT_WAIT"
+);
 /// The exit status of a process whose front thread died or hung.
 const EXIT_FRONT_STUCK: i32 = 70;
 /// The status file is written again after this long without a change.
