@@ -263,10 +263,14 @@ impl Embedder {
     /// No-op when the cache is empty — a lexical-only session must leave
     /// zero filesystem footprint under the cache dir (T35: no implicit
     /// model/cache activity by default).
+    ///
+    /// No-op too when nothing was embedded since the cache was loaded or
+    /// last saved: an embedder that was only constructed and dropped must
+    /// not rewrite the user's cache file.
     pub fn save_cache(&self) {
         if let Some(ref dir) = self.cache_dir {
             let mut cache = self.cache.lock().unwrap();
-            if cache.entries.is_empty() {
+            if cache.entries.is_empty() || cache.new_entries == 0 {
                 return;
             }
             std::fs::create_dir_all(dir).ok();
@@ -688,6 +692,36 @@ mod tests {
         assert_eq!(Embedder::hashing().model_id(), HASH_MODEL_ID);
         // Lazy: constructing the ONNX embedder loads no model.
         assert_eq!(Embedder::new(None, None, true).model_id(), "all-MiniLM-L6-v2");
+    }
+
+    #[test]
+    fn a_loaded_cache_with_no_new_entry_is_not_rewritten() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let file = dir.path().join(CACHE_FILENAME);
+        // Spaces and line breaks that `save_to_disk` would not write: a
+        // rewrite changes the bytes even though the content is the same.
+        let vector = vec!["0.5"; EMBEDDING_DIM].join(", ");
+        let written = format!(
+            "{{\n  \"version\": {CACHE_VERSION},\n  \"model\": \"{MODEL_NAME}\",\n  \"dim\": {EMBEDDING_DIM},\n  \
+             \"embeddings\": [ {{ \"hash\": \"abc\", \"embedding\": [ {vector} ] }} ]\n}}\n"
+        );
+        std::fs::write(&file, &written).unwrap();
+
+        let embedder = Embedder::new(Some(dir.path().to_path_buf()), None, true);
+        assert_eq!(embedder.cache_len(), 1, "the cache file must have been read");
+        embedder.save_cache();
+        drop(embedder);
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), written);
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+        // Control: with a new entry the same call does write the file.
+        let embedder = Embedder::new(Some(dir.path().to_path_buf()), None, true);
+        embedder.cache.lock().unwrap().insert("def".to_string(), vec![0.25; EMBEDDING_DIM]);
+        drop(embedder);
+        let rewritten = std::fs::read_to_string(&file).unwrap();
+        assert_ne!(rewritten, written);
+        assert!(rewritten.contains("\"def\""), "the new entry must be saved");
     }
 
     #[test]

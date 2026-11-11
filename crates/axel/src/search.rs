@@ -36,8 +36,11 @@ impl BrainSearch {
     ///
     /// The embedding model is loaded on the first embed and is never
     /// downloaded here: without its files, embedding is an error.
+    ///
+    /// The file is checked first: the default embedder, which reads the
+    /// user's embedding cache, is built only for a brain that is accepted.
     pub fn open(brain_path: &Path) -> Result<Self> {
-        Self::open_with_embedder(brain_path, Self::default_embedder())
+        Self::open_with(brain_path, crate::r8::DEFAULT_EMBEDDER, Self::default_embedder)
     }
 
     /// The embedder `open` uses: all-MiniLM-L6-v2, loaded on first use, with
@@ -55,12 +58,16 @@ impl BrainSearch {
     /// Refuse an embedder whose model is not the one the brain was built
     /// with: vectors of two models must not share an index.
     pub(crate) fn check_embedder(recorded_model: &str, embedder: &Embedder) -> Result<()> {
-        if recorded_model == embedder.model_id() {
+        Self::check_model(recorded_model, embedder.model_id())
+    }
+
+    fn check_model(recorded_model: &str, model_id: &str) -> Result<()> {
+        if recorded_model == model_id {
             Ok(())
         } else {
             Err(AxelError::ModelMismatch {
                 expected: recorded_model.to_string(),
-                actual: embedder.model_id().to_string(),
+                actual: model_id.to_string(),
             })
         }
     }
@@ -74,6 +81,16 @@ impl BrainSearch {
     /// If a matching on-disk HNSW cache exists, loads it instead of
     /// rebuilding from raw embeddings.
     pub fn open_with_embedder(brain_path: &Path, embedder: Embedder) -> Result<Self> {
+        Self::open_with(brain_path, embedder.model_id(), move || embedder)
+    }
+
+    /// Open the file, refuse it unless it records `model_id`, and only then
+    /// call `make_embedder`, which must give an embedder of that model.
+    fn open_with(
+        brain_path: &Path,
+        model_id: &'static str,
+        make_embedder: impl FnOnce() -> Embedder,
+    ) -> Result<Self> {
         // VelociRAG's Database::open expects a directory and creates velocirag.db inside it.
         // For .r8 files, we need from_connection with the actual file path.
         let conn = rusqlite::Connection::open_with_flags(
@@ -101,7 +118,9 @@ impl BrainSearch {
                 brain_path.display()
             ))
         })?;
-        Self::check_embedder(&recorded_model, &embedder)?;
+        Self::check_model(&recorded_model, model_id)?;
+        let embedder = make_embedder();
+        debug_assert_eq!(embedder.model_id(), model_id);
 
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(AxelError::Db)?;
