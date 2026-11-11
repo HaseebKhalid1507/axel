@@ -19,11 +19,13 @@ use axel::ext::tools_forum::NO_CALLER;
 use axel::ext::types::{
     Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, Job, Mode, ServeEnd, Status, TestHooks,
 };
+use axel::project_memory::{RecordLinks, Sensitivity};
+use axel::store::{self, Inserted, NewRow};
 use axel::error::AxelError;
 use axel::ext::types::IndexerCtx;
 use axel::indexer;
 use axel::indexer_start;
-use axel::vindex::{VecDelta, VecKey, VecScope};
+use axel::vindex::{VecDelta, VecItem, VecKey, VecScope};
 use rusqlite::Connection;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -2036,3 +2038,125 @@ fn w4_8_the_status_row_gives_the_age_of_the_purge_mark() {
     indexer_start::write_status(&mut ctx).unwrap();
     assert_eq!(status_row(&dirs.brain()).unwrap()["purge_pending_ms"], Value::Null);
 }
+
+// ── v2 front follow-up ──────────────────────────────────────────────────────
+
+const FRONT_PROJECT: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+const FRONT_T: i64 = 1_760_000_000_000;
+
+/// One archive row of chat `session-S`, the last turn of an archive sealed at `FRONT_T`:
+/// what a forget call at that time purges. Returns its `vid`.
+fn forgettable_turn(dirs: &Dirs) -> i64 {
+    let conn = make_brain(&dirs.brain());
+    let logical = axel::project::logical("session-S");
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let row = NewRow {
+        id: "mem_turn".to_string(),
+        class: "episodic_turn",
+        project_key: FRONT_PROJECT,
+        title: "the forgotten turn".to_string(),
+        abstract_text: String::new(),
+        content: "User: the deploy key rotation | Assistant: rotated on the build host".to_string(),
+        tags: Vec::new(),
+        created_ms: FRONT_T - 1_000,
+        time_source: "archive",
+        sensitivity: Sensitivity::Normal,
+        provenance: "test".to_string(),
+        expires_ms: None,
+        importance: 0.5,
+        origin_kind: "archive",
+        origin_ref: "arch-1",
+        unit_pos: Some("x3.0".to_string()),
+        session_id: Some("session-S"),
+        logical: Some(&logical),
+        links: RecordLinks::default(),
+        turn_key: Some("9f2c1a7e04b35d66".to_string()),
+        hidden: None,
+    };
+    let Inserted::New { vid } = store::insert_row(&conn, None, &row).unwrap() else { panic!("not inserted") };
+    conn.execute(
+        "INSERT INTO archive_index(scope_dir, rel_name, archive_id, logical, state, time_source, cover_ms,
+                                   session_id, first_seen_ms)
+         VALUES (?1, 's000001/arch-1.json', 'arch-1', ?2, 'indexed', 'archive', ?3, 'session-S', ?3)",
+        rusqlite::params![FRONT_PROJECT, logical, FRONT_T],
+    )
+    .unwrap();
+    conn.execute_batch("COMMIT").unwrap();
+    vid
+}
+
+/// A ready front state whose clock stands at `FRONT_T`, with the row's vector in its array,
+/// and the other ends of its channels.
+fn front_with_vector(dirs: &Dirs, vid: i64) -> (FrontState, Receiver<Job>, Sender<VecDelta>) {
+    let status = Arc::new(Status::default());
+    let b = Boot { embedder: None, clock: Arc::new(|| FRONT_T), test: Arc::new(TestHooks::default()), status };
+    let (mut st, jobs_rx, vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    assert_eq!(st.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    let item = VecItem { key: VecKey::Mem(vid), scope: VecScope::Project(FRONT_PROJECT.to_string()), v: unit(3) };
+    assert_eq!(st.index.apply(VecDelta::Upsert(vec![item])), 0);
+    assert!(st.index.get(&VecKey::Mem(vid)).is_some());
+    (st, jobs_rx, vec_tx)
+}
+
+fn forget_in_s() -> FrontCall {
+    FrontCall {
+        seq: 1,
+        carry: Carry { skipped: Vec::new(), forgot: vec!["session-S".to_string()] },
+        work: FrontWork::Tool { name: "search".to_string(), input: json!({}), caller: Caller::default() },
+    }
+}
+
+fn rows_named(dirs: &Dirs, id: &str) -> i64 {
+    Connection::open(dirs.brain())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn f1_a_forget_call_takes_the_purged_rows_vector_out_of_the_array() {
+    let dirs = Dirs::new();
+    let vid = forgettable_turn(&dirs);
+    let (mut st, _jobs_rx, _vec_tx) = front_with_vector(&dirs, vid);
+    front::handle(&mut st, forget_in_s());
+    assert_eq!(rows_named(&dirs, "mem_turn"), 0, "the mark purged nothing");
+    assert!(st.index.get(&VecKey::Mem(vid)).is_none(), "the vector of a purged row is still in the array");
+}
+
+#[test]
+fn f1_a_kept_mark_written_late_takes_the_vector_out_too() {
+    let dirs = Dirs::new();
+    let vid = forgettable_turn(&dirs);
+    let (mut st, _jobs_rx, _vec_tx) = front_with_vector(&dirs, vid);
+    st.forget_marks =
+        vec![ForgetMark { session_id: "session-S".to_string(), from_ms: FRONT_T, to_ms: FRONT_T, turn_key: None }];
+    assert_eq!(front::retry_written(&mut st), 1);
+    assert_eq!(rows_named(&dirs, "mem_turn"), 0);
+    assert!(st.index.get(&VecKey::Mem(vid)).is_none(), "the vector of a purged row is still in the array");
+}
+
+#[test]
+fn f1_a_mark_whose_commit_fails_removes_no_vector() {
+    let dirs = Dirs::new();
+    let vid = forgettable_turn(&dirs);
+    // The purge runs, then the `COMMIT` fails: a deferred foreign key is left broken.
+    Connection::open(dirs.brain())
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE t_parent(id TEXT PRIMARY KEY);
+             CREATE TABLE t_child(p TEXT REFERENCES t_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER t_break AFTER UPDATE OF forget_units ON archive_index
+             BEGIN INSERT INTO t_child VALUES ('nobody'); END;",
+        )
+        .unwrap();
+    let (mut st, _jobs_rx, _vec_tx) = front_with_vector(&dirs, vid);
+    front::handle(&mut st, forget_in_s());
+    assert_eq!(rows_named(&dirs, "mem_turn"), 1, "the transaction was not rolled back");
+    let marks: i64 = Connection::open(dirs.brain())
+        .unwrap()
+        .query_row("SELECT COUNT(*) FROM forgotten_turns", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(marks, 0);
+    assert!(st.index.get(&VecKey::Mem(vid)).is_some(), "a rolled-back mark removed a vector");
+}
+

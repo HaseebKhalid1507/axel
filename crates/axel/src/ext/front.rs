@@ -1,6 +1,7 @@
 //! The front thread's loop: it answers calls (hooks and tools) on its own connection and
 //! owns the vector array. It never does background work.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -22,7 +23,7 @@ use crate::ext::types::{
 use crate::ext::{hooks, tools};
 use crate::r8::EMBEDDING_DIM;
 use crate::recall::View;
-use crate::vindex::{ExactIndex, VecDelta};
+use crate::vindex::{ExactIndex, VecDelta, VecKey};
 use crate::{index_archives, project};
 
 /// Forget marks kept for a later try (wave 3, 12b ruling 7; wave 4, R-12b item 1).
@@ -305,15 +306,33 @@ fn error_kind(e: &AxelError) -> &'static str {
     }
 }
 
-fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> MarkEnd {
-    let Some(conn) = st.conn.as_ref() else { return MarkEnd::NotNow };
+/// One mark, and the vectors of the rows it purged out of the array, once its `COMMIT`
+/// has held.
+fn write_forget_mark(st: &mut FrontState, mark: &ForgetMark) -> MarkEnd {
+    let (end, vids) = write_mark(st, mark);
+    remove_vectors(st, vids);
+    end
+}
+
+/// The vectors of purged rows leave the array. Called only with the `vid`s of a
+/// transaction that has committed.
+fn remove_vectors(st: &mut FrontState, vids: Vec<i64>) {
+    if !vids.is_empty() {
+        st.index.apply(VecDelta::Remove(vids.into_iter().map(VecKey::Mem).collect()));
+    }
+}
+
+/// The mark in its own transaction. The `vid`s of the rows it purged are returned only
+/// when the `COMMIT` succeeded: after a rollback the rows are still there.
+fn write_mark(st: &FrontState, mark: &ForgetMark) -> (MarkEnd, Vec<i64>) {
+    let Some(conn) = st.conn.as_ref() else { return (MarkEnd::NotNow, Vec::new()) };
     let logical = project::logical(&mark.session_id);
     let guard = match brain_v2::begin_write_front(conn, &st.writing) {
         Ok(guard) => guard,
-        Err(e) if is_busy(&e) => return MarkEnd::NotNow,
-        Err(e) => return MarkEnd::Failed(error_kind(&e)),
+        Err(e) if is_busy(&e) => return (MarkEnd::NotNow, Vec::new()),
+        Err(e) => return (MarkEnd::Failed(error_kind(&e)), Vec::new()),
     };
-    let marked = index_archives::mark_forgotten_turn(
+    let marked = index_archives::mark_forgotten_turn_vids(
         conn,
         &logical,
         Some(&mark.session_id),
@@ -323,7 +342,7 @@ fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> MarkEnd {
         mark.turn_key.as_deref(),
     );
     let ended = match marked {
-        Ok(_) => conn.execute_batch("COMMIT").map_err(AxelError::from),
+        Ok((_, vids)) => conn.execute_batch("COMMIT").map(|()| vids).map_err(AxelError::from),
         Err(e) => Err(e),
     };
     if ended.is_err() {
@@ -331,16 +350,30 @@ fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> MarkEnd {
     }
     drop(guard);
     match ended {
-        Ok(()) => MarkEnd::Written,
-        Err(e) if is_busy(&e) => MarkEnd::NotNow,
-        Err(e) => MarkEnd::Failed(error_kind(&e)),
+        Ok(vids) => (MarkEnd::Written, vids),
+        Err(e) if is_busy(&e) => (MarkEnd::NotNow, Vec::new()),
+        Err(e) => (MarkEnd::Failed(error_kind(&e)), Vec::new()),
     }
+}
+
+/// `retry_marks` with `write_mark`; the vectors of what the written marks purged leave
+/// the array after the round (each mark's `COMMIT` has held by then).
+/// Public for its test.
+pub fn retry_written(st: &mut FrontState) -> usize {
+    let gone = RefCell::new(Vec::new());
+    let written = retry_marks(st, |st, mark| {
+        let (end, vids) = write_mark(st, mark);
+        gone.borrow_mut().extend(vids);
+        end
+    });
+    remove_vectors(st, gone.into_inner());
+    written
 }
 
 /// The kept marks, oldest first, each given to `write` once. A mark that cannot be written
 /// now stops the round and stays, with every mark behind it; a mark that failed for another
 /// reason is dropped with a log line, and the round goes on. Returns how many were written.
-/// Public for its test: `write` is `write_forget_mark` everywhere else.
+/// Public for its test: `write` is `write_mark` everywhere else (`retry_written`).
 // RULING: wave4 R-12b item 1. A mark that can never be written does not keep the ones
 // behind it out.
 pub fn retry_marks(st: &mut FrontState, write: impl Fn(&FrontState, &ForgetMark) -> MarkEnd) -> usize {
@@ -370,7 +403,7 @@ fn retry_forget_marks(st: &mut FrontState) {
     if conn.busy_timeout(Duration::ZERO).is_err() {
         return;
     }
-    retry_marks(st, write_forget_mark);
+    retry_written(st);
     if let Some(conn) = st.conn.as_ref() {
         let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
     }
@@ -385,7 +418,7 @@ fn last_try_forget_marks(st: &mut FrontState) {
         return;
     }
     if is_ready(st) && connect(st) {
-        retry_marks(st, write_forget_mark);
+        retry_written(st);
     }
     if !st.forget_marks.is_empty() {
         log_line(&format!("front carry: forget marks lost at the end: {}", st.forget_marks.len()));

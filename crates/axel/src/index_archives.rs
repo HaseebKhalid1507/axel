@@ -2071,13 +2071,9 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut
 /// - It may be called late and more than once for one mark: a second call changes nothing
 ///   but `to_ms`.
 /// - `mark_purged`, always: the log row deleted here held the prompt's first characters.
-// SPEC: 3644-3647 bound the function to indexed lookups, so the time rule reads an
-// archive's edge from the rows that are in the brain, not from its file (step 3b of the
-// indexer reads the file). When another rule has already taken that archive's edge unit
-// (a key mark of a neighbouring window with the same prompt), the row before it is "the
-// last" and goes too: one unit too many, which `restore --forget-turns` brings back. An
-// archive the same row already covered at an earlier call (`to_ms` only grows) is not
-// visited again.
+///
+/// `mark_forgotten_turn_vids` is the same call, and also returns the `vid`s of the rows it
+/// purged: the front thread removes their vectors from its array once its `COMMIT` holds.
 pub fn mark_forgotten_turn(
     conn: &Connection,
     logical: &str,
@@ -2087,6 +2083,26 @@ pub fn mark_forgotten_turn(
     to_ms: i64,
     turn_key: Option<&str>,
 ) -> Result<Vec<String>> {
+    mark_forgotten_turn_vids(conn, logical, session_id, source, from_ms, to_ms, turn_key).map(|(ids, _)| ids)
+}
+
+/// `mark_forgotten_turn`, returning `(ids, vids)` of the rows it purged.
+// SPEC: 3644-3647 bound the function to indexed lookups, so the time rule reads an
+// archive's edge from the rows that are in the brain, not from its file (step 3b of the
+// indexer reads the file). When another rule has already taken that archive's edge unit
+// (a key mark of a neighbouring window with the same prompt), the row before it is "the
+// last" and goes too: one unit too many, which `restore --forget-turns` brings back. An
+// archive the same row already covered at an earlier call (`to_ms` only grows) is not
+// visited again.
+pub fn mark_forgotten_turn_vids(
+    conn: &Connection,
+    logical: &str,
+    session_id: Option<&str>,
+    source: &str,
+    from_ms: i64,
+    to_ms: i64,
+    turn_key: Option<&str>,
+) -> Result<(Vec<String>, Vec<i64>)> {
     if conn.is_autocommit() {
         return Err(crate::error::AxelError::Other(
             "mark_forgotten_turn: no transaction is open; the caller begins and commits".into(),
@@ -2129,7 +2145,7 @@ pub fn mark_forgotten_turn(
     )?;
     let keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
     let mut purged: Vec<String> = Vec::new();
-    // The front thread owns the vector array and removes the ids this returns from it.
+    // The front thread owns the vector array and removes these from it after its commit.
     let mut vids: Vec<i64> = Vec::new();
     // Where the window before the turn's own begins, in the directory where that is
     // earliest: the lower bound of the log rows that go by key.
@@ -2206,5 +2222,5 @@ pub fn mark_forgotten_turn(
         log_line(&format!("forget mark: {log_rows} recall-log rows of the turn deleted"));
     }
     mark_purged(conn)?;
-    Ok(purged)
+    Ok((purged, vids))
 }
