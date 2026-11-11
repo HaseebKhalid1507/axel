@@ -16,6 +16,7 @@ pub mod brain_v2;
 pub mod store;
 pub mod project;
 pub mod archive;
+mod fs_open;
 pub mod notes;
 pub mod indexer;
 pub mod indexer_start;

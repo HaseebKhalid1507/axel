@@ -25,6 +25,8 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 tracing = { workspace = true }
 walkdir = { workspace = true }
+# fs_open.rs: O_NOFOLLOW | O_NONBLOCK for the readers of core's files.
+libc = "0.2"
 # forum.rs is core's file, which makes author ids with a v4 uuid.
 uuid = { workspace = true }
 clap = { version = "4", features = ["derive", "env"] }

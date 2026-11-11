@@ -257,52 +257,9 @@ fn same_file(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
     true
 }
 
-/// `O_NOFOLLOW | O_NONBLOCK` of the targets this is built for; `None` elsewhere, where the
-/// open is a plain one and the two `stat`s around it are the only check.
-// RULING: wave2-c6-review finding 6: the crate does not depend on `libc`, so the two flags
-// are written out per target.
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    any(target_arch = "x86", target_arch = "x86_64", target_arch = "riscv64")
-))]
-const NOFOLLOW_NONBLOCK: Option<i32> = Some(0o400000 | 0o4000);
-#[cfg(all(
-    any(target_os = "linux", target_os = "android"),
-    any(target_arch = "arm", target_arch = "aarch64")
-))]
-const NOFOLLOW_NONBLOCK: Option<i32> = Some(0o100000 | 0o4000);
-#[cfg(any(target_os = "macos", target_os = "ios"))]
-const NOFOLLOW_NONBLOCK: Option<i32> = Some(0x0100 | 0x0004);
-#[cfg(not(any(
-    all(
-        any(target_os = "linux", target_os = "android"),
-        any(
-            target_arch = "x86",
-            target_arch = "x86_64",
-            target_arch = "riscv64",
-            target_arch = "arm",
-            target_arch = "aarch64"
-        )
-    ),
-    target_os = "macos",
-    target_os = "ios"
-)))]
-const NOFOLLOW_NONBLOCK: Option<i32> = None;
-
-/// Opens for reading without following a link in the last place and without waiting: the
-/// open of a FIFO that has no writer returns at once instead of blocking the indexer.
-fn open_no_wait(path: &Path) -> std::io::Result<fs::File> {
-    let mut options = fs::OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        if let Some(flags) = NOFOLLOW_NONBLOCK {
-            options.custom_flags(flags);
-        }
-    }
-    options.open(path)
-}
+// RULING: wave2-c6-review finding 6: the open is `fs_open::open_no_wait` (O_NOFOLLOW |
+// O_NONBLOCK from `libc`), shared with the notes reader.
+use crate::fs_open::open_no_wait;
 
 /// The bytes of the file `lstat` saw as `listed`. The name can have been replaced between
 /// the `lstat` and the open: what was opened must be that same regular file, and it is
@@ -982,9 +939,7 @@ mod tests {
         // A link swapped in is not followed.
         let link = tmp.path().join("link.json");
         std::os::unix::fs::symlink(&regular, &link).unwrap();
-        if NOFOLLOW_NONBLOCK.is_some() {
-            assert!(matches!(read_listed(&link, &listed), Err(SkipReason(r)) if r.starts_with("cannot open")));
-        }
+        assert!(matches!(read_listed(&link, &listed), Err(SkipReason(r)) if r.starts_with("cannot open")));
 
         let fifo = tmp.path().join("swapped.json");
         match std::process::Command::new("mkfifo").arg(&fifo).status() {

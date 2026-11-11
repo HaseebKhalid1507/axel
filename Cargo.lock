@@ -105,6 +105,7 @@ dependencies = [
  "clap",
  "dirs",
  "hex",
+ "libc",
  "rusqlite",
  "serde",
  "serde_json",
