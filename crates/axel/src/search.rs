@@ -31,13 +31,49 @@ pub struct BrainSearch {
 }
 
 impl BrainSearch {
-    /// Initialize search for a brain at the given path.
+    /// Initialize search for a brain at the given path, with the default
+    /// embedder (see [`BrainSearch::default_embedder`]).
     ///
-    /// Opens a second SQLite connection (read-only for search).
-    /// Downloads the embedding model on first use if not cached.
+    /// The embedding model is loaded on the first embed and is never
+    /// downloaded here: without its files, embedding is an error.
+    pub fn open(brain_path: &Path) -> Result<Self> {
+        Self::open_with_embedder(brain_path, Self::default_embedder())
+    }
+
+    /// The embedder `open` uses: all-MiniLM-L6-v2, loaded on first use, with
+    /// the embedding cache persisted to ~/.cache/axel/embeddings so repeated
+    /// embed() calls for the same content are free across sessions.
+    pub(crate) fn default_embedder() -> Embedder {
+        let embedding_cache_dir = dirs::cache_dir()
+            .unwrap_or_else(|| PathBuf::from(".cache"))
+            .join("axel")
+            .join("embeddings");
+
+        Embedder::new(Some(embedding_cache_dir), None, true)
+    }
+
+    /// Refuse an embedder whose model is not the one the brain was built
+    /// with: vectors of two models must not share an index.
+    pub(crate) fn check_embedder(recorded_model: &str, embedder: &Embedder) -> Result<()> {
+        if recorded_model == embedder.model_id() {
+            Ok(())
+        } else {
+            Err(AxelError::ModelMismatch {
+                expected: recorded_model.to_string(),
+                actual: embedder.model_id().to_string(),
+            })
+        }
+    }
+
+    /// Initialize search for a brain at the given path, embedding with
+    /// `embedder`.
+    ///
+    /// Opens a second SQLite connection to the brain file. Refuses, before
+    /// writing anything, an embedder whose `model_id` differs from the
+    /// brain's `brain_meta.embedder_model`.
     /// If a matching on-disk HNSW cache exists, loads it instead of
     /// rebuilding from raw embeddings.
-    pub fn open(brain_path: &Path) -> Result<Self> {
+    pub fn open_with_embedder(brain_path: &Path, embedder: Embedder) -> Result<Self> {
         // VelociRAG's Database::open expects a directory and creates velocirag.db inside it.
         // For .r8 files, we need from_connection with the actual file path.
         let conn = rusqlite::Connection::open_with_flags(
@@ -47,20 +83,31 @@ impl BrainSearch {
         )
         .map_err(AxelError::Db)?;
 
+        let recorded_model: Option<String> = conn
+            .query_row(
+                "SELECT json_extract(value, '$.embedder_model') FROM brain_meta WHERE key = 'meta'",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|e| {
+                AxelError::Search(format!(
+                    "{} has no readable brain_meta: {e}",
+                    brain_path.display()
+                ))
+            })?;
+        let recorded_model = recorded_model.ok_or_else(|| {
+            AxelError::Search(format!(
+                "{} does not record its embedder model",
+                brain_path.display()
+            ))
+        })?;
+        Self::check_embedder(&recorded_model, &embedder)?;
+
         conn.execute_batch("PRAGMA journal_mode=WAL;")
             .map_err(AxelError::Db)?;
 
         let db = Database::from_connection(conn, brain_path.to_path_buf())
             .map_err(|e| AxelError::Search(e.to_string()))?;
-
-        // Wire embedding cache: persist to ~/.cache/axel/embeddings so
-        // repeated embed() calls for the same content are free across sessions.
-        let embedding_cache_dir = dirs::cache_dir()
-            .unwrap_or_else(|| PathBuf::from(".cache"))
-            .join("axel")
-            .join("embeddings");
-
-        let embedder = Embedder::new(Some(embedding_cache_dir), None, true);
 
         // Derive the HNSW index cache path from the brain file path.
         let cache_path = brain_path.with_extension("r8.hnsw");
@@ -269,24 +316,104 @@ mod tests {
     use super::*;
     use crate::r8::Brain;
 
+    use velocirag::embedder::HASH_MODEL_ID;
+
+    /// A brain recorded as built with the hashing embedder: these tests
+    /// embed, and no test loads the ONNX model.
     fn tmp_brain_with_search() -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.r8");
-        Brain::create(&path, Some("test")).unwrap();
+        Brain::create_with_model(&path, Some("test"), HASH_MODEL_ID, velocirag::EMBEDDING_DIM)
+            .unwrap();
         (dir, path)
+    }
+
+    fn open_hashing(path: &Path) -> Result<BrainSearch> {
+        BrainSearch::open_with_embedder(path, Embedder::hashing())
+    }
+
+    fn refusal(result: Result<BrainSearch>) -> AxelError {
+        match result {
+            Ok(_) => panic!("an embedder of another model must be refused"),
+            Err(error) => error,
+        }
     }
 
     #[test]
     fn open_search_on_brain() {
         let (_dir, path) = tmp_brain_with_search();
-        let search = BrainSearch::open(&path);
+        let search = open_hashing(&path);
         assert!(search.is_ok(), "Failed to open search: {:?}", search.err());
+    }
+
+    #[test]
+    fn hash_embedder_on_a_minilm_brain_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("minilm.r8");
+        Brain::create(&path, Some("test")).unwrap();
+        let tables_before = table_count(&path);
+
+        let error = refusal(open_hashing(&path));
+        assert!(
+            matches!(
+                &error,
+                AxelError::ModelMismatch { expected, actual }
+                    if expected == "all-MiniLM-L6-v2" && actual == "hash-384"
+            ),
+            "{error}"
+        );
+        // Refused before anything was written: no search tables, no index file.
+        assert_eq!(table_count(&path), tables_before);
+        assert!(!path.with_extension("r8.hnsw").exists());
+
+        // The brain's own model is still accepted (nothing is loaded by opening).
+        assert!(BrainSearch::open_with_embedder(&path, Embedder::new(None, None, true)).is_ok());
+    }
+
+    #[test]
+    fn minilm_embedder_on_a_hash_brain_is_refused() {
+        let (_dir, path) = tmp_brain_with_search();
+
+        let error = refusal(BrainSearch::open_with_embedder(
+            &path,
+            Embedder::new(None, None, true),
+        ));
+        assert!(
+            matches!(
+                &error,
+                AxelError::ModelMismatch { expected, actual }
+                    if expected == "hash-384" && actual == "all-MiniLM-L6-v2"
+            ),
+            "{error}"
+        );
+        assert!(open_hashing(&path).is_ok());
+    }
+
+    #[test]
+    fn a_file_without_brain_meta_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE t(v)")
+            .unwrap();
+
+        let error = refusal(open_hashing(&path));
+        assert!(error.to_string().contains("brain_meta"), "{error}");
+        assert_eq!(table_count(&path), 1);
+    }
+
+    fn table_count(path: &Path) -> i64 {
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM sqlite_master", [], |row| row.get(0))
+            .unwrap()
     }
 
     #[test]
     fn index_and_search_document() {
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         // Index a document
         search.index_document(
@@ -305,7 +432,7 @@ mod tests {
     #[test]
     fn index_multiple_and_rank() {
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         search.index_document("d1", "The quick brown fox jumps over the lazy dog", None, None).unwrap();
         search.index_document("d2", "Rust programming language memory safety borrow checker", None, None).unwrap();
@@ -322,7 +449,7 @@ mod tests {
         use axel_memkoshi::memory::{Memory, MemoryCategory};
 
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         let mut mem = Memory::new(
             MemoryCategory::Events,
@@ -342,7 +469,7 @@ mod tests {
     #[test]
     fn empty_brain_search_returns_empty() {
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         let results = search.search("anything", 5).unwrap();
         assert!(results.results.is_empty());
@@ -351,7 +478,7 @@ mod tests {
     #[test]
     fn cache_stale_flag_set_after_index_document() {
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         assert!(!search.cache_stale, "Cache should start clean");
         search.index_document("d1", "hello world", None, None).unwrap();
@@ -361,7 +488,7 @@ mod tests {
     #[test]
     fn flush_clears_stale_flag() {
         let (_dir, path) = tmp_brain_with_search();
-        let mut search = BrainSearch::open(&path).unwrap();
+        let mut search = open_hashing(&path).unwrap();
 
         search.index_document("d1", "hello world", None, None).unwrap();
         assert!(search.cache_stale);
@@ -376,7 +503,7 @@ mod tests {
 
         // Cold build: index two docs, flush cache.
         {
-            let mut search = BrainSearch::open(&path).unwrap();
+            let mut search = open_hashing(&path).unwrap();
             search.index_document("a", "alpha document", None, None).unwrap();
             search.index_document("b", "beta document", None, None).unwrap();
             search.flush().unwrap();
@@ -386,7 +513,7 @@ mod tests {
         let cache_path = path.with_extension("r8.hnsw");
         assert!(cache_path.exists(), "HNSW cache file should exist after flush");
 
-        let search = BrainSearch::open(&path).unwrap();
+        let search = open_hashing(&path).unwrap();
         assert!(search.index_built, "Index should be pre-built from warm cache");
         assert_eq!(search.index.len(), 2, "Warm load should have 2 vectors");
 

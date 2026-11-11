@@ -1,11 +1,58 @@
 use axel::brain::AxelBrain;
 use tempfile::TempDir;
+use velocirag::embedder::Embedder;
 
+/// These tests embed (`remember*` and `update_memory*` index what they
+/// store), so the brain is built with the hashing embedder: no test loads
+/// the ONNX model.
 fn setup_test_brain() -> (AxelBrain, TempDir) {
     let temp_dir = tempfile::tempdir().unwrap();
     let brain_path = temp_dir.path().join("test.r8");
-    let brain = AxelBrain::open_or_create(&brain_path, Some("test-agent")).unwrap();
+    let brain =
+        AxelBrain::open_or_create_with(&brain_path, Some("test-agent"), Embedder::hashing())
+            .unwrap();
     (brain, temp_dir)
+}
+
+#[test]
+fn open_or_create_with_records_the_embedder_and_indexes_with_it() {
+    let (mut brain, _temp_dir) = setup_test_brain();
+    assert_eq!(brain.meta().embedder_model, "hash-384");
+    assert_eq!(brain.meta().embedding_dim, 384);
+
+    // The memory is embedded and searchable, with no model on this machine.
+    let id = brain
+        .remember("The harbour lantern was repaired on the ninth of March by the keeper", "events", 0.6)
+        .unwrap();
+    let found = brain.search("harbour lantern keeper", 5).unwrap();
+    assert_eq!(found.results[0].doc_id, id);
+}
+
+#[test]
+fn open_or_create_with_refuses_a_brain_built_with_another_model() {
+    let temp_dir = tempfile::tempdir().unwrap();
+
+    // A hash-384 brain: reopens with the hashing embedder, not with the default one.
+    let hash_path = temp_dir.path().join("hash.r8");
+    drop(AxelBrain::open_or_create_with(&hash_path, Some("t"), Embedder::hashing()).unwrap());
+    assert!(AxelBrain::open_or_create_with(&hash_path, None, Embedder::hashing()).is_ok());
+    let error = match AxelBrain::open_or_create(&hash_path, None) {
+        Ok(_) => panic!("the default embedder must be refused on a hash-384 brain"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("hash-384") && error.contains("all-MiniLM-L6-v2"), "{error}");
+    let error = match AxelBrain::open(&hash_path) {
+        Ok(_) => panic!("the default embedder must be refused on a hash-384 brain"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("hash-384") && error.contains("all-MiniLM-L6-v2"), "{error}");
+
+    // A default brain: the hashing embedder is refused.
+    let default_path = temp_dir.path().join("default.r8");
+    let brain = AxelBrain::open_or_create(&default_path, Some("t")).unwrap();
+    assert_eq!(brain.meta().embedder_model, "all-MiniLM-L6-v2");
+    drop(brain);
+    assert!(AxelBrain::open_or_create_with(&default_path, None, Embedder::hashing()).is_err());
 }
 
 #[test]

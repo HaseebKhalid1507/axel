@@ -73,6 +73,7 @@ use crate::error::{AxelError, Result};
 use crate::inject::{self, InjectionContext, InjectionEntry};
 use crate::r8::Brain;
 use crate::search::BrainSearch;
+use velocirag::embedder::Embedder;
 
 /// Unified brain handle — one struct for all Axel operations.
 ///
@@ -89,13 +90,31 @@ pub struct AxelBrain {
 }
 
 impl AxelBrain {
-    /// Open an existing brain or create a new one.
+    /// Open an existing brain or create a new one, with the default embedder.
     pub fn open_or_create(path: impl AsRef<Path>, agent_name: Option<&str>) -> Result<Self> {
+        Self::open_or_create_with(path, agent_name, BrainSearch::default_embedder())
+    }
+
+    /// Open an existing brain or create a new one, embedding with `embedder`.
+    ///
+    /// A new brain is recorded as built with the embedder's model. An
+    /// existing brain built with another model is refused, unchanged.
+    pub fn open_or_create_with(
+        path: impl AsRef<Path>,
+        agent_name: Option<&str>,
+        embedder: Embedder,
+    ) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
-        let brain = Brain::open_or_create(&path, agent_name)?;
+        let brain = if path.exists() {
+            let brain = Brain::open(&path)?;
+            BrainSearch::check_embedder(&brain.meta().embedder_model, &embedder)?;
+            brain
+        } else {
+            Brain::create_with_model(&path, agent_name, embedder.model_id(), embedder.dim())?
+        };
         // Additive, transactional project-memory migration (T32–T36).
         crate::project_memory::migrate(brain.conn())?;
-        let search = BrainSearch::open(&path)?;
+        let search = BrainSearch::open_with_embedder(&path, embedder)?;
         let storage = MemoryStorage::open_existing(&path)?;
         let pipeline = MemoryPipeline::new();
 

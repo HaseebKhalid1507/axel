@@ -2,9 +2,19 @@
 //!
 //! Uses all-MiniLM-L6-v2 via ONNX Runtime for fast CPU inference.
 //! MD5 content hashing with LRU eviction. Lazy model loading.
+//!
+//! Three ways to build one:
+//! * [`Embedder::new`]: the model is found (cache folder, HuggingFace hub
+//!   cache, models folder) and loaded on the first `embed()` call. It is
+//!   never downloaded unless downloads were switched on
+//!   ([`crate::download::set_offline`]).
+//! * [`Embedder::from_model_dir`]: the model is loaded now, from exactly the
+//!   folder given.
+//! * [`Embedder::hashing`]: no model at all, a hashed bag of words. For
+//!   tests, and for brains recorded as [`HASH_MODEL_ID`].
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use md5::{Digest, Md5};
@@ -22,6 +32,20 @@ use crate::EMBEDDING_DIM;
 const DEFAULT_CACHE_SIZE: usize = 10_000;
 const MAX_BATCH_SIZE: usize = 256;
 const MAX_SEQ_LENGTH: usize = 256;
+/// In-memory cache size of an embedder that has no disk cache.
+const MEMORY_ONLY_CACHE_SIZE: usize = 256;
+
+/// [`Embedder::model_id`] of the model-free hashing backend.
+pub const HASH_MODEL_ID: &str = "hash-384";
+
+/// What turns text into vectors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Backend {
+    /// all-MiniLM-L6-v2 through ONNX Runtime.
+    Onnx,
+    /// No model: see [`hash_embed`].
+    Hash,
+}
 
 // ── Embedder ────────────────────────────────────────────────────────────────
 
@@ -31,6 +55,7 @@ pub struct Embedder {
     cache: Mutex<LruCache>,
     cache_dir: Option<PathBuf>,
     normalize: bool,
+    backend: Backend,
 }
 
 /// Simple LRU cache backed by a Vec (order = recency) and HashMap for O(1) lookup.
@@ -187,6 +212,49 @@ impl Embedder {
             cache: Mutex::new(cache),
             cache_dir,
             normalize,
+            backend: Backend::Onnx,
+        }
+    }
+
+    /// Load the model from exactly `dir`, now: `onnx/model.onnx`, else
+    /// `model.onnx`, and `tokenizer.json`. No other folder is looked at and
+    /// nothing is downloaded or created; missing files are an error. The
+    /// embedder has no disk cache and an in-memory cache of 256 entries.
+    pub fn from_model_dir(dir: &Path, threads: usize, normalize: bool) -> Result<Self> {
+        let (session, tokenizer) = load_model(dir, threads)?;
+        Ok(Self {
+            session: Some(session),
+            tokenizer: Some(tokenizer),
+            cache: Mutex::new(LruCache::new(MEMORY_ONLY_CACHE_SIZE)),
+            cache_dir: None,
+            normalize,
+            backend: Backend::Onnx,
+        })
+    }
+
+    /// An embedder with no model: each text becomes a hashed bag of its
+    /// words (see [`hash_embed`]). Deterministic, touches no file and no
+    /// network. Its vectors only say how many words two texts share, so it
+    /// is for tests and for brains recorded as [`HASH_MODEL_ID`]; they must
+    /// never be mixed with vectors of the ONNX model.
+    pub fn hashing() -> Self {
+        Self {
+            session: None,
+            tokenizer: None,
+            cache: Mutex::new(LruCache::new(MEMORY_ONLY_CACHE_SIZE)),
+            cache_dir: None,
+            normalize: true,
+            backend: Backend::Hash,
+        }
+    }
+
+    /// The name of the model that makes this embedder's vectors:
+    /// `"all-MiniLM-L6-v2"` or [`HASH_MODEL_ID`]. A brain records it, and
+    /// vectors of different models must not share an index.
+    pub fn model_id(&self) -> &'static str {
+        match self.backend {
+            Backend::Onnx => MODEL_NAME,
+            Backend::Hash => HASH_MODEL_ID,
         }
     }
 
@@ -223,6 +291,10 @@ impl Embedder {
     pub fn embed(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
+        }
+
+        if self.backend == Backend::Hash {
+            return Ok(texts.iter().map(|text| hash_embed(text)).collect());
         }
 
         self.ensure_model_loaded()?;
@@ -287,33 +359,7 @@ impl Embedder {
         }
 
         let model_dir = self.resolve_model_dir()?;
-        // Support both layouts: onnx/model.onnx (HF style) and model.onnx (flat/Python style)
-        let onnx_path = if model_dir.join("onnx").join("model.onnx").exists() {
-            model_dir.join("onnx").join("model.onnx")
-        } else {
-            model_dir.join("model.onnx")
-        };
-        let tokenizer_path = model_dir.join("tokenizer.json");
-
-        if !onnx_path.exists() || !tokenizer_path.exists() {
-            return Err(VelociError::Embedding(format!(
-                "Model files not found at {}. Run `velocirag download-model` first, \
-                 or ensure huggingface-hub has cached the model.",
-                model_dir.display()
-            )));
-        }
-
-        tracing::info!("Loading ONNX model from {}", onnx_path.display());
-
-        let session = Session::builder()
-            .map_err(|e| VelociError::Embedding(format!("Failed to create session builder: {}", e)))?
-            .with_intra_threads(num_cpus())
-            .map_err(|e| VelociError::Embedding(format!("Failed to set thread count: {}", e)))?
-            .commit_from_file(&onnx_path)
-            .map_err(|e| VelociError::Embedding(format!("Failed to load ONNX model: {}", e)))?;
-
-        let tokenizer = Tokenizer::from_file(&tokenizer_path)
-            .map_err(|e| VelociError::Embedding(format!("Failed to load tokenizer: {}", e)))?;
+        let (session, tokenizer) = load_model(&model_dir, num_cpus())?;
 
         self.session = Some(session);
         self.tokenizer = Some(tokenizer);
@@ -353,7 +399,8 @@ impl Embedder {
             }
         }
 
-        // Auto-download from HuggingFace
+        // The models folder. Offline (the default) this is an error when the
+        // files are missing; it downloads only after `set_offline(false)`.
         crate::download::ensure_model(&crate::download::EMBEDDER_MODEL)
     }
 
@@ -460,6 +507,88 @@ impl Embedder {
     }
 }
 
+// ── Model loading ───────────────────────────────────────────────────────────
+
+/// Load the ONNX session and the tokenizer from `model_dir`. Reads only;
+/// missing files are an error.
+fn load_model(model_dir: &Path, threads: usize) -> Result<(Session, Tokenizer)> {
+    // Support both layouts: onnx/model.onnx (HF style) and model.onnx (flat/Python style)
+    let onnx_path = if model_dir.join("onnx").join("model.onnx").exists() {
+        model_dir.join("onnx").join("model.onnx")
+    } else {
+        model_dir.join("model.onnx")
+    };
+    let tokenizer_path = model_dir.join("tokenizer.json");
+
+    if !onnx_path.exists() || !tokenizer_path.exists() {
+        return Err(VelociError::Embedding(format!(
+            "Model files not found at {} (onnx/model.onnx or model.onnx, and tokenizer.json). \
+             Run `axel model fetch`.",
+            model_dir.display()
+        )));
+    }
+
+    tracing::info!("Loading ONNX model from {}", onnx_path.display());
+
+    let session = Session::builder()
+        .map_err(|e| VelociError::Embedding(format!("Failed to create session builder: {}", e)))?
+        .with_intra_threads(threads.max(1))
+        .map_err(|e| VelociError::Embedding(format!("Failed to set thread count: {}", e)))?
+        .commit_from_file(&onnx_path)
+        .map_err(|e| VelociError::Embedding(format!("Failed to load ONNX model: {}", e)))?;
+
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+        .map_err(|e| VelociError::Embedding(format!("Failed to load tokenizer: {}", e)))?;
+
+    Ok((session, tokenizer))
+}
+
+// ── Hashing backend ─────────────────────────────────────────────────────────
+
+/// The model-free vector of a text. Its words are the runs of alphanumeric
+/// characters, lowercased, of 2 or more characters. Each word is hashed with
+/// FNV-1a 64 and adds +1 or -1 (bit 63 of the hash set: -1) at index
+/// `hash % 384`. The sum is L2-normalised. A text with no word gives the
+/// zero vector.
+fn hash_embed(text: &str) -> Vec<f32> {
+    let mut vector = vec![0.0f32; EMBEDDING_DIM];
+    let mut word = String::new();
+    let mut add = |word: &mut String| {
+        if word.chars().count() >= 2 {
+            let hash = fnv1a64(word.as_bytes());
+            let sign = if hash >> 63 == 1 { -1.0 } else { 1.0 };
+            vector[(hash % EMBEDDING_DIM as u64) as usize] += sign;
+        }
+        word.clear();
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            word.extend(c.to_lowercase());
+        } else {
+            add(&mut word);
+        }
+    }
+    add(&mut word);
+
+    let norm: f32 = vector.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 0.0 {
+        for value in &mut vector {
+            *value /= norm;
+        }
+    }
+    vector
+}
+
+/// FNV-1a, 64 bit.
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    hash
+}
+
 // ── Utility ─────────────────────────────────────────────────────────────────
 
 fn md5_hash(text: &str) -> String {
@@ -477,5 +606,122 @@ fn num_cpus() -> usize {
 impl Drop for Embedder {
     fn drop(&mut self) {
         self.save_cache();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        // Both are unit length.
+        a.iter().zip(b).map(|(x, y)| x * y).sum()
+    }
+
+    fn norm(v: &[f32]) -> f32 {
+        v.iter().map(|x| x * x).sum::<f32>().sqrt()
+    }
+
+    #[test]
+    fn fnv1a64_matches_the_reference_vectors() {
+        assert_eq!(fnv1a64(b""), 0xcbf2_9ce4_8422_2325);
+        assert_eq!(fnv1a64(b"a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv1a64(b"foobar"), 0x8594_4171_f739_67e8);
+    }
+
+    #[test]
+    fn hashing_is_deterministic_and_unit_length() {
+        let text = "Rust is a systems programming language focused on safety";
+        let mut one = Embedder::hashing();
+        let mut two = Embedder::hashing();
+        let first = one.embed_one(text).unwrap();
+
+        assert_eq!(first.len(), EMBEDDING_DIM);
+        assert_eq!(one.dim(), EMBEDDING_DIM);
+        assert!((norm(&first) - 1.0).abs() < 1e-5, "norm {}", norm(&first));
+        // The same instance again, another instance, and the batch call.
+        assert_eq!(one.embed_one(text).unwrap(), first);
+        assert_eq!(two.embed_one(text).unwrap(), first);
+        assert_eq!(two.embed(&["other words", text]).unwrap()[1], first);
+    }
+
+    #[test]
+    fn hashing_puts_texts_that_share_words_closer() {
+        let mut embedder = Embedder::hashing();
+        let query = embedder.embed_one("memory safety in rust").unwrap();
+        let shares = embedder
+            .embed_one("rust programming language memory safety borrow checker")
+            .unwrap();
+        let shares_none = embedder
+            .embed_one("the quick brown fox jumps over the lazy dog")
+            .unwrap();
+
+        assert!(cosine(&query, &shares) > 0.4, "{}", cosine(&query, &shares));
+        assert!(cosine(&query, &shares) > cosine(&query, &shares_none) + 0.2);
+    }
+
+    #[test]
+    fn hashing_words_are_lowercase_alphanumeric_runs_of_two_or_more() {
+        let mut embedder = Embedder::hashing();
+        // Case and punctuation do not matter.
+        assert_eq!(
+            embedder.embed_one("Borrow-Checker: RUST!").unwrap(),
+            embedder.embed_one("borrow checker rust").unwrap()
+        );
+        // One word, whatever its count, is one direction.
+        assert_eq!(
+            embedder.embed_one("rust rust rust").unwrap(),
+            embedder.embed_one("rust").unwrap()
+        );
+        // Single characters are not words; a text without words is the zero vector.
+        assert_eq!(
+            embedder.embed_one("a rust b").unwrap(),
+            embedder.embed_one("rust").unwrap()
+        );
+        assert!(embedder.embed_one("a b c ! ?").unwrap().iter().all(|x| *x == 0.0));
+        assert!(embedder.embed_one("").unwrap().iter().all(|x| *x == 0.0));
+    }
+
+    #[test]
+    fn model_id_names_the_backend_without_loading_anything() {
+        assert_eq!(Embedder::hashing().model_id(), "hash-384");
+        assert_eq!(Embedder::hashing().model_id(), HASH_MODEL_ID);
+        // Lazy: constructing the ONNX embedder loads no model.
+        assert_eq!(Embedder::new(None, None, true).model_id(), "all-MiniLM-L6-v2");
+    }
+
+    #[test]
+    fn from_model_dir_on_an_empty_folder_is_an_error_and_creates_nothing() {
+        let dir = tempfile::TempDir::new().unwrap();
+
+        let error = match Embedder::from_model_dir(dir.path(), 2, true) {
+            Ok(_) => panic!("an empty folder must not give an embedder"),
+            Err(error) => error.to_string(),
+        };
+
+        assert!(error.contains(&dir.path().display().to_string()), "{error}");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0, "the folder must stay empty");
+
+        // A folder that does not exist is an error too, and is not created.
+        let missing = dir.path().join("missing");
+        assert!(Embedder::from_model_dir(&missing, 2, true).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    #[ignore = "needs the ONNX model: set AXEL_TEST_MODEL_DIR and run with --ignored"]
+    fn from_model_dir_loads_the_model_and_embeds() {
+        let dir = std::env::var_os("AXEL_TEST_MODEL_DIR")
+            .map(PathBuf::from)
+            .expect("set AXEL_TEST_MODEL_DIR");
+        let mut embedder = Embedder::from_model_dir(&dir, 2, true).unwrap();
+
+        assert_eq!(embedder.model_id(), "all-MiniLM-L6-v2");
+        let vectors = embedder
+            .embed(&["a cat sat on the mat", "a kitten rested on the rug", "quarterly tax filing"])
+            .unwrap();
+        assert!((norm(&vectors[0]) - 1.0).abs() < 1e-4);
+        // Real semantics: no shared content words, still the closer pair.
+        assert!(cosine(&vectors[0], &vectors[1]) > cosine(&vectors[0], &vectors[2]));
     }
 }

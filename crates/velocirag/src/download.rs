@@ -1,17 +1,37 @@
-//! Auto-download models from HuggingFace on first use.
+//! Download models from HuggingFace, and only when asked.
 //!
-//! The legacy `ensure_model` entry point remains for non-continuous-memory
-//! callers. [`LocalEmbeddingModel`] is the guarded E3 path: it is off by
+//! The process is **offline by default** ([`is_offline`]): `ensure_model`
+//! returns the model folder when the files are already there and an error
+//! otherwise, without building a URL. Only an explicit fetch command calls
+//! [`set_offline`]`(false)` first.
+//!
+//! [`LocalEmbeddingModel`] is the guarded E3 path: it is off by
 //! default, enablement is separate from the explicit download stub, and none
 //! of its operations can construct a network request.
 
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::error::{Result, VelociError};
 
 const HF_BASE: &str = "https://huggingface.co";
+
+/// While true, nothing in this crate downloads a model.
+static OFFLINE: AtomicBool = AtomicBool::new(true);
+
+/// Forbid (`true`) or allow (`false`) model downloads in this process.
+/// Offline is the default for every entry point; only `axel model fetch`
+/// switches it off.
+pub fn set_offline(offline: bool) {
+    OFFLINE.store(offline, Ordering::SeqCst);
+}
+
+/// Whether model downloads are forbidden in this process (the default).
+pub fn is_offline() -> bool {
+    OFFLINE.load(Ordering::SeqCst)
+}
 
 /// Model registry — what to download and where.
 pub struct ModelSpec {
@@ -92,15 +112,32 @@ pub fn models_cache_dir() -> PathBuf {
         .join("models")
 }
 
-/// Ensure a model is downloaded. Returns the local model directory.
-/// Downloads from HuggingFace if files are missing.
+/// Return the local folder of a model whose files are all present.
+///
+/// When files are missing: offline (the default), an error that names the
+/// folder and `axel model fetch`, with nothing created and no URL built;
+/// otherwise the files are downloaded from HuggingFace.
 pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf> {
-    let model_dir = models_cache_dir().join(spec.local_dir);
+    ensure_model_in(&models_cache_dir(), spec)
+}
+
+/// [`ensure_model`] with the models folder given by the caller instead of
+/// taken from the user's cache directory.
+pub fn ensure_model_in(models_dir: &Path, spec: &ModelSpec) -> Result<PathBuf> {
+    let model_dir = models_dir.join(spec.local_dir);
 
     // Check if all files already exist
     let all_present = spec.files.iter().all(|(_, local)| model_dir.join(local).exists());
     if all_present {
         return Ok(model_dir);
+    }
+
+    if is_offline() {
+        return Err(VelociError::Embedding(format!(
+            "model files for {} are not in {} and downloads are off; run `axel model fetch`",
+            spec.repo,
+            model_dir.display()
+        )));
     }
 
     tracing::info!("Downloading model: {} ...", spec.repo);

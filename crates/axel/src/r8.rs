@@ -65,9 +65,24 @@ pub struct Brain {
 }
 
 impl Brain {
-    /// Create a new `.r8` brain file at the given path.
+    /// Create a new `.r8` brain file at the given path, recorded as built
+    /// with the default embedding model.
     /// Fails if the file already exists.
     pub fn create(path: &Path, agent_name: Option<&str>) -> Result<Self> {
+        Self::create_with_model(path, agent_name, DEFAULT_EMBEDDER, EMBEDDING_DIM)
+    }
+
+    /// Create a new `.r8` brain file recorded as built with the embedding
+    /// model `model` of `dim` dimensions (`brain_meta.embedder_model`,
+    /// `embedding_dim`). Search refuses to open a brain with an embedder of
+    /// another model.
+    /// Fails if the file already exists.
+    pub fn create_with_model(
+        path: &Path,
+        agent_name: Option<&str>,
+        model: &str,
+        dim: usize,
+    ) -> Result<Self> {
         if path.exists() {
             return Err(AxelError::Other(format!(
                 "Brain already exists at {}",
@@ -97,8 +112,8 @@ impl Brain {
 
         let meta = BrainMeta {
             schema_version: SCHEMA_VERSION,
-            embedder_model: DEFAULT_EMBEDDER.to_string(),
-            embedding_dim: EMBEDDING_DIM as i32,
+            embedder_model: model.to_string(),
+            embedding_dim: dim as i32,
             agent_name: agent_name.map(|s| s.to_string()),
             created: now.clone(),
             last_modified: now,
@@ -357,6 +372,23 @@ mod tests {
         // Reopen
         let brain = Brain::open(&path).unwrap();
         assert_eq!(brain.meta().agent_name.as_deref(), Some("test-agent"));
+    }
+
+    #[test]
+    fn create_with_model_records_the_model_and_its_dimension() {
+        let (_dir, path) = tmp_brain();
+
+        let brain = Brain::create_with_model(&path, Some("test-agent"), "hash-384", 384).unwrap();
+        assert_eq!(brain.meta().embedder_model, "hash-384");
+        assert_eq!(brain.meta().embedding_dim, 384);
+        assert_eq!(brain.meta().schema_version, SCHEMA_VERSION);
+        drop(brain);
+
+        // It is in the file, not only in the handle.
+        let brain = Brain::open(&path).unwrap();
+        assert_eq!(brain.meta().embedder_model, "hash-384");
+        assert_eq!(brain.meta().embedding_dim, 384);
+        assert!(Brain::create_with_model(&path, None, "hash-384", 384).is_err());
     }
 
     #[test]
