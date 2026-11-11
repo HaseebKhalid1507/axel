@@ -1673,3 +1673,41 @@ fn f7_catch_up_lists_saved_rows_changed_in_the_source() {
         assert_eq!(out.report["saved_changed_in_source"][table]["count"], 0, "{}", out.report);
     }
 }
+
+/// Finding 8: a `--watch` that is not the same bytes as the source is said, with both
+/// hashes, by `init` and by `catch-up`; the exit is the same.
+#[test]
+fn f8_a_watched_file_that_differs_from_the_source_is_said() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let backup = fx.root().join("backup/axel.r8");
+    fs::create_dir(backup.parent().unwrap()).unwrap();
+    fs::copy(&fx.old, &backup).unwrap();
+    let watched_before = state(&fx.old);
+
+    // The same bytes: nothing to say.
+    let mut opts = fx.init_opts(&backup);
+    opts.watch = Some(fx.old.clone());
+    let out = import::init(&fx.dest(), &opts);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert!(out.report.get("watch_differs_from_source").is_none(), "{}", out.report);
+
+    // The live file was written to after the backup was taken.
+    change_axel(&fx.old, |conn| add_memory(conn, "mem-ffff0006", "late note", "written after the copy", 0.5));
+    let watched_before_catch_up = state(&fx.old);
+    let out = import::catch_up(&fx.dest(), &CatchUpOpts { from_axel: backup.clone(), watch: Some(fx.old.clone()) });
+    show("catch-up, the watched file differs", &out);
+    assert_eq!(out.code, 0, "{}", out.report);
+    let differs = &out.report["watch_differs_from_source"];
+    assert_eq!(differs["watch"]["sha256"], json!(sha(&fx.old)));
+    assert_eq!(differs["source"]["sha256"], json!(sha(&backup)));
+    assert_eq!(differs["watch"]["wal_sha256"], Value::Null);
+
+    fs::remove_file(&fx.new).unwrap();
+    let out = import::init(&fx.dest(), &opts);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["watch_differs_from_source"]["watch"]["path"], json!(fx.old.to_string_lossy()));
+    // The watched file is read, never written.
+    assert_eq!(state(&fx.old), watched_before_catch_up);
+    assert_ne!(watched_before, watched_before_catch_up);
+}

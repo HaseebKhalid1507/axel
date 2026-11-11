@@ -724,6 +724,42 @@ fn watch_detail(path: &Path) -> Res<Value> {
     }))
 }
 
+/// When `--watch` names another file than the source, its bytes and its log's are hashed
+/// (a read-only `File::open`) and compared with the source's (wave5-c19-review finding 8):
+/// what was written to the watched file after the source was copied from it is in neither
+/// brain, and `status` would never say so. A difference is a warning; the exit is the same.
+fn watch_compared(watch: Option<&Path>, source: &Path, stat: &SourceStat, rep: &mut Report) {
+    let Some(watch) = watch else { return };
+    let watch = watch.canonicalize().unwrap_or_else(|_| watch.to_path_buf());
+    if watch == source {
+        return;
+    }
+    // An empty log is no log.
+    let log = |s: &Option<FileStat>| s.as_ref().filter(|s| s.size > 0).map(|s| s.sha256.clone());
+    let source_hashes = (Some(stat.main.sha256.clone()), log(&stat.sides[0]));
+    let read = file_stat(&watch).and_then(|main| Ok((main, file_stat(&side(&watch, "-wal"))?)));
+    let (watch_hashes, trouble) = match read {
+        Ok((main, wal)) => ((main.map(|m| m.sha256), log(&wal)), None),
+        Err(e) => ((None, None), Some(e.to_string())),
+    };
+    if watch_hashes == source_hashes && trouble.is_none() {
+        return;
+    }
+    eprintln!(
+        "warning: --watch {} is not the same bytes as the source {}: what was written to it after the source \
+         was copied is in neither brain",
+        watch.display(),
+        source.display()
+    );
+    rep.insert(
+        "watch_differs_from_source".into(),
+        json!({
+            "watch": { "path": shown(&watch), "sha256": watch_hashes.0, "wal_sha256": watch_hashes.1, "error": trouble },
+            "source": { "path": shown(source), "sha256": source_hashes.0, "wal_sha256": source_hashes.1 },
+        }),
+    );
+}
+
 #[allow(clippy::too_many_arguments)]
 fn log_row(
     conn: &Connection,
@@ -1036,6 +1072,7 @@ fn prepare(
     // The numbers `status` compares with: of `--watch` when given, else of the source as
     // step 2 found it (taken again by `lstat`, which is how `status` reads them).
     let watch = watch_detail(opts.watch.as_deref().unwrap_or(source))?;
+    watch_compared(opts.watch.as_deref(), source, &copy.stat, rep);
 
     // What `open_v2` would refuse is refused first, as a source this command cannot import.
     match brain_v2::require_v2(&copy.db) {
@@ -2112,6 +2149,7 @@ fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: 
     }
     let found = axel_source(source, &dest, ".catchup-", rep, temp)?;
     let watch = watch_detail(opts.watch.as_deref().unwrap_or(source.as_path()))?;
+    watch_compared(opts.watch.as_deref(), source, &found.stat, rep);
 
     let conn = brain_v2::connect(&dest, Role::Cli)?;
     // Attached read-only and immutable: no lock is taken on it and no file is made beside it.
