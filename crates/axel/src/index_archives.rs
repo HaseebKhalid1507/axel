@@ -2396,7 +2396,7 @@ fn purge_left_out(conn: &Connection, scope_dir: &str, ids: &[String], gone: &mut
 }
 
 /// `purge_left_out`; with `cli`, what went is counted in `cli_units`, not `forget_units`
-/// (v2 c18b review round 2, item 2).
+/// (v2 c18b review round 2, item 2), and the rows of a kept archive go too (round 3, item 5).
 fn purge_left_out_by(
     conn: &Connection,
     scope_dir: &str,
@@ -2410,18 +2410,20 @@ fn purge_left_out_by(
     let mut going: Vec<String> = Vec::new();
     let mut per_archive: Vec<(String, i64)> = Vec::new();
     {
+        // RULING: v2 c18b review round 3, item 5. A kept archive obeys a `cli` mark (round 1,
+        // item 4): its proven copy of a deleted turn goes too.
         let mut stmt = conn.prepare(
             "SELECT e.origin_ref FROM memory_ext e JOIN memories m ON m.id = e.mem_id
               WHERE e.mem_id = ?1 AND e.origin_kind = 'archive' AND m.project_key = ?2
-                AND NOT EXISTS (SELECT 1 FROM archive_index a
-                                 WHERE a.scope_dir = ?2 AND a.archive_id = e.origin_ref
-                                   AND a.keep_forget_turns = 1)",
+                AND (?3 OR NOT EXISTS (SELECT 1 FROM archive_index a
+                                        WHERE a.scope_dir = ?2 AND a.archive_id = e.origin_ref
+                                          AND a.keep_forget_turns = 1))",
         )?;
         for id in ids {
             if going.contains(id) {
                 continue;
             }
-            let archive_id: Option<String> = stmt.query_row(params![id, scope_dir], |r| r.get(0)).optional()?;
+            let archive_id: Option<String> = stmt.query_row(params![id, scope_dir, cli], |r| r.get(0)).optional()?;
             let Some(archive_id) = archive_id else { continue };
             going.push(id.clone());
             match per_archive.iter_mut().find(|(known, _)| *known == archive_id) {

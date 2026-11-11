@@ -190,21 +190,29 @@ fn twin_line(row: &RowInfo) -> String {
     let text = if row.secret {
         "(a secret memory; its text is not shown)".to_string()
     } else {
-        screen::show(reply_line(&row.content), 120)
+        screen::show(reply_line(&row.content, row.turn_key.as_deref()), 120)
     };
     format!("m:{} · {when} · ctx-{} · {text}", one(&row.id), one(&row.origin_ref))
 }
 
-/// The first line of a turn's reply: the line that starts with `Assistant`; else the first
-/// non-empty line after the prompt's first; else the first line.
-fn reply_line(content: &str) -> &str {
-    let mut lines = content.lines().filter(|l| !l.trim().is_empty());
-    let first = lines.next().unwrap_or("");
-    content
-        .lines()
-        .find(|l| l.starts_with("Assistant"))
-        .or_else(|| lines.next())
-        .unwrap_or(first)
+/// The first line of a turn's reply with its label, found by the composition
+/// (`archive::exchange_text`): the `"Assistant: "` line after which the prompt before it has
+/// the row's key, else the first such line after the prompt's first; else (a `Continued`
+/// row, a note) the first non-empty line.
+// RULING: v2 c18b review round 3, item 5: a prompt may hold a line that starts with
+// "Assistant"; the key tells where the prompt ends.
+fn reply_line<'a>(content: &'a str, turn_key: Option<&str>) -> &'a str {
+    const SPLIT: &str = "\nAssistant: ";
+    let first_line = |text: &'a str| text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let Some(prompt) = content.strip_prefix("User: ") else { return first_line(content) };
+    let splits: Vec<usize> = prompt.match_indices(SPLIT).map(|(at, _)| at).collect();
+    let keyed = turn_key.and_then(|key| {
+        splits.iter().find(|at| crate::archive::turn_key(&prompt[..**at]) == key)
+    });
+    match keyed.or(splits.first()) {
+        Some(at) => first_line(&prompt[at + 1..]),
+        None => first_line(content),
+    }
 }
 
 // ── --now ───────────────────────────────────────────────────────────────────

@@ -2388,3 +2388,57 @@ fn two_deleted_turns_of_one_archive_with_one_prompt_keep_a_mark_each() {
     assert_eq!(rows_with(world.db(), "TWINA"), 0);
     assert_eq!(rows_with(world.db(), "TWINB"), 0, "the second turn's copy was not taken");
 }
+
+/// v2 c18b review round 3, item 5: a kept archive obeys a `cli` mark at `forget --now` too:
+/// its visible copy of the deleted turn, proven by its text, is listed and taken.
+#[test]
+fn forget_now_takes_the_proven_copy_in_a_kept_archive() {
+    const P: &str = "please tell me again what the doctor said on Tuesday afternoon";
+    let mut world = Indexed::new();
+    let a = Arch::new(81, "s-kept", T0)
+        .turn(P, &reply("KEPTCOPY"))
+        .forget_call("forget the thing about the landlord from this morning please", "KEPTFORGET")
+        .about("upload queue");
+    let b = Arch::new(82, "s-kept", T0 + 1_000_000).about("deploy window");
+    world.file(&a);
+    world.file(&b);
+    world.scan();
+    let kept = restore_turns(&world.path(), &format!("ctx-{}", a.id));
+    assert_eq!(kept.code, 0, "{}", kept.err);
+    world.scan();
+    let keep: i64 = world.db().query_row("SELECT keep_forget_turns FROM archive_index WHERE archive_id = ?1", [&a.id], |r| r.get(0)).unwrap();
+    assert_eq!(keep, 1, "the archive is not kept: the test proves nothing");
+    assert_eq!(visible_with(world.db(), "KEPTCOPY"), 1);
+    // The turn again, as a capture of the newer archive's window: the hide twins nothing in
+    // the kept archive (it twins in the newest only).
+    let mut cap = capture("mem_cap_kept", "s-kept", &key_of(P));
+    cap.project = scope();
+    cap.created_ms = T0 + 500_000;
+    cap.content = format!("User: {P}\nAssistant: {}", reply("KEPTCOPY"));
+    cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+    world.put(&cap);
+    let run = forget_cmd(&world.path(), &["mem_cap_kept"], true, false, "y\n");
+    assert!(run.out.contains("Delete 1 memories for good, take 1 archived rows out of the brain? [y/N]"), "{}", run.out);
+    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+    assert_eq!(rows_with(world.db(), "KEPTCOPY"), 0, "the kept archive's copy of the deleted turn stayed");
+}
+
+/// v2 c18b review round 3, item 5: a listed row shows the first line of its reply, found by
+/// the composition and the key, also when the prompt holds a line that starts "Assistant".
+#[test]
+fn a_listed_row_shows_its_reply_when_the_prompt_holds_a_line_that_starts_with_assistant() {
+    const P: &str = "here is the transcript I saved\nAssistant: PROMPTFAKE this line is part of my prompt\nwhat went wrong in it?";
+    let mut world = Indexed::new();
+    let a = Arch::new(83, "s-line", T0).turn(P, &reply("REPLYREAL")).about("upload queue");
+    world.file(&a);
+    world.scan();
+    let mut cap = capture("mem_cap_line", "s-line", &key_of(P));
+    cap.project = scope();
+    cap.created_ms = T0 - 100;
+    cap.content = format!("User: {P}\nAssistant: {}", reply("REPLYREAL"));
+    world.put(&cap);
+    let run = forget_cmd(&world.path(), &["mem_cap_line"], false, false, "");
+    assert_eq!(run.code, 0, "{}", run.err);
+    let twin = run.out.lines().find(|l| l.contains(&format!("ctx-{}", a.id))).unwrap_or_else(|| panic!("no twin listed: {}", run.out));
+    assert!(twin.contains("REPLYREAL") && !twin.contains("PROMPTFAKE"), "{twin}");
+}
