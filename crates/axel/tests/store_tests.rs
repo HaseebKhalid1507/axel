@@ -1335,3 +1335,167 @@ fn purge_many_refuses_a_connection_without_secure_delete() {
     assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_stays'"), 1);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
 }
+
+// ── Ruling 5 of the commit 11 review: the purge of a replacement ────────────
+
+fn superseded_by(conn: &Connection, id: &str) -> Option<String> {
+    text_of(conn, "SELECT superseded_by FROM memories WHERE id = ?1", id)
+}
+
+fn invalidated_at(conn: &Connection, id: &str) -> Option<String> {
+    text_of(conn, "SELECT invalidated_at FROM memories WHERE id = ?1", id)
+}
+
+/// Rows `ids[0] -> ids[1] -> …`: each is superseded by the next.
+fn chain(brain: &V2Brain, ids: &[&str]) {
+    for id in ids {
+        put(brain, &row(id, "decision", "tool", &format!("what {id} says about the retry limit")));
+    }
+    tx(&brain.conn, || {
+        for pair in ids.windows(2) {
+            assert_eq!(store::supersede(&brain.conn, pair[0], pair[1]).unwrap(), 1);
+        }
+    });
+}
+
+#[test]
+fn the_purge_of_a_replacement_restores_the_row_it_replaced() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    for id in ["mem_a", "mem_h", "mem_n", "mem_b", "mem_z"] {
+        put(&brain, &row(id, "decision", "tool", &format!("what {id} says about the retry limit")));
+    }
+    for id in ["mem_a", "mem_h", "mem_n"] {
+        shadow(&path, id, &format!("the shadow document of {id}"));
+    }
+    tx(conn, || {
+        // A is replaced by B. H is hidden by a model and replaced by B. N is replaced by Z.
+        assert_eq!(store::hide(conn, "mem_h", "model:session-s").unwrap(), 1);
+        for (old, new) in [("mem_a", "mem_b"), ("mem_h", "mem_b"), ("mem_n", "mem_z")] {
+            assert_eq!(store::supersede(conn, old, new).unwrap(), 1);
+        }
+    });
+    for id in ["mem_a", "mem_h", "mem_n"] {
+        assert!(invalidated_at(conn, id).is_some());
+        assert_eq!(shadow_mark(conn, id).as_deref(), Some("memory_hidden"));
+        assert!(!is_returned(conn, id));
+    }
+    let texts: Vec<String> = ["mem_a", "mem_h", "mem_n"].iter().map(|id| saved(conn, id)).collect();
+    let h_mark = mark_of(conn, "mem_h");
+    let n_before = whole(conn, "mem_n");
+
+    // The wrong correction is forgotten.
+    assert_eq!(tx(conn, || store::purge(conn, "mem_b", true, true).unwrap()), 1);
+
+    // A is as it was before B: both columns cleared together, the shadow mark too.
+    assert_eq!(superseded_by(conn, "mem_a"), None);
+    assert_eq!(invalidated_at(conn, "mem_a"), None, "the purge of a replacement left the row half restored");
+    assert_eq!(shadow_mark(conn, "mem_a"), None);
+    assert!(is_returned(conn, "mem_a"));
+    // H is no longer superseded, and stays hidden as the model left it: its mark stays.
+    assert_eq!(superseded_by(conn, "mem_h"), None);
+    assert_eq!(invalidated_at(conn, "mem_h"), None);
+    assert_eq!(mark_of(conn, "mem_h"), h_mark);
+    assert_eq!(shadow_mark(conn, "mem_h").as_deref(), Some("memory_hidden"), "a hidden row keeps its shadow mark");
+    assert!(!is_returned(conn, "mem_h"));
+    // N, replaced by a row that was not purged, has the bytes it had.
+    assert_eq!(whole(conn, "mem_n"), n_before);
+    assert_eq!(shadow_mark(conn, "mem_n").as_deref(), Some("memory_hidden"));
+    for (id, text) in ["mem_a", "mem_h", "mem_n"].iter().zip(&texts) {
+        assert_eq!(&saved(conn, id), text, "{id}: no saved text changed");
+    }
+
+    // The model's hide is undone by a restore, as before.
+    assert_eq!(tx(conn, || store::restore(conn, "mem_h").unwrap()), 1);
+    assert!(is_returned(conn, "mem_h"));
+    assert_eq!(shadow_mark(conn, "mem_h"), None);
+}
+
+#[test]
+fn the_purge_of_a_link_of_a_chain_hands_the_old_row_to_what_replaced_the_link() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+
+    // A -> B -> C, and only B is purged: A is replaced by C and stays out.
+    put(&brain, &row("mem_a", "decision", "tool", "the retry limit is three"));
+    shadow(&path, "mem_a", "the shadow document of mem_a");
+    chain(&brain, &["mem_b", "mem_c"]);
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_a", "mem_b").unwrap()), 1);
+    conn.execute("UPDATE memories SET invalidated_at = '2026-01-02T03:04:05+00:00' WHERE id = 'mem_a'", []).unwrap();
+    assert_eq!(shadow_mark(conn, "mem_a").as_deref(), Some("memory_hidden"));
+    let text = saved(conn, "mem_a");
+    assert_eq!(tx(conn, || store::purge(conn, "mem_b", false, true).unwrap()), 1);
+    assert_eq!(superseded_by(conn, "mem_a").as_deref(), Some("mem_c"));
+    assert_eq!(invalidated_at(conn, "mem_a").as_deref(), Some("2026-01-02T03:04:05+00:00"), "invalidated_at stays");
+    assert_eq!(shadow_mark(conn, "mem_a").as_deref(), Some("memory_hidden"), "the shadow mark stays");
+    assert!(!is_returned(conn, "mem_a"));
+    assert!(is_returned(conn, "mem_c"));
+    assert_eq!(saved(conn, "mem_a"), text);
+
+    // P -> Q -> R -> S, and Q and R are purged in one call: the walk takes two steps.
+    chain(&brain, &["mem_p", "mem_q", "mem_r", "mem_s"]);
+    let p_invalidated = invalidated_at(conn, "mem_p");
+    assert!(p_invalidated.is_some());
+    let ids = vec!["mem_r".to_string(), "mem_q".to_string()];
+    assert_eq!(tx(conn, || store::purge_many(conn, &ids, false, true).unwrap()), 2);
+    assert_eq!(superseded_by(conn, "mem_p").as_deref(), Some("mem_s"), "the walk stopped before the end of the purge set");
+    assert_eq!(invalidated_at(conn, "mem_p"), p_invalidated);
+    assert!(!is_returned(conn, "mem_p"));
+
+    // Then C, which nothing replaced, is purged: A is as it was before any of them.
+    assert_eq!(tx(conn, || store::purge(conn, "mem_c", false, true).unwrap()), 1);
+    assert_eq!(superseded_by(conn, "mem_a"), None);
+    assert_eq!(invalidated_at(conn, "mem_a"), None);
+    assert_eq!(shadow_mark(conn, "mem_a"), None);
+    assert!(is_returned(conn, "mem_a"));
+    assert_eq!(saved(conn, "mem_a"), text);
+    assert_eq!(superseded_by(conn, "mem_p").as_deref(), Some("mem_s"), "another chain is untouched");
+}
+
+#[test]
+fn the_purge_of_a_whole_chain_and_of_rows_that_name_each_other_ends() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_kept", "note", "tool", "a row none of this touches"));
+    let kept = whole(conn, "mem_kept");
+
+    // A, B and C in one call: all three go.
+    chain(&brain, &["mem_a", "mem_b", "mem_c"]);
+    let ids: Vec<String> = ["mem_b", "mem_a", "mem_c"].iter().map(|s| s.to_string()).collect();
+    assert_eq!(tx(conn, || store::purge_many(conn, &ids, false, true).unwrap()), 3);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 1);
+
+    // X and Y name each other, and Z was replaced by X. Both purged: the walk ends, and
+    // nothing replaces Z any more.
+    chain(&brain, &["mem_z", "mem_x", "mem_y"]);
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_y", "mem_x").unwrap()), 1);
+    assert_eq!(superseded_by(conn, "mem_x").as_deref(), Some("mem_y"));
+    assert_eq!(superseded_by(conn, "mem_y").as_deref(), Some("mem_x"));
+    let ids = vec!["mem_x".to_string(), "mem_y".to_string()];
+    assert_eq!(tx(conn, || store::purge_many(conn, &ids, false, true).unwrap()), 2);
+    assert_eq!(superseded_by(conn, "mem_z"), None);
+    assert_eq!(invalidated_at(conn, "mem_z"), None);
+    assert!(is_returned(conn, "mem_z"));
+
+    // M and N name each other and only N is purged: M is not replaced by itself.
+    chain(&brain, &["mem_m", "mem_n"]);
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_n", "mem_m").unwrap()), 1);
+    assert_eq!(tx(conn, || store::purge(conn, "mem_n", false, true).unwrap()), 1);
+    assert_eq!(superseded_by(conn, "mem_m"), None);
+    assert_eq!(invalidated_at(conn, "mem_m"), None);
+    assert!(is_returned(conn, "mem_m"));
+
+    // D -> E, and E names a row that does not exist: with E purged nothing replaces D.
+    chain(&brain, &["mem_d", "mem_e"]);
+    assert_eq!(tx(conn, || store::supersede(conn, "mem_e", "mem_ghost").unwrap()), 1);
+    assert_eq!(tx(conn, || store::purge(conn, "mem_e", false, true).unwrap()), 1);
+    assert_eq!(superseded_by(conn, "mem_d"), None);
+    assert_eq!(invalidated_at(conn, "mem_d"), None);
+
+    assert_eq!(whole(conn, "mem_kept"), kept);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
+    assert_eq!(returned(conn), vec!["mem_d".to_string(), "mem_kept".to_string(), "mem_m".to_string(), "mem_z".to_string()]);
+}

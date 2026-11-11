@@ -12,7 +12,7 @@
 //! Hide, restore and supersede never change saved text. `purge_many` is the one way a
 //! row leaves.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use axel_memkoshi::memory::{Memory, MemoryCategory};
 use axel_memkoshi::security::MemorySigner;
@@ -213,6 +213,26 @@ fn names_one_of(detail: &str, set: &HashSet<&str>) -> bool {
     false
 }
 
+/// What replaces a row once its replacement `purged` is gone: the walk follows
+/// `superseded_by` through the rows of the purge set (`next` holds theirs) to the first
+/// id outside it. It stops after as many steps as the set has ids, so two rows that name
+/// each other end it. `None`: nothing replaces the row any more.
+fn replacement_after(
+    purged: &str,
+    set: &HashSet<&str>,
+    next: &HashMap<String, Option<String>>,
+) -> Option<String> {
+    let mut at = purged;
+    for _ in 0..set.len() {
+        let after = next.get(at)?.as_deref()?;
+        if !set.contains(after) {
+            return Some(after.to_string());
+        }
+        at = after;
+    }
+    None
+}
+
 fn without(json: &str, set: &HashSet<&str>) -> (Vec<String>, bool) {
     let all: Vec<String> = serde_json::from_str(json).unwrap_or_default();
     let before = all.len();
@@ -282,6 +302,16 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
 
         // 2. The link scrub: one read, and only the rows that name an id of the set are
         // rewritten.
+        // RULING: wave3-c11 ruling 5: the purge of a replacement restores the row it
+        // replaced. `after`: for a row that stays and whose `superseded_by` is purged, the
+        // row that replaces it afterwards, if any.
+        let next: HashMap<String, Option<String>> = {
+            let mut stmt =
+                conn.prepare("SELECT id, superseded_by FROM memories WHERE id IN (SELECT id FROM temp.purge_ids)")?;
+            let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?;
+            rows.collect::<rusqlite::Result<_>>()?
+        };
+        let mut after: Vec<(String, Option<String>)> = Vec::new();
         let linked: Vec<(String, String, String, String)> = {
             let mut stmt = conn.prepare(
                 "SELECT id, superseded_by, supersedes, contradicts, confirmed_by FROM memories
@@ -303,27 +333,48 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
                 let (supersedes, a) = without(&supersedes, &set);
                 let (contradicts, b) = without(&contradicts, &set);
                 let (confirmed_by, c) = without(&confirmed_by, &set);
-                let pointed = superseded_by.as_deref().is_some_and(|s| set.contains(s));
-                if pointed || a || b || c {
+                let purged = superseded_by.filter(|s| set.contains(s.as_str()));
+                if purged.is_some() || a || b || c {
                     out.push((
-                        id,
+                        id.clone(),
                         serde_json::to_string(&supersedes)?,
                         serde_json::to_string(&contradicts)?,
                         serde_json::to_string(&confirmed_by)?,
                     ));
                 }
+                if let Some(purged) = purged {
+                    if !set.contains(id.as_str()) {
+                        let replacement = replacement_after(&purged, &set, &next).filter(|r| *r != id);
+                        after.push((id, replacement));
+                    }
+                }
             }
             out
         };
         {
-            let mut update = conn.prepare(
-                "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3,
-                        superseded_by = CASE WHEN superseded_by IN (SELECT id FROM temp.purge_ids)
-                                             THEN NULL ELSE superseded_by END
-                  WHERE id = ?4",
-            )?;
+            let mut update =
+                conn.prepare("UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3 WHERE id = ?4")?;
             for (id, supersedes, contradicts, confirmed_by) in &linked {
                 update.execute(params![supersedes, contradicts, confirmed_by, id])?;
+            }
+        }
+        for (id, replacement) in &after {
+            // A replacement that is not a row replaces nothing.
+            let replacement = match replacement {
+                Some(r) if exists(conn, "SELECT 1 FROM memories WHERE id = ?1", r)? => Some(r),
+                _ => None,
+            };
+            match replacement {
+                // A -> B -> C, B purged: A is replaced by C and stays out.
+                Some(r) => {
+                    conn.execute("UPDATE memories SET superseded_by = ?1 WHERE id = ?2", params![r, id])?;
+                }
+                // The link is gone and A is as it was before it: the two columns are
+                // cleared together, and the shadow mark unless A is also hidden.
+                None => {
+                    conn.execute("UPDATE memories SET superseded_by = NULL, invalidated_at = NULL WHERE id = ?1", [id])?;
+                    clear_shadow(conn, id)?;
+                }
             }
         }
 
