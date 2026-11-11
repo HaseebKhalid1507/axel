@@ -86,6 +86,9 @@ pub struct Status {
     pub panics: AtomicU64,
     // indexer thread
     pub vectors_waiting: AtomicU64,
+    /// Note files that needed a vector and did not get one in the last sync of the note
+    /// folders (`docsync::tick`).
+    pub docs_waiting: AtomicU64,
     pub model_loaded: AtomicBool,
     /// 0 pending, 1 running, 2 done.
     pub scan: AtomicU8,

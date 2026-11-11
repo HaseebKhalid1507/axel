@@ -928,7 +928,8 @@ fn open_state_and_open_ctx_hand_back_the_other_ends_of_their_channels() {
     let row = status_row(&dirs.brain()).unwrap();
     for key in [
         "pid", "mode", "reason", "written_ms", "started_ms", "scan", "indexer_running", "embed_stopped",
-        "model_loaded", "model", "model_dir", "embedder", "vectors_waiting", "breaker_open", "breaker_trips",
+        "model_loaded", "model", "model_dir", "embedder", "vectors_waiting", "docs_waiting", "breaker_open",
+        "breaker_trips",
         "hook_misses", "sessions_dropped", "jobs_dropped", "tokens_blanked", "turns_withheld", "write_errors",
         "panics", "forum", "base", "warnings",
     ] {

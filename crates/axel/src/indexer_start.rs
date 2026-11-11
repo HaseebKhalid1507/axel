@@ -513,6 +513,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "model_dir": ctx.cfg.model_dir.to_string_lossy(),
         "embedder": ctx.cfg.embedder.to_string(),
         "vectors_waiting": n(&s.vectors_waiting),
+        "docs_waiting": n(&s.docs_waiting),
         "breaker_open": s.breaker_open.load(Ordering::Relaxed),
         "breaker_trips": n(&s.breaker_trips),
         "hook_misses": n(&s.hook_misses),

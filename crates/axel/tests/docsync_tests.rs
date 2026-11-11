@@ -262,6 +262,15 @@ fn t22_with_no_embedder_a_new_file_gets_no_row_and_waits() {
     assert_eq!(report.waiting, 1);
     assert_eq!(w.count(), 0);
     assert!(w.deltas().is_empty());
+
+    // The scheduled tick puts that count where `status` reads it, and takes it back to 0
+    // when nothing waits any more.
+    assert_eq!(w.ctx.status.docs_waiting.load(Ordering::Relaxed), 0);
+    docsync::tick(&mut w.ctx).unwrap();
+    assert_eq!(w.ctx.status.docs_waiting.load(Ordering::Relaxed), 1);
+    std::fs::remove_file(w.path("notes/new.md")).unwrap();
+    docsync::tick(&mut w.ctx).unwrap();
+    assert_eq!(w.ctx.status.docs_waiting.load(Ordering::Relaxed), 0);
 }
 
 #[test]

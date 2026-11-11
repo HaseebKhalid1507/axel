@@ -60,7 +60,10 @@ struct Plan {
 
 /// Every 900 s (called by `indexer::tick`).
 pub fn tick(ctx: &mut IndexerCtx) -> Result<()> {
-    sync(ctx).map(|_| ())
+    let report = sync(ctx)?;
+    // What `status` shows as documents waiting: the files this sync left without a vector.
+    ctx.status.docs_waiting.store(report.waiting as u64, Ordering::Relaxed);
+    Ok(())
 }
 
 /// One whole sync: plan, hide, restore, then at most 8 files embedded and written, each in
