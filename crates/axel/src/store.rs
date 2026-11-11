@@ -3,8 +3,11 @@
 //!
 //! Every function here that writes runs inside the caller's transaction
 //! (`brain_v2::begin_write` or `begin_write_front` … `COMMIT`) and refuses a connection
-//! that has none open. Each is all or nothing by itself as well: it works inside a
-//! savepoint, so a caller that goes on after an error commits none of the failed call.
+//! that has none open. Each works inside a savepoint, so a failed call leaves none of its
+//! own writes behind. **After an error from `store` the caller rolls back; it never
+//! commits.** The error may mean that SQLite has already rolled the whole transaction
+//! back (a full disk, an I/O error): whatever the caller wrote before the call is then
+//! gone too, and statements it ran afterwards would commit one by one.
 //!
 //! Hide, restore and supersede never change saved text. `purge_many` is the one way a
 //! row leaves.
@@ -69,7 +72,8 @@ fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
 }
 
-/// Runs `work` inside a savepoint of the caller's transaction: all of it or none.
+/// Runs `work` inside a savepoint of the caller's transaction: all of it or none. On an
+/// error the caller gets the first error, and rolls back.
 fn atomic<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
     if conn.is_autocommit() {
         return Err(AxelError::Other(
@@ -83,7 +87,14 @@ fn atomic<T>(conn: &Connection, work: impl FnOnce() -> Result<T>) -> Result<T> {
             Ok(v)
         }
         Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK TO axel_store; RELEASE axel_store");
+            // RULING: wave3-c11 ruling 2: when the savepoint cannot be taken back and a
+            // transaction is still open, a half-done call must never be committed (in
+            // `purge_many` that would be the `axel_purge` row): the whole transaction goes.
+            // When SQLite rolled it back by itself there is nothing left to take back.
+            let back = conn.execute_batch("ROLLBACK TO axel_store; RELEASE axel_store");
+            if back.is_err() && !conn.is_autocommit() {
+                let _ = conn.execute_batch("ROLLBACK");
+            }
             Err(e)
         }
     }

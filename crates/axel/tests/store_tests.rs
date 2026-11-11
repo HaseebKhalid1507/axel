@@ -295,8 +295,8 @@ fn a_write_is_all_of_a_rows_tables_or_none() {
     assert_eq!(tx(conn, || store::insert_row(conn, brain.signer.as_ref(), &again).unwrap()), Inserted::Exists);
     assert_eq!(whole(conn, "mem_one"), before);
 
-    // A row whose last table fails leaves nothing in the first two, even when the caller
-    // commits after the error.
+    // A row whose last table fails leaves nothing in the first two: the failed call took
+    // its own writes back. The caller then rolls back; it never commits after an error.
     conn.execute(
         "INSERT INTO memory_ext(mem_id, origin_kind, content_hash, created_ms) VALUES ('mem_half', 'tool', 'x', 1)",
         [],
@@ -305,7 +305,9 @@ fn a_write_is_all_of_a_rows_tables_or_none() {
     let half = row("mem_half", "note", "tool", "a row that cannot get its memory_ext row");
     brain_v2::begin_write(conn).unwrap();
     assert!(store::insert_row(conn, brain.signer.as_ref(), &half).is_err());
-    conn.execute_batch("COMMIT").unwrap();
+    assert!(!conn.is_autocommit(), "the transaction is still the caller's to roll back");
+    assert_eq!(parts("mem_half"), (0, 0, 1), "inside the transaction, before the rollback");
+    conn.execute_batch("ROLLBACK").unwrap();
     assert_eq!(parts("mem_half"), (0, 0, 1));
 
     // A tombstoned id is not written again.
@@ -320,7 +322,7 @@ fn a_write_is_all_of_a_rows_tables_or_none() {
     brain_v2::begin_write(conn).unwrap();
     assert!(store::insert_row(conn, None, &odd).is_err());
     assert!(store::insert_row(conn, None, &row("mem_odd", "note", "elsewhere", "an origin nobody knows")).is_err());
-    conn.execute_batch("COMMIT").unwrap();
+    conn.execute_batch("ROLLBACK").unwrap();
     assert_eq!(parts("mem_odd"), (0, 0, 0));
 
     // The front thread's write: the guard does not commit; the caller does. After the
@@ -1186,4 +1188,87 @@ fn a_hide_takes_over_a_pause_mark_and_no_other() {
     // It is an ordinary hide now: restore by id brings it back.
     assert_eq!(tx(conn, || store::restore(conn, "mem_s2").unwrap()), 1);
     assert!(is_returned(conn, "mem_s2"));
+}
+
+// ── Ruling 2 of the commit 11 review: after an error the caller rolls back ──
+
+#[test]
+fn after_an_error_from_store_nothing_of_the_callers_transaction_is_in_the_file() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    let signer = brain.signer.as_ref();
+    let parts = |conn: &Connection, id: &str| {
+        (
+            count_id(conn, "SELECT COUNT(*) FROM memories WHERE id = ?1", id),
+            count_id(conn, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = ?1", id),
+            count_id(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = ?1", id),
+        )
+    };
+    put(&brain, &row("mem_kept", "note", "tool", "a row saved before any of this"));
+    // The id whose `memory_ext` row cannot be written.
+    conn.execute(
+        "INSERT INTO memory_ext(mem_id, origin_kind, content_hash, created_ms) VALUES ('mem_half', 'tool', 'x', 1)",
+        [],
+    )
+    .unwrap();
+
+    // 1. The front thread's way: the error leaves with `?`, the guard rolls back. The
+    // caller's own earlier writes (a row, a pause, a hide) are not in the file.
+    let writing = AtomicBool::new(false);
+    let front = brain_v2::connect(&path, Role::Front).unwrap();
+    let handler = || -> axel::error::Result<()> {
+        let _guard = brain_v2::begin_write_front(&front, &writing)?;
+        store::insert_row(&front, signer, &row("mem_first", "note", "tool", "the caller's own earlier row"))?;
+        store::set_pause(&front, "chat-s", Some("session-s"), "recall", "cli")?;
+        assert_eq!(store::hide(&front, "mem_kept", "cli")?, 1);
+        assert_eq!(parts(&front, "mem_first"), (1, 1, 1));
+        store::insert_row(&front, signer, &row("mem_half", "note", "tool", "a row that cannot get its memory_ext row"))?;
+        front.execute_batch("COMMIT")?;
+        Ok(())
+    };
+    assert!(handler().is_err());
+    assert!(front.is_autocommit(), "the transaction is closed");
+    assert!(!writing.load(Ordering::SeqCst));
+    for c in [conn, &front] {
+        assert_eq!(parts(c, "mem_first"), (0, 0, 0), "the caller's earlier row is in the file");
+        assert_eq!(parts(c, "mem_half"), (0, 0, 1));
+        assert_eq!(count(c, "SELECT COUNT(*) FROM chat_pauses"), 0);
+        assert_eq!(mark_of(c, "mem_kept"), (None, None));
+    }
+
+    // 2. SQLite rolls the whole transaction back by itself, as it does on a full disk:
+    // here a trigger of this connection does it. `store` returns that first error, not
+    // the failure of its own `ROLLBACK TO`; the caller's earlier writes are gone, and no
+    // writer goes on outside a transaction.
+    conn.execute_batch(
+        "CREATE TEMP TRIGGER the_disk_is_full BEFORE INSERT ON memory_ext WHEN NEW.mem_id = 'mem_boom'
+         BEGIN SELECT RAISE(ROLLBACK, 'the disk is full, says the test'); END;",
+    )
+    .unwrap();
+    brain_v2::begin_write(conn).unwrap();
+    assert!(matches!(
+        store::insert_row(conn, signer, &row("mem_before", "note", "tool", "written before the failure")).unwrap(),
+        Inserted::New { .. }
+    ));
+    assert_eq!(store::hide(conn, "mem_kept", "cli").unwrap(), 1);
+    let failed = store::insert_row(conn, signer, &row("mem_boom", "note", "tool", "the row the disk had no room for")).unwrap_err();
+    assert!(failed.to_string().contains("the disk is full, says the test"), "the first error is returned: {failed}");
+    assert!(conn.is_autocommit(), "SQLite closed the transaction");
+    let refused = store::insert_row(conn, signer, &row("mem_after", "note", "tool", "a row written after the failure")).unwrap_err();
+    assert!(refused.to_string().contains("no transaction is open"), "{refused}");
+    assert!(store::hide(conn, "mem_kept", "cli").is_err());
+    conn.execute_batch("DROP TRIGGER the_disk_is_full").unwrap();
+    for c in [conn, &front] {
+        for id in ["mem_before", "mem_boom", "mem_after"] {
+            assert_eq!(parts(c, id), (0, 0, 0), "{id}");
+        }
+        assert_eq!(mark_of(c, "mem_kept"), (None, None));
+        assert_eq!(count(c, "SELECT COUNT(*) FROM memories"), 1);
+        assert_eq!(count(c, "SELECT COUNT(*) FROM axel_purge"), 0);
+    }
+
+    // The connection is whole: the next write goes through.
+    put(&brain, &row("mem_next", "note", "tool", "the write after the failure"));
+    assert_eq!(parts(&front, "mem_next"), (1, 1, 1));
 }
