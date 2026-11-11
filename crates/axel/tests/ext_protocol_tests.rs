@@ -2236,3 +2236,21 @@ fn f3_a_label_takes_its_home_from_the_config_not_from_home() {
     assert_eq!(axel::inject::who(&pick, &cfg, None), "file in ~/notes: deploy.md");
 }
 
+#[test]
+fn f4_a_turn_the_carry_drops_is_counted_at_once() {
+    let dirs = Dirs::new();
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut st, _jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
+    assert!(st.cfg.capture);
+    st.capture.on_user(Some("session-D"), Some("/tmp/project"), "how is the deploy key rotated on the host", now_ms());
+    assert!(st.capture.is_pending("session-D"));
+    let call = FrontCall {
+        seq: 1,
+        carry: Carry { skipped: vec!["session-D".to_string()], forgot: Vec::new() },
+        work: FrontWork::Tool { name: "search".to_string(), input: json!({}), caller: Caller::default() },
+    };
+    front::handle(&mut st, call);
+    assert!(!st.capture.is_pending("session-D"));
+    assert_eq!(status.turns_dropped.load(Ordering::Relaxed), 1, "the dropped turn waits for another hook");
+}
+

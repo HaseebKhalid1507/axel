@@ -249,6 +249,11 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
     for session_id in &carry.skipped {
         st.capture.drop_session(session_id);
     }
+    // The turns let go here are counted now, not at the next capture hook of any chat.
+    let dropped = st.capture.take_dropped();
+    if dropped > 0 && st.cfg.capture {
+        st.status.turns_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
     // A chat in which core's `memory_forget` was called: the turn is not to be learned.
     for session_id in &carry.forgot {
         mark_forgotten(st, session_id);
