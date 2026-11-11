@@ -1182,6 +1182,9 @@ impl Indexed {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join(format!("{}.json", a.id)), a.json(&scope)).unwrap();
     }
+    fn has_row(&self, id: &str) -> bool {
+        count(self.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1
+    }
     fn scan(&mut self) {
         index_archives::scan(&mut self.ctx).unwrap();
     }
@@ -1392,13 +1395,18 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let before = all(&world);
     let no = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "n\n");
     let out = &no.out;
-    let asked = out.find("Delete 1 memories for good and take 1 archived rows out of the brain? [y/N]").unwrap_or_else(|| panic!("{out}"));
+    let asked = out
+        .find("Delete 1 memories for good, take 1 archived rows out of the brain and hide 1 more? [y/N]")
+        .unwrap_or_else(|| panic!("{out}"));
     let listed = out.find(&format!("m:{old_row} \u{b7} ")).unwrap_or_else(|| panic!("the taken row is not listed: {out}"));
     let archive = out.find(&format!("  ctx-{}:", old.id)).unwrap_or_else(|| panic!("{out}"));
     assert!(archive < listed && listed < asked, "{out}");
     assert!(out.contains("OLDCONTINUE"), "{out}");
     // v2 c18b review round 2, item 1: another turn with the same prompt is not taken.
-    assert!(!out.contains(&format!("m:{other_row}")), "{out}");
+    // Round 3, item 2: it is listed to be hidden, after the rows taken.
+    let doubt = out.find("These 1 archived rows have the prompt of a deleted turn").unwrap_or_else(|| panic!("{out}"));
+    let other_at = out.find(&format!("m:{other_row}")).unwrap_or_else(|| panic!("{out}"));
+    assert!(listed < doubt && doubt < other_at && other_at < asked, "{out}");
     assert_eq!(all(&world), before, "the listing changed a row");
 
     let yes = forget_cmd(&world.path(), &["mem_cap_seven"], true, false, "y\n");
@@ -1407,6 +1415,7 @@ fn forget_now_lists_the_archived_rows_its_mark_takes_before_it_asks() {
     let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
     assert!(!has(&old_row));
     assert!(has(&other_row), "the mark took another turn with the same prompt");
+    assert_eq!(hidden_by_with(world.db(), "OLDOTHER"), [Some("cli:unproven".to_string())]);
     // Round 2, item 2: the row the mark took is counted apart from the forget tool's span.
     assert_eq!(left_counts(world.db(), &old), (1, 1));
 
@@ -1594,8 +1603,12 @@ fn forget_now_deletes_nothing_when_the_mark_would_take_a_row_it_did_not_list() {
     let run = forget_now_meanwhile(&world.path(), &["mem_cap_drift"], || {
         world.db().execute("UPDATE memories SET content = ?1 WHERE id = ?2", params![cap.content, other_row]).unwrap();
     });
-    assert!(!run.out.contains(&format!("m:{other_row}")), "the row was listed: the test proves nothing: {}", run.out);
+    // Round 3, item 2: listed to be hidden, not taken.
+    let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{}", run.out));
+    assert!(run.out[..doubt].find(&format!("m:{other_row}")).is_none(), "the row was listed as taken: the test proves nothing: {}", run.out);
     assert_eq!(run.code, 75, "{}{}", run.out, run.err);
+    let hidden: Option<String> = world.db().query_row("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", [&other_row], |r| r.get(0)).unwrap();
+    assert_eq!(hidden, None, "the rollback left the hide");
     assert!(run.err.contains("nothing was deleted; run it again"), "{}", run.err);
     let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
     assert!(has("mem_cap_drift") && has(&other_row));
@@ -2062,7 +2075,7 @@ fn delete_the_capture(world: &mut Indexed, archives: &[&Arch], order: Order) -> 
         file(world);
     }
     let run = forget_cmd(&world.path(), &[&id], true, false, "y\n");
-    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+    assert!(run.out.contains("Deleted ") && run.out.contains(" memories for good."), "{}{}", run.out, run.err);
     if order == Order::After {
         file(world);
     }
@@ -2074,6 +2087,12 @@ const P_EVENT: &str = "look at the build failure and send a worker to fix it ple
 /// A worker's report keeps the archive's span going after the turn's first final reply;
 /// capture ends the turn at that reply.
 fn event_case(order: Order) -> Indexed {
+    event_case_with(order, false)
+}
+
+/// `event_case`; with `newer`, a later archive of the chat is there too, so that the hide
+/// twins nothing in the archive of the turn (it twins in the newest only).
+fn event_case_with(order: Order, newer: bool) -> Indexed {
     let mut world = Indexed::new();
     let mut chat = Chat::new(&world, "s-event");
     let at = T0 - 100_000;
@@ -2087,7 +2106,9 @@ fn event_case(order: Order) -> Indexed {
         .user(event)
         .says("EVENTSECOND the worker is done and the build is green again")
         .about("upload queue");
-    delete_the_capture(&mut world, &[&a], order);
+    let b = Arch::new(32, "s-event", T0 + 100_000).about("deploy window");
+    let archives: Vec<&Arch> = if newer { vec![&a, &b] } else { vec![&a] };
+    delete_the_capture(&mut world, &archives, order);
     world
 }
 
@@ -2170,4 +2191,103 @@ fn newline_case(order: Order) -> Indexed {
 fn a_long_deleted_turn_whose_prompt_ends_in_a_line_break_never_comes_back() {
     let world = newline_case(Order::After);
     assert_eq!(visible_with(world.db(), "NLSTEP1 "), 0, "the deleted turn came back");
+}
+
+/// v2 c18b review round 3, item 2: every shape, its archives indexed before the deletion
+/// (the capture hidden meanwhile) or after it: the deleted turn is never visible again.
+#[test]
+fn a_deleted_turn_is_never_visible_again_whether_its_archive_is_indexed_before_or_after() {
+    for order in [Order::Before, Order::After] {
+        for newer in [false, true] {
+            let world = event_case_with(order, newer);
+            assert_eq!(visible_with(world.db(), "EVENTFIRST"), 0, "event, {order:?}, newer {newer}");
+        }
+        let world = split_case(order);
+        assert_eq!(visible_with(world.db(), "SPLITFIRST"), 0, "split, {order:?}");
+        assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "split, {order:?}");
+        let world = newline_case(order);
+        assert_eq!(visible_with(world.db(), "NLSTEP1 "), 0, "newline, {order:?}");
+    }
+}
+
+/// v2 c18b review round 3, item 2, under round 2's item 5: a row listed to be hidden that
+/// is hidden by someone else while the question waits: nothing is deleted.
+#[test]
+fn forget_now_deletes_nothing_when_a_row_it_would_hide_changes_while_it_asks() {
+    let mut world = Indexed::new();
+    // An older archive with the prompt (a turn the hide does not twin: it twins in the
+    // newest archive only), then the turn itself, captured after both were indexed.
+    let a = Arch::new(33, "s-event", T0)
+        .turn(P_EVENT, "EVENTFIRST I sent a worker to fix the failing build; it will report back and more")
+        .about("upload queue");
+    let b = Arch::new(34, "s-event", T0 + 1_000_000).about("deploy window");
+    world.file_in(&work_scope(&world), &a);
+    world.file_in(&work_scope(&world), &b);
+    world.scan();
+    let mut chat = Chat::new(&world, "s-event");
+    chat.user(P_EVENT, T0 + 500_000);
+    chat.says(&world, "EVENTFIRST I sent a worker to fix the failing build; it will report back", false, T0 + 501_000);
+    let id = the_capture(&world);
+    tx(world.db(), || {
+        store::hide(world.db(), &id, "cli").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
+    });
+    let row: String = world.db().query_row("SELECT id FROM memories WHERE content LIKE '%and more%'", [], |r| r.get(0)).unwrap();
+    assert_eq!(visible_with(world.db(), "and more"), 1);
+    let run = forget_now_meanwhile(&world.path(), &[&id], || {
+        tx(world.db(), || store::hide(world.db(), &row, "model:other").unwrap());
+    });
+    let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{}", run.out));
+    assert!(run.out[doubt..].contains(&format!("m:{row}")), "the row was not listed to be hidden: the test proves nothing: {}", run.out);
+    assert_eq!(run.code, 75, "{}{}", run.out, run.err);
+    assert!(world.has_row(&id));
+    assert_eq!(hidden_by_with(world.db(), "EVENTFIRST"), [Some("model:other".to_string()), Some("cli".to_string())]);
+}
+
+/// v2 c18b review round 3, item 2: an archived row deleted by its own id (a model hid it)
+/// whose turn was split across two archives: the rest of it, the next file's leading
+/// `Continued` row, is listed before the question and hidden with the purge.
+#[test]
+fn forget_now_of_an_archived_row_hides_the_rest_of_its_split_turn() {
+    const P: &str = "migrate the ledger tables to the new schema and tell me when it is done";
+    let mut world = Indexed::new();
+    let call = json!({"role": "assistant", "content": [
+        {"type": "text", "text": "SPLITFIRST I will start with the ledger tables and move them one at a time"},
+        {"type": "tool_use", "id": "toolu_02", "name": "bash", "input": {"command": "migrate"}},
+    ]});
+    let result = json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_02", "content": "ok"}]});
+    let mut a = Arch::new(43, "s-split", T0).about("upload queue").user(P);
+    a.items.push(call.clone());
+    let mut b = Arch::new(44, "s-split", T0 + 100_000).user(P);
+    b.items.push(call);
+    b.items.push(result);
+    let mut b = b.says("SPLITSECOND the ledger tables are on the new schema now, every one of them");
+    b.carried = Some(2);
+    world.file(&a);
+    world.file(&b);
+    world.scan();
+    let first: String = world.db().query_row("SELECT id FROM memories WHERE content LIKE '%SPLITFIRST%'", [], |r| r.get(0)).unwrap();
+    let second: String = world.db().query_row("SELECT id FROM memories WHERE content LIKE '%SPLITSECOND%'", [], |r| r.get(0)).unwrap();
+    tx(world.db(), || {
+        store::hide(world.db(), &first, "model:s-split").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, first]).unwrap();
+    });
+    assert_eq!(visible_with(world.db(), "SPLITSECOND"), 1);
+
+    let run = forget_cmd(&world.path(), &[&first], true, false, "y\n");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    let doubt = run
+        .out
+        .find("These 1 archived rows have the prompt of a deleted turn but their text does not prove them that turn; they will be hidden, not deleted:")
+        .unwrap_or_else(|| panic!("{}", run.out));
+    let listed = run.out.find(&format!("m:{second} \u{b7} ")).unwrap_or_else(|| panic!("{}", run.out));
+    let asked = run.out.find("Delete 1 memories for good and hide 1 more? [y/N]").unwrap_or_else(|| panic!("{}", run.out));
+    assert!(doubt < listed && listed < asked, "{}", run.out);
+    assert!(run.out.contains(&format!("\"axel-v2 restore {second}\" brings it back; \"axel-v2 forget --now {second}\" deletes it once it has been hidden 24 h")), "{}", run.out);
+    assert!(run.out.contains("1 archived rows with the prompt of a deleted turn are hidden, as listed above."), "{}", run.out);
+    assert!(!world.has_row(&first));
+    assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "the rest of the deleted turn is visible");
+    assert_eq!(hidden_by_with(world.db(), "SPLITSECOND"), [Some("cli:unproven".to_string())]);
+    let counted: i64 = world.db().query_row("SELECT cli_unproven FROM archive_index WHERE archive_id = ?1", [&b.id], |r| r.get(0)).unwrap();
+    assert_eq!(counted, 1);
 }

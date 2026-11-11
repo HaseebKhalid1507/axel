@@ -245,6 +245,8 @@ struct Purged {
     shadows: i64,
     back: usize,
     left_out: Vec<String>,
+    /// The visible archived rows hidden as `cli:unproven` (v2 c18b review round 3, item 2).
+    unproven: Vec<String>,
     /// Each deleted turn (a capture or an archived row) and the Synaps archive that still
     /// holds it, when one is known.
     in_synaps: Vec<(String, Option<String>)>,
@@ -377,7 +379,7 @@ fn delete_hidden(
     }
     // RULING: v2 c18b review, item 7. What the forget mark of the deleted turns takes is
     // found by doing it, in a transaction that is rolled back, and listed before the question.
-    let taken = mark_takes(conn, &ripe, &twins)?;
+    let (taken, doubt) = mark_takes(conn, &ripe, &twins)?;
     if !taken.is_empty() {
         writeln!(
             term.out,
@@ -405,11 +407,29 @@ fn delete_hidden(
             "  No command brings these copies back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too. Other turns with the same prompt stay."
         )?;
     }
+    // RULING: v2 c18b review round 3, item 2: what has the prompt of a deleted turn, near
+    // it, and is not proven that turn is listed and hidden with the purge.
+    if !doubt.is_empty() {
+        writeln!(
+            term.out,
+            "These {} archived rows have the prompt of a deleted turn but their text does not prove them that turn; they will be hidden, not deleted:",
+            doubt.len()
+        )?;
+        for row in &doubt {
+            writeln!(
+                term.out,
+                "    {} (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it once it has been hidden {hours} h)",
+                twin_line(row),
+                id = one(&row.id)
+            )?;
+        }
+    }
     // RULING: v2 c18b review round 2, item 4: the question counts all that goes.
+    let hide = if doubt.is_empty() { String::new() } else { format!(" and hide {} more", doubt.len()) };
     if taken.is_empty() {
-        write!(term.out, "Delete {total} memories for good? [y/N] ")?;
+        write!(term.out, "Delete {total} memories for good{hide}? [y/N] ")?;
     } else {
-        write!(term.out, "Delete {total} memories for good and take {} archived rows out of the brain? [y/N] ", taken.len())?;
+        write!(term.out, "Delete {total} memories for good, take {} archived rows out of the brain{hide}? [y/N] ", taken.len())?;
     }
     term.out.flush()?;
     let mut answer = String::new();
@@ -422,7 +442,10 @@ fn delete_hidden(
     // 4. One transaction: the purge, the forget marks, the purge mark.
     // RULING: v2 c18b review round 2, item 5. Inside it, the rows, their twins and what the
     // mark takes are read again; anything that is not what was listed rolls it back.
-    let listed: Vec<String> = taken.iter().map(|r| r.id.clone()).collect();
+    let listed = Listed {
+        taken: taken.iter().map(|r| r.id.clone()).collect(),
+        unproven: doubt.iter().map(|r| r.id.clone()).collect(),
+    };
     let purged = match write(conn, || purge(conn, &ripe, &twins, Some(&listed))) {
         Err(e) if e.to_string().contains(CHANGED) => {
             writeln!(term.err, "{CHANGED}")?;
@@ -484,6 +507,13 @@ fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) {
             term.out,
             "The forget mark took {} archived copies of the deleted turns out of the brain, as listed above.",
             purged.left_out.len()
+        );
+    }
+    if !purged.unproven.is_empty() {
+        let _ = writeln!(
+            term.out,
+            "{} archived rows with the prompt of a deleted turn are hidden, as listed above.",
+            purged.unproven.len()
         );
     }
     if purged.back > 0 {
@@ -549,34 +579,48 @@ fn synaps_archive(conn: &Connection, row: &RowInfo, twins: &[Twin], ids: &[Strin
         .flatten())
 }
 
-/// The archived rows the forget marks of `purge` take (beside the rows named and their
-/// proven twins): `purge` itself, run in a transaction that is always rolled back.
-fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Vec<RowInfo>> {
-    let keys: Vec<&str> = ripe
-        .iter()
-        .filter(|r| r.origin == "capture" || r.origin == "archive")
-        .filter_map(|r| r.turn_key.as_deref())
-        .collect();
-    let mut candidates: Vec<RowInfo> = Vec::new();
-    for key in keys {
-        for row in rows_where(conn, "WHERE e.origin_kind = 'archive' AND e.turn_key = ?1 ORDER BY e.created_ms, e.vid", [key])? {
-            if !candidates.iter().any(|c| c.id == row.id) {
-                candidates.push(row);
-            }
-        }
-    }
-    if candidates.is_empty() {
-        return Ok(Vec::new());
+/// The ids of what the forget marks of `purge` did when the list was made.
+#[derive(Default)]
+struct Listed {
+    taken: Vec<String>,
+    unproven: Vec<String>,
+}
+
+/// What the forget marks of `purge` do (beside the rows named and their proven twins): the
+/// archived rows they take, and the visible ones they hide as `cli:unproven`. Found by
+/// running `purge` itself in a transaction that is always rolled back; the rows are read
+/// inside it, before the rollback.
+fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<(Vec<RowInfo>, Vec<RowInfo>)> {
+    if !ripe.iter().any(|r| (r.origin == "capture" || r.origin == "archive") && r.turn_key.is_some()) {
+        return Ok((Vec::new(), Vec::new()));
     }
     if let Err(e) = crate::brain_v2::begin_write(conn) {
         return Err(busy_or(e));
     }
-    let taken = purge(conn, ripe, twins, None).map(|p| p.left_out);
+    let done = (|| -> Result<(Vec<RowInfo>, Vec<RowInfo>)> {
+        let mut before: Vec<RowInfo> = Vec::new();
+        for row in ripe {
+            if let Some(key) = row.turn_key.as_deref() {
+                before.extend(rows_where(conn, "WHERE e.origin_kind = 'archive' AND e.turn_key = ?1 ORDER BY e.created_ms, e.vid", [key])?);
+            }
+        }
+        let p = purge(conn, ripe, twins, None)?;
+        let taken = before.into_iter().filter(|r| p.left_out.contains(&r.id)).fold(Vec::new(), |mut all: Vec<RowInfo>, r| {
+            if !all.iter().any(|a| a.id == r.id) {
+                all.push(r);
+            }
+            all
+        });
+        let mut hidden = Vec::new();
+        for id in &p.unproven {
+            hidden.extend(row_info(conn, id)?);
+        }
+        Ok((taken, hidden))
+    })();
     if !conn.is_autocommit() {
         conn.execute_batch("ROLLBACK")?;
     }
-    let taken = taken.map_err(busy_or)?;
-    Ok(candidates.into_iter().filter(|c| taken.contains(&c.id)).collect())
+    done.map_err(busy_or)
 }
 
 /// `show::BUSY` for a lock that did not come in time; any other error as it is.
@@ -594,7 +638,7 @@ fn busy_or(e: crate::error::AxelError) -> crate::error::AxelError {
 /// the list was made, anything that is not as listed (a named row, its twins and whether
 /// each is proven, what the mark takes) is the error `CHANGED`, and the caller rolls back.
 /// Without it (the dry run), a row that changed is left as it is.
-fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Option<&[String]>) -> Result<Purged> {
+fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Option<&Listed>) -> Result<Purged> {
     let changed = || Err(crate::error::AxelError::Other(CHANGED.into()));
     let mut ids: Vec<String> = Vec::new();
     // `(logical, session_id, turn_key, created_ms, text)` of each turn deleted by its own id.
@@ -657,7 +701,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
         }
     }
     if ids.is_empty() {
-        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), in_synaps: Vec::new() });
+        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), unproven: Vec::new(), in_synaps: Vec::new() });
     }
     let mut in_synaps = Vec::new();
     for (row, its) in ripe.iter().zip(twins) {
@@ -683,33 +727,37 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
         }
     }
 
+    // RULING: v2 c18b review round 3, item 2: the rest of a split turn of an archived row
+    // deleted here, read before it goes.
+    let mut rests = Vec::new();
+    for id in &ids {
+        rests.extend(index_archives::rest_of_turn(conn, id)?);
+    }
     let deleted = store::purge_many(conn, &ids, true, true)?;
-    // RULING: v2 c18b review, item 1: a twin not proven the same turn is never purged. The
-    // forget mark takes the chat's archived rows by key, hidden ones too, so for the length
-    // of the calls below the kept twins have no key; it is put back before the commit.
-    // RULING: v2 c18b review round 2, item 7: the key put back is the one read here, inside
-    // the transaction, as it is stored ('' stays '').
-    let mut keys: Vec<(String, rusqlite::types::Value)> = Vec::new();
-    for id in &kept {
-        let key: rusqlite::types::Value =
-            conn.query_row("SELECT turn_key FROM memory_ext WHERE mem_id = ?1", [id], |r| r.get(0))?;
-        keys.push((id.clone(), key));
-        conn.execute("UPDATE memory_ext SET turn_key = NULL WHERE mem_id = ?1", [id])?;
-    }
+    // RULING: v2 c18b review, item 1: a twin not proven the same turn is never purged.
+    // RULING: v2 c18b review round 3, item 2. The forget mark sees the kept twins with their
+    // keys (round 2 took the keys away for its length): a mark takes a row only when its
+    // hash proves it, which `same_turn` then proves too, so it takes no kept twin; and it
+    // must see them to hide the rest of a split turn whose first half is one.
     let mut left_out = Vec::new();
+    let mut unproven = Vec::new();
     for (logical, session_id, key, at, text) in &marks {
-        left_out.extend(index_archives::mark_deleted_turn(conn, logical, session_id.as_deref(), *at, Some(key.as_str()), text)?);
+        let did = index_archives::mark_deleted_turn(conn, logical, session_id.as_deref(), *at, Some(key.as_str()), text)?;
+        left_out.extend(did.taken);
+        unproven.extend(did.unproven);
     }
-    for (id, key) in &keys {
-        conn.execute("UPDATE memory_ext SET turn_key = ?2 WHERE mem_id = ?1", params![id, key])?;
+    index_archives::hide_unproven(conn, &rests, &left_out, &mut unproven)?;
+    if left_out.iter().any(|id| kept.contains(id)) {
+        return changed();
     }
     if let Some(listed) = listed {
-        let (mut took, mut was) = (left_out.clone(), listed.to_vec());
-        took.sort();
-        took.dedup();
-        was.sort();
-        was.dedup();
-        if took != was {
+        let sorted = |ids: &[String]| {
+            let mut ids = ids.to_vec();
+            ids.sort();
+            ids.dedup();
+            ids
+        };
+        if sorted(&left_out) != sorted(&listed.taken) || sorted(&unproven) != sorted(&listed.unproven) {
             return changed();
         }
     }
@@ -727,7 +775,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Optio
             back += 1;
         }
     }
-    Ok(Purged { deleted, shadows, back, left_out, in_synaps })
+    Ok(Purged { deleted, shadows, back, left_out, unproven, in_synaps })
 }
 
 fn wal_len(path: &Path) -> u64 {

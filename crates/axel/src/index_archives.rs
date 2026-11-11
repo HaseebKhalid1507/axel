@@ -2428,6 +2428,61 @@ fn purge_left_out_by(
     Ok(going)
 }
 
+/// The leading `Continued` row of the file after `archive_id` among `files`, when the row
+/// `id` is the last turn of `archive_id`: the rest of its turn, when a compaction split it.
+fn rest_of(conn: &Connection, scope_dir: &str, files: &[ChatFile], archive_id: &str, id: &str) -> Result<Option<String>> {
+    let Some(at) = files.iter().position(|f| f.archive_id == archive_id) else { return Ok(None) };
+    let Some(next) = files.get(at + 1) else { return Ok(None) };
+    if turn_rows(conn, scope_dir, archive_id)?.pop().is_none_or(|(last, _)| last != id) {
+        return Ok(None);
+    }
+    let lead = turn_rows(conn, scope_dir, &next.archive_id)?.into_iter().next();
+    Ok(lead.filter(|(_, letter)| *letter == 'c').map(|(id, _)| id))
+}
+
+/// `rest_of` an archived row, read from the brain: call it before the row is deleted.
+pub fn rest_of_turn(conn: &Connection, id: &str) -> Result<Option<String>> {
+    let row: Option<(String, Option<String>, Option<String>, String)> = conn
+        .query_row(
+            "SELECT e.origin_ref, e.logical, e.session_id, m.project_key FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+              WHERE e.mem_id = ?1 AND e.origin_kind = 'archive'",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+        )
+        .optional()?;
+    let Some((archive_id, logical, session_id, scope_dir)) = row else { return Ok(None) };
+    let files = chat_files(conn, &scope_dir, logical.as_deref().unwrap_or(""), session_id.as_deref())?;
+    rest_of(conn, &scope_dir, &files, &archive_id, id)
+}
+
+/// Hides as `cli:unproven` each of `ids` that is a visible archive row and is not in
+/// `taken`, counts it in its archive's `cli_unproven`, and adds it to `hidden`.
+pub fn hide_unproven(conn: &Connection, ids: &[String], taken: &[String], hidden: &mut Vec<String>) -> Result<()> {
+    for id in ids {
+        if taken.contains(id) || hidden.contains(id) {
+            continue;
+        }
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT e.origin_ref, m.project_key FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+                  WHERE e.mem_id = ?1 AND e.origin_kind = 'archive' AND e.hidden_ms IS NULL",
+                [id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        let Some((archive_id, scope_dir)) = row else { continue };
+        if store::hide(conn, id, UNPROVEN)? > 0 {
+            conn.execute(
+                "UPDATE archive_index SET cli_unproven = cli_unproven + 1
+                  WHERE scope_dir = ?1 AND archive_id = ?2 AND state = 'indexed'",
+                params![scope_dir, archive_id],
+            )?;
+            hidden.push(id.clone());
+        }
+    }
+    Ok(())
+}
+
 /// Section 4, "the live call": the row of `forgotten_turns` for a turn in which a forget
 /// tool was called (source `call`), or for a hidden turn that `forget --now` removed
 /// (source `cli`), and what that row leaves out among the rows indexed so far. Returns the
@@ -2484,7 +2539,7 @@ pub fn mark_forgotten_turn_vids(
     to_ms: i64,
     turn_key: Option<&str>,
 ) -> Result<(Vec<String>, Vec<i64>)> {
-    mark_turn(conn, logical, session_id, source, from_ms, to_ms, turn_key, &TurnText::default())
+    mark_turn(conn, logical, session_id, source, from_ms, to_ms, turn_key, &TurnText::default(), &mut Vec::new())
 }
 
 /// The `cli` row of a hidden turn that `forget --now` deleted, with the hashes of its text
@@ -2493,6 +2548,10 @@ pub fn mark_forgotten_turn_vids(
 /// with its key, near it, whose own text is that turn's. Returns the ids it purged. As
 /// `mark_forgotten_turn` otherwise; `mark_forgotten_turn` with `cli` and no text takes no
 /// row by its key (nothing proves one the same turn).
+///
+/// The rows with its key, near it, that their text does not prove the turn, and the
+/// leading `Continued` row of the file after one whose last turn has the key, are hidden
+/// as `cli:unproven` when they are visible (v2 c18b review round 3, item 2).
 pub fn mark_deleted_turn(
     conn: &Connection,
     logical: &str,
@@ -2500,8 +2559,19 @@ pub fn mark_deleted_turn(
     at_ms: i64,
     turn_key: Option<&str>,
     text: &TurnText,
-) -> Result<Vec<String>> {
-    mark_turn(conn, logical, session_id, "cli", at_ms, at_ms, turn_key, text).map(|(ids, _)| ids)
+) -> Result<DeletedTurn> {
+    let mut unproven = Vec::new();
+    let (taken, _) = mark_turn(conn, logical, session_id, "cli", at_ms, at_ms, turn_key, text, &mut unproven)?;
+    Ok(DeletedTurn { taken, unproven })
+}
+
+/// What the `cli` mark of one deleted turn did.
+#[derive(Debug, Default)]
+pub struct DeletedTurn {
+    /// The archived rows it took: their text is the turn's.
+    pub taken: Vec<String>,
+    /// The visible rows it hid as `cli:unproven`.
+    pub unproven: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2514,6 +2584,7 @@ fn mark_turn(
     to_ms: i64,
     turn_key: Option<&str>,
     text: &TurnText,
+    unproven: &mut Vec<String>,
 ) -> Result<(Vec<String>, Vec<i64>)> {
     if conn.is_autocommit() {
         return Err(crate::error::AxelError::Other(
@@ -2581,8 +2652,11 @@ fn mark_turn(
         params![logical, session_id],
     )?;
     let mut keyed = if key.is_empty() { Vec::new() } else { key_rows(conn, logical, key)? };
+    // Every row with the key, proven or not: the files whose last turn may go on in the next.
+    let all_keyed = keyed.clone();
     // RULING: v2 c18b review round 2, item 1: a `cli` row takes only the rows whose own
     // text is the deleted turn's.
+    let mut not_proven: Vec<(String, String)> = Vec::new();
     if source == "cli" {
         let mut proven = Vec::new();
         for (id, archive_id) in keyed {
@@ -2592,6 +2666,8 @@ fn mark_turn(
                 .flatten();
             if content.is_some_and(|c| text.takes_row(&c)) {
                 proven.push((id, archive_id));
+            } else {
+                not_proven.push((id, archive_id));
             }
         }
         keyed = proven;
@@ -2627,6 +2703,18 @@ fn mark_turn(
             }
         }
         purged.extend(purge_left_out_by(conn, scope_dir, &targets, source == "cli", &mut vids)?);
+        if source == "cli" {
+            // RULING: v2 c18b review round 3, item 2 (fail closed). What has the key, is near
+            // and is not proven may be the deleted turn as the archive holds it: hidden, in
+            // this transaction. So is the leading `Continued` row of the file after one whose
+            // last turn has the key: the rest of a turn whose window was split.
+            let mut doubt: Vec<String> =
+                not_proven.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())).map(|(id, _)| id.clone()).collect();
+            for (id, archive_id) in all_keyed.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())) {
+                doubt.extend(rest_of(conn, scope_dir, &files, archive_id, id)?);
+            }
+            hide_unproven(conn, &doubt, &purged, unproven)?;
+        }
     }
 
     // The turn's own trace in the recall log: its row was written at the start of the turn,
