@@ -190,6 +190,19 @@ pub fn run(brain_path: &std::path::Path) -> Result<()> {
         };
 
         match request.method.as_str() {
+            "initialize" => {
+                // synaps-dev requires protocol_version in the initialize response;
+                // hooks are declared in the plugin manifest, so an empty capabilities
+                // set is fine here. (S334 fix: JR's edbdea40 axel CLI omitted this.)
+                if let Some(id) = request.id {
+                    let response = RpcResponse {
+                        jsonrpc: "2.0".to_string(),
+                        id,
+                        result: json!({"protocol_version": 1}),
+                    };
+                    let _ = write_message(&mut writer, &response);
+                }
+            }
             "hook.handle" => {
                 let kind = request.params.get("kind")
                     .and_then(|v| v.as_str())
