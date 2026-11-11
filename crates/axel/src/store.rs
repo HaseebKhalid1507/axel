@@ -807,7 +807,8 @@ pub fn clear_pause(conn: &Connection, logical: &str, session_id: Option<&str>, w
         };
         let mut back = 0;
         for id in &ids {
-            back += restore_one(conn, id)?;
+            // A resume undoes the pause's hide only (v2 c18b review, item 6).
+            back += restore_one(conn, id, false)?;
         }
         Ok(back)
     })
