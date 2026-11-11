@@ -1828,3 +1828,33 @@ fn f14_the_new_brains_own_integrity_failure_is_exit_5() {
     assert!(error.ends_with(&format!("Nothing was put at {}.", fx.new.display())), "{error}");
     assert!(listing(fx.new.parent().unwrap()).is_empty());
 }
+
+/// Finding 13: catch-up adopts and indexes the memories it brings by adoption's rules: text
+/// that is not UTF-8 is not readable, and gets neither a `memory_ext` row nor a word row; a
+/// title that is not text is indexed as empty.
+#[test]
+fn f13_catch_up_adopts_by_adoptions_rules() {
+    let fx = fx();
+    make_axel(&fx.old);
+    assert_eq!(fx.init(&fx.old).code, 0);
+    change_axel(&fx.old, |conn| {
+        conn.execute_batch(
+            "INSERT INTO memories(id, category, topic, title, content, created)
+                  VALUES ('mem-not-utf8', 'events', 'sea', 'broken', CAST(x'c328' AS TEXT), '2026-01-02T03:04:05+00:00');
+             INSERT INTO memories(id, category, topic, title, content, created)
+                  VALUES ('mem-blob-title', 'events', 'sea', x'00ff', 'the cormorant dried its wings', '2026-01-02 03:04:05');",
+        )
+        .unwrap();
+    });
+    let out = fx.catch_up();
+    show("catch-up, rows adoption cannot read", &out);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert_eq!(out.report["memories"]["brought"], 2);
+    assert_eq!(out.report["memories"]["unreadable_not_adopted"], 1);
+    let new = Connection::open(&fx.new).unwrap();
+    assert_eq!(count(&new, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem-not-utf8'"), 0);
+    assert_eq!(count(&new, "SELECT COUNT(*) FROM memories_fts WHERE mem_id = 'mem-not-utf8'"), 0);
+    assert_eq!(text(&new, "SELECT title FROM memories_fts WHERE mem_id = 'mem-blob-title'"), "");
+    assert_eq!(word_hits(&new, "cormorant"), ["mem-blob-title"]);
+    assert_eq!(text(&new, "SELECT time_source FROM memory_ext WHERE mem_id = 'mem-blob-title'"), "exact");
+}

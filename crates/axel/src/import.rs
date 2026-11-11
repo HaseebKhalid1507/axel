@@ -2370,8 +2370,14 @@ fn catch_up_steps(
             }
         }
 
-        // Adoption of the new memories as `legacy`, and their word rows: what
-        // `brain_v2::adopt_orphans` does, inside this transaction.
+        // Adoption of the new memories as `legacy`, and their word rows, inside this
+        // transaction and by adoption's own rules (`brain_v2::adopt_in_transaction`;
+        // wave5-c19-review finding 13): `brain_v2::text_at` says what is text (a type of
+        // text and valid UTF-8), a row it cannot read gets neither a `memory_ext` row nor a
+        // word row, and a title or an abstract it cannot read is indexed as empty.
+        // `created` is read as `brain_v2::created_ms` reads it (RFC 3339, then the two
+        // SQLite forms, else the time of adoption and `observed`); that function is private
+        // to `brain_v2.rs`, so `parse_time` here is the same three forms.
         let model: Option<String> = conn
             .query_row("SELECT json_extract(value, '$.embedder_model') FROM main.brain_meta WHERE key = 'meta'", [], |r| {
                 r.get(0)
@@ -2392,14 +2398,12 @@ fn catch_up_steps(
             )?;
             let mut rows = read.query([])?;
             while let Some(r) = rows.next()? {
-                let (id, content) = (Cell::of(r.get_ref(0)?), Cell::of(r.get_ref(1)?));
-                let (Some(id), Some(content)) = (id.text(), content.text()) else {
+                let (Some(id), Some(content)) = (brain_v2::text_at(r, 0)?, brain_v2::text_at(r, 1)?) else {
                     unreadable += 1;
                     continue;
                 };
-                let hash = hex::encode(Sha256::digest(crate::archive::normalise(content).as_bytes()));
-                let created = Cell::of(r.get_ref(2)?);
-                let (ms, time_source) = match created.text().and_then(parse_time) {
+                let hash = hex::encode(Sha256::digest(crate::archive::normalise(&content).as_bytes()));
+                let (ms, time_source) = match brain_v2::text_at(r, 2)?.as_deref().and_then(parse_time) {
                     Some(ms) => (ms, "exact"),
                     None => (now_ms(), "observed"),
                 };
@@ -2411,17 +2415,25 @@ fn catch_up_steps(
                 insert.execute(params![id, hash, ms, time_source, if shadow { model.as_deref() } else { None }, embedding])?;
             }
         }
-        conn.execute(
-            "INSERT INTO main.memories_fts(mem_id, title, abstract, content)
-             SELECT m.id, m.title,
-                    CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.abstract_text END,
-                    CASE WHEN m.sensitivity = 'secret' THEN '' ELSE m.content END
-               FROM main.memories m
-              WHERE m.id IN (SELECT id FROM temp.cu_mem)
-                AND NOT EXISTS (SELECT 1 FROM main.memories_fts f WHERE f.mem_id = m.id)
-                AND typeof(m.id) = 'text' AND typeof(m.content) = 'text'",
-            [],
-        )?;
+        {
+            let mut read = conn.prepare(
+                "SELECT m.id, m.content, m.title, m.abstract_text, COALESCE(m.sensitivity = 'secret', 0)
+                   FROM main.memories m
+                  WHERE m.id IN (SELECT id FROM temp.cu_mem)
+                    AND NOT EXISTS (SELECT 1 FROM main.memories_fts f WHERE f.mem_id = m.id)",
+            )?;
+            let mut insert =
+                conn.prepare("INSERT INTO main.memories_fts(mem_id, title, abstract, content) VALUES (?1, ?2, ?3, ?4)")?;
+            let mut rows = read.query([])?;
+            while let Some(r) = rows.next()? {
+                let (Some(id), Some(content)) = (brain_v2::text_at(r, 0)?, brain_v2::text_at(r, 1)?) else { continue };
+                let title = brain_v2::text_at(r, 2)?.unwrap_or_default();
+                let secret: bool = r.get(4)?;
+                let (abstract_text, content) =
+                    if secret { (String::new(), String::new()) } else { (brain_v2::text_at(r, 3)?.unwrap_or_default(), content) };
+                insert.execute(params![id, title, abstract_text, content])?;
+            }
+        }
 
         // The handoff: taken when the source's is the later one.
         let mut handoff = "the source has none";
