@@ -181,8 +181,19 @@ fn credential(hit: &screen::Hit) -> AxelError {
 /// whitespace, which `show` turns into a gap, is not such a character.
 // SPEC: ruling R-17.5 names "what `screen::show` removes"; `screen` keeps that test private
 // (`removed`), so it is asked through `show`, once per distinct non-ASCII character.
+// RULING: R-17.5, second ruling: the variation selectors and the zero-width joiner pass,
+// because emoji are made of them. The credential check does not depend on this one: `screen`
+// drops these characters before it matches, so a token split by one is still refused.
 fn invisible(c: char) -> bool {
+    if emoji_part(c) {
+        return false;
+    }
     !c.is_ascii() && !c.is_whitespace() && screen::show(c.encode_utf8(&mut [0; 4]), 1).is_empty()
+}
+
+/// U+FE00 to U+FE0F (variation selectors) and U+200D (the joiner).
+fn emoji_part(c: char) -> bool {
+    matches!(c, '\u{FE00}'..='\u{FE0F}' | '\u{200D}')
 }
 
 /// The first of `body`, `title`, `request_key` that holds an invisible character.

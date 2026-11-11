@@ -1872,7 +1872,7 @@ fn a_post_with_an_invisible_character_is_refused() {
     let root = id_of(&fx.root(&me, "k0", "Root", "plain"));
     let before = fx.count("forum_posts");
 
-    let hidden = ['\u{202E}', '\u{2066}', '\u{200B}', '\u{200D}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{061C}', '\u{E0041}'];
+    let hidden = ['\u{202E}', '\u{2066}', '\u{200B}', '\u{200C}', '\u{2060}', '\u{FEFF}', '\u{00AD}', '\u{061C}', '\u{E0041}'];
     for c in hidden {
         assert_eq!(screen::show(&format!("a{c}b"), 10), "ab", "show removes U+{:04X}", c as u32);
         for (field, input) in [
@@ -1905,4 +1905,76 @@ fn a_post_with_an_invisible_character_is_refused() {
     assert_eq!(got["result"]["status"], "created");
     let thread = fx.entries(json!({"thread_id": id_of(&got)}), &me);
     assert_eq!(thread[0]["body"], kept);
+}
+
+/// R-17.5, second ruling: emoji are made of variation selectors and the joiner, so those
+/// pass, and the post reads back byte for byte.
+#[test]
+fn emoji_selectors_and_the_joiner_pass_in_a_post() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let me = chat(&cwd, "s-emoji", &who("a", "ga", None));
+
+    let warning = "\u{26A0}\u{FE0F}";
+    let check = "\u{2714}\u{FE0F}";
+    let heart = "\u{2764}\u{FE0F}";
+    let family = "\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F467}";
+    let rainbow_flag = "\u{1F3F3}\u{FE0F}\u{200D}\u{1F308}";
+    let body = format!("{warning} the build is red\n{check} fixed {heart}\n{family} {rainbow_flag} text\u{FE0E}style");
+    let title = format!("{warning} Status {check}");
+    // A request key is ASCII letters, digits and `._-` by core's rule, so it holds no emoji.
+    let key = "status-1";
+
+    let got = fx.ok("forum_post", json!({"request_key": key, "title": title, "body": body}), &me);
+    assert_eq!(got["result"]["status"], "created", "{got}");
+    let thread = fx.entries(json!({"thread_id": id_of(&got)}), &me);
+    assert_eq!(thread[0]["body"].as_str().unwrap().as_bytes(), body.as_bytes());
+    assert_eq!(thread[0]["envelope"]["title"].as_str().unwrap().as_bytes(), title.as_bytes());
+    let stored: (String, String) = fx
+        .db()
+        .query_row("SELECT body, title FROM forum_posts WHERE id = ?1", [id_of(&got)], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(stored, (body.clone(), title.clone()));
+    // An exact retry is the same post.
+    let again = fx.ok("forum_post", json!({"request_key": key, "title": title, "body": body}), &me);
+    assert_eq!(again["result"]["status"], "duplicate");
+
+    // Their neighbours are still refused.
+    for c in ['\u{200B}', '\u{200C}', '\u{200E}', '\u{2060}', '\u{FEFF}', '\u{202E}'] {
+        let text = fx.invalid("forum_post", json!({"request_key": "k", "title": "T", "body": format!("{warning}{c}")}), &me);
+        assert_eq!(text, forum_store::invisible_text("body"));
+    }
+}
+
+/// R-17.5, second ruling: a joiner or a variation selector inside a credential does not
+/// hide it from test 13's rule, in the body, the title or the request key.
+#[test]
+fn a_credential_split_by_an_emoji_character_is_still_refused() {
+    let mut fx = Fx::new();
+    let cwd = fx.project("a");
+    let me = chat(&cwd, "s-split", &who("a", "ga", None));
+    let expected = "forum: [invalid] the post contains what looks like a credential (a token starting \"ghp_\"); remove it and post again";
+    let halves = ["a1B2c3D4e5F6g7H8i9", "J0k1L2m3N4o5P6q7R8"];
+
+    for c in ['\u{200D}', '\u{FE0F}', '\u{FE00}'] {
+        // In the middle of the value, inside the prefix, and after every character.
+        let middle = ["gh", "p_", halves[0], &c.to_string(), halves[1]].concat();
+        let in_prefix = ["g", &c.to_string(), "hp_", halves[0], halves[1]].concat();
+        let every: String = ["gh", "p_", halves[0], halves[1]].concat().chars().flat_map(|x| [x, c]).collect();
+        for token in [middle, in_prefix, every] {
+            for input in [
+                json!({"request_key": "k", "title": "Deploy notes", "body": format!("use {token} for the deploy")}),
+                json!({"request_key": "k", "title": format!("see {token}"), "body": "a harmless body"}),
+            ] {
+                let text = fx.refused("forum_post", input, &me);
+                assert_eq!(text, expected, "U+{:04X}", c as u32);
+                assert!(!text.contains(halves[0]) && !text.contains(halves[1]));
+            }
+            // A request key cannot hold the character at all: core's rule for the key
+            // refuses it before anything else looks.
+            let text = fx.invalid("forum_post", json!({"request_key": token, "title": "T", "body": "a harmless body"}), &me);
+            assert_eq!(text, "forum: forum request_key must be 1..64 ASCII letters/digits/._-");
+        }
+    }
+    assert_eq!(fx.count("forum_posts"), 0, "no row is written");
 }
