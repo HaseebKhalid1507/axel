@@ -2291,7 +2291,9 @@ fn f2_a_carry_that_takes_the_budget_leaves_recall_none_of_it() {
     let (b, _status) = boot(None, TestHooks::default());
     let (mut st, jobs_rx, _vec_tx) = front::open_state(dirs.ext_config("off"), b);
     assert!(st.cfg.recall);
-    // The forget mark of the carry waits the front thread's 1.5 s for a locked brain.
+    // RULING: v2 c18a review round 2, item 1: the carry's mark no longer waits for a locked
+    // brain; it is kept. The rpc thread's deadline has already passed when the call arrives,
+    // so recall still has none of a budget (by the foreman).
     let holder = Connection::open(dirs.brain()).unwrap();
     holder.execute_batch("BEGIN IMMEDIATE").unwrap();
     let ev = HookEvent {
@@ -2302,7 +2304,7 @@ fn f2_a_carry_that_takes_the_budget_leaves_recall_none_of_it() {
         data: json!({}),
         received_ms: now_ms(),
     };
-    let deadline = Instant::now() + Duration::from_millis(st.cfg.recall_budget_ms);
+    let deadline = Instant::now();
     let call = FrontCall {
         seq: 1,
         carry: Carry { skipped: Vec::new(), forgot: vec!["session-S".to_string()] },
@@ -2310,7 +2312,7 @@ fn f2_a_carry_that_takes_the_budget_leaves_recall_none_of_it() {
     };
     let start = Instant::now();
     let answer = front::handle(&mut st, call);
-    assert!(start.elapsed() >= Duration::from_millis(1_000), "the carry did not wait: {:?}", start.elapsed());
+    assert!(start.elapsed() < Duration::from_millis(500), "the carry waited: {:?}", start.elapsed());
     assert!(matches!(answer, FrontAnswer::Hook(HookOut::Continue)));
     assert_eq!(st.forget_marks.len(), 1);
     let outcomes: Vec<String> = jobs_rx
