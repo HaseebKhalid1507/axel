@@ -2948,6 +2948,78 @@ fn a_far_file_scanned_alone_before_the_files_between_gives_the_same_rows_as_seal
     assert_eq!(run.errors(), 0);
 }
 
+// ── Round 3, item 4: what stands as a neighbour in the sorted pass ──────────
+
+#[test]
+fn a_record_whose_created_ms_is_no_time_stands_as_no_files_neighbour() {
+    let env = Env::new();
+    let dir = scope(KEY);
+    let mut run = env.run();
+    let key = key_of(FORGET_PROMPT);
+    // A mark made long after the newest real file's seal (as in the 1b test).
+    assert!(live_call(&run, "s-notime", T0 + 5 * W, T0 + 5 * W + 1_000, Some(&key)).is_empty());
+    let real = Arch::new(1, "s-notime").at(T0).turn(FORGET_PROMPT, &reply("NEWESTREALFILE"));
+    // Far ahead, and no time a row can hold: the indexer refuses it.
+    let bogus = Arch::new(2, "s-notime").at(9_000_000_000_000_000_000).about("retry limit");
+    env.put_live(&dir, &real);
+    env.put_live(&dir, &bogus);
+    run.scan();
+    let conn = run.db();
+    assert_eq!(state(conn, &dir, &rel(&bogus.id)).and_then(|s| s.1).as_deref(), Some("created_ms is not a time"));
+    assert_eq!(
+        positions(conn, &dir, &real),
+        ["x0.0"],
+        "a record the indexer refuses ended the stretch of the newest real file"
+    );
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_file_that_panics_in_the_sorted_pass_is_no_later_file_for_the_files_after_it() {
+    // C panics. D, after it, is judged with C absent, as the brain will hold it: B's mark
+    // reaches D's same-key turn, which is left out and counted. (B, before C, was judged
+    // with C between; its own step 3b did not reach D, and D took the mark itself.)
+    let env = Env::new();
+    let dir = scope(KEY);
+    let files = four_windows();
+    let mut run = env.run_with(TestHooks { panic_archive_id: Some(files[2].id.clone()), ..TestHooks::default() }, None);
+    for a in &files {
+        env.put_live(&dir, a);
+    }
+    run.scan();
+    let conn = run.db();
+    assert_eq!(state(conn, &dir, &rel(&files[2].id)).and_then(|s| s.1).as_deref(), Some("panic"));
+    assert_eq!(run.panics(), 1);
+    assert_eq!(positions(conn, &dir, &files[0]), ["x0.0"]);
+    assert_eq!(positions(conn, &dir, &files[1]), ["x4.0"]);
+    assert!(rows(conn, &dir, &files[3]).is_empty(), "D was judged with the file that panicked between");
+    assert_eq!(forget_units(conn, &dir, &files[3]), 1);
+    assert_eq!(run.errors(), 0);
+}
+
+#[test]
+fn a_skipped_file_read_again_is_indexed_in_seal_order_with_the_new_files() {
+    // D is indexed while B cannot be read as a record. The next scan finds B whole and A
+    // and C new: B is judged knowing C, which lies between it and D.
+    let dir = scope(KEY);
+    let expect = sealed_in_order();
+    let env = Env::new();
+    let mut run = env.run();
+    let files = four_windows();
+    let b = env.put_live(&dir, &files[1]);
+    std::fs::write(&b, "x".repeat(files[1].json(&dir).len() + 40)).unwrap();
+    env.put_live(&dir, &files[3]);
+    run.scan();
+    assert_eq!(state_of(run.db(), &dir, &files[1]), "skipped");
+    assert_eq!(positions(run.db(), &dir, &files[3]), ["x0.0"]);
+    for a in &files[..3] {
+        env.put_live(&dir, a);
+    }
+    run.scan();
+    assert_eq!(shape(run.db(), &dir, &files), expect, "B was read again before the files between");
+    assert_eq!(run.errors(), 0);
+}
+
 #[test]
 fn a_mark_whose_window_after_is_not_known_yet_takes_the_far_files_turn_and_counts_it() {
     // FINDING (reported, not hidden): "near" is judged from the files known at that

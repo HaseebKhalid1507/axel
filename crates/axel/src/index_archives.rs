@@ -1400,12 +1400,19 @@ pub fn scan(ctx: &mut IndexerCtx) -> Result<()> {
         if !between_files(ctx)? {
             return Ok(());
         }
+        // RULING: wave4 R-13 round 3, item 4. A known `skipped` file that is read again is
+        // indexed in seal order with the new files, knowing the files sealed after it.
+        let dir = root.join(scope_dir);
         let is_new = ctx.cfg.archives
-            && ctx.conn.as_ref().is_some_and(|conn| matches!(known(conn, scope_dir, &entry.rel_name), Ok(None)));
+            && ctx.conn.as_ref().is_some_and(|conn| match known(conn, scope_dir, &entry.rel_name) {
+                Ok(None) => true,
+                Ok(Some(row)) => row.state == "skipped" && read_again(&row, &FileAt::of(&dir, scope_dir, entry)),
+                Err(_) => false,
+            });
         if is_new {
             fresh.push(at);
         } else {
-            one_file(ctx, &root.join(scope_dir), scope_dir, entry, &[])?;
+            one_file(ctx, &dir, scope_dir, entry, &[])?;
         }
     }
     // Each new file is indexed knowing the new files sealed after it (`Seen::later`).
@@ -1450,7 +1457,7 @@ pub fn scan(ctx: &mut IndexerCtx) -> Result<()> {
     Ok(())
 }
 
-/// `(seal time, lstat time, place)` of a file the scan has not seen before: the record's
+/// `(seal time, lstat time, place)` of a file the scan has not indexed yet: the record's
 /// own `created_ms`, or the file's time when the record gives none; `i64::MIN` for a
 /// tombstone and for a file that cannot be read as a record. `place` is the file as one
 /// sealed after another, for a record that gives its time and its chat. Nothing is written.
@@ -1460,14 +1467,19 @@ fn seal_time(dir: &Path, scope_dir: &str, entry: &ArchiveEntry) -> (i64, i64, Op
     let read = catch_unwind(AssertUnwindSafe(|| archive::read_archive(&path, scope_dir, entry.id_from_name.as_deref())));
     match read {
         Ok(Ok(ArchiveFile::Live(a))) => {
-            let place = a.created_ms.filter(|_| !a.logical.is_empty()).map(|cover_ms| Later {
+            // RULING: wave4 R-13 round 3, item 4. The reader's test of a time (as in
+            // `index_archive`): a record whose `created_ms` is no time sorts as one that
+            // gives none, and stands as no file's neighbour.
+            let created_ms =
+                a.created_ms.filter(|ms| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(*ms).is_some());
+            let place = created_ms.filter(|_| !a.logical.is_empty()).map(|cover_ms| Later {
                 scope_dir: scope_dir.to_string(),
                 logical: a.logical.clone(),
                 rel_name: entry.rel_name.clone(),
                 archive_id: a.id.clone(),
                 cover_ms,
             });
-            (a.created_ms.unwrap_or(file_ms), file_ms, place)
+            (created_ms.unwrap_or(file_ms), file_ms, place)
         }
         _ => (i64::MIN, file_ms, None),
     }
@@ -1584,12 +1596,7 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
         },
         "skipped" => {
             let reason = row.skip_reason.as_deref();
-            // A refused file (see `write_refused`) whose time is another now.
-            let touched = row.time_source.as_deref() == Some("mtime")
-                && row.cover_ms.is_none()
-                && row.created_ms.is_some()
-                && mtime_ms(&at.path()) != row.created_ms;
-            if !(changed || touched || (reason == Some("panic") && INDEXER_VERSION > row.indexer_version)) {
+            if !read_again(&row, &at) {
                 return Ok(());
             }
             let got = at.read(None);
@@ -1604,6 +1611,17 @@ fn scan_file(ctx: &IndexerCtx, dir: &Path, scope_dir: &str, entry: &ArchiveEntry
         // Known and the same size, or a tombstone: no open, no read.
         _ => Ok(()),
     }
+}
+
+/// Is a `skipped` file read again: its size changed, it is a refused file (see
+/// `write_refused`) whose time is another now, or it panicked under an older indexer.
+fn read_again(row: &Known, at: &FileAt) -> bool {
+    let changed = row.file_size != Some(at.size);
+    let touched = row.time_source.as_deref() == Some("mtime")
+        && row.cover_ms.is_none()
+        && row.created_ms.is_some()
+        && mtime_ms(&at.path()) != row.created_ms;
+    changed || touched || (row.skip_reason.as_deref() == Some("panic") && INDEXER_VERSION > row.indexer_version)
 }
 
 /// Known `indexed` files that are gone. One whose archive is live in another project
