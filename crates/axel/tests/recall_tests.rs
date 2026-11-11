@@ -1927,7 +1927,7 @@ fn final_3_an_excluded_folder_that_could_not_be_resolved_is_tried_again() {
     let _ = h.before("s2", question);
     let _ = h.trace();
     assert!(recall::times_resolved(&folder) > after_one, "a failed resolve was kept");
-    assert_eq!(RecallConfig::from_ext(&h.ext, NOW).exclude_paths, [link.clone()]);
+    assert_eq!(RecallConfig::from_ext(&h.ext, NOW).exclude_paths, std::slice::from_ref(&link));
 
     // The link is made: the next prompt resolves it.
     std::os::unix::fs::symlink(&real, &link).unwrap();
