@@ -374,4 +374,61 @@ fn forum_on_follows_the_hosts_backend_line() {
     c.base = PathBuf::from("/nonexistent/axel-tests/base");
     c.forum = ForumMode::Auto;
     assert!(c.forum_on());
+    assert_eq!(c.forum_decided_by(), None);
+
+    // RULING: wave2-c12a review finding 1: a profile's config is read too, since the host
+    // may read it instead of the main one.
+    let decided = |mode: ForumMode| {
+        let mut c = cfg(json!({}));
+        c.base = tmp.path().to_path_buf();
+        c.forum = mode;
+        c.forum_decided_by()
+    };
+    let profile = |name: &str, text: &str| {
+        std::fs::create_dir_all(tmp.path().join(name)).unwrap();
+        std::fs::write(tmp.path().join(name).join("config"), text).unwrap();
+    };
+    let sub = tmp.path().join("subconscious/config");
+
+    // The main config says nothing, a profile says axel.
+    write("model = x\n");
+    profile("work", "memory.backend = legacy\n");
+    profile("subconscious", "memory.backend = axel\n");
+    assert!(!with(ForumMode::Auto));
+    assert_eq!(decided(ForumMode::Auto), Some(sub.clone()));
+    // On and off still do not look.
+    assert!(with(ForumMode::On));
+    assert!(!with(ForumMode::Off));
+    assert_eq!(decided(ForumMode::On), None);
+    assert_eq!(decided(ForumMode::Off), None);
+
+    // The main config says legacy, a profile says axel.
+    write("memory.backend = legacy\n");
+    assert!(!with(ForumMode::Auto));
+    assert_eq!(decided(ForumMode::Auto), Some(sub.clone()));
+
+    // The main one decides first when both say axel.
+    write("memory.backend = axel\n");
+    assert_eq!(decided(ForumMode::Auto), Some(tmp.path().join("config")));
+
+    // Main and two profiles legacy or commented out: on.
+    write("memory.backend = legacy\n");
+    profile("subconscious", "# memory.backend = axel\n");
+    assert!(with(ForumMode::Auto));
+    assert_eq!(decided(ForumMode::Auto), None);
+
+    // A file named `config` two levels down is not read.
+    profile("work/deeper", "memory.backend = axel\n");
+    assert!(with(ForumMode::Auto));
+
+    // A file (not a folder) under the base is not a profile.
+    std::fs::write(tmp.path().join("notadir"), "memory.backend = axel\n").unwrap();
+    assert!(with(ForumMode::Auto));
+
+    // A directory that is a link is not followed.
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("config"), "memory.backend = axel\n").unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), tmp.path().join("linked")).unwrap();
+    assert!(with(ForumMode::Auto));
+    assert_eq!(decided(ForumMode::Auto), None);
 }

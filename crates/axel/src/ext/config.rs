@@ -319,27 +319,71 @@ impl ExtConfig {
 
     /// Whether this process declares the forum tools (section 6, "The clash").
     ///
-    /// `on` and `off` are taken as given. `auto` reads `<base>/config`: a line
-    /// `memory.backend = axel` that is not commented out means the host still owns the forum
-    /// and this returns false. No such line, or a config that cannot be read, means on: the
+    /// `on` and `off` are taken as given. `auto` asks `forum_decided_by`: a config file that
+    /// says `memory.backend = axel` (a live line) means the host may still own the forum and
+    /// this returns false. No such line, or a config that cannot be read, means on: the
     /// host's own default for that key is plain files, where its forum tools are disabled.
     /// The caller reads this once, at start.
     pub fn forum_on(&self) -> bool {
         match self.forum {
             ForumMode::On => true,
             ForumMode::Off => false,
-            ForumMode::Auto => {
-                base_config_value(&self.base, "memory.backend").as_deref() != Some("axel")
-            }
+            ForumMode::Auto => self.forum_decided_by().is_none(),
         }
     }
+
+    /// Under `auto`, the first config file that says `memory.backend = axel` (for `status`
+    /// to name); `None` when none does or the mode is not `auto`.
+    ///
+    /// RULING: wave2-c12a review finding 1. The host reads `<base>/<profile>/config` instead
+    /// of `<base>/config` when a profile is active and that file exists, and this process
+    /// cannot learn the profile (cleared environment, no profile in `initialize.params`). So
+    /// every candidate is read: `<base>/config`, then `<dir>/config` for each directory
+    /// directly under the base, by name; any one saying `axel` decides.
+    pub fn forum_decided_by(&self) -> Option<PathBuf> {
+        if self.forum != ForumMode::Auto {
+            return None;
+        }
+        host_config_files(&self.base)
+            .into_iter()
+            .find(|f| config_file_value(f, "memory.backend").as_deref() == Some("axel"))
+    }
+}
+
+/// At most this many entries of the base folder are looked at for profile folders.
+pub const MAX_PROFILE_ENTRIES: usize = 256;
+
+/// `<base>/config`, then `<base>/<dir>/config` for each directory directly under the base
+/// (RULING: wave2-c12a review finding 1). A link is not followed to a directory, nothing
+/// deeper is read, at most `MAX_PROFILE_ENTRIES` entries are looked at and the folders are
+/// sorted by name so the order is stable. A base that cannot be listed gives the main file
+/// alone (missing files read as "no such line").
+fn host_config_files(base: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = match std::fs::read_dir(base) {
+        Ok(entries) => entries
+            .take(MAX_PROFILE_ENTRIES)
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|e| e.path())
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    dirs.sort();
+    let mut files = vec![base.join("config")];
+    files.extend(dirs.into_iter().map(|d| d.join("config")));
+    files
 }
 
 /// The value of `key` in `<base>/config` (`key = value` lines; `#` begins a comment; the
 /// last line for the key wins; quotes around the value are dropped). `None` when the file
 /// cannot be read or has no such line. The reader that `forum = auto` uses (section 6).
 pub fn base_config_value(base: &Path, key: &str) -> Option<String> {
-    let text = std::fs::read_to_string(base.join("config")).ok()?;
+    config_file_value(&base.join("config"), key)
+}
+
+/// `base_config_value` for one config file given by its path.
+fn config_file_value(file: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(file).ok()?;
     let mut found = None;
     for line in text.lines() {
         let line = line.split('#').next().unwrap_or("").trim();
