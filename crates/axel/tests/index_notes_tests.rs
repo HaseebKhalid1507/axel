@@ -64,6 +64,7 @@ fn cfg(root: &Path) -> ExtConfig {
         model_dir: root.join("model"),
         log_queries: false,
         warnings: Vec::new(),
+        home: root.join("home"),
     }
 }
 

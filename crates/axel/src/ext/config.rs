@@ -50,6 +50,9 @@ pub struct ExtConfig {
     pub model_dir: PathBuf,
     pub log_queries: bool,
     pub warnings: Vec<String>,
+    /// The home folder this config was read with: what `~` stood for in its paths, and what
+    /// it stands for in a label. Never `$HOME` read later (wave 4, R-12b item 7).
+    pub home: PathBuf,
 }
 
 /// The default brain for `home`: `<home>/.local/share/axel/brain.r8` (section 1), whatever
@@ -355,6 +358,7 @@ impl ExtConfig {
             model_dir,
             log_queries,
             warnings: r.warnings,
+            home: home.to_path_buf(),
         }
     }
 

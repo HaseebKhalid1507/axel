@@ -1987,3 +1987,14 @@ fn w4_6_after_a_recovery_a_second_failure_does_not_show_the_place_of_the_first()
     assert_eq!((&said["reason"], &said["reason_at"]), (&json!("BrainChanged"), &Value::Null), "{said}");
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
+
+// ── Wave 4, R-12b item 7: the config keeps the home it was read with ────────
+
+#[test]
+fn w4_7_the_config_keeps_the_home_it_was_read_with() {
+    let home = TempDir::new().unwrap();
+    let cfg = ExtConfig::from_initialize(&json!({"config": {"sources": "~/notes/sources.toml"}}), home.path());
+    assert_eq!(cfg.home, home.path());
+    assert_eq!(cfg.sources.as_deref(), Some(home.path().join("notes/sources.toml").as_path()));
+    assert_ne!(Some(cfg.home.as_os_str()), std::env::var_os("HOME").as_deref(), "the test's home is not the process's");
+}

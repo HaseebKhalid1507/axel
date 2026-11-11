@@ -58,6 +58,7 @@ fn cfg() -> ExtConfig {
         model_dir: PathBuf::from("/nonexistent/skeleton/model"),
         log_queries: false,
         warnings: Vec::new(),
+        home: PathBuf::from("/nonexistent/skeleton/home"),
     }
 }
 
