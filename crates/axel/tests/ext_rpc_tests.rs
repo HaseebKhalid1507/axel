@@ -321,10 +321,13 @@ fn the_base_config_reader() {
 /// The extension and the command line must open the same brain when neither is told one.
 #[test]
 fn default_brain_is_the_command_lines_default() {
-    // For the process's own home: exactly `AxelConfig::default()`, whatever the platform
-    // and `XDG_DATA_HOME` make of it.
+    // RULING: wave2-c12a review finding 2: the path is pinned as text, never through
+    // `XDG_DATA_HOME`, so both sides name it whatever the shell sets.
     if let Some(real) = dirs::home_dir() {
-        assert_eq!(default_brain(&real), axel::config::AxelConfig::default().brain_path);
+        let pinned = PathBuf::from(format!("{}/.local/share/axel/brain.r8", real.display()));
+        assert_eq!(default_brain(&real), pinned);
+        assert_eq!(axel::config::AxelConfig::default().brain_path, pinned);
+        assert_eq!(axel::config::data_dir_for(&real), real.join(".local/share"));
     }
     // For another home (a test's): under that home, never under the real one.
     assert_eq!(

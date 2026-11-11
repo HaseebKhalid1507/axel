@@ -52,14 +52,17 @@ pub struct ExtConfig {
     pub warnings: Vec<String>,
 }
 
-/// The default brain for `home` (section 1: `dirs::data_dir()/axel/brain.r8`, which is
-/// `~/.local/share/axel/brain.r8` on Linux without `XDG_DATA_HOME`). For the process's own
-/// home this is the file the command line opens by default (`AxelConfig::default`).
+/// The default brain for `home`: `<home>/.local/share/axel/brain.r8` (section 1), whatever
+/// `XDG_DATA_HOME` says on either side (RULING: wave2-c12a review finding 2;
+/// `config::data_dir_for`). For the process's own home this is the file the command line
+/// opens by default (`AxelConfig::default`).
 pub fn default_brain(home: &Path) -> PathBuf {
     crate::config::data_dir_for(home).join("axel").join("brain.r8")
 }
 
-/// The default model folder under `home` (section 11, "The model").
+/// The default model folder under `home` (section 11, "The model"). `XDG_CACHE_HOME` is
+/// never read, for the reason `config::data_dir_for` gives (RULING: wave2-c12a review
+/// finding 2): the command line's `model fetch` must download here through this function.
 pub fn default_model_dir(home: &Path) -> PathBuf {
     home.join(".cache/velocirag/models/all-MiniLM-L6-v2")
 }

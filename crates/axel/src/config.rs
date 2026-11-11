@@ -2,23 +2,22 @@
 
 use std::path::{Path, PathBuf};
 
-/// The data folder for `home`.
+/// The data folder for `home`: `<home>/.local/share`, always.
 ///
-/// When `home` is this process's own home it is `dirs::data_dir()`, so `XDG_DATA_HOME` and
-/// the platform's rule are honoured and the command line (`AxelConfig::default`) and the
-/// extension (`ext::config::default_brain`) name the same default brain. For any other
-/// `home` (a test's) it is `<home>/.local/share`.
+/// RULING: wave2-c12a review finding 2. `XDG_DATA_HOME` is never read: the host starts the
+/// extension with a cleared environment, so the extension never sees it, while the owner's
+/// shell may set it for the command line. Reading it on one side only would make the
+/// command line (`AxelConfig::default`) and the extension (`ext::config::default_brain`)
+/// name different default brains.
 pub fn data_dir_for(home: &Path) -> PathBuf {
-    match (dirs::data_dir(), dirs::home_dir()) {
-        (Some(data), Some(real)) if real == home => data,
-        _ => home.join(".local/share"),
-    }
+    home.join(".local/share")
 }
 
 /// Plugin configuration, loaded from `~/.synaps-cli/axel.toml`.
 #[derive(Debug, Clone)]
 pub struct AxelConfig {
-    /// Path to the default brain file: `dirs::data_dir()/axel/brain.r8`.
+    /// Path to the default brain file: `<home>/.local/share/axel/brain.r8`, whatever
+    /// `XDG_DATA_HOME` says (`data_dir_for`).
     pub brain_path: PathBuf,
 
     /// Maximum tokens to inject per turn (Tier 0 + Tier 1).
@@ -40,8 +39,10 @@ pub struct AxelConfig {
 impl Default for AxelConfig {
     fn default() -> Self {
         // The v2 brain. `axel.r8` under the config folder is the old brain and is never
-        // the default again.
-        let base = dirs::data_dir()
+        // the default again. RULING: wave2-c12a review finding 2: the same folder as the
+        // extension's default (`data_dir_for`); with no home, `.local/share` relative.
+        let base = dirs::home_dir()
+            .map(|home| data_dir_for(&home))
             .unwrap_or_else(|| PathBuf::from(".local/share"))
             .join("axel");
 
