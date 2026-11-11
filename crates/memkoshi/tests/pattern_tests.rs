@@ -1,6 +1,5 @@
 //! Integration tests for `patterns.rs` — pattern detection over the event log.
 
-use axel_memkoshi::memory::{Memory, MemoryCategory};
 use axel_memkoshi::patterns::{PatternDetector, PatternType};
 use axel_memkoshi::storage::MemoryStorage;
 use tempfile::TempDir;

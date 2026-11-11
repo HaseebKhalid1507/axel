@@ -117,7 +117,7 @@ pub fn reindex_source(
     }
 
     // Prune: anything in DB under this prefix that no longer exists on disk.
-    for (file_path, _) in &indexed {
+    for file_path in indexed.keys() {
         if !seen_on_disk.contains(file_path) && !std::path::Path::new(file_path).exists() {
             if !dry_run {
                 let n = search.db().delete_documents_by_file(file_path)

@@ -236,7 +236,7 @@ impl AxelBrain {
                 abstract_text: r.content.chars().take(200).collect(),
                 category: r.source.clone(),
                 importance: 0.5,
-                relevance_score: r.score as f64,
+                relevance_score: r.score,
             }
         }).collect();
 

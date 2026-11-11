@@ -437,7 +437,7 @@ impl TopicAnalyzer {
         let mut common: Vec<(String, usize)> = all_words.into_iter()
             .filter(|(_, c)| *c >= 2)
             .collect();
-        common.sort_by(|a, b| b.1.cmp(&a.1));
+        common.sort_by_key(|a| std::cmp::Reverse(a.1));
         common.truncate(self.n_topics * 2);
 
         // Group notes by shared words

@@ -466,7 +466,7 @@ pub fn build_graph(
 
                 match embedder.embed(&texts) {
                     Ok(embs) => {
-                        for (node, emb) in chunk.iter().zip(embs.into_iter()) {
+                        for (node, emb) in chunk.iter().zip(embs) {
                             node_embeddings.push((node.id.clone(), emb));
                         }
                     }

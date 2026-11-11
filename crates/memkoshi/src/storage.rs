@@ -258,10 +258,8 @@ impl MemoryStorage {
         let mut deleted_count = 0u64;
         
         for memory in all_memories {
-            if memory.is_expired() {
-                if self.delete_memory(&memory.id)? {
-                    deleted_count += 1;
-                }
+            if memory.is_expired() && self.delete_memory(&memory.id)? {
+                deleted_count += 1;
             }
         }
         

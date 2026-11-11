@@ -63,7 +63,7 @@ pub fn strengthen(search: &BrainSearch, dry_run: bool, verbose: bool) -> Result<
     if !doc_ids.is_empty() {
         // Chunk to stay under SQLite's parameter limit (default 32766).
         for chunk in doc_ids.chunks(500) {
-            let placeholders = std::iter::repeat("?").take(chunk.len()).collect::<Vec<_>>().join(",");
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT doc_id, excitability FROM documents WHERE doc_id IN ({placeholders})"
             );

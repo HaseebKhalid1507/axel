@@ -790,7 +790,7 @@ mod episodic_storage_tests {
 
     #[test]
     fn all_typed_record_classes_have_the_required_storage_class() {
-        let records = vec![
+        let records = [
             EpisodicRecord::Turn(EpisodicTurn {
                 content: "turn".into(),
                 source_session_id: None,

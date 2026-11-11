@@ -107,7 +107,7 @@ fn legacy_r8_opens_migrates_and_old_rows_stay_out_of_project_scope() {
     }
 
     // Opening with the new code must migrate without error…
-    let mut brain = AxelBrain::open(&path).unwrap();
+    let brain = AxelBrain::open(&path).unwrap();
     // …keep the legacy row readable through the legacy API…
     assert!(brain.memories(10).unwrap().iter().any(|m| m.id == "mem_legacy1"));
     // …and NOT leak it into any project scope (fail closed by default).

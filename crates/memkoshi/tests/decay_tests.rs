@@ -27,18 +27,6 @@ fn make_memory(importance: f64) -> Memory {
     m
 }
 
-/// Backdate the `created` column of a memory in the DB by `days_ago` days.
-fn backdate_memory(storage: &MemoryStorage, id: &str, days_ago: i64) {
-    let conn = storage.conn();
-    let ts = (chrono::Utc::now() - chrono::Duration::days(days_ago))
-        .to_rfc3339();
-    conn.execute(
-        "UPDATE memories SET created = ?1 WHERE id = ?2",
-        rusqlite::params![ts, id],
-    )
-    .unwrap();
-}
-
 /// Insert a `memory_access` row with a timestamp `days_ago` days in the past.
 fn insert_access_at(storage: &MemoryStorage, memory_id: &str, days_ago: i64) {
     let conn = storage.conn();
@@ -68,7 +56,7 @@ fn get_importance(storage: &MemoryStorage, id: &str) -> f64 {
 #[test]
 fn boost_increases_importance_for_recently_accessed() {
     let (_dir, storage) = tmp_storage();
-    let mut mem = make_memory(0.5);
+    let mem = make_memory(0.5);
     storage.store_memory(&mem).unwrap();
 
     // Record an access that happened 2 days ago (well within the 7-day boost window).

@@ -57,11 +57,7 @@ pub fn reciprocal_rank_fusion(
     let total: usize = results_lists.iter().map(|r| r.len()).sum();
     let max_per_set = if total > MAX_FUSION_RESULTS {
         let valid_count = results_lists.iter().filter(|r| !r.is_empty()).count();
-        if valid_count > 0 {
-            MAX_FUSION_RESULTS / valid_count
-        } else {
-            0
-        }
+        MAX_FUSION_RESULTS.checked_div(valid_count).unwrap_or(0)
     } else {
         usize::MAX
     };

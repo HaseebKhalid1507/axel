@@ -35,7 +35,7 @@ fn main() {
     let mut files: Vec<_> = walkdir::WalkDir::new(notes_dir)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "md"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "md"))
         .collect();
     files.sort_by_key(|e| e.path().to_path_buf());
 

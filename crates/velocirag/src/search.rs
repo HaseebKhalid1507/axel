@@ -337,7 +337,7 @@ impl<'a> SearchEngine<'a> {
         Ok(())
     }
 
-    fn apply_excitability_boost(&self, fused: &mut Vec<FusedResult>) {
+    fn apply_excitability_boost(&self, fused: &mut [FusedResult]) {
         if !fused.is_empty() {
             let placeholders: Vec<String> = (0..fused.len()).map(|i| format!("?{}", i + 1)).collect();
             let sql = format!(
@@ -798,6 +798,6 @@ fn extract_top_terms(text: &str, n: usize) -> Vec<String> {
     }
 
     let mut sorted: Vec<_> = counts.into_iter().collect();
-    sorted.sort_by(|a, b| b.1.cmp(&a.1));
+    sorted.sort_by_key(|a| std::cmp::Reverse(a.1));
     sorted.into_iter().take(n).map(|(w, _)| w).collect()
 }

@@ -417,7 +417,7 @@ fn cmd_index_sync(
     // Prune: anything in DB under this prefix that wasn't seen on disk.
     let mut pruned = 0usize;
     if !no_prune {
-        for (file_path, _) in &indexed {
+        for file_path in indexed.keys() {
             if !seen_on_disk.contains(file_path) && !std::path::Path::new(file_path).exists() {
                 let n = search.db().delete_documents_by_file(file_path)
                     .map_err(|e| format!("Delete failed: {e}"))?;
@@ -539,7 +539,7 @@ fn cmd_consolidate(
         let mut lines = Vec::new();
         lines.push(format!("# Consolidation Report — {}", chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")));
         lines.push(String::new());
-        lines.push(format!("## Summary"));
+        lines.push("## Summary".to_string());
         lines.push(format!("- Reindex: {} checked, {} reindexed, {} new, {} pruned",
             stats.reindex.checked, stats.reindex.reindexed, stats.reindex.new_files, stats.reindex.pruned));
         lines.push(format!("- Strengthen: {} boosted, {} decayed, {} extinction",
@@ -596,7 +596,8 @@ fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Er
          FROM consolidation_log ORDER BY id DESC LIMIT 20"
     )?;
 
-    let rows: Vec<(i64, String, Option<String>, i64, i64, i64, i64, i64, i64, i64, i64, f64)> = stmt
+    type HistoryRow = (i64, String, Option<String>, i64, i64, i64, i64, i64, i64, i64, i64, f64);
+    let rows: Vec<HistoryRow> = stmt
         .query_map([], |row| {
             Ok((
                 row.get(0)?, row.get(1)?, row.get(2)?,
