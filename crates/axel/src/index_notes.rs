@@ -20,6 +20,7 @@ use crate::ext::types::{Clock, IndexerCtx, Mode};
 use crate::notes::{self, NoteRecord, NoteSensitivity, NotesError, NotesFile};
 use crate::project_memory::{RecordLinks, Sensitivity};
 use crate::store::{self, Inserted, NewRow};
+use crate::vindex::{VecDelta, VecKey};
 use crate::{brain_v2, index_archives, project};
 
 const DAY_MS: i64 = 86_400_000;
@@ -98,8 +99,9 @@ pub fn pass_counted(ctx: &mut IndexerCtx) -> Result<PassReport> {
         let got = catch_unwind(AssertUnwindSafe(|| {
             one_file(conn, ctx.signer.as_ref(), &dir, name, &ctx.clock, &mut report)
         }));
-        if isolated(ctx, name, got)?.is_none() {
-            report.files_failed += 1;
+        match isolated(ctx, name, got)? {
+            Some(removed) => send_removed(ctx, removed),
+            None => report.files_failed += 1,
         }
     }
 
@@ -120,9 +122,10 @@ pub fn pass_counted(ctx: &mut IndexerCtx) -> Result<PassReport> {
             }
             let got = catch_unwind(AssertUnwindSafe(|| gone_file(conn, name, path_text)));
             match isolated(ctx, name, got)? {
-                Some(purged) => {
-                    report.purged += purged;
+                Some(removed) => {
+                    report.purged += removed.len();
                     report.files_gone += 1;
+                    send_removed(ctx, removed);
                 }
                 None => report.files_failed += 1,
             }
@@ -130,6 +133,28 @@ pub fn pass_counted(ctx: &mut IndexerCtx) -> Result<PassReport> {
         report.listed = true;
     }
     Ok(report)
+}
+
+/// After the commit of a purge: the front thread's index drops the vectors of the rows that
+/// left (`store::purge_many`: "the caller sends `VecDelta::Remove` after the commit"). With
+/// no receiver (the front thread is gone) there is no index to correct.
+// RULING: wave 4, R-14 item 4.
+fn send_removed(ctx: &IndexerCtx, vids: Vec<i64>) {
+    if !vids.is_empty() {
+        let _ = ctx.vec_tx.send(VecDelta::Remove(vids.into_iter().map(VecKey::Mem).collect()));
+    }
+}
+
+/// The `memory_ext.vid` of each id that has one: the keys of their vectors.
+fn vids_of(conn: &Connection, ids: &[String]) -> Result<Vec<i64>> {
+    let mut stmt = conn.prepare("SELECT vid FROM memory_ext WHERE mem_id = ?1")?;
+    let mut vids = Vec::new();
+    for id in ids {
+        if let Some(vid) = stmt.query_row([id], |r| r.get::<_, i64>(0)).optional()? {
+            vids.push(vid);
+        }
+    }
+    Ok(vids)
 }
 
 /// What the work of one file gave, taken the way the archive scan takes it
@@ -178,14 +203,21 @@ pub fn on_forgotten(ctx: &mut IndexerCtx, id: &str, project_key: &str) -> Result
         return Ok(());
     }
     brain_v2::begin_write(conn)?;
-    let work = || -> Result<()> {
-        if found(conn)? && store::purge_many(conn, &[id.to_string()], false, true)? > 0 {
-            index_archives::mark_purged(conn)?;
+    let work = || -> Result<Vec<i64>> {
+        let ids = [id.to_string()];
+        let mut removed = Vec::new();
+        if found(conn)? {
+            removed = vids_of(conn, &ids)?;
+            if store::purge_many(conn, &ids, false, true)? > 0 {
+                index_archives::mark_purged(conn)?;
+            }
         }
         conn.execute_batch("COMMIT")?;
-        Ok(())
+        Ok(removed)
     };
-    work().inspect_err(|_| rollback(conn))
+    let removed = work().inspect_err(|_| rollback(conn))?;
+    send_removed(ctx, removed);
+    Ok(())
 }
 
 /// Core's test of a note id (`valid_import_id`): 1 to 128 bytes, no white space, no
@@ -244,16 +276,16 @@ fn one_file(
     name: &str,
     clock: &Clock,
     report: &mut PassReport,
-) -> Result<()> {
-    let Some(key) = key_of(name) else { return Ok(()) };
+) -> Result<Vec<i64>> {
+    let Some(key) = key_of(name) else { return Ok(Vec::new()) };
     let path = dir.join(name);
     let path_text = path.to_string_lossy().into_owned();
     // SPEC: 2318-2319 "regular files only": a listed name that cannot be `lstat`ed, or is
     // not a regular file (a link, a folder), is left alone, and so are its rows: it was
     // listed, so it is not "gone", and it was not read, so it says nothing.
-    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Ok(()) };
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Ok(Vec::new()) };
     if !meta.file_type().is_file() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let seen = (i64::try_from(meta.len()).unwrap_or(i64::MAX), mtime_ns(&meta));
     let stored = stored_row(conn, &path_text)?;
@@ -263,14 +295,14 @@ fn one_file(
     let same = stored.as_ref().is_some_and(|s| (s.size, s.mtime_ns) == seen);
     if same && stored.as_ref().is_some_and(|s| s.ok) {
         report.files_unchanged += 1;
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let file = match notes::read_file(&path, key) {
         Ok(file) => file,
         Err(NotesError::Changed) => {
             report.files_changed += 1;
-            return Ok(());
+            return Ok(Vec::new());
         }
         Err(refused) => {
             // `ok = 0` with the reason and the size and time seen; the mirror, the live
@@ -279,7 +311,7 @@ fn one_file(
             let reason = refused.to_string();
             report.files_refused += 1;
             if same && stored.as_ref().is_some_and(|s| !s.ok && s.reason.as_deref() == Some(reason.as_str())) {
-                return Ok(());
+                return Ok(Vec::new());
             }
             brain_v2::begin_write(conn)?;
             let work = || -> Result<()> {
@@ -294,7 +326,7 @@ fn one_file(
                 Ok(())
             };
             work().inspect_err(|_| rollback(conn))?;
-            return Ok(());
+            return Ok(Vec::new());
         }
     };
 
@@ -306,7 +338,8 @@ fn one_file(
     report.inserted += done.inserted;
     report.purged += done.purged;
     report.rewritten += done.rewritten;
-    Ok(())
+    // The vector keys of the rows that left, for the caller to send now that it committed.
+    Ok(done.removed)
 }
 
 /// What [`mirror`] did to the rows of one file.
@@ -315,12 +348,15 @@ struct Mirrored {
     inserted: usize,
     purged: usize,
     rewritten: usize,
+    /// The `vid` of every row purged, rewritten ones included.
+    removed: Vec<i64>,
 }
 
 /// The row an id already has, whatever made it.
 struct Existing {
     origin_kind: Option<String>,
     origin_ref: Option<String>,
+    vid: Option<i64>,
     hidden_ms: Option<i64>,
     hidden_by: Option<String>,
     title: String,
@@ -334,13 +370,14 @@ fn existing_row(conn: &Connection, id: &str) -> Result<Option<Existing>> {
     Ok(conn
         .query_row(
             "SELECT e.origin_kind, e.origin_ref, e.hidden_ms, e.hidden_by,
-                    m.title, m.content, m.sensitivity, m.tags, m.expires_at
+                    m.title, m.content, m.sensitivity, m.tags, m.expires_at, e.vid
                FROM memories m LEFT JOIN memory_ext e ON e.mem_id = m.id WHERE m.id = ?1",
             [id],
             |r| {
                 Ok(Existing {
                     origin_kind: r.get(0)?,
                     origin_ref: r.get(1)?,
+                    vid: r.get(9)?,
                     hidden_ms: r.get(2)?,
                     hidden_by: r.get(3)?,
                     title: r.get(4)?,
@@ -404,6 +441,7 @@ fn mirror(
                 .cloned(),
         );
     }
+    let mut removed = vids_of(conn, &leave)?;
     let purged = store::purge_many(conn, &leave, false, true)?;
 
     // Inserts, and notes whose record changed under the same id.
@@ -434,6 +472,7 @@ fn mirror(
             store::purge_many(conn, std::slice::from_ref(&note.id), false, true)?;
             rewritten += 1;
             rewrote = true;
+            removed.extend(old.vid);
             row.hidden = old.hidden_ms.map(|ms| (ms, old.hidden_by.unwrap_or_default()));
         }
         // SPEC: 2346 "`created_ms` = `timestamp_ms`": a time the row writer cannot store
@@ -483,7 +522,7 @@ fn mirror(
                 last_seen_ms = MAX(projects.last_seen_ms, excluded.last_seen_ms)",
         params![scope_dir, key, now],
     )?;
-    Ok(Mirrored { inserted, purged, rewritten })
+    Ok(Mirrored { inserted, purged, rewritten, removed })
 }
 
 /// The ids this file has mirrored: `origin_kind = 'note_file'`, `origin_ref` = its name.
@@ -496,21 +535,28 @@ fn rows_of(conn: &Connection, name: &str) -> Result<Vec<String>> {
 }
 
 fn new_row<'a>(note: &NoteRecord, scope_dir: &'a str, name: &'a str) -> NewRow<'a> {
-    let mut tags = note.tags.clone();
-    let sensitivity = match note.sensitivity {
-        NoteSensitivity::Normal => Sensitivity::Normal,
+    // RULING: wave 4, R-14 item 4: the tags of a note pass the screen, as its text does in
+    // the row writer; a secret note stores no tags at all (a tag is copied where the body
+    // is not). The title is cut from the redacted text, as an archive's is.
+    let screened = |tags: &[String]| -> Vec<String> {
+        tags.iter().map(|t| crate::screen::redact(t).text.into_owned()).collect()
+    };
+    let (sensitivity, tags) = match note.sensitivity {
+        NoteSensitivity::Normal => (Sensitivity::Normal, screened(&note.tags)),
         NoteSensitivity::Sensitive => {
+            let mut tags = screened(&note.tags);
             if !tags.iter().any(|t| t == "sensitive") {
                 tags.push("sensitive".to_string());
             }
-            Sensitivity::Normal
+            (Sensitivity::Normal, tags)
         }
-        NoteSensitivity::Secret => Sensitivity::Secret,
+        NoteSensitivity::Secret => (Sensitivity::Secret, Vec::new()),
     };
     let title = match sensitivity {
         Sensitivity::Secret => SECRET_TITLE.to_string(),
         Sensitivity::Normal => {
-            note.content.split_whitespace().take(TITLE_WORDS).collect::<Vec<_>>().join(" ")
+            let redacted = crate::screen::redact(&note.content);
+            redacted.text.split_whitespace().take(TITLE_WORDS).collect::<Vec<_>>().join(" ")
         }
     };
     // SPEC: 2348-2349: an expiry past what a time can hold is no expiry.
@@ -571,15 +617,17 @@ fn gone_files(conn: &Connection, dir: &Path, names: &[String]) -> Result<Vec<(St
 }
 
 /// Step 4, one file that is gone: its rows are purged without a tombstone and its
-/// `note_files` row is deleted, in one transaction. Returns the rows purged. After an `Err`
-/// or a panic the caller rolls back ([`isolated`]).
-fn gone_file(conn: &Connection, name: &str, path_text: &str) -> Result<usize> {
+/// `note_files` row is deleted, in one transaction. Returns the `vid` of each row purged.
+/// After an `Err` or a panic the caller rolls back ([`isolated`]).
+fn gone_file(conn: &Connection, name: &str, path_text: &str) -> Result<Vec<i64>> {
     brain_v2::begin_write(conn)?;
-    let purged = store::purge_many(conn, &rows_of(conn, name)?, false, true)?;
+    let ids = rows_of(conn, name)?;
+    let removed = vids_of(conn, &ids)?;
+    let purged = store::purge_many(conn, &ids, false, true)?;
     if purged > 0 {
         index_archives::mark_purged(conn)?;
     }
     conn.execute("DELETE FROM note_files WHERE path = ?1", [path_text])?;
     conn.execute_batch("COMMIT")?;
-    Ok(purged)
+    Ok(removed)
 }

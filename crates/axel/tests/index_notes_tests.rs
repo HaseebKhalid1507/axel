@@ -20,7 +20,7 @@ use axel::index_notes::{self, PassReport};
 use axel::project::project_dir;
 use axel::project_memory::{RecordLinks, Sensitivity};
 use axel::store::{self, Inserted, NewRow};
-use axel::vindex::VecDelta;
+use axel::vindex::{VecDelta, VecKey};
 use rusqlite::Connection;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -36,7 +36,7 @@ struct World {
     base: PathBuf,
     ctx: IndexerCtx,
     _jobs_rx: Receiver<Job>,
-    _vec_rx: Receiver<VecDelta>,
+    vec_rx: Receiver<VecDelta>,
 }
 
 fn cfg(root: &Path) -> ExtConfig {
@@ -98,7 +98,7 @@ fn world() -> World {
         test,
         writing: Arc::new(AtomicBool::new(false)),
     };
-    World { _tmp: tmp, base, ctx, _jobs_rx: jobs_rx, _vec_rx: vec_rx }
+    World { _tmp: tmp, base, ctx, _jobs_rx: jobs_rx, vec_rx }
 }
 
 impl World {
@@ -1133,4 +1133,131 @@ fn a_gone_file_whose_purge_fails_does_not_stop_the_next_gone_file() {
     assert_eq!((report.files_failed, report.files_gone, report.purged), (0, 1, 3));
     assert_eq!(w.notes(), ids(&[]));
     assert_eq!(w.nf_rows(), 0);
+}
+
+// ── Wave 4, R-14 items 4 and 5: the screen, the vectors, the log, the folder ─
+
+impl World {
+    fn vid(&self, id: &str) -> i64 {
+        self.count(&format!("SELECT vid FROM memory_ext WHERE mem_id = '{id}'"))
+    }
+
+    /// Every vector key the indexer told the front thread to drop since the last call.
+    fn removed(&self) -> Vec<VecKey> {
+        let mut keys = Vec::new();
+        while let Ok(delta) = self.vec_rx.try_recv() {
+            match delta {
+                VecDelta::Remove(more) => keys.extend(more),
+                _ => panic!("the notes pass sends nothing but Remove"),
+            }
+        }
+        keys.sort();
+        keys
+    }
+}
+
+/// A token of the kind the screen blanks; put together here so that this file holds none.
+fn token() -> String {
+    format!("{}{}{}", "AKIA", "ABCDEFGH", "12345678")
+}
+
+/// The redaction of a note: the token is in no column of the row, in no word row, and in
+/// no tag; a secret note stores no tags.
+#[test]
+fn a_note_is_stored_through_the_screen_and_a_secret_note_stores_no_tags() {
+    let mut w = world();
+    let token = token();
+    let text = format!("the deploy key is {token} and the harbour is quiet");
+    let stored = axel::screen::redact(&text);
+    assert_eq!(stored.blanked, 1, "the test needs a token the screen blanks");
+    let tag = token.clone();
+    assert!(!axel::screen::redact(&tag).text.contains(&token), "the test needs a tag the screen blanks");
+    let secret_text = format!("the vault word is {token}");
+    w.write(
+        KEY,
+        &format!(
+            "{}{}{}",
+            rec_full(N1, 1_700_000_000_000, &text, &["plain", &tag], None, None),
+            rec_full(N2, 1_700_000_000_100, "two is sensitive", &[&tag], Some("sensitive"), None),
+            rec_full("mem-secret", 1_700_000_000_200, &secret_text, &["creds", &tag], Some("secret"), None),
+        ),
+    );
+    assert_eq!(w.pass().inserted, 3);
+
+    assert_eq!(w.content(N1).unwrap(), stored.text);
+    let title = w.text("SELECT title FROM memories WHERE id = ?1", N1).unwrap();
+    assert_eq!(title, stored.text, "the title is the first 12 words of the redacted text");
+    for id in [N1, N2] {
+        for column in ["title", "abstract_text", "content", "tags", "provenance"] {
+            let value = w.text(&format!("SELECT {column} FROM memories WHERE id = ?1"), id).unwrap();
+            assert!(!value.contains(&token), "{id}: {column} holds the token: {value}");
+        }
+    }
+    let screened_tag = axel::screen::redact(&tag).text.into_owned();
+    assert_eq!(
+        w.text("SELECT tags FROM memories WHERE id = ?1", N1).unwrap(),
+        json!(["plain", screened_tag]).to_string()
+    );
+    assert_eq!(
+        w.text("SELECT tags FROM memories WHERE id = ?1", N2).unwrap(),
+        json!([screened_tag, "sensitive"]).to_string()
+    );
+    assert_eq!(w.text("SELECT tags FROM memories WHERE id = ?1", "mem-secret").unwrap(), "[]");
+    assert_eq!(w.count("SELECT count(*) FROM memories WHERE tags LIKE '%creds%'"), 0);
+    let words: String = w
+        .conn()
+        .query_row("SELECT group_concat(title || ' ' || abstract || ' ' || content, ' ') FROM memories_fts", [], |r| r.get(0))
+        .unwrap();
+    assert!(!words.contains(&token) && !words.contains("vault"), "{words}");
+
+    // The same file again, read: the stored rows are what the screen makes of the records,
+    // so nothing is rewritten.
+    let body = fs::read_to_string(w.file(KEY)).unwrap();
+    w.write(KEY, &body);
+    let report = w.pass();
+    assert_eq!((report.files_read, report.rewritten), (1, 0));
+}
+
+/// After the commit of every purge the front thread is told to drop the vectors.
+#[test]
+fn the_front_index_is_told_to_drop_the_vector_of_every_row_that_left() {
+    let mut w = three_mirrored();
+    w.write(KEY_B, &rec_of(KEY_B, "mem-next", 9, "a note of the next file"));
+    w.pass();
+    assert_eq!(w.removed(), Vec::new(), "nothing left yet");
+    let (v1, v2, v3, v4) = (w.vid(N1), w.vid(N2), w.vid(N3), w.vid("mem-next"));
+
+    // A tombstone line.
+    w.write(KEY, &format!("{}{}{}{}", n1(), n2(), n3(), tomb(N2)));
+    w.pass();
+    assert_eq!(w.removed(), vec![VecKey::Mem(v2)]);
+    // A note rewritten under its id: the old row's vector goes.
+    w.write(KEY, &format!("{}{}{}", rec(N1, 1_700_000_000_000, "the first note is about omega"), n3(), tomb(N2)));
+    assert_eq!(w.pass().rewritten, 1);
+    assert_eq!(w.removed(), vec![VecKey::Mem(v1)]);
+    // The forget event.
+    index_notes::on_forgotten(&mut w.ctx, N3, KEY).unwrap();
+    assert_eq!(w.removed(), vec![VecKey::Mem(v3)]);
+    index_notes::on_forgotten(&mut w.ctx, N3, KEY).unwrap();
+    assert_eq!(w.removed(), Vec::new());
+    // A file that is gone.
+    fs::remove_file(w.file(KEY_B)).unwrap();
+    assert_eq!(w.pass().files_gone, 1);
+    assert_eq!(w.removed(), vec![VecKey::Mem(v4)]);
+}
+
+/// Nothing is sent for a purge that was rolled back.
+#[test]
+fn no_vector_is_dropped_for_a_purge_that_did_not_commit() {
+    let mut w = three_mirrored();
+    w.conn()
+        .execute_batch(
+            "CREATE TRIGGER test_abort BEFORE INSERT ON memory_ext WHEN NEW.mem_id = 'mem-boom'
+             BEGIN SELECT RAISE(ABORT, 'test: this note is refused'); END;",
+        )
+        .unwrap();
+    w.write(KEY, &format!("{}{}{}{}{}", n1(), n2(), n3(), tomb(N2), rec("mem-boom", 9, "the note that fails")));
+    assert_eq!(w.pass().files_failed, 1);
+    assert_eq!(w.notes(), ids(&[N1, N3, N2]));
+    assert_eq!(w.removed(), Vec::new());
 }
