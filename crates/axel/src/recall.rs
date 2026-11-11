@@ -1520,10 +1520,14 @@ pub fn on_before_message_until(st: &mut FrontState, ev: &HookEvent, recall_allow
         // (a worker), a host message, a chat filed elsewhere and a hook with no project are
         // never captured, so the log keeps no text of them. A turn that ends withheld or
         // marked is known only later: capture then calls `drop_logged_turn`.
+        // RULING: v2 final capture round, item 2: a message inside a turn a forget call
+        // marked, or one core withholds, is never stored either (recall runs before the
+        // capture of this message, so the pending buffer is the turn it belongs to).
         let never_captured = session_id.is_none_or(str::is_empty)
             || host.is_some()
             || elsewhere
-            || view.project.is_none();
+            || view.project.is_none()
+            || session_id.is_some_and(|s| st.capture.holds_no_text(s));
         let mut cfg = RecallConfig::from_ext(&st.cfg, now);
         cfg.model_loaded = st.status.model_loaded.load(Ordering::Relaxed);
         let req = RecallRequest {

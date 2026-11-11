@@ -218,6 +218,9 @@ pub fn handle(st: &mut FrontState, call: FrontCall) -> FrontAnswer {
         FrontWork::Hook { ev, recall_allowed, deadline } => {
             if !ready {
                 if let Some(sid) = ev.session_id.as_deref() { st.capture.drop_session(sid); }
+                // RULING: v2 final capture round, item 2: a marked or withheld turn let go
+                // here still reaches `write_turn`.
+                capture::after_let_go(st);
                 return FrontAnswer::Hook(HookOut::Continue);
             }
             // RULING: v2 front follow-up, item 2. Recall works to the rpc thread's deadline,
@@ -255,10 +258,8 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
         st.capture.drop_session(session_id);
     }
     // The turns let go here are counted now, not at the next capture hook of any chat.
-    let dropped = st.capture.take_dropped();
-    if dropped > 0 && st.cfg.capture {
-        st.status.turns_dropped.fetch_add(dropped, Ordering::Relaxed);
-    }
+    // RULING: v2 final capture round, item 2: and a marked or withheld one is sent.
+    capture::after_let_go(st);
     // A chat in which core's `memory_forget` was called: the turn is not to be learned.
     for session_id in &carry.forgot {
         let _ = mark_forgotten(st, session_id);

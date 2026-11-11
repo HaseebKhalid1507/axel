@@ -1802,3 +1802,87 @@ fn final_1_a_prompt_replaced_before_the_forget_call_is_forgotten_too() {
     assert!(cap.replaced_keys("t").is_empty());
     assert_eq!(cap.suppress("t").map(|(from, _)| from), Some(50));
 }
+
+/// The next log job on the queue; other jobs are passed over.
+fn next_log(jobs: &Receiver<Job>) -> Option<recall::RecallTrace> {
+    loop {
+        match jobs.try_recv() {
+            Ok(Job::LogRecall(trace)) => return Some(*trace),
+            Ok(_) => continue,
+            Err(_) => return None,
+        }
+    }
+}
+
+/// A clock the test moves.
+fn clock_at(st: &mut FrontState, ms: i64) -> Arc<std::sync::atomic::AtomicI64> {
+    let at = Arc::new(std::sync::atomic::AtomicI64::new(ms));
+    let read = at.clone();
+    st.clock = Arc::new(move || read.load(Ordering::SeqCst));
+    at
+}
+
+/// Item 2 (silverhand 2): a message inside a marked or withheld turn leaves no text in the
+/// log, and such a turn let go before its end (here: the session ends) still reaches
+/// `write_turn`: the mark ends when it was let go and the turn's log rows go, also when the
+/// queue refuses the turn.
+// RULING: v2 final capture round, item 2
+#[test]
+fn final_2_a_marked_or_withheld_turn_let_go_before_its_end_still_closes_and_keeps_no_log_text() {
+    let lab = Lab::new();
+    let (mut ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    let clock = clock_at(&mut st, 1_600);
+    let marked = "forget the phone number of Bob that I gave you this morning";
+    let withheld = "the db password is hunter2, keep it for the deploy tonight";
+    let later = "and the number of Alice as well, from the same message";
+    assert!(screen::core_withholds(withheld) && !screen::core_withholds(later));
+
+    // S: a turn marked by a forget call. W: a withheld turn.
+    user(&mut st, "S", &cwd, marked, 1_000);
+    assistant(&mut st, "S", &cwd, "I will call the forget tool for that number.", true, 1_500);
+    let _ = forget_call(&mut st, "S", &cwd);
+    assert_eq!(to_ms(ctx_conn(&ctx), "S"), 1_600);
+    user(&mut st, "W", &cwd, withheld, 1_000);
+    assert!(st.capture.holds_no_text("S") && st.capture.holds_no_text("W"));
+
+    // A later message of each: recall keeps no preview and no words of it. Another chat's
+    // message, for comparison, keeps them.
+    for chat in ["S", "W", "T"] {
+        let ev = hook("before_message", Some(chat), Some(&cwd), Some(later), json!({}), 2_000);
+        let _ = recall::on_before_message(&mut st, &ev, true);
+        let trace = next_log(&jobs).expect("a log job");
+        let kept = (trace.query_preview.is_some(), trace.query_tokens.is_empty());
+        assert_eq!(kept, if chat == "T" { (true, false) } else { (false, true) }, "{chat}: {trace:?}");
+        capture::on_user_event(&mut st, &ev);
+    }
+    assert!(!st.capture.holds_no_text("T"));
+
+    // Log rows of the two turns (as an older binary would have written them).
+    for chat in ["S", "W"] {
+        log_at(&mut ctx, chat, later, true, 2_000);
+    }
+    log_at(&mut ctx, "S", "what did the review say about the archive reader", true, 500);
+
+    // S's session ends before its last reply: the turn is sent, ending now.
+    clock.store(5_000, Ordering::SeqCst);
+    capture::on_session_end_event(&mut st, &hook("on_session_end", Some("S"), Some(&cwd), None, json!({}), 5_000));
+    let turn = next_capture(&jobs).expect("the marked turn was thrown away");
+    assert!(turn.suppressed);
+    assert_eq!((turn.session_id.as_str(), turn.started_ms, turn.at_ms), ("S", 1_000, 5_000));
+    assert_eq!((turn.prompt.as_str(), turn.reply.as_str()), ("", ""));
+    indexer::dispatch(&mut ctx, Job::Capture(turn));
+    assert_eq!(to_ms(ctx_conn(&ctx), "S"), 5_000, "the mark still ends at the call");
+    assert_eq!(log_times(ctx_conn(&ctx), "S"), [500], "a log row of the marked turn survived");
+
+    // W is let go by a reply hook with no `has_tool_use` while the queue is full: the front
+    // writes it.
+    while st.jobs.try_send(Job::Tick).is_ok() {}
+    clock.store(6_000, Ordering::SeqCst);
+    let bare = hook("on_message_complete", Some("W"), Some(&cwd), Some("Noted."), json!({}), 6_000);
+    capture::on_assistant_event(&mut st, &bare);
+    assert!(!st.capture.is_pending("W"));
+    assert_eq!(log_times(ctx_conn(&ctx), "W"), Vec::<i64>::new(), "a log row of the withheld turn survived");
+    assert_eq!(dropped(&status), 0, "a marked or withheld turn is not a dropped one");
+    nothing_stored(ctx_conn(&ctx));
+}

@@ -46,6 +46,9 @@ pub struct CaptureState {
     dropped: u64,
     /// Tokens blanked in the turns completed since `take_blanked` was last called.
     blanked: u64,
+    /// Marked or withheld buffers let go before their turn ended, by session, for
+    /// `take_released`.
+    released: Vec<(String, TurnBuffer)>,
 }
 
 struct TurnBuffer {
@@ -155,13 +158,45 @@ impl CaptureState {
         std::mem::take(&mut self.blanked)
     }
 
-    /// Removes the chat's buffer and counts the turn that goes with it.
+    /// Removes the chat's buffer and counts the turn that goes with it. A marked or
+    /// withheld buffer is not thrown away: `take_released` hands it out as a turn.
     fn let_go(&mut self, session_id: &str) {
         if let Some(buf) = self.pending.remove(session_id) {
             if !buf.suppressed && !buf.withheld {
                 self.dropped += 1;
+            } else {
+                // RULING: v2 final capture round, item 2. Its mark's end must still move
+                // and its log rows must still go: it reaches `write_turn` as a turn.
+                self.released.push((session_id.to_string(), buf));
             }
         }
+    }
+
+    /// The marked or withheld buffers let go since this was last called, each as a
+    /// completed turn that ends at `now_ms`. They carry no text.
+    // RULING: v2 final capture round, item 2.
+    pub fn take_released(&mut self, now_ms: i64) -> Vec<CompletedTurn> {
+        std::mem::take(&mut self.released)
+            .into_iter()
+            .map(|(session_id, buf)| CompletedTurn {
+                session_id,
+                cwd: buf.cwd,
+                prompt: String::new(),
+                turn_key: buf.turn_key,
+                reply: String::new(),
+                started_ms: buf.turn_from_ms,
+                at_ms: now_ms.max(buf.last_ms),
+                suppressed: buf.suppressed,
+                withheld: buf.withheld,
+            })
+            .collect()
+    }
+
+    /// Whether the chat's pending turn is marked by a forget call or withheld: nothing of
+    /// it will be stored, so recall keeps no text of its messages.
+    // RULING: v2 final capture round, item 2.
+    pub fn holds_no_text(&self, session_id: &str) -> bool {
+        self.pending.get(session_id).is_some_and(|buf| buf.suppressed || buf.withheld)
     }
 
     pub fn on_user(&mut self, session_id: Option<&str>, cwd: Option<&str>, text: &str, now_ms: i64) {
@@ -506,12 +541,19 @@ pub fn write_turn(
     })
 }
 
-/// Moves what pairing let go to `Status.turns_dropped`. With capture off no turn is
-/// stored, so none is missing.
-fn count_dropped(st: &mut FrontState) {
+/// After pairing has let buffers go: what it let go moves to `Status.turns_dropped` (with
+/// capture off no turn is stored, so none is missing), and a marked or withheld buffer it
+/// let go is sent as a turn that ends now. Called by the three `on_*_event` functions and
+/// by the front thread wherever it lets a chat go.
+pub(crate) fn after_let_go(st: &mut FrontState) {
     let dropped = st.capture.take_dropped();
     if dropped > 0 && st.cfg.capture {
         st.status.turns_dropped.fetch_add(dropped, Ordering::Relaxed);
+    }
+    // RULING: v2 final capture round, item 2.
+    let now = (st.clock)();
+    for turn in st.capture.take_released(now) {
+        send_turn(st, turn, 0);
     }
 }
 
@@ -527,7 +569,7 @@ pub fn on_user_event(st: &mut FrontState, ev: &HookEvent) {
             None => st.capture.drop_session(session_id),
         }
     }
-    count_dropped(st);
+    after_let_go(st);
 }
 
 /// `on_message_complete` (called by `ext::hooks::handle`). No SQL: the turn goes to the
@@ -536,7 +578,7 @@ pub fn on_assistant_event(st: &mut FrontState, ev: &HookEvent) {
     if let Some(session_id) = ev.session_id.as_deref() {
         pair_reply(st, session_id, ev);
     }
-    count_dropped(st);
+    after_let_go(st);
 }
 
 fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
@@ -550,8 +592,13 @@ fn pair_reply(st: &mut FrontState, session_id: &str, ev: &HookEvent) {
     let Some(turn) = st.capture.on_assistant(Some(session_id), text, has_tool_use, ev.received_ms) else {
         return;
     };
-    let storable = st.cfg.capture && !turn.suppressed && !turn.withheld;
     let blanked = st.capture.take_blanked();
+    send_turn(st, turn, blanked);
+}
+
+/// A turn that has ended, to the indexer; `blanked`: the tokens blanked in its text.
+fn send_turn(st: &mut FrontState, turn: CompletedTurn, blanked: u64) {
+    let storable = st.cfg.capture && !turn.suppressed && !turn.withheld;
     // `write_turn` is given no `Status`: the count is made here, where the turn ends.
     if turn.withheld && !turn.suppressed && st.cfg.capture {
         st.status.turns_withheld.fetch_add(1, Ordering::Relaxed);
@@ -587,7 +634,7 @@ pub fn on_session_end_event(st: &mut FrontState, ev: &HookEvent) {
     if let Some(session_id) = ev.session_id.as_deref() {
         st.capture.on_session_end(session_id);
     }
-    count_dropped(st);
+    after_let_go(st);
 }
 
 #[cfg(test)]
