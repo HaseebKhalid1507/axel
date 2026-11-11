@@ -2503,6 +2503,10 @@ fn a_model_or_pause_hide_of_a_same_key_row_gives_way_to_cli_unproven() {
         assert_eq!(run.code, 0, "{by}: {}{}", run.out, run.err);
         let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{by}: {}", run.out));
         assert!(run.out[doubt..].contains(&format!("m:{other}")), "{by}: not listed: {}", run.out);
+        // Round 5, item 4: the line says whose hide it takes over.
+        let said = if by == "pause" { "; it was paused, and resume will no longer bring it back" } else { "; it was hidden by the assistant, and restore --by-model will no longer list it" };
+        let line = run.out[doubt..].lines().find(|l| l.contains(&format!("m:{other}"))).unwrap();
+        assert!(line.contains(said), "{by}: {line}");
         assert_eq!(hidden_by_with(world.db(), "YIELDOTHER"), [Some("cli:unproven".to_string())], "{by}");
 
         // Index time: the row brought back and hidden by a model, its file replaced.

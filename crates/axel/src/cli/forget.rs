@@ -424,9 +424,17 @@ fn delete_hidden(
             doubt.len()
         )?;
         for row in &doubt {
+            // RULING: v2 c18b review round 5, item 4: a hide it takes over is named.
+            let was = match row.hidden_by.as_deref() {
+                Some("pause") => "; it was paused, and resume will no longer bring it back",
+                Some(by) if by.starts_with("model:") => {
+                    "; it was hidden by the assistant, and restore --by-model will no longer list it"
+                }
+                _ => "",
+            };
             writeln!(
                 term.out,
-                "    {} (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it once it has been hidden {hours} h)",
+                "    {} (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it once it has been hidden {hours} h{was})",
                 twin_line(row),
                 id = one(&row.id)
             )?;
@@ -612,6 +620,19 @@ fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Resul
                 before.extend(rows_where(conn, "WHERE e.origin_kind = 'archive' AND e.turn_key = ?1 ORDER BY e.created_ms, e.vid", [key])?);
             }
         }
+        // Who hid what the mark may take over (round 5, item 4), read before it does.
+        let mut was: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        {
+            let mut stmt = conn.prepare(
+                "SELECT mem_id, hidden_by FROM memory_ext
+                  WHERE hidden_ms IS NOT NULL AND origin_kind = 'archive'
+                    AND (hidden_by = 'pause' OR substr(hidden_by, 1, 6) = 'model:')",
+            )?;
+            for row in stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))? {
+                let (id, by) = row?;
+                was.insert(id, by);
+            }
+        }
         let p = purge(conn, ripe, twins, None)?;
         let taken = before.into_iter().filter(|r| p.left_out.contains(&r.id)).fold(Vec::new(), |mut all: Vec<RowInfo>, r| {
             if !all.iter().any(|a| a.id == r.id) {
@@ -621,7 +642,11 @@ fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Resul
         });
         let mut hidden = Vec::new();
         for id in &p.unproven {
-            hidden.extend(row_info(conn, id)?);
+            // `hidden_by` as it was before the mark: visible, or a hide it takes over.
+            hidden.extend(row_info(conn, id)?.map(|mut row| {
+                row.hidden_by = was.get(id).cloned();
+                row
+            }));
         }
         Ok((taken, hidden))
     })();
