@@ -683,6 +683,107 @@ fn t08_a_slow_or_failing_embedder_leaves_words_and_a_past_deadline_leaves_nothin
     }
 }
 
+/// A statement no deadline should ever stop: 300,000 steps of a counter, far more than the
+/// progress handler's interval. It fails when a handler with a past deadline is still set.
+fn count_slowly(conn: &Connection) -> rusqlite::Result<i64> {
+    conn.query_row(
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 300000) SELECT COUNT(*) FROM c",
+        [],
+        |r| r.get(0),
+    )
+}
+
+#[test]
+fn t08b_a_statement_still_running_at_the_deadline_is_stopped_and_nothing_is_left_on_the_connection() {
+    let mut fx = Fx::new();
+    // Words only: the first thing recall does with the brain is the by-words statement.
+    fx.cfg.model_loaded = false;
+    fx.put(&row("mem_gull", "gull note", "gull tern skua petrel fulmar gannet shag auk"));
+    let query = "gull tern skua petrel fulmar gannet shag auk";
+    let conn = &fx.brain.conn;
+
+    // A brain on which that one statement is slow: every row of the word index matches the
+    // query, and all of them are scored before the best 48 are known. Rows are added until
+    // a whole recall takes 120 ms on this machine.
+    let whole = |fx: &Fx| {
+        let start = Instant::now();
+        let out = fx.recall_until(query, &chat("s1"), true, Instant::now() + Duration::from_secs(120));
+        assert_eq!(ids(&out), ["mem_gull"], "{:?}", out.trace);
+        start.elapsed()
+    };
+    let mut full = whole(&fx);
+    let mut rows = 0;
+    while full < Duration::from_millis(120) {
+        let batch = rows.max(40_000);
+        assert!(rows < 2_000_000, "the statement never got slow: {full:?} with {rows} rows");
+        tx(conn, || {
+            let mut stmt = conn
+                .prepare("INSERT INTO memories_fts(mem_id, title, abstract, content) VALUES (?1, 'filler', '', ?2)")
+                .unwrap();
+            for i in 0..batch {
+                stmt.execute(params![format!("gone_{rows}_{i}"), format!("{query} filler {i}")]).unwrap();
+            }
+        });
+        rows += batch;
+        full = whole(&fx).min(whole(&fx));
+    }
+
+    // The deadline passes a fifth of the way in. Without the stop the answer comes when
+    // the statement is done; with it, at the deadline. Three tries: a machine that stalls
+    // can make one late, and no machine makes the unstopped statement fast.
+    let mut stopped = false;
+    for _ in 0..3 {
+        let start = Instant::now();
+        let out = fx.recall_until(query, &chat("s1"), true, start + full / 5);
+        let took = start.elapsed();
+        // A stopped statement is the deadline: `timeout`, never `error`, and no part of an answer.
+        assert_eq!(out.outcome.0, "timeout", "{:?}", out.trace);
+        assert!(out.picks.is_empty() && out.trace.picks.is_empty());
+        assert_eq!(out.trace.generators.mem_words, 0, "the statement did not return its rows");
+        if took < full / 2 {
+            stopped = true;
+            break;
+        }
+    }
+    assert!(stopped, "three recalls ran past their deadline for as long as the whole statement takes ({full:?})");
+
+    // That deadline is past now, and the connection is the one other handlers write with:
+    // a long statement on it runs to its end.
+    assert_eq!(count_slowly(conn).unwrap(), 300_000);
+}
+
+#[test]
+fn t08c_no_way_out_of_recall_leaves_its_deadline_on_the_connection() {
+    let mut fx = Fx::new();
+    fx.put(&row("mem_gull", "gull note", "gull tern skua petrel fulmar gannet shag auk"));
+    let query = "gull tern skua petrel fulmar gannet shag auk";
+    // A recall that returns at its first look at the clock,
+    let out = fx.recall_until(query, &chat("s1"), true, Instant::now());
+    assert_eq!(out.outcome.0, "timeout");
+    assert_eq!(count_slowly(&fx.brain.conn).unwrap(), 300_000);
+    // and one that runs to its end with a deadline that then passes.
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let out = fx.recall_until(query, &chat("s1"), true, deadline);
+    assert_eq!(ids(&out), ["mem_gull"], "{:?}", out.trace);
+    std::thread::sleep(deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(20));
+    assert_eq!(count_slowly(&fx.brain.conn).unwrap(), 300_000);
+}
+
+#[test]
+fn t08d_a_candidate_query_reads_the_first_65536_characters_of_a_body() {
+    // Seen through the one thing that reads a whole body: two files with no path are one
+    // pick when their content is the same. These two differ only past character 65,536.
+    let mut fx = Fx::new();
+    fx.cfg.model_loaded = false;
+    let head = format!("the lighthouse keeper logbook\n{}", "é".repeat(65_536));
+    fx.put_doc("notes::logbook-a", &format!("{head} first ending"), None, "{}");
+    fx.put_doc("notes::logbook-b", &format!("{head} second ending"), None, "{}");
+    let out = fx.recall("lighthouse keeper logbook", &chat("s1"), true);
+    assert_eq!(out.picks.len(), 1, "{:?}", ids(&out));
+    assert_eq!(whys(&out, "duplicate").len(), 1, "{:?}", out.trace.dropped);
+    assert!(out.picks[0].descriptor.snippet.as_deref().unwrap().starts_with("the lighthouse keeper logbook"));
+}
+
 // ── Section 3, test 9 ───────────────────────────────────────────────────────
 
 fn at(y: i32, m: u32, d: u32) -> i64 {

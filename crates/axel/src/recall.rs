@@ -281,7 +281,12 @@ const FILED_SESSIONS: usize = 256;
 // SPEC: 3136-3140, 3160: a note file is stored whole and nothing bounds what recall reads
 // of one. The words and the passage are looked for in the first 64 KiB of a body, so that
 // a few very large files cannot take the budget.
+// RULING: wave 4 ruling R-15 item 1: the candidate queries read no more than the first
+// 65,536 characters of a body (`substr` in `MEM_COLUMNS` and `DOC_COLUMNS`), so a row of any
+// size costs a bounded read.
 const BODY_SCAN_BYTES: usize = 64 * 1024;
+/// SQLite asks "is the deadline past" once in this many steps of its virtual machine.
+const PROGRESS_STEPS: std::os::raw::c_int = 1_000;
 
 // SPEC: 3081 says "a 60-word stop list" and gives no words. These are the sixty.
 const STOP_WORDS: [&str; 60] = [
@@ -353,7 +358,7 @@ fn time_of(ms: i64) -> Option<DateTime<Utc>> {
 
 // ── Rows ────────────────────────────────────────────────────────────────────
 
-const MEM_COLUMNS: &str = "m.id, m.project_key, m.title, m.content, m.category, m.tags, m.created,
+const MEM_COLUMNS: &str = "m.id, m.project_key, m.title, substr(m.content, 1, 65536), m.category, m.tags, m.created,
             m.sensitivity, m.retention, m.provenance, m.supersedes, m.contradicts,
             m.confirmed_by, m.invalidated_at, m.superseded_by,
             e.vid, e.origin_kind, e.origin_ref, e.session_id, e.content_hash,
@@ -366,7 +371,7 @@ const MEM_VISIBLE: &str = "e.hidden_ms IS NULL
             OR (:global AND (m.project_key = 'p0000000000000000' OR m.project_key IS NULL)))
        AND (m.expires_at IS NULL OR m.expires_at > :now)";
 
-const DOC_COLUMNS: &str = "d.id, d.doc_id, d.content, d.file_path, d.metadata, d.created, d.source_mtime_ms";
+const DOC_COLUMNS: &str = "d.id, d.doc_id, substr(d.content, 1, 65536), d.file_path, d.metadata, d.created, d.source_mtime_ms";
 
 struct MemRow {
     id: String,
@@ -894,6 +899,32 @@ fn shown_ref(c: &Cand) -> String {
     }
 }
 
+// ── The deadline inside a statement ─────────────────────────────────────────
+
+/// While this lives, a statement on `conn` that is still running at `deadline` is stopped
+/// by SQLite (it returns `SQLITE_INTERRUPT`). Dropping it removes the handler, on every
+/// way out of `recall`, a panic included: the same connection serves other handlers, and
+/// their statements must never be stopped by a deadline that is long past.
+struct StopAt<'a>(&'a Connection);
+
+impl<'a> StopAt<'a> {
+    fn set(conn: &'a Connection, deadline: Instant) -> StopAt<'a> {
+        conn.progress_handler(PROGRESS_STEPS, Some(move || Instant::now() >= deadline));
+        StopAt(conn)
+    }
+}
+
+impl Drop for StopAt<'_> {
+    fn drop(&mut self) {
+        self.0.progress_handler(0, None::<fn() -> bool>);
+    }
+}
+
+/// True for the error of a statement that the progress handler stopped.
+fn interrupted(e: &rusqlite::Error) -> bool {
+    matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == rusqlite::ErrorCode::OperationInterrupted)
+}
+
 // ── The entry point ─────────────────────────────────────────────────────────
 
 fn finish(mut trace: RecallTrace, started: Instant, picks: Vec<Pick>, outcome: &str) -> RecallOutcome {
@@ -906,8 +937,10 @@ fn finish(mut trace: RecallTrace, started: Instant, picks: Vec<Pick>, outcome: &
 /// The one entry point, called on the front thread by the hook and by `axel_search`.
 ///
 /// It reads and never writes; it waits for nothing but the query's vector, and for that at
-/// most 80 ms; it looks at `req.deadline` between its stages and inside the loop over the
-/// array's hits, and past it answers `timeout` with no picks: never a part of an answer.
+/// most 80 ms; it looks at `req.deadline` between its stages and at every row of every
+/// loop, and a statement that is still running at the deadline is stopped by SQLite's
+/// progress handler (set here, removed on every way out). Past the deadline it answers
+/// `timeout` with no picks: never a part of an answer.
 pub fn recall(
     conn: &Connection,
     index: &ExactIndex,
@@ -918,6 +951,9 @@ pub fn recall(
     let started = Instant::now();
     let view = req.view;
     let late = || Instant::now() >= req.deadline;
+    let _stop = StopAt::set(conn, req.deadline);
+    // A read that failed: a statement stopped at the deadline is the deadline, not an error.
+    let failed = |e: &rusqlite::Error| if interrupted(e) || late() { "timeout" } else { "error" };
 
     // 1. The query. Redacted first: a pasted key is never a token, embedded or logged.
     let redacted = screen::redact(req.query);
@@ -983,14 +1019,14 @@ pub fn recall(
     if !expr.is_empty() {
         let rows = match mem_by_words(conn, &expr, &scope) {
             Ok(rows) => rows,
-            Err(_) => return finish(trace, started, Vec::new(), "error"),
+            Err(e) => return finish(trace, started, Vec::new(), failed(&e)),
         };
         trace.generators.mem_words = rows.len();
         for m in rows {
+            if late() {
+                return finish(trace, started, Vec::new(), "timeout");
+            }
             add(&mut cands, search.mem(m));
-        }
-        if late() {
-            return finish(trace, started, Vec::new(), "timeout");
         }
     }
 
@@ -1022,7 +1058,7 @@ pub fn recall(
                 }
                 // No such row: the key is dropped.
                 Ok(None) => {}
-                Err(_) => return finish(trace, started, Vec::new(), "error"),
+                Err(e) => return finish(trace, started, Vec::new(), failed(&e)),
             }
         }
     }
@@ -1031,10 +1067,13 @@ pub fn recall(
     if view.documents && !expr.is_empty() {
         let rows = match docs_by_words(conn, &expr) {
             Ok(rows) => rows,
-            Err(_) => return finish(trace, started, Vec::new(), "error"),
+            Err(e) => return finish(trace, started, Vec::new(), failed(&e)),
         };
         trace.generators.doc_words = rows.len();
         for d in rows {
+            if late() {
+                return finish(trace, started, Vec::new(), "timeout");
+            }
             add(&mut cands, search.doc(d));
         }
     }
