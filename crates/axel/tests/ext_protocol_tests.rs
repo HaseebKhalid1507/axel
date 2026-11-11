@@ -1769,3 +1769,37 @@ fn w4_1_the_kept_forget_marks_are_tried_once_more_before_the_front_thread_ends()
     assert!(log.contains("front carry: forget marks written late: 2"), "{log}");
     assert!(!log.contains("lost at the end"), "{log}");
 }
+
+// ── Wave 4, R-12b item 2: the memories that cannot be read are counted ──────
+
+fn insert_unreadable_memory(conn: &Connection, id: &str) {
+    conn.execute(
+        "INSERT INTO memories(id, category, topic, title, abstract_text, content, created)
+         VALUES(?1, 'events', 'topic', 'a blob', '', x'FFFE0001', '2025-01-01T00:00:00Z')",
+        [id],
+    )
+    .unwrap();
+}
+
+#[test]
+fn w4_2_the_unreadable_memories_are_counted_at_open_and_by_the_tick_and_the_row_says_so() {
+    let dirs = Dirs::new();
+    {
+        let conn = make_brain(&dirs.brain());
+        insert_memory(&conn, "mem_fine", None, None, false);
+        insert_unreadable_memory(&conn, "mem_blob_1");
+    }
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    assert_eq!(status.unreadable_memories.load(Ordering::Relaxed), 1, "open_v2's count was dropped");
+    assert_eq!(status_row(&dirs.brain()).unwrap()["unreadable_memories"], 1);
+
+    // Another one arrives under the running process: the tick's adoption counts both.
+    insert_unreadable_memory(ctx.conn.as_ref().unwrap(), "mem_blob_2");
+    indexer::tick(&mut ctx);
+    assert_eq!(status.unreadable_memories.load(Ordering::Relaxed), 2, "the tick's count was dropped");
+    indexer_start::write_status(&mut ctx).unwrap();
+    assert_eq!(status_row(&dirs.brain()).unwrap()["unreadable_memories"], 2);
+    assert_eq!(status.panics.load(Ordering::Relaxed), 0);
+}

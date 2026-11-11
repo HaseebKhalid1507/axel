@@ -93,6 +93,9 @@ pub struct Status {
     /// folders (`docsync::tick`).
     pub docs_waiting: AtomicU64,
     pub model_loaded: AtomicBool,
+    /// Memories with no `memory_ext` row whose `id` or `content` cannot be read as text:
+    /// what `open_v2` and the last adoption counted (wave 4, R-12b item 2).
+    pub unreadable_memories: AtomicU64,
     /// 0 pending, 1 running, 2 done.
     pub scan: AtomicU8,
     /// When this process answered `initialize`.

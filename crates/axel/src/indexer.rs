@@ -84,9 +84,12 @@ const STATUS_MS: i64 = 30_000;
 /// `catch_unwind`. There is no sweep: nothing is deleted by time.
 pub fn tick(ctx: &mut IndexerCtx) {
     if due(ctx, "adopt_orphans", ADOPT_MS) {
-        guarded(ctx, |ctx| match ctx.conn.as_ref() {
-            Some(conn) => brain_v2::adopt_orphans(conn, "cli").map(|_| ()),
-            None => Ok(()),
+        // RULING: wave4 R-12b item 2. The rows the adoption could not read are counted.
+        guarded(ctx, |ctx| {
+            let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
+            let done = brain_v2::adopt_orphans_counted(conn, "cli")?;
+            ctx.status.unreadable_memories.store(done.skipped as u64, Ordering::Relaxed);
+            Ok(())
         });
     }
     if due(ctx, "index_notes::pass", NOTES_MS) {

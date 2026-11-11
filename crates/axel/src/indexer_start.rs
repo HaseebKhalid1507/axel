@@ -232,6 +232,8 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
         }
     }
 
+    // RULING: wave4 R-12b item 2. What `open_v2` could not adopt is said in `status`.
+    ctx.status.unreadable_memories.store(brain.unreadable_memories as u64, Ordering::Relaxed);
     ctx.conn = Some(brain.conn);
     ctx.signer = brain.signer;
     ctx.brain_file = file_id(&path);
@@ -514,6 +516,7 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
         "embedder": ctx.cfg.embedder.to_string(),
         "vectors_waiting": n(&s.vectors_waiting),
         "docs_waiting": n(&s.docs_waiting),
+        "unreadable_memories": n(&s.unreadable_memories),
         "breaker_open": s.breaker_open.load(Ordering::Relaxed),
         "breaker_trips": n(&s.breaker_trips),
         "hook_misses": n(&s.hook_misses),
