@@ -3501,3 +3501,62 @@ fn a_replaced_file_gives_up_the_marks_and_the_keep_flag_of_the_file_before_it() 
     assert_eq!(forgot_rows(conn).len(), 1);
     assert_eq!(run.errors(), 0);
 }
+
+// ── Round 5, item 2: a file refused on first sight, named by an event ────────
+
+/// The event of `a`, arrived at `received_ms`.
+fn archived_at(env: &Env, dir: &str, a: &Arch, session: &str, received_ms: i64) -> Job {
+    let path = env.archives().join(dir).join(rel(&a.id));
+    let mut job = archived(a, KEY, Some(&path), Some(session), None, None);
+    if let Job::Archive { received_ms: at, .. } = &mut job {
+        *at = received_ms;
+    }
+    job
+}
+
+/// Guards what the owner would lose: turns of the window of a file the reader refused,
+/// which are only in that file, deleted as stand-ins by the file after it.
+#[test]
+fn a_file_refused_on_first_sight_takes_its_place_from_the_event_and_bounds_the_file_after_it() {
+    for d_by in ["event", "scan"] {
+        let env = Env::new();
+        let dir = scope(KEY);
+        let mut run = env.run();
+        let files = bounded_chat("s-refevent");
+        let (b, c, d) = (&files[0], &files[1], &files[2]);
+        capture(&run, "mem_cap_in_c", &dir, "s-refevent", T0 + 2 * W - 100_000, None);
+        capture(&run, "mem_cap_in_d", &dir, "s-refevent", T0 + 3 * W - 100_000, None);
+        env.put_live(&dir, b);
+        run.job(archived_at(&env, &dir, b, "s-refevent", T0 + W + 500));
+        // C cannot be read as a record.
+        env.put(&dir, SHELF, &c.id, &"x".repeat(c.json(&dir).len() + 40));
+        run.job(archived_at(&env, &dir, c, "s-refevent", T0 + 2 * W + 500));
+        assert_eq!(
+            spot(run.db(), &dir, c),
+            (
+                Some("not valid JSON".to_string()),
+                Some(c.logical.clone()),
+                Some("s-refevent".to_string()),
+                Some(T0 + 2 * W + 500),
+                Some("observed".to_string())
+            ),
+            "a refused file took no place from its event"
+        );
+        env.put_live(&dir, d);
+        if d_by == "event" {
+            run.job(archived_at(&env, &dir, d, "s-refevent", T0 + 3 * W + 500));
+        } else {
+            run.scan();
+        }
+        assert_eq!(positions(run.db(), &dir, d), ["x0.0"]);
+        assert_eq!(capture_ids(run.db()), ["mem_cap_in_c"], "D by {d_by}: D took the window of the refused file");
+
+        // C is a record again: read again, indexed at its own time, its stand-in replaced.
+        env.put_live(&dir, c);
+        run.scan();
+        assert_eq!(positions(run.db(), &dir, c), ["x0.0"]);
+        assert_eq!(spot(run.db(), &dir, c).3, c.created_ms);
+        assert!(capture_ids(run.db()).is_empty());
+        assert_eq!(run.errors(), 0);
+    }
+}

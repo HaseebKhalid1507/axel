@@ -315,6 +315,26 @@ impl Held {
     }
 }
 
+impl Held {
+    /// The place an event gives a file whose head cannot be read: its chat, from the
+    /// session id (`logical` is derived from it, as capture derives it), and its arrival
+    /// time, `observed`. None with no event, or an event with no session id.
+    fn of_event(seen: &Seen, at: &FileAt) -> Option<Held> {
+        let session_id = seen.session_id?;
+        let ms = seen.received_ms.filter(|ms| chrono::DateTime::<chrono::Utc>::from_timestamp_millis(*ms).is_some())?;
+        Some(Held {
+            archive_id: at.name_id.unwrap_or("").to_string(),
+            logical: project::logical(session_id),
+            session_id: Some(session_id.to_string()),
+            created_ms: ms,
+            time_source: "observed",
+            cover_ms: ms,
+            win_no: seen.window,
+            part_no: seen.part,
+        })
+    }
+}
+
 /// The `skip_reason`s the indexer writes itself. Any other is the reader's refusal of a
 /// file (`write_refused`).
 // RULING: v2 archives round 4. `error` is new: a file whose indexing failed with an error
@@ -1074,7 +1094,17 @@ fn settle(
             mark_purged(conn)
         }),
         Err(reason) if is_io(&reason) => Ok(()),
-        Err(reason) => in_write(conn, || write_refused(conn, at, row, &reason, first_seen_ms)),
+        // RULING: v2 archives round 5, item 2. A file the reader refuses takes its place from
+        // the event that named it, when there was one (`Held::of_event`). On the scan path it
+        // keeps none: there is no event, and nothing of the file can be read (no chat, no
+        // time). Core writes no file over its own limits (16 MiB, 4,096 messages, a note of
+        // 8,192 bytes: a window over them is cut into parts), so a refused file is a damaged
+        // one, one of a version this reader does not know, or one changed by hand: not
+        // expected from core at all.
+        Err(reason) => {
+            let held = Held::of_event(seen, at);
+            in_write(conn, || write_refused(conn, at, row, &reason, first_seen_ms, held.as_ref()))
+        }
     }
 }
 
@@ -1086,26 +1116,39 @@ fn settle(
 // RULING: v2 archives round 4. A row that has a place in its chat's order (a file indexed
 // before and refused now) keeps it: its `time_source` and `cover_ms` stay. A row with none
 // says `mtime`, with a null `cover_ms`, as before.
+// RULING: v2 archives round 5, item 2. A row with no place takes `held`, the place an event
+// gave, when there is one.
 fn write_refused(
     conn: &Connection,
     at: &FileAt,
     row: Option<&Known>,
     reason: &SkipReason,
     first_seen_ms: i64,
+    held: Option<&Held>,
 ) -> Result<()> {
     let archive_id = at.name_id.or(row.map(|r| r.archive_id.as_str())).unwrap_or("");
     let file_ms = mtime_ms(&at.path());
     let placed = row.is_some_and(|r| {
         r.cover_ms.is_some() && matches!(r.time_source.as_deref(), Some("archive" | "observed"))
     });
+    let held = held.filter(|_| !placed);
     let skipped = RowOut {
         skip_reason: Some(&reason.0),
+        logical: held.map(|h| h.logical.as_str()),
+        session_id: held.and_then(|h| h.session_id.as_deref()),
         created_ms: file_ms,
-        time_source: if placed { None } else { file_ms.map(|_| "mtime") },
+        time_source: match held {
+            _ if placed => None,
+            Some(h) => Some(h.time_source),
+            None => file_ms.map(|_| "mtime"),
+        },
+        cover_ms: held.map(|h| h.cover_ms),
+        win_no: held.and_then(|h| h.win_no),
+        part_no: held.and_then(|h| h.part_no),
         ..RowOut::new(archive_id, "skipped", first_seen_ms)
     };
     upsert_row(conn, at, &skipped)?;
-    if !placed {
+    if !placed && held.is_none() {
         conn.execute(
             "UPDATE archive_index SET cover_ms = NULL WHERE scope_dir = ?1 AND rel_name = ?2",
             params![at.scope_dir, at.rel_name],
@@ -1140,7 +1183,7 @@ fn refuse_indexed(ctx: &IndexerCtx, at: &FileAt, row: &Known, reason: &SkipReaso
                 params![at.scope_dir, row.archive_id],
             )?;
         }
-        write_refused(conn, at, Some(row), reason, row.first_seen_ms)
+        write_refused(conn, at, Some(row), reason, row.first_seen_ms, None)
     })
 }
 
@@ -1258,8 +1301,9 @@ pub fn on_job(ctx: &mut IndexerCtx, job: &Job) -> Result<()> {
 // RULING: v2 archives round 4. When indexing it fails (a panic, an error that is not a
 // panic), its `skipped` row keeps its place: the chat and the time `index_archive` would
 // have given it, from the record's head and what the event said (the session id, the
-// arrival time for a record with no time of its own). A file the reader refuses has no
-// head to read, and no place.
+// arrival time for a record with no time of its own).
+// RULING: v2 archives round 5, item 2. A file the reader refuses has no head to read: it
+// takes its place from the event alone (`settle`, `Held::of_event`).
 fn event_file(ctx: &IndexerCtx, at: &FileAt, row: Option<&Known>, seen: &Seen, archive_id: &str) -> Result<()> {
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
     let got = at.read(Some(archive_id));
