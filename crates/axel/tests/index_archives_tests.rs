@@ -2027,9 +2027,11 @@ fn t25_a_unit_with_the_key_of_a_hidden_capture_is_born_hidden_as_its_twin() {
     assert!(has(conn, "mem_cap_h"), "the record of the hide was deleted");
     assert_eq!(unmatched_hidden(conn, &dir, &a), 0);
 
-    assert_eq!(tx(conn, || store::restore(conn, "mem_cap_h").unwrap()), 1);
+    // RULING: v2 c18b review, item 1: the capture's text is not its archived row's, so no
+    // twin proves it the same turn, and restoring it keeps the capture (by the foreman).
+    assert_eq!(tx(conn, || store::restore(conn, "mem_cap_h").unwrap()), 2);
     assert!(hidden_by(conn, &dir, &a).iter().all(|(_, by)| by.is_none()));
-    assert!(!has(conn, "mem_cap_h"));
+    assert!(has(conn, "mem_cap_h"));
 }
 
 #[test]

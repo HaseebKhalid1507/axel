@@ -1309,7 +1309,7 @@ fn s5_t14_the_first_line_of_recall_counts_what_the_assistant_hid() {
     let archive_id = "00112233445566778899aabbccddeeff";
     lab.put(&capture_row(capture, &dir_a, "R", prompt, "the shelduck brood went to the creek mouth"));
     archive_index(lab.conn(), &dir_a, "R", archive_id, now_ms() - HOUR, 0);
-    lab.put(&archive_row("mem_shelduckarch0001", &dir_a, "R", archive_id, 2, prompt, "to the creek mouth"));
+    lab.put(&archive_row("mem_shelduckarch0001", &dir_a, "R", archive_id, 2, prompt, "the shelduck brood went to the creek mouth"));
     old_memory(lab.conn(), "mem_shelduckold00001", "an old shelduck count from the estuary", "legacy");
     lab.conn()
         .execute(
