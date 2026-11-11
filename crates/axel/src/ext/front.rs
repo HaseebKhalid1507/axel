@@ -260,13 +260,14 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
     }
     // A chat in which core's `memory_forget` was called: the turn is not to be learned.
     for session_id in &carry.forgot {
-        mark_forgotten(st, session_id);
+        let _ = mark_forgotten(st, session_id);
     }
 }
 
-/// Section 4, "the live call", for one session of `Carry.forgot`: `capture.suppress`, then
-/// `mark_forgotten_turn` inside `begin_write_front`.
-fn mark_forgotten(st: &mut FrontState, session_id: &str) {
+/// Section 4, "the live call", for one session of `Carry.forgot`, and for the model's
+/// `forget` tool (`tools_core::mark_turn`): `capture.suppress`, then `write_forget_mark`.
+/// A mark that is not written now is kept. Returns what became of the try.
+pub(crate) fn mark_forgotten(st: &mut FrontState, session_id: &str) -> MarkEnd {
     let now = (st.clock)();
     let (from_ms, turn_key) = match st.capture.suppress(session_id) {
         Some((started_ms, key)) => (started_ms, Some(key)),
@@ -277,7 +278,7 @@ fn mark_forgotten(st: &mut FrontState, session_id: &str) {
     // a mark that is not written now is kept, whatever kept it out (the mode is not
     // `Ready`, there is no connection, the write lock is held).
     let end = if is_ready(st) && st.conn.is_some() { write_forget_mark(st, &mark) } else { MarkEnd::NotNow };
-    match end {
+    match &end {
         MarkEnd::Written => {}
         MarkEnd::Failed(kind) => log_line(&format!("front carry: forget mark dropped: {kind}")),
         MarkEnd::NotNow => {
@@ -291,6 +292,7 @@ fn mark_forgotten(st: &mut FrontState, session_id: &str) {
             log_line("front carry: forget mark not written, kept");
         }
     }
+    end
 }
 
 /// What became of one try to write a mark.

@@ -20,16 +20,16 @@ use sha2::{Digest, Sha256};
 
 use crate::chat_history::CLASS_EPISODIC_TURN;
 use crate::error::AxelError;
-use crate::ext::front::view_for;
+use crate::ext::front::{self, view_for, MarkEnd};
 use crate::ext::server::log_line;
 use crate::ext::tools_forum::NO_CALLER;
-use crate::ext::types::{Caller, DegradedReason, ForgetMark, FrontState, ToolError};
+use crate::ext::types::{Caller, DegradedReason, FrontState, ToolError};
 use crate::project_memory::{RecordLinks, Retention, ScopedDescriptor, Sensitivity};
 use crate::recall::{self, Kind, Origin, Pick, RecallConfig, RecallRequest, View, PASSAGE_CHARS};
 use crate::retrieval::ScoreParts;
 use crate::store::{self, Inserted, NewRow, CAP_REFUSAL, GLOBAL_KEY};
 use crate::vindex::{VecDelta, VecKey};
-use crate::{archive, brain_v2, index_archives, inject, project, screen};
+use crate::{archive, brain_v2, inject, project, screen};
 
 type Result<T> = std::result::Result<T, ToolError>;
 
@@ -63,8 +63,6 @@ const TITLE_WORDS: usize = 12;
 // SPEC: 3969 gives `ttl_hours` no maximum. A time past this (about 114 years) is refused
 // as a wrong value rather than failing as a write.
 const MAX_TTL_HOURS: i64 = 1_000_000;
-/// Forget marks kept for a later try; one more gives up the oldest (as `ext::front` does).
-const FORGET_MARKS_KEPT: usize = 256;
 
 const KINDS: [&str; 6] = ["decision", "preference", "task", "correction", "fact", "note"];
 const CATEGORIES: [&str; 4] = ["events", "preferences", "entities", "cases"];
@@ -816,56 +814,31 @@ fn recall_tool(st: &FrontState, input: &Value, caller: &Caller) -> Result<String
 // ── forget ──────────────────────────────────────────────────────────────────
 
 /// Section 4, "the live call": the turn this call is made in is not to be learned. In a
-/// transaction of its own, which commits whatever the rest of the call does. A mark that
-/// meets the write lock is kept for the front thread's next try and the call answers busy
-/// (the rest of it would wait for the same lock): an exact retry is safe.
+/// transaction of its own, which commits whatever the rest of the call does, written by the
+/// front thread's own path (`front::mark_forgotten`): the same mark, the same kept list, and
+/// the vectors of the archive rows it purged leave the array. A mark that meets the write
+/// lock is kept for the front thread's next try and the call answers busy (the rest of it
+/// would wait for the same lock): an exact retry is safe.
 fn mark_turn(st: &mut FrontState, session_id: &str) -> Result<()> {
-    let now = (st.clock)();
-    let (from_ms, turn_key) = match st.capture.suppress(session_id) {
-        Some((started_ms, key)) => (started_ms, Some(key)),
-        None => (now, None),
-    };
-    let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
-    let written = write_mark(connection(st)?, st, &mark);
-    // NOTE: the archive rows the mark purged keep their vectors until the indexer's resync:
-    // the ids are of rows that are gone, and their keys cannot be read any more. Recall
-    // resolves every key against its row, so such a vector is never shown.
-    match written {
-        Ok(_) => Ok(()),
-        Err(e) if is_busy(&e) => {
-            if st.forget_marks.len() >= FORGET_MARKS_KEPT {
-                st.forget_marks.remove(0);
-                log_line("forget tool: forget mark given up (too many waiting)");
+    connection(st)?;
+    match front::mark_forgotten(st, session_id) {
+        MarkEnd::Written => Ok(()),
+        MarkEnd::NotNow => Err(ToolError::Busy),
+        // The error by its kind, as the front path keeps it: a changed or damaged brain
+        // makes the mode `Degraded` and the call unavailable; any other failure counts as a
+        // write error and the mark is dropped, as the front thread drops it.
+        MarkEnd::Failed(kind) => {
+            let err = match kind {
+                "BrainChanged" => AxelError::BrainChanged,
+                "BrainDamaged" => AxelError::BrainDamaged(kind.to_string()),
+                _ => AxelError::Other(kind.to_string()),
+            };
+            match failed(st, &err, true) {
+                unavailable @ ToolError::Unavailable(_) => Err(unavailable),
+                _ => Ok(()),
             }
-            st.forget_marks.push(mark);
-            log_line("forget tool: forget mark not written, kept");
-            Err(ToolError::Busy)
         }
-        Err(e) => match failed(st, &e, true) {
-            unavailable @ ToolError::Unavailable(_) => Err(unavailable),
-            // Dropped, as the front thread drops a mark that failed for another reason.
-            _ => Ok(()),
-        },
     }
-}
-
-/// `begin_write_front`, `mark_forgotten_turn` with source `call`, `COMMIT`. Returns the ids
-/// the mark purged.
-fn write_mark(conn: &Connection, st: &FrontState, mark: &ForgetMark) -> crate::error::Result<Vec<String>> {
-    let logical = project::logical(&mark.session_id);
-    let guard = brain_v2::begin_write_front(conn, &st.writing)?;
-    let purged = index_archives::mark_forgotten_turn(
-        conn,
-        &logical,
-        Some(&mark.session_id),
-        "call",
-        mark.from_ms,
-        mark.to_ms,
-        mark.turn_key.as_deref(),
-    )?;
-    conn.execute_batch("COMMIT")?;
-    drop(guard);
-    Ok(purged)
 }
 
 fn forget(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<String> {

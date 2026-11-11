@@ -1008,6 +1008,54 @@ fn s4_t06_the_tool_half_of_suppress() {
     assert!(present("mem_slipway0000000w1"), "the same key three windows back is not");
 }
 
+/// Chat S's archive sealed inside the turn of `prompt` (asked 10 minutes ago), with two
+/// exchanges and their vectors: `(kept vid, purged vid)` once a forget mark is written.
+fn sealed_inside_the_turn(lab: &mut Lab, prompt: &str) -> (i64, i64) {
+    let (a, dir_a) = (lab.a.clone(), lab.dir_a.clone());
+    let now = now_ms();
+    let archive_id = "00000000000000000000000000000ab5";
+    archive_index(lab.conn(), &dir_a, "S", archive_id, now - 5 * 60_000, 0);
+    let kept = lab.put(&archive_row("mem_ospreyarch0000w1", &dir_a, "S", archive_id, 1, "where does the osprey fish", "on the reservoir"));
+    let purged = lab.put(&archive_row("mem_ospreyarch0000w2", &dir_a, "S", archive_id, 2, "and at dusk", "it roosts in the pines"));
+    lab.st.capture.on_user(Some("S"), Some(&a), prompt, now - 10 * 60_000);
+    (kept, purged)
+}
+
+#[test]
+fn fu_the_model_s_forget_takes_the_vector_of_the_archive_row_it_purged_out_of_the_array() {
+    let mut lab = Lab::new();
+    let chat = lab.chat(&lab.a.clone(), "S");
+    let (kept, purged) = sealed_inside_the_turn(&mut lab, "forget where the osprey roosts");
+    lab.refused("forget", json!({ "id": "m:mem_0000000000000000" }), &chat);
+    assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memories WHERE id = ?1", "mem_ospreyarch0000w2"), 0, "nothing purged");
+    assert!(lab.st.index.get(&VecKey::Mem(purged)).is_none(), "the purged row's vector is still in the front's array");
+    assert!(lab.st.index.get(&VecKey::Mem(kept)).is_some(), "a row the mark kept lost its vector");
+    assert!(lab.st.forget_marks.is_empty());
+}
+
+#[test]
+fn fu_a_busy_lock_keeps_the_model_s_mark_and_it_is_written_later_with_its_vector_removal() {
+    let mut lab = Lab::new();
+    let chat = lab.chat(&lab.a.clone(), "S");
+    let (_, purged) = sealed_inside_the_turn(&mut lab, "forget where the osprey roosts");
+    let holder = brain_v2::connect(&lab.ext.brain, Role::Indexer).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let answer = lab.call("forget", json!({ "id": "m:mem_0000000000000000" }), &chat);
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert!(matches!(answer, Err(ToolError::Busy)), "{answer:?}");
+    assert_eq!(lab.st.forget_marks.len(), 1, "the mark was not kept");
+    assert_eq!(lab.st.forget_marks[0].session_id, "S");
+    assert!(call_row(lab.conn(), "S").is_empty());
+    assert!(lab.st.index.get(&VecKey::Mem(purged)).is_some());
+
+    // The front thread's next try writes it, through the same path.
+    assert_eq!(front::retry_written(&mut lab.st), 1);
+    assert!(lab.st.forget_marks.is_empty());
+    assert_eq!(call_row(lab.conn(), "S").len(), 1);
+    assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memories WHERE id = ?1", "mem_ospreyarch0000w2"), 0);
+    assert!(lab.st.index.get(&VecKey::Mem(purged)).is_none());
+}
+
 // ── Section 4, test 12 (i), (ii), (iv), (v) ─────────────────────────────────
 
 #[test]
