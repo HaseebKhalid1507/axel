@@ -1262,6 +1262,35 @@ fn remember_blanks_a_secret_looking_token_as_insert_row_does() {
     assert!(rows[0].3.contains("rotates monthly"));
     assert_eq!(in_tables(w.db(), &token()), 0);
     assert!(!String::from_utf8_lossy(&done.stdout).contains(&token()));
+    // v2 c18b review, item 2: not even a head of the key (the text puts it at character 41,
+    // where a title of 60 characters cut it to 19), in any column of any table.
+    let key = token();
+    let slices: Vec<&str> = (0..=key.len() - 12).map(|at| &key[at..at + 12]).collect();
+    let tables: Vec<String> = {
+        let mut stmt = w.db().prepare("SELECT name FROM sqlite_master WHERE type = 'table'").unwrap();
+        let rows = stmt.query_map([], |r| r.get(0)).unwrap();
+        rows.collect::<rusqlite::Result<_>>().unwrap()
+    };
+    assert!(tables.iter().any(|t| t == "memories"));
+    for table in &tables {
+        for row in dump(w.db(), &format!("SELECT * FROM \"{table}\"")) {
+            for value in row {
+                let bytes = match value {
+                    Sql::Text(text) => text.into_bytes(),
+                    Sql::Blob(bytes) => bytes,
+                    _ => continue,
+                };
+                for slice in &slices {
+                    assert!(
+                        !bytes.windows(12).any(|w| w == slice.as_bytes()),
+                        "{slice:?}, a part of the key, is in table {table}"
+                    );
+                }
+            }
+        }
+    }
+    let said = String::from_utf8_lossy(&done.stdout);
+    assert!(slices.iter().all(|s| !said.contains(s)), "{said}");
 }
 
 #[test]

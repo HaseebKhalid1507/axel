@@ -626,6 +626,9 @@ fn cmd_consolidate_history(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Er
     Ok(ExitCode::SUCCESS)
 }
 
+/// The words of a remembered text that make its title, as the tool's `remember` takes.
+const REMEMBER_TITLE_WORDS: usize = 12;
+
 fn cmd_remember(
     cli: &Cli,
     content_parts: &[String],
@@ -645,7 +648,15 @@ fn cmd_remember(
         return Ok(ExitCode::FAILURE);
     }
     let category = parse_category(category_str)?;
-    let title: String = content.chars().take(60).collect();
+    // RULING: v2 c18b review, item 2. The title is the first words of the text as it will
+    // be stored (redacted), cut on word boundaries as the tool does: a cut by characters of
+    // the raw text could keep the head of a key, too short to be redacted afterwards.
+    let title: String = axel::screen::redact(&content)
+        .text
+        .split_whitespace()
+        .take(REMEMBER_TITLE_WORDS)
+        .collect::<Vec<_>>()
+        .join(" ");
     let mem = Memory::new(category, topic, &title, &content);
     if let Err(errors) = MemoryPipeline::new().validate(&mem) {
         eprintln!("Validation failed:");
@@ -688,7 +699,7 @@ fn cmd_remember(
     if !matches!(inserted, Inserted::New { .. }) {
         return Err("the memory could not be saved; nothing was stored; try again".into());
     }
-    println!("✓ Remembered: {} ({})", show::one(&axel::screen::redact(&title).text), mem.id);
+    println!("✓ Remembered: {} ({})", show::one(&title), mem.id);
     println!("  category: {} | topic: {} | every project", category.as_str(), show::one(topic));
     Ok(ExitCode::SUCCESS)
 }
