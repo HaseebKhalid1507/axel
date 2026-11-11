@@ -125,11 +125,11 @@ pub fn ensure_model(spec: &ModelSpec) -> Result<PathBuf> {
     ensure_model_in(&models_cache_dir(), spec)
 }
 
-/// What "the embedding model's files are in `dir`" means, for the loader and
-/// for the offline check alike: `tokenizer.json` and one of
-/// `onnx/model.onnx` (HuggingFace layout) and `model.onnx` (flat layout,
-/// what Python velocirag leaves), in that order of preference. Returns the
-/// graph it found. Only existence is checked.
+/// What "the model files are in `dir`" means, for the loader, for the
+/// offline check and for the embedder's lookup alike: `tokenizer.json` and
+/// one of `onnx/model.onnx` (HuggingFace layout) and `model.onnx` (flat
+/// layout, what Python velocirag leaves), in that order of preference.
+/// Returns the graph it found. Only existence is checked.
 pub fn model_files_in(dir: &Path) -> Option<PathBuf> {
     if !dir.join("tokenizer.json").exists() {
         return None;
@@ -139,20 +139,13 @@ pub fn model_files_in(dir: &Path) -> Option<PathBuf> {
         .find(|graph| graph.exists())
 }
 
-/// The embedding model's folder in the user's models folder: accepted as it
-/// is when [`model_files_in`] finds the files in either layout, otherwise
-/// [`ensure_model`]'s answer.
-pub(crate) fn ensure_embedder_model() -> Result<PathBuf> {
-    ensure_embedder_model_in(&models_cache_dir())
-}
-
-/// [`ensure_embedder_model`] with the models folder given by the caller.
-pub(crate) fn ensure_embedder_model_in(models_dir: &Path) -> Result<PathBuf> {
-    let model_dir = models_dir.join(EMBEDDER_MODEL.local_dir);
-    if model_files_in(&model_dir).is_some() {
-        return Ok(model_dir);
-    }
-    ensure_model_in(models_dir, &EMBEDDER_MODEL)
+/// The one message for a folder in which [`model_files_in`] finds no model.
+pub(crate) fn missing_model_message(dir: &Path) -> String {
+    format!(
+        "the model files are not in {}. Copy model.onnx (or onnx/model.onnx) and tokenizer.json \
+         into it, or run \"{FETCH_COMMAND}\".",
+        dir.display()
+    )
 }
 
 /// [`ensure_model`] with the models folder given by the caller instead of
@@ -160,23 +153,13 @@ pub(crate) fn ensure_embedder_model_in(models_dir: &Path) -> Result<PathBuf> {
 pub(crate) fn ensure_model_in(models_dir: &Path, spec: &ModelSpec) -> Result<PathBuf> {
     let model_dir = models_dir.join(spec.local_dir);
 
-    // Check if all files already exist
-    let all_present = spec.files.iter().all(|(_, local)| model_dir.join(local).exists());
-    if all_present {
+    // The files are there in either layout: nothing to do.
+    if model_files_in(&model_dir).is_some() {
         return Ok(model_dir);
     }
 
     if is_offline() {
-        // FETCH_COMMAND is not built yet; until it is, the message also
-        // says what to copy.
-        let files: Vec<&str> = spec.files.iter().map(|(_, local)| *local).collect();
-        return Err(VelociError::Embedding(format!(
-            "model files for {} are not in {} and downloads are off. Copy {} into it; \
-             `{FETCH_COMMAND}` will do this once it is built",
-            spec.repo,
-            model_dir.display(),
-            files.join(" and "),
-        )));
+        return Err(VelociError::Embedding(missing_model_message(&model_dir)));
     }
 
     tracing::info!("Downloading model: {} ...", spec.repo);

@@ -406,7 +406,12 @@ impl Embedder {
         // The models folder, accepted in either layout the loader reads.
         // Offline (the default) this is an error when the files are missing;
         // it downloads only after `set_offline(false)`.
-        crate::download::ensure_embedder_model()
+        let models_dir = crate::download::models_cache_dir()
+            .join(crate::download::EMBEDDER_MODEL.local_dir);
+        if crate::download::model_files_in(&models_dir).is_some() {
+            return Ok(models_dir);
+        }
+        crate::download::ensure_model(&crate::download::EMBEDDER_MODEL)
     }
 
     fn embed_batch(&mut self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
@@ -520,14 +525,7 @@ fn load_model(model_dir: &Path, threads: usize) -> Result<(Session, Tokenizer)> 
     // Both layouts: onnx/model.onnx (HF style) and model.onnx (flat/Python
     // style). The same test as the offline check's.
     let Some(onnx_path) = crate::download::model_files_in(model_dir) else {
-        // FETCH_COMMAND is not built yet; until it is, the message also says
-        // what to copy.
-        return Err(VelociError::Embedding(format!(
-            "the model files are not in {}. Copy model.onnx (or onnx/model.onnx) and \
-             tokenizer.json into it; `{}` will do this once it is built",
-            model_dir.display(),
-            crate::download::FETCH_COMMAND
-        )));
+        return Err(VelociError::Embedding(crate::download::missing_model_message(model_dir)));
     };
     let tokenizer_path = model_dir.join("tokenizer.json");
 

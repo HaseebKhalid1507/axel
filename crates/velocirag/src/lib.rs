@@ -69,7 +69,7 @@ mod offline_download_tests {
     use tempfile::TempDir;
 
     use crate::download::{
-        ensure_embedder_model_in, ensure_model, ensure_model_in, is_offline, model_files_in,
+        ensure_model, ensure_model_in, is_offline, model_files_in,
         models_cache_dir, EMBEDDER_MODEL, FETCH_COMMAND, RERANKER_MODEL,
     };
 
@@ -88,8 +88,21 @@ mod offline_download_tests {
             assert!(error.contains(&folder), "the error must name the folder: {error}");
             assert!(error.contains(FETCH_COMMAND), "the error must name the command: {error}");
         }
-        let error = ensure_embedder_model_in(&models).unwrap_err().to_string();
-        assert!(error.contains(FETCH_COMMAND), "{error}");
+        // The whole text, once: the loader gives the same one.
+        let folder = models.join(EMBEDDER_MODEL.local_dir);
+        assert_eq!(
+            ensure_model_in(&models, &EMBEDDER_MODEL).unwrap_err().to_string(),
+            format!(
+                "Embedding error: the model files are not in {}. Copy model.onnx (or onnx/model.onnx) \
+                 and tokenizer.json into it, or run \"axel-v2 model fetch\".",
+                folder.display()
+            )
+        );
+        let loader = match crate::embedder::Embedder::from_model_dir(&folder, 1, true) {
+            Ok(_) => panic!("a folder that does not exist is not a model"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(loader, ensure_model_in(&models, &EMBEDDER_MODEL).unwrap_err().to_string());
 
         assert_eq!(
             std::fs::read_dir(home.path()).unwrap().count(),
@@ -158,7 +171,7 @@ mod offline_download_tests {
         let (_home, models, folder) = models_folder_with(&["model.onnx", "tokenizer.json"]);
 
         assert_eq!(model_files_in(&folder), Some(folder.join("model.onnx")));
-        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+        assert_eq!(ensure_model_in(&models, &EMBEDDER_MODEL).unwrap(), folder);
         assert!(!folder.join("onnx").exists(), "nothing may be created");
     }
 
@@ -166,12 +179,12 @@ mod offline_download_tests {
     fn the_hub_layout_passes_the_offline_check_and_is_preferred() {
         let (_home, models, folder) = models_folder_with(&["onnx/model.onnx", "tokenizer.json"]);
         assert_eq!(model_files_in(&folder), Some(folder.join("onnx").join("model.onnx")));
-        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+        assert_eq!(ensure_model_in(&models, &EMBEDDER_MODEL).unwrap(), folder);
 
         let (_home, models, folder) =
             models_folder_with(&["model.onnx", "onnx/model.onnx", "tokenizer.json"]);
         assert_eq!(model_files_in(&folder), Some(folder.join("onnx").join("model.onnx")));
-        assert_eq!(ensure_embedder_model_in(&models).unwrap(), folder);
+        assert_eq!(ensure_model_in(&models, &EMBEDDER_MODEL).unwrap(), folder);
     }
 
     #[test]
@@ -179,7 +192,7 @@ mod offline_download_tests {
         for files in [&["model.onnx"][..], &["onnx/model.onnx"][..], &["tokenizer.json"][..]] {
             let (_home, models, folder) = models_folder_with(files);
             assert_eq!(model_files_in(&folder), None, "{files:?}");
-            let error = ensure_embedder_model_in(&models).unwrap_err().to_string();
+            let error = ensure_model_in(&models, &EMBEDDER_MODEL).unwrap_err().to_string();
             assert!(error.contains(&folder.display().to_string()), "{error}");
             assert!(error.contains(FETCH_COMMAND), "{error}");
         }
@@ -192,7 +205,7 @@ mod offline_download_tests {
         // ONNX Runtime, not with the "files are not in" message.
         for files in [&["model.onnx", "tokenizer.json"][..], &["onnx/model.onnx", "tokenizer.json"][..]] {
             let (_home, models, folder) = models_folder_with(files);
-            assert!(ensure_embedder_model_in(&models).is_ok());
+            assert!(ensure_model_in(&models, &EMBEDDER_MODEL).is_ok());
             let error = match crate::embedder::Embedder::from_model_dir(&folder, 1, true) {
                 Ok(_) => panic!("an empty file is not a model"),
                 Err(error) => error.to_string(),
@@ -201,7 +214,7 @@ mod offline_download_tests {
             assert!(error.contains("Failed to load ONNX model"), "{files:?}: {error}");
         }
         let (_home, models, folder) = models_folder_with(&["model.onnx"]);
-        assert!(ensure_embedder_model_in(&models).is_err());
+        assert!(ensure_model_in(&models, &EMBEDDER_MODEL).is_err());
         let error = match crate::embedder::Embedder::from_model_dir(&folder, 1, true) {
             Ok(_) => panic!("a folder without a tokenizer is not a model"),
             Err(error) => error.to_string(),

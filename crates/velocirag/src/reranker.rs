@@ -137,17 +137,16 @@ impl Reranker {
     fn load_model(&mut self) {
         let model_dir = resolve_model_dir();
 
-        let onnx_path = model_dir.join("onnx").join("model.onnx");
+        // The same test as the offline check's, so a folder it accepts loads.
         let tokenizer_path = model_dir.join("tokenizer.json");
-
-        if !onnx_path.exists() || !tokenizer_path.exists() {
+        let Some(onnx_path) = crate::download::model_files_in(&model_dir) else {
             self.load_error = Some(format!(
                 "Cross-encoder model not found at {}. Download from huggingface: {}",
                 model_dir.display(), MODEL_NAME
             ));
             tracing::error!("{}", self.load_error.as_ref().unwrap());
             return;
-        }
+        };
 
         tracing::info!("Loading cross-encoder model from {}", onnx_path.display());
 
