@@ -491,8 +491,15 @@ fn mirror(
             store::purge_many(conn, std::slice::from_ref(&note.id), false, true)?;
             rewritten += 1;
             removed.extend(old.vid);
-            row.hidden = old.hidden_ms.map(|ms| (ms, old.hidden_by.unwrap_or_default()));
-            kept = Some(Kept { superseded_by: old.superseded_by, invalidated_at: old.invalidated_at, links });
+            row.hidden = old.hidden_ms.map(|ms| (ms, old.hidden_by.clone().unwrap_or_default()));
+            // RULING: v2 final small round, item 1: `hidden_by` is put back as it was, NULL
+            // included, by `put_back`; the row writer only takes a string.
+            kept = Some(Kept {
+                superseded_by: old.superseded_by,
+                invalidated_at: old.invalidated_at,
+                hidden_by: old.hidden_by,
+                links,
+            });
         }
         let inserted_now = store::insert_row(conn, signer, &row)?;
         if let (Inserted::New { .. }, Some(kept)) = (inserted_now, &kept) {
@@ -544,6 +551,7 @@ fn mirror(
 struct Kept {
     superseded_by: Option<String>,
     invalidated_at: Option<String>,
+    hidden_by: Option<String>,
     links: Vec<LinkRow>,
 }
 
@@ -604,6 +612,12 @@ fn put_back(conn: &Connection, id: &str, kept: &Kept) -> Result<()> {
             params![kept.superseded_by, kept.invalidated_at, id],
         )?;
     }
+    // RULING: v2 final small round, item 1: a hide carried over keeps its `hidden_by`
+    // exactly: a NULL stays NULL, not ''.
+    conn.execute(
+        "UPDATE memory_ext SET hidden_by = ?1 WHERE mem_id = ?2 AND hidden_ms IS NOT NULL",
+        params![kept.hidden_by, id],
+    )?;
     for row in &kept.links {
         conn.execute(
             "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3, superseded_by = ?4,

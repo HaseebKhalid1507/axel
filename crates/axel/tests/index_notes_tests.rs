@@ -990,6 +990,33 @@ fn a_note_rewritten_under_the_same_id_loses_its_old_text_and_keeps_its_hide() {
     assert_eq!(w.count(&format!("SELECT hidden_ms FROM memory_ext WHERE mem_id = '{N2}'")), 1234);
 }
 
+// RULING: v2 final small round, item 1: a carried-over hide keeps its `hidden_by` exactly.
+#[test]
+fn a_rewritten_hidden_note_keeps_a_null_hidden_by_null_and_a_string_as_it_was() {
+    let mut w = three_mirrored();
+    w.conn().execute("UPDATE memory_ext SET hidden_ms = 1234, hidden_by = NULL WHERE mem_id = ?1", [N1]).unwrap();
+    w.conn().execute("UPDATE memory_ext SET hidden_ms = 5678, hidden_by = 'cli' WHERE mem_id = ?1", [N2]).unwrap();
+
+    w.write(
+        KEY,
+        &format!(
+            "{}{}{}",
+            rec(N1, 1_700_000_000_000, "the first note now says gamma"),
+            rec(N2, 1_700_000_000_100, "the second note is about delta"),
+            n3()
+        ),
+    );
+    let report = w.pass();
+    assert_eq!((report.rewritten, report.purged, report.inserted), (2, 0, 0));
+    assert_eq!(w.content(N1).unwrap(), "the first note now says gamma");
+    assert_eq!(w.count(&format!("SELECT hidden_ms FROM memory_ext WHERE mem_id = '{N1}'")), 1234);
+    assert_eq!(w.text("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", N1), None, "NULL became a string");
+    assert_eq!(w.count(&format!("SELECT hidden_ms FROM memory_ext WHERE mem_id = '{N2}'")), 5678);
+    assert_eq!(w.text("SELECT hidden_by FROM memory_ext WHERE mem_id = ?1", N2).as_deref(), Some("cli"));
+    // A row that was not hidden stays not hidden.
+    assert_eq!(w.count(&format!("SELECT hidden_ms IS NULL AND hidden_by IS NULL FROM memory_ext WHERE mem_id = '{N3}'")), 1);
+}
+
 /// Guards what the owner would lose: he makes a note secret, and its body stays in the
 /// word index.
 #[test]
