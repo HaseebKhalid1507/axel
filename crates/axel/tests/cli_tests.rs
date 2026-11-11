@@ -71,12 +71,13 @@ fn forget_cmd(path: &Path, ids: &[&str], now: bool, hidden: bool, answer: &str) 
 }
 
 fn restore_ids(path: &Path, ids: &[&str]) -> Ran {
-    let args = restore::Args { ids: strings(ids), by_model: false, since: None, forget_turns: None };
+    let args = restore::Args { ids: strings(ids), by_model: false, since: None, yes: false, forget_turns: None };
     ran("", |t| restore::run_with(&args, path, t))
 }
 
 fn restore_turns(path: &Path, archive: &str) -> Ran {
-    let args = restore::Args { ids: Vec::new(), by_model: false, since: None, forget_turns: Some(archive.to_string()) };
+    let args =
+        restore::Args { ids: Vec::new(), by_model: false, since: None, yes: false, forget_turns: Some(archive.to_string()) };
     ran("", |t| restore::run_with(&args, path, t))
 }
 
@@ -840,8 +841,15 @@ fn t14_restore_by_model_since_brings_back_what_a_model_did_since_then_and_prints
     w.hide("mem_last_year", "model:s0", 400 * DAY_MS);
 
     let since = chrono::DateTime::from_timestamp_millis(now_ms() - 2 * DAY_MS).unwrap().format("%Y-%m-%d").to_string();
-    let args = restore::Args { ids: Vec::new(), by_model: true, since: Some(since), forget_turns: None };
-    let run = ran("", |t| restore::run_with(&args, &w.path, t));
+    let args = restore::Args { ids: Vec::new(), by_model: true, since: Some(since), yes: false, forget_turns: None };
+    // Item 6 of the c18b review: listed and asked first; "no" changes nothing.
+    let state = |w: &World| dump(w.db(), "SELECT m.id, m.superseded_by, e.hidden_by FROM memories m JOIN memory_ext e ON e.mem_id = m.id ORDER BY m.id");
+    let before = state(&w);
+    let no = ran("n\n", |t| restore::run_with(&args, &w.path, t));
+    assert!(no.out.contains("Undo these 4 changes? [y/N]") && no.out.contains("Nothing was changed."), "{}", no.out);
+    assert!(no.out.contains("hidden by model:s1 on ") && no.out.contains("superseded by m:mem_fix: m:mem_was"), "{}", no.out);
+    assert_eq!(state(&w), before);
+    let run = ran("y\n", |t| restore::run_with(&args, &w.path, t));
     assert_eq!(run.code, 0, "{}", run.err);
     assert!(run.out.contains("3 hidden and 1 superseded memories restored"), "{}", run.out);
     for id in ["mem_m1", "mem_old_shadow", "mem_m_cap", "mem_was"] {
@@ -862,6 +870,63 @@ fn t14_restore_by_model_since_brings_back_what_a_model_did_since_then_and_prints
     assert_eq!(was, (None, None));
     assert_eq!(w.hidden_by("mem_cli").as_deref(), Some("cli"));
     assert_eq!(w.hidden_by("mem_last_year").as_deref(), Some("model:s0"));
+}
+
+/// v2 c18b review, item 6: `--by-model` undoes what a model did and nothing a person did.
+#[test]
+fn restore_by_model_undoes_a_models_supersede_and_leaves_the_persons_hide() {
+    let w = World::new();
+    let since = chrono::DateTime::from_timestamp_millis(now_ms() - 2 * DAY_MS).unwrap().format("%Y-%m-%d").to_string();
+    let saved_by_model = |id: &str| {
+        let mut fix = r(id, "tool", &format!("what the model saved as {id}"));
+        fix.origin_ref = "s1".to_string();
+        w.put(&fix);
+    };
+    // A model superseded X; the person then hid X.
+    w.put(&r("mem_x", "legacy", "the person's own decision"));
+    saved_by_model("mem_y");
+    tx(w.db(), || store::supersede(w.db(), "mem_x", "mem_y").unwrap());
+    w.hide("mem_x", "cli", HOUR_MS);
+    // A model hid Z and superseded it.
+    w.put(&r("mem_z", "legacy", "a decision a model hid and replaced"));
+    saved_by_model("mem_y2");
+    tx(w.db(), || store::supersede(w.db(), "mem_z", "mem_y2").unwrap());
+    w.hide("mem_z", "model:s1", HOUR_MS);
+
+    let args = restore::Args { ids: Vec::new(), by_model: true, since: Some(since), yes: true, forget_turns: None };
+    let run = ran("", |t| restore::run_with(&args, &w.path, t));
+    assert_eq!(run.code, 0, "{}", run.err);
+    assert!(!run.out.contains("[y/N]"), "--yes asked: {}", run.out);
+    let superseded = |id: &str| -> Option<String> {
+        w.db().query_row("SELECT superseded_by FROM memories WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    };
+    assert_eq!(superseded("mem_x"), None);
+    assert_eq!(w.hidden_by("mem_x").as_deref(), Some("cli"), "--by-model undid the person's hide");
+    assert!(run.out.contains("m:mem_x: no longer superseded by m:mem_y; still hidden (by cli"), "{}", run.out);
+    assert_eq!((superseded("mem_z"), w.hidden_by("mem_z")), (None, None));
+    assert!(run.out.contains("m:mem_z: no longer hidden; also no longer superseded by m:mem_y2"), "{}", run.out);
+}
+
+/// v2 c18b review, item 6: `restore <id>` of a row hidden and superseded undoes the hide only.
+#[test]
+fn restore_of_a_row_hidden_and_superseded_undoes_the_hide_and_says_how_to_undo_the_supersede() {
+    let w = World::new();
+    w.put(&r("mem_both", "tool", "a decision replaced and then hidden"));
+    w.shadow("mem_both", "a decision replaced and then hidden");
+    w.put(&r("mem_new", "tool", "the decision that replaced it"));
+    tx(w.db(), || store::supersede(w.db(), "mem_both", "mem_new").unwrap());
+    w.hide("mem_both", "cli", HOUR_MS);
+    let superseded = || -> Option<String> {
+        w.db().query_row("SELECT superseded_by FROM memories WHERE id = 'mem_both'", [], |r| r.get(0)).unwrap()
+    };
+    let first = restore_ids(&w.path, &["mem_both"]);
+    assert_eq!(w.hidden_by("mem_both"), None);
+    assert_eq!(superseded().as_deref(), Some("mem_new"), "the restore of a hide undid a supersede too");
+    assert!(first.out.contains("still superseded by m:mem_new; \"axel-v2 restore mem_both\" again"), "{}", first.out);
+    assert_eq!(w.shadow_mark("mem_both").as_deref(), Some("memory_hidden"), "a superseded row's shadow was unmarked");
+    restore_ids(&w.path, &["mem_both"]);
+    assert_eq!(superseded(), None);
+    assert_eq!(w.shadow_mark("mem_both"), None);
 }
 
 // ── Section 5, test 17: what the commands print ─────────────────────────────

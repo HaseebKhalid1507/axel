@@ -1,9 +1,10 @@
-//! `restore [<id>...] [--by-model --since <date>] [--forget-turns <ctx-id>]`. Commit 18b
-//! writes this file.
+//! `restore [<id>...] [--by-model --since <date> [--yes]] [--forget-turns <ctx-id>]`.
+//! Commit 18b writes this file.
 //!
-//! Every row goes back through `store::restore` (the shadow mark, the twins of a hidden
-//! turn), one id at a time, in one transaction. `--forget-turns` asks the next scan to read
-//! an archive again with the forget rules off for it.
+//! A row goes back through `store::restore_hide` (the shadow mark, the twins of a hidden
+//! turn) or `store::restore_supersede`, one change at a time, in one transaction.
+//! `--forget-turns` asks the next scan to read an archive again with the forget rules off
+//! for it.
 
 use std::path::Path;
 use std::process::ExitCode;
@@ -11,21 +12,25 @@ use std::process::ExitCode;
 use chrono::{DateTime, NaiveDate};
 use rusqlite::{params, Connection};
 
-use crate::cli::show::{self, find_all, find_archive, one, open, write, Term, FAILED, OK, USAGE};
+use crate::cli::show::{self, find_all, find_archive, one, open, row_info, rows_where, write, RowInfo, Term, FAILED, OK, USAGE};
 use crate::error::Result;
 use crate::ext::types::BrainArg;
-use crate::{index_archives, store};
+use crate::{index_archives, screen, store};
 
 #[derive(clap::Args)]
 pub struct Args {
     /// Ids of hidden rows to bring back
     pub ids: Vec<String>,
-    /// Every row a model hid or superseded (with --since)
+    /// Every row a model hid or superseded (with --since), in every project
     #[arg(long)]
     pub by_model: bool,
-    /// With --by-model: since this date
+    /// With --by-model: since this date, a day (2026-11-01, read as midnight UTC) or an
+    /// RFC 3339 time
     #[arg(long, value_name = "DATE")]
     pub since: Option<String>,
+    /// With --by-model: do not ask before restoring
+    #[arg(long)]
+    pub yes: bool,
     /// Index again the turns of this archive that a forget tool left out
     #[arg(long, value_name = "CTX-ID")]
     pub forget_turns: Option<String>,
@@ -51,10 +56,10 @@ pub fn parse_since(given: &str) -> Option<i64> {
 
 pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     let forms = usize::from(!args.ids.is_empty()) + usize::from(args.by_model) + usize::from(args.forget_turns.is_some());
-    if forms != 1 || (args.since.is_some() && !args.by_model) {
+    if forms != 1 || (args.since.is_some() && !args.by_model) || (args.yes && !args.by_model) {
         writeln!(
             term.err,
-            "give one of: ids (\"axel-v2 restore <id>...\"), \"--by-model --since <date>\", \"--forget-turns ctx-<id>\""
+            "give one of: ids (\"axel-v2 restore <id>...\"), \"--by-model --since <date> [--yes]\", \"--forget-turns ctx-<id>\""
         )?;
         return Ok(USAGE);
     }
@@ -64,32 +69,41 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     }
     if args.by_model {
         let Some(since) = args.since.as_deref().and_then(parse_since) else {
-            writeln!(term.err, "--by-model needs --since <date>, a day such as 2026-11-01")?;
+            writeln!(term.err, "--by-model needs --since <date>, a day such as 2026-11-01 (UTC)")?;
             return Ok(USAGE);
         };
-        return by_model(&conn, since, term);
+        return by_model(&conn, since, args.yes, term);
     }
 
     let Some(ids) = find_all(&conn, &args.ids, term.err)? else {
         writeln!(term.err, "Nothing was changed.")?;
         return Ok(FAILED);
     };
-    let mut twins = Vec::new();
+    let mut before = Vec::new();
     for id in &ids {
-        twins.push(conn.query_row(
+        let twins = conn.query_row(
             "SELECT COUNT(*) FROM memory_ext WHERE hidden_by = ?1",
             [format!("twin:{id}")],
             |r| r.get::<_, i64>(0),
-        )?);
+        )?;
+        let hidden = row_info(&conn, id)?.is_some_and(|row| row.hidden_ms.is_some());
+        before.push((twins, hidden));
     }
-    let backs = write(&conn, || ids.iter().map(|id| store::restore(&conn, id)).collect::<Result<Vec<usize>>>())?;
-    for ((full, n), twins) in ids.iter().zip(backs).zip(twins) {
+    // RULING: v2 c18b review, item 6. One change per call: a hidden row gets its hide back
+    // and keeps a supersede (said below); a row that is only superseded gets that undone.
+    let backs = write(&conn, || {
+        let mut backs = Vec::new();
+        for (id, (_, hidden)) in ids.iter().zip(&before) {
+            backs.push(if *hidden { store::restore_hide(&conn, id)? } else { store::restore_supersede(&conn, id)? });
+        }
+        Ok(backs)
+    })?;
+    for ((full, n), (twins, _)) in ids.iter().zip(backs).zip(before) {
         let id = one(full);
-        let stays: bool =
-            conn.query_row("SELECT EXISTS(SELECT 1 FROM memories WHERE id = ?1)", [full], |r| r.get(0))?;
+        let now = row_info(&conn, full)?;
         if n == 0 {
             writeln!(term.out, "m:{id} was neither hidden nor superseded; nothing to undo.")?;
-        } else if twins > 0 && !stays {
+        } else if twins > 0 && now.is_none() {
             writeln!(
                 term.out,
                 "Restored m:{id}: the turn is back as its archived row; the stand-in row is gone ({n} archived rows with its prompt are visible again)."
@@ -103,58 +117,111 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
         } else {
             writeln!(term.out, "Restored m:{id}.")?;
         }
+        if let Some(by) = now.as_ref().and_then(|row| row.superseded_by.as_deref()) {
+            writeln!(
+                term.out,
+                "  m:{id} is still superseded by m:{}; \"axel-v2 restore {id}\" again undoes that too.",
+                one(by)
+            )?;
+        }
     }
     Ok(OK)
 }
 
-fn ids_of(conn: &Connection, sql: &str, since: i64) -> Result<Vec<String>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map([since], |r| r.get(0))?;
-    Ok(rows.collect::<rusqlite::Result<_>>()?)
+/// `m:<id> · <first line of its text>`.
+fn brief(row: &RowInfo) -> String {
+    let text = if row.secret {
+        "(a secret memory; its text is not shown)".to_string()
+    } else {
+        let first = format!("{}\n{}", row.title, row.content);
+        screen::show(first.lines().find(|l| !l.trim().is_empty()).unwrap_or(""), 120)
+    };
+    format!("m:{} · {text}", one(&row.id))
 }
 
 /// Every row hidden by a model since `since`, and every row superseded since then by a
-/// row the assistant saved, each through `store::restore` (R3-6b).
-fn by_model(conn: &Connection, since: i64, term: &mut Term) -> Result<u8> {
-    let hidden = ids_of(
+/// row the assistant saved (R3-6b), in every project: listed, asked, then undone.
+// RULING: v2 c18b review, item 6. A superseded row gets only its supersede undone; its hide
+// too only when a model hid it (`model:…`). A hide by the person or a pause stays.
+fn by_model(conn: &Connection, since: i64, yes: bool, term: &mut Term) -> Result<u8> {
+    let hidden = rows_where(conn, "WHERE e.hidden_by LIKE 'model:%' AND e.hidden_ms >= ?1 ORDER BY e.hidden_ms, m.id", [since])?;
+    let superseded = rows_where(
         conn,
-        "SELECT mem_id FROM memory_ext WHERE hidden_by LIKE 'model:%' AND hidden_ms >= ?1 ORDER BY hidden_ms, mem_id",
-        since,
+        "WHERE m.superseded_by IN (SELECT mem_id FROM memory_ext WHERE origin_kind = 'tool' AND created_ms >= ?1)
+          ORDER BY m.id",
+        [since],
     )?;
-    let superseded = ids_of(
-        conn,
-        "SELECT m.id FROM memories m JOIN memory_ext e ON e.mem_id = m.superseded_by
-          WHERE e.origin_kind = 'tool' AND e.created_ms >= ?1 ORDER BY e.created_ms, m.id",
-        since,
-    )?;
-    let (back_hidden, back_superseded) = write(conn, || {
-        let mut done: Vec<&String> = Vec::new();
-        let mut counts = (Vec::new(), Vec::new());
-        for (list, out) in [(&hidden, &mut counts.0), (&superseded, &mut counts.1)] {
-            for id in list {
-                // A row both hidden and superseded is restored once and counted in both.
-                if done.contains(&id) || store::restore(conn, id)? > 0 {
-                    out.push(id.clone());
-                }
-                done.push(id);
-            }
-        }
-        Ok(counts)
-    })?;
     let since_text = show::date(since);
-    if !back_hidden.is_empty() {
-        let listed: Vec<String> = back_hidden.iter().map(|id| format!("m:{}", one(id))).collect();
-        writeln!(term.out, "Hidden by the assistant, restored: {}", listed.join(", "))?;
+    if hidden.is_empty() && superseded.is_empty() {
+        writeln!(term.out, "0 hidden and 0 superseded memories restored (no change by the assistant since {since_text}).")?;
+        return Ok(OK);
     }
-    if !back_superseded.is_empty() {
-        let listed: Vec<String> = back_superseded.iter().map(|id| format!("m:{}", one(id))).collect();
-        writeln!(term.out, "Superseded by the assistant, restored: {}", listed.join(", "))?;
+    writeln!(term.out, "Changes by the assistant since {since_text}, in every project:")?;
+    for row in &hidden {
+        let when = row.hidden_ms.map(show::date).unwrap_or_default();
+        writeln!(term.out, "  hidden by {} on {when}: {}", one(row.hidden_by.as_deref().unwrap_or("?")), brief(row))?;
+    }
+    for row in &superseded {
+        writeln!(term.out, "  superseded by m:{}: {}", one(row.superseded_by.as_deref().unwrap_or("?")), brief(row))?;
+    }
+    if !yes {
+        write!(term.out, "Undo these {} changes? [y/N] ", hidden.len() + superseded.len())?;
+        term.out.flush()?;
+        let mut answer = String::new();
+        term.input.read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            writeln!(term.out, "\nNothing was changed.")?;
+            return Ok(OK);
+        }
+    }
+
+    // `(id, what was undone)`, in the order listed.
+    let (lines, back_hidden, back_superseded) = write(conn, || {
+        let mut lines: Vec<String> = Vec::new();
+        let (mut back_hidden, mut back_superseded) = (0usize, 0usize);
+        for row in &hidden {
+            if store::restore_hide(conn, &row.id)? == 0 {
+                continue;
+            }
+            back_hidden += 1;
+            let mut line = format!("m:{}: no longer hidden", one(&row.id));
+            if let Some(by) = superseded.iter().find(|s| s.id == row.id).and_then(|s| s.superseded_by.as_deref()) {
+                if store::restore_supersede(conn, &row.id)? > 0 {
+                    back_superseded += 1;
+                    line.push_str(&format!("; also no longer superseded by m:{}", one(by)));
+                }
+            }
+            lines.push(line);
+        }
+        for row in superseded.iter().filter(|s| !hidden.iter().any(|h| h.id == s.id)) {
+            if store::restore_supersede(conn, &row.id)? == 0 {
+                continue;
+            }
+            back_superseded += 1;
+            let by = one(row.superseded_by.as_deref().unwrap_or("?"));
+            let mut line = format!("m:{}: no longer superseded by m:{by}", one(&row.id));
+            match row.hidden_by.as_deref() {
+                Some(model) if model.starts_with("model:") => {
+                    if store::restore_hide(conn, &row.id)? > 0 {
+                        back_hidden += 1;
+                        line.push_str(&format!("; also no longer hidden (by {})", one(model)));
+                    }
+                }
+                Some(other) if row.hidden_ms.is_some() => {
+                    line.push_str(&format!("; still hidden (by {}: \"axel-v2 restore {}\" undoes that)", one(other), one(&row.id)));
+                }
+                _ => {}
+            }
+            lines.push(line);
+        }
+        Ok((lines, back_hidden, back_superseded))
+    })?;
+    for line in &lines {
+        writeln!(term.out, "  {line}")?;
     }
     writeln!(
         term.out,
-        "{} hidden and {} superseded memories restored (changes by the assistant since {since_text}).",
-        back_hidden.len(),
-        back_superseded.len()
+        "{back_hidden} hidden and {back_superseded} superseded memories restored (changes by the assistant since {since_text})."
     )?;
     Ok(OK)
 }

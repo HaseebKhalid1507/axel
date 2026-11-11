@@ -614,10 +614,31 @@ pub fn proven_twin(conn: &Connection, capture_id: &str, twin_id: &str) -> Result
 /// otherwise the capture itself is visible again beside them.
 /// Returns the number of rows that are back (0: nothing to undo).
 pub fn restore(conn: &Connection, id: &str) -> Result<usize> {
-    atomic(conn, || restore_one(conn, id))
+    atomic(conn, || restore_one(conn, id, true))
 }
 
-fn restore_one(conn: &Connection, id: &str) -> Result<usize> {
+/// `restore` of the hide only: a supersede stays. Returns the number of rows that are back.
+// RULING: v2 c18b review, item 6. A row both hidden and superseded is two changes, often
+// by two people: undoing one must not undo the other, and no command puts a supersede back.
+pub fn restore_hide(conn: &Connection, id: &str) -> Result<usize> {
+    atomic(conn, || restore_one(conn, id, false))
+}
+
+/// Undoes a supersede only: `superseded_by` and `invalidated_at`, and the shadow mark
+/// when the row is not hidden. A hide stays. Returns 1 when the row was superseded.
+pub fn restore_supersede(conn: &Connection, id: &str) -> Result<usize> {
+    atomic(conn, || {
+        let n = conn.execute(
+            "UPDATE memories SET superseded_by = NULL, invalidated_at = NULL
+              WHERE id = ?1 AND (superseded_by IS NOT NULL OR invalidated_at IS NOT NULL)",
+            [id],
+        )?;
+        clear_shadow(conn, id)?;
+        Ok(n)
+    })
+}
+
+fn restore_one(conn: &Connection, id: &str, supersede: bool) -> Result<usize> {
     let row: Option<(String, bool, Option<String>)> = conn
         .query_row(
             "SELECT origin_kind, hidden_ms IS NOT NULL, hidden_by FROM memory_ext WHERE mem_id = ?1",
@@ -648,15 +669,19 @@ fn restore_one(conn: &Connection, id: &str) -> Result<usize> {
                 capture,
             )?;
         if waiting {
-            return restore_one(conn, capture);
+            return restore_one(conn, capture, supersede);
         }
     }
 
-    let mut back = conn.execute(
-        "UPDATE memories SET superseded_by = NULL, invalidated_at = NULL
-          WHERE id = ?1 AND (superseded_by IS NOT NULL OR invalidated_at IS NOT NULL)",
-        [id],
-    )?;
+    let mut back = if supersede {
+        conn.execute(
+            "UPDATE memories SET superseded_by = NULL, invalidated_at = NULL
+              WHERE id = ?1 AND (superseded_by IS NOT NULL OR invalidated_at IS NOT NULL)",
+            [id],
+        )?
+    } else {
+        0
+    };
     if hidden {
         let twins: Vec<String> = if origin == "capture" && twin_of.is_none() {
             let mut stmt = conn.prepare("SELECT mem_id FROM memory_ext WHERE hidden_by = ?1")?;
