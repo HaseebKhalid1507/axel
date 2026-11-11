@@ -228,6 +228,16 @@ pub fn purge_many(conn: &Connection, ids: &[String], tombstone: bool, forget_log
     if ids.is_empty() {
         return Ok(0);
     }
+    // RULING: wave3-c11 ruling 3: the pragma is set per connection, and without it the
+    // freed pages keep the text. Read once, before anything is written. The ruling refuses
+    // 0; `FAST` (2) is refused too, because it leaves the text in pages on the free list.
+    let secure_delete: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0))?;
+    if secure_delete != 1 {
+        return Err(AxelError::Other(format!(
+            "purge: this connection has PRAGMA secure_delete = {secure_delete}; a purge needs \
+             secure_delete = ON (a connection of brain_v2::connect has it)"
+        )));
+    }
     atomic(conn, || {
         // 0. The delete guard lets `DELETE FROM memories` through only while this row exists.
         conn.execute("INSERT INTO axel_purge(one) VALUES (1)", [])?;

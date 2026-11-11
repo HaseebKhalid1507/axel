@@ -1272,3 +1272,66 @@ fn after_an_error_from_store_nothing_of_the_callers_transaction_is_in_the_file()
     put(&brain, &row("mem_next", "note", "tool", "the write after the failure"));
     assert_eq!(parts(&front, "mem_next"), (1, 1, 1));
 }
+
+// ── Ruling 3 of the commit 11 review: no purge without `secure_delete` ─────
+
+#[test]
+fn purge_many_refuses_a_connection_without_secure_delete() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_stays", "note", "tool", "the heron row a plain connection may not purge"));
+    put(&brain, &row("mem_other", "note", "tool", "a neighbour"));
+    // A hidden capture with a twin: its restore ends in a purge of the capture.
+    put(&brain, &capture_row("mem_cap", TURN_KEY));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_cap", "cli").unwrap()), 1);
+    let mut twin = archive_row("mem_twin", "eeee0000eeee0000eeee0000eeee0000", TURN_KEY);
+    twin.hidden = Some((now_ms(), "twin:mem_cap".to_string()));
+    put(&brain, &twin);
+    let state = |c: &Connection| {
+        let mut out = vec![whole(c, "mem_stays"), whole(c, "mem_other"), whole(c, "mem_cap"), whole(c, "mem_twin")];
+        for id in ["mem_cap", "mem_twin"] {
+            out.push(format!("{:?}", mark_of(c, id)));
+        }
+        for table in ["memories", "memories_fts", "memory_ext", "memory_tombstones", "axel_purge"] {
+            out.push(format!("{table}={}", count(c, &format!("SELECT COUNT(*) FROM {table}"))));
+        }
+        out
+    };
+    let before = state(conn);
+
+    // A connection that did not come through `connect`: the pragma is off, or `FAST`.
+    let plain = Connection::open(&path).unwrap();
+    for (setting, value) in [("OFF", 0), ("FAST", 2)] {
+        plain.execute_batch(&format!("PRAGMA secure_delete = {setting}")).unwrap();
+        assert_eq!(count(&plain, "PRAGMA secure_delete"), value);
+        brain_v2::begin_write(&plain).unwrap();
+        for refused in [
+            store::purge(&plain, "mem_stays", true, true).unwrap_err(),
+            store::purge_many(&plain, &["mem_stays".to_string(), "mem_other".to_string()], false, false).unwrap_err(),
+            store::restore(&plain, "mem_cap").unwrap_err(),
+        ] {
+            assert!(refused.to_string().contains("PRAGMA secure_delete"), "{setting}: {refused}");
+        }
+        assert_eq!(count(&plain, "SELECT COUNT(*) FROM axel_purge"), 0, "refused before the purge row is written");
+        assert_eq!(state(&plain), before, "{setting}: nothing changed inside the transaction");
+        plain.execute_batch("ROLLBACK").unwrap();
+        assert_eq!(state(conn), before, "{setting}: nothing changed");
+    }
+    // What does not delete is not refused there.
+    assert_eq!(tx(&plain, || store::hide(&plain, "mem_other", "cli").unwrap()), 1);
+    assert_eq!(tx(&plain, || store::restore(&plain, "mem_other").unwrap()), 1);
+    assert_eq!(state(conn), before);
+    drop(plain);
+
+    // A connection of `connect` has the pragma and purges.
+    let cli = brain_v2::connect(&path, Role::Cli).unwrap();
+    assert_eq!(count(&cli, "PRAGMA secure_delete"), 1);
+    assert_eq!(tx(&cli, || store::restore(&cli, "mem_cap").unwrap()), 1);
+    assert!(is_returned(conn, "mem_twin"));
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories WHERE id = 'mem_cap'"), 0);
+    assert_eq!(tx(&cli, || store::purge(&cli, "mem_stays", true, true).unwrap()), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories WHERE id = 'mem_stays'"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones WHERE id = 'mem_stays'"), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
+}
