@@ -99,7 +99,8 @@ pub fn tick(ctx: &mut IndexerCtx) {
     if due(ctx, "recall::trim_log", TRIM_MS) {
         guarded(ctx, recall::trim_log);
     }
-    if due(ctx, "write_status", STATUS_MS) {
+    let status_ms = ctx.test.status_tick_ms.map_or(STATUS_MS, |ms| ms as i64);
+    if due(ctx, "write_status", status_ms) {
         guarded(ctx, indexer_start::write_status);
     }
 }

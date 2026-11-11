@@ -738,6 +738,7 @@ impl<W: Write> Pump<W> {
                     mode: st.mode.clone(),
                     last_run: HashMap::new(),
                     bulk_out: false,
+                    brain_file: None,
                     clock: st.clock.clone(),
                     test: st.test.clone(),
                     writing: st.writing.clone(),

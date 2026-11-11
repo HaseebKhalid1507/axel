@@ -55,6 +55,7 @@ pub fn open_ctx(cfg: ExtConfig, boot: Boot) -> (IndexerCtx, Receiver<Job>, Recei
         mode: Arc::new(AtomicU8::new(Mode::Starting as u8)),
         last_run: Default::default(),
         bulk_out: false,
+        brain_file: None,
         clock: boot.clock,
         test: boot.test,
         writing: Arc::new(AtomicBool::new(false)),
@@ -81,6 +82,7 @@ pub fn ensure_open(ctx: &mut IndexerCtx) {
         if degraded {
             ctx.conn = None;
             ctx.signer = None;
+            ctx.brain_file = None;
         }
         return;
     }
@@ -147,19 +149,53 @@ fn canonical_base(base: &Path) -> String {
 
 const BASE_SQL: &str = "SELECT value FROM context_data WHERE layer = 'axel' AND key = 'synaps_base'";
 
-/// The base an existing file records, read without writing to it. `None` for a file that
-/// cannot be read this way: `open_v2` says what is wrong with it.
-fn recorded_base_unopened(path: &Path) -> Option<String> {
+/// The base an existing file records, read without writing to it. `Ok(None)` when there is
+/// no file, or the file has no such table or row: `open_v2` says what it is.
+// RULING: wave3-c12b ruling 6. A look that fails (the file is locked, or cannot be read) is
+// an error, never "no base recorded": `open_v2` must not run on a brain that may belong to
+// another base. `reason_of` makes it `BrainNotReady`, which is tried again, or
+// `BrainDamaged` for a file that is not a database.
+fn recorded_base_unopened(path: &Path) -> Result<Option<String>> {
     if !path.is_file() {
-        return None;
+        return Ok(None);
     }
     let conn = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .ok()?;
-    let _ = conn.busy_timeout(Duration::from_millis(1_000));
-    conn.query_row(BASE_SQL, [], |r| r.get::<_, String>(0)).optional().ok().flatten()
+    )?;
+    conn.busy_timeout(Duration::from_millis(1_000))?;
+    let has_table: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_data')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_table {
+        return Ok(None);
+    }
+    Ok(conn.query_row(BASE_SQL, [], |r| r.get::<_, String>(0)).optional()?)
+}
+
+// RULING: wave3-c12b ruling 5. The file this process opened is known by its device and
+// inode numbers. A brain restored over the path, or a path that is gone, leaves the open
+// connections on a file nobody will read again. Unix only: elsewhere there is no number to
+// compare, nothing is kept, and the check never fires.
+#[cfg(unix)]
+fn file_id(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_id(_path: &Path) -> Option<(u64, u64)> {
+    None
+}
+
+/// True when the path no longer names the file that was opened.
+fn brain_file_changed(ctx: &IndexerCtx) -> bool {
+    match ctx.brain_file {
+        Some(opened) => file_id(&ctx.cfg.brain) != Some(opened),
+        None => false,
+    }
 }
 
 /// `open_v2`, with the base guard on both sides of it: a brain recorded for another Synaps
@@ -167,7 +203,7 @@ fn recorded_base_unopened(path: &Path) -> Option<String> {
 fn open(ctx: &mut IndexerCtx) -> Result<()> {
     let path = ctx.cfg.brain.clone();
     let base = canonical_base(&ctx.cfg.base);
-    if let Some(recorded) = recorded_base_unopened(&path) {
+    if let Some(recorded) = recorded_base_unopened(&path)? {
         if recorded != base {
             return Err(AxelError::OtherBase(PathBuf::from(recorded)));
         }
@@ -203,6 +239,7 @@ fn open(ctx: &mut IndexerCtx) -> Result<()> {
 
     ctx.conn = Some(brain.conn);
     ctx.signer = brain.signer;
+    ctx.brain_file = file_id(&path);
     let usable = model_usable(ctx).unwrap_or(false);
     ctx.status.model_loaded.store(usable, Ordering::Relaxed);
     if ctx.embed.model_id().is_some() && !usable {
@@ -447,6 +484,12 @@ pub fn write_status(ctx: &mut IndexerCtx) -> Result<()> {
     let Some(conn) = ctx.conn.as_ref() else { return Ok(()) };
     let mode = mode_of(ctx);
     if mode != Some(Mode::Ready) {
+        return Ok(());
+    }
+    // RULING: wave3-c12b ruling 5. Before the row, every 30 s.
+    if brain_file_changed(ctx) {
+        log_line("brain file replaced or gone");
+        degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
         return Ok(());
     }
     let s = &ctx.status;

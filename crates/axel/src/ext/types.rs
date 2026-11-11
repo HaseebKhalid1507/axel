@@ -179,6 +179,8 @@ pub struct IndexerCtx {
     pub mode: Arc<AtomicU8>,
     pub last_run: HashMap<&'static str, i64>,
     pub bulk_out: bool,
+    /// Device and inode of the brain file when it was opened (wave 3, 12b ruling 5).
+    pub brain_file: Option<(u64, u64)>,
     pub clock: Clock,
     pub test: Arc<TestHooks>,
     pub writing: Arc<AtomicBool>,
@@ -242,6 +244,8 @@ pub struct TestHooks {
     pub hang_front_start: bool,
     /// Replaces the 60 s a front thread has to hand over the indexer's queue.
     pub front_start_limit_ms: Option<u64>,
+    /// Replaces the 30 s between two status ticks of the indexer.
+    pub status_tick_ms: Option<u64>,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.

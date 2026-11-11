@@ -1358,3 +1358,82 @@ fn r8_a_degraded_indexer_runs_no_handler() {
     assert_eq!(status.panics.load(Ordering::Relaxed), 0);
     assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Degraded as u8);
 }
+
+// ── Wave 3 rulings 5 and 6: the file under the process ──────────────────────
+
+#[test]
+fn r5_a_brain_file_replaced_under_the_process_degrades_it_and_the_new_file_is_not_written() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks { status_tick_ms: Some(50), ..TestHooks::default() });
+    assert_eq!(wait_status_file(&dirs, "ready", Duration::from_secs(15))["reason"], "None");
+
+    // The same bytes under a new inode, as a restored backup would be.
+    let copy = dirs.brain().with_extension("copy");
+    std::fs::copy(dirs.brain(), &copy).unwrap();
+    let before = sha256(&copy);
+    std::fs::rename(&copy, dirs.brain()).unwrap();
+
+    let said = wait_status_file(&dirs, "degraded", Duration::from_secs(10));
+    assert_eq!(said["reason"], "BrainChanged", "{said}");
+    let written = host.status.status_written_ms.load(Ordering::Relaxed);
+    assert_eq!(
+        host.tool("search")["result"]["content"],
+        "Axel is unavailable: BrainChanged. Synaps itself is not affected."
+    );
+    assert_eq!(host.hook("before_message", "s1"), continues());
+    // More than one turn of the indexer's loop: no status row follows.
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(host.status.status_written_ms.load(Ordering::Relaxed), written);
+    assert!(wait_for_log(&dirs, "brain file replaced or gone").matches("brain file replaced").count() == 1);
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    assert_eq!(sha256(&dirs.brain()), before, "the new file was written");
+
+    // A path that is gone is the same.
+    let other = Dirs::new();
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(other.ext_config("off"), b);
+    assert!(ctx.brain_file.is_some());
+    indexer_start::write_status(&mut ctx).unwrap();
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    std::fs::remove_file(other.brain()).unwrap();
+    indexer_start::write_status(&mut ctx).unwrap();
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Degraded as u8);
+    assert_eq!(DegradedReason::from_u8(status.reason.load(Ordering::SeqCst)), DegradedReason::BrainChanged);
+    assert!(!other.brain().exists(), "a brain was made where one had gone");
+}
+
+#[test]
+fn r6_a_look_that_cannot_read_the_brain_is_not_ready_and_open_v2_does_not_run() {
+    let dirs = Dirs::new();
+    drop(make_brain(&dirs.brain()));
+    // Another connection holds the file: every read by anyone else is `SQLITE_BUSY`.
+    let holder = Connection::open(dirs.brain()).unwrap();
+    holder
+        .execute_batch(
+            "PRAGMA locking_mode = EXCLUSIVE; BEGIN IMMEDIATE;
+             INSERT INTO context_data(key, value, layer) VALUES('held', 'x', 'test'); COMMIT;",
+        )
+        .unwrap();
+
+    let mut host = Host::start(None, TestHooks::default());
+    let start = Instant::now();
+    host.call("initialize", json!({"config": dirs.config("off")}));
+    // The look gives up after its 1 s. `open_v2`, had it run, would wait 5 s more.
+    wait_for_log(&dirs, "brain not open: BrainNotReady");
+    assert!(start.elapsed() < Duration::from_secs(3), "open_v2 ran after the look failed: {:?}", start.elapsed());
+    assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::BrainNotReady);
+
+    // Released: nothing opens the brain before the next retry, a minute away.
+    drop(holder);
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        host.tool("search")["result"]["content"],
+        "Axel is unavailable: BrainNotReady. Synaps itself is not affected."
+    );
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+    let conn = Connection::open(dirs.brain()).unwrap();
+    let rows: i64 = conn
+        .query_row("SELECT COUNT(*) FROM context_data WHERE layer = 'axel'", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "the brain was written by a process that could not read its base");
+}

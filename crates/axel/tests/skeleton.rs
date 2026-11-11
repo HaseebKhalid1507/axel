@@ -102,6 +102,7 @@ fn indexer_ctx(test: TestHooks, conn: Option<Connection>) -> (IndexerCtx, Receiv
         mode: Arc::new(AtomicU8::new(Mode::Ready as u8)),
         last_run: HashMap::new(),
         bulk_out: false,
+        brain_file: None,
         clock: Arc::new(|| 1_000),
         test,
         writing: Arc::new(AtomicBool::new(false)),
