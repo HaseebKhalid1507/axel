@@ -581,18 +581,47 @@ fn origin_of(kind: &str) -> Option<Origin> {
     })
 }
 
-/// A row of `recall` as a `Pick`, so that its label is made as search makes it.
+/// A column that may be NULL: `Some(None)` for NULL, `Some(Some(text))` for text, and
+/// `None` for anything else (a blob, a number, text that is not UTF-8).
+fn nullable_text(r: &rusqlite::Row, index: usize) -> rusqlite::Result<Option<Option<String>>> {
+    if matches!(r.get_ref(index)?, rusqlite::types::ValueRef::Null) {
+        return Ok(Some(None));
+    }
+    Ok(brain_v2::text_at(r, index)?.map(Some))
+}
+
+/// A row of `recall` as a `Pick`, so that its label is made as search makes it. A row that
+/// cannot be read as text where text is due is `None`: it is skipped, as the search engine
+/// skips it (`recall::mem_row`), so one bad old row does not fail every answer.
+// RULING: v2 c18a review, item 1.
 fn pick_of(r: &rusqlite::Row) -> rusqlite::Result<Option<Pick>> {
-    let id: String = r.get(0)?;
-    let project_key: Option<String> = r.get(1)?;
-    let title: String = r.get(2)?;
-    let body: String = r.get(3)?;
-    let category: String = r.get(4)?;
-    let tags: Option<String> = r.get(5)?;
-    let origin_kind: String = r.get(6)?;
-    let origin_ref: String = r.get(7)?;
-    let created_ms: i64 = r.get(8)?;
-    let time_source: String = r.get(9)?;
+    let text = |index| brain_v2::text_at(r, index);
+    let (
+        Some(id),
+        Some(project_key),
+        Some(title),
+        Some(body),
+        Some(category),
+        Some(tags),
+        Some(origin_kind),
+        Some(origin_ref),
+        Ok(created_ms),
+        Some(time_source),
+    ) = (
+        text(0)?,
+        nullable_text(r, 1)?,
+        text(2)?,
+        text(3)?,
+        text(4)?,
+        nullable_text(r, 5)?,
+        text(6)?,
+        text(7)?,
+        r.get::<_, i64>(8),
+        text(9)?,
+    )
+    else {
+        return Ok(None);
+    };
     let Some(origin) = origin_of(&origin_kind) else { return Ok(None) };
     let shown = match origin {
         Origin::Archive if is_archive_id(&origin_ref) => format!("ctx-{origin_ref}"),
@@ -686,16 +715,21 @@ fn recent_rows(
 }
 
 /// The handoff as the command line reads it (`get_context("handoff")`): `(text, updated)`.
+/// A layer whose value or date cannot be read as text is passed over.
+// RULING: v2 c18a review, item 1.
 fn handoff(conn: &Connection) -> rusqlite::Result<Option<(String, Option<String>)>> {
-    conn.query_row(
+    let mut stmt = conn.prepare_cached(
         "SELECT value, updated FROM context_data
           WHERE key = 'handoff'
-          ORDER BY CASE layer WHEN 'session' THEN 0 WHEN 'boot' THEN 1 WHEN 'archive' THEN 2 ELSE 3 END
-          LIMIT 1",
-        [],
-        |r| Ok((r.get(0)?, r.get(1)?)),
-    )
-    .optional()
+          ORDER BY CASE layer WHEN 'session' THEN 0 WHEN 'boot' THEN 1 WHEN 'archive' THEN 2 ELSE 3 END",
+    )?;
+    let mut rows = stmt.query([])?;
+    while let Some(r) = rows.next()? {
+        if let (Some(value), Some(updated)) = (brain_v2::text_at(r, 0)?, nullable_text(r, 1)?) {
+            return Ok(Some((value, updated)));
+        }
+    }
+    Ok(None)
 }
 
 /// The first line for a chat (R-1, 4.1 risk 2): what the assistant hid and superseded,

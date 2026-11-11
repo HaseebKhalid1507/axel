@@ -1763,3 +1763,52 @@ fn s7_t07_a_brain_changed_under_the_server_answers_unavailable_and_writes_nothin
     assert_eq!(count(&host.conn(), "SELECT COUNT(*) FROM memories"), 0);
 }
 
+// ── The review of 18a (v2 c18a review, items 1 to 5) ────────────────────────
+
+// RULING: v2 c18a review, item 1: a row that cannot be read is skipped, by `recall` and by
+// the handoff, as the search engine skips it.
+#[test]
+fn r1_an_old_row_whose_title_is_not_text_does_not_fail_recall_in_any_project() {
+    let mut lab = Lab::new();
+    // Old rows of the old binary, global, adopted by the tick: adoption reads only `id` and
+    // `content`, so these two are adopted with their titles as they are.
+    for (id, title) in [("mem_blobtitle000001", "X'00ff10'"), ("mem_badutf8title001", "CAST(X'c328' AS TEXT)")] {
+        lab.conn()
+            .execute(
+                &format!(
+                    "INSERT INTO memories (id, category, topic, title, content, created)
+                     VALUES (?1, 'events', 'old', {title}, 'the curlew roost on the saltmarsh at dusk', ?2)"
+                ),
+                params![id, chrono::Utc::now().to_rfc3339()],
+            )
+            .unwrap();
+    }
+    old_memory(lab.conn(), "mem_goodlegacy00001", "the curlew flock was counted on the saltmarsh", "legacy");
+    for id in ["mem_blobtitle000001", "mem_badutf8title001", "mem_goodlegacy00001"] {
+        assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memory_ext WHERE mem_id = ?1", id), 1, "{id} not adopted");
+    }
+    assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories WHERE typeof(title) = 'blob'"), 1);
+    // A handoff whose first layer is a blob: the next layer is read.
+    lab.conn()
+        .execute_batch(
+            "INSERT INTO context_data(layer, key, value, updated) VALUES ('session', 'handoff', X'00ff', '2026-11-10');
+             INSERT INTO context_data(layer, key, value, updated) VALUES ('boot', 'handoff', 'HANDOFF-CURLEW count the roost', '2026-11-09');",
+        )
+        .unwrap();
+
+    // A chat of project B, which has a saved row of its own.
+    let t = lab.chat(&lab.b.clone(), "T");
+    let own = lab.remember(&t, "the beta project counts terns on the breakwater");
+    let recalled = lab.recall(&t);
+    assert!(recalled.contains(&own), "{recalled}");
+    assert!(recalled.contains("mem_goodlegacy00001"), "{recalled}");
+    assert!(recalled.contains("HANDOFF-CURLEW"), "{recalled}");
+    assert!(!recalled.contains("mem_blobtitle000001") && !recalled.contains("mem_badutf8title001"), "{recalled}");
+    // And in project A, with `focus: saved`.
+    let s = lab.chat(&lab.a.clone(), "S");
+    let saved = lab.ok("recall", json!({ "focus": "saved" }), &s);
+    assert!(saved.contains("mem_goodlegacy00001"), "{saved}");
+    // Search skipped them before this round, and still does.
+    let found = lab.search(&s, "curlew roost saltmarsh");
+    assert!(!found.contains("mem_blobtitle000001") && !found.contains("mem_badutf8title001"), "{found}");
+}
