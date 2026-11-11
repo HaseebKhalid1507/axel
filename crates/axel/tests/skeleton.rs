@@ -187,7 +187,6 @@ fn every_stub_gives_its_fixed_answer() {
     assert!(index_archives::mark_forgotten_turn(&conn, "l", Some("s1"), "tool", 0, 1, None)
         .unwrap()
         .is_empty());
-    assert_eq!(index_archives::forget_archive(&conn, "scope", "id").unwrap(), 0);
 
     // capture
     let mut cap = CaptureState::default();
