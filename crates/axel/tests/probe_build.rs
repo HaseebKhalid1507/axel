@@ -10,7 +10,7 @@
 //! | a | `Embedder` and `rusqlite::Connection` are `Send` |
 //! | b | `SQLITE_OPEN_NOFOLLOW` exists and a `?mode=ro&immutable=1` URI opens |
 //! | c | recall generators a and c run as written on the existing tables |
-//! | d | FTS5 `secure-delete` + `PRAGMA secure_delete` leave no trace of a deleted row |
+//! | d | FTS5 `secure-delete` + `PRAGMA secure_delete` leave no trace of a deleted row, option first or rows first, small or bulk writes; text deleted before the option goes only with `optimize` |
 //! | e | the `kv` guard triggers stop `INSERT OR REPLACE … '2'`, and let `'3'` through |
 //! | f | on the store's own connection: its `INSERT OR REPLACE` fires neither delete trigger; a plain delete is stopped by the guard unless `axel_purge` has its row |
 //! | g | `json_set` and `json_extract` exist in the bundled SQLite |
@@ -334,95 +334,251 @@ fn c_generators_a_and_c_run_on_the_existing_tables() {
 
 const MEMORY_MARKER: &str = "zqxprobemem8841kd27";
 const CHUNK_MARKER: &str = "zqxprobedoc5539wt64";
+/// Case "old residue": the row deleted before the option is on.
+const EARLY_MEMORY_MARKER: &str = "vkjearlymem4417rpq";
+const EARLY_CHUNK_MARKER: &str = "wbnearlydoc9023hxm";
 
-/// Write a memory and a note chunk that each carry a marker, delete both,
-/// checkpoint, and count the markers in the file before and after. The tail
+/// Hits of one row's markers in the file, one count per word index. The tail
 /// of each marker is counted too, because the word index stores a term
 /// without the prefix it shares with its neighbour.
-fn marker_counts_around_a_purge(fts_secure_delete: bool) -> (usize, usize) {
-    let dir = TempDir::new().unwrap();
-    let (path, db) = legacy_brain(&dir);
-    let conn = db.conn();
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Hits {
+    memory: usize,
+    chunk: usize,
+}
 
+impl Hits {
+    const NONE: Hits = Hits { memory: 0, chunk: 0 };
+
+    fn in_file(path: &Path, memory_marker: &str, chunk_marker: &str) -> Hits {
+        let bytes = file_bytes(path);
+        let count = |m: &str| occurrences(&bytes, m) + occurrences(&bytes, &m[9..]);
+        Hits { memory: count(memory_marker), chunk: count(chunk_marker) }
+    }
+
+    fn in_both(self) -> bool {
+        self.memory > 0 && self.chunk > 0
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FtsOption {
+    Never,
+    BeforeRows,
+    AfterRows,
+}
+
+fn secure_delete_pragma_on(conn: &Connection) {
     conn.execute_batch("PRAGMA secure_delete = ON").unwrap();
     let on: i64 = conn.query_row("PRAGMA secure_delete", [], |r| r.get(0)).unwrap();
     assert_eq!(on, 1);
+}
 
-    if fts_secure_delete {
-        // FTS5 accepts the option on both word indexes, and keeps it.
-        conn.execute("INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1)", [])
+/// Migration 1's two statements. FTS5 accepts the option on both word
+/// indexes, and keeps it.
+fn fts_secure_delete_on(conn: &Connection) {
+    conn.execute("INSERT INTO memories_fts(memories_fts, rank) VALUES('secure-delete', 1)", [])
+        .unwrap();
+    conn.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('secure-delete', 1)", [])
+        .unwrap();
+    for table in ["memories_fts_config", "chunks_fts_config"] {
+        let kept: i64 = conn
+            .query_row(&format!("SELECT v FROM {table} WHERE k = 'secure-delete'"), [], |r| r.get(0))
             .unwrap();
-        conn.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('secure-delete', 1)", [])
-            .unwrap();
-        for table in ["memories_fts_config", "chunks_fts_config"] {
-            let kept: i64 = conn
-                .query_row(
-                    &format!("SELECT v FROM {table} WHERE k = 'secure-delete'"),
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap();
-            assert_eq!(kept, 1, "{table}");
+        assert_eq!(kept, 1, "{table}");
+    }
+}
+
+/// `rows` memories and `rows` note chunks. Each `(i, memory marker, chunk
+/// marker)` in `marked` makes row `i` of both carry the markers; its chunk is
+/// `doomed-<k>` for the k-th entry. With `one_transaction` all memories go in
+/// one transaction and all chunks in another (one fresh segment per word
+/// index); otherwise every row is its own transaction. Returns the marked
+/// memories' ids, in the order of `marked`.
+fn write_rows(db: &Database, rows: usize, one_transaction: bool, marked: &[(usize, &str, &str)]) -> Vec<String> {
+    let conn = db.conn();
+    let mark = |i: usize| marked.iter().position(|m| m.0 == i);
+    let memories: Vec<Memory> = (0..rows)
+        .map(|i| match mark(i) {
+            Some(k) => Memory::new(
+                MemoryCategory::Events,
+                "probe",
+                "doomed",
+                format!("the word is {} today", marked[k].1),
+            ),
+            None => Memory::new(
+                MemoryCategory::Events,
+                "probe",
+                "kept",
+                format!("kept row {i} about harbours and lanterns"),
+            ),
+        })
+        .collect();
+    if one_transaction {
+        let items: Vec<(Memory, MemoryScope)> =
+            memories.iter().map(|m| (m.clone(), scope(PROJECT))).collect();
+        project_memory::store_scoped_batch(conn, &items).unwrap();
+    } else {
+        for memory in &memories {
+            project_memory::store_scoped(conn, memory, &scope(PROJECT)).unwrap();
         }
     }
 
     let zeros = vec![0.0f32; velocirag::EMBEDDING_DIM];
     let meta = serde_json::json!({});
-    for i in 0..4 {
-        store(conn, PROJECT, "kept", &format!("kept row {i} about harbours and lanterns"));
-        db.insert_document(
-            &format!("kept-{i}"),
-            &format!("kept chunk {i} about harbours and lanterns"),
-            &meta,
-            &zeros,
-            Some("/notes/kept.md"),
-        )
-        .unwrap_or_else(|e| panic!("insert kept-{i}: {e}"));
+    if one_transaction {
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
     }
-    let doomed = store(conn, PROJECT, "doomed", &format!("the word is {MEMORY_MARKER} today"));
-    db.insert_document(
-        "doomed",
-        &format!("the word is {CHUNK_MARKER} today"),
-        &meta,
-        &zeros,
-        Some("/notes/doomed.md"),
-    )
-    .unwrap_or_else(|e| panic!("insert doomed: {e}"));
+    for i in 0..rows {
+        let (doc_id, content, file_path) = match mark(i) {
+            Some(k) => (format!("doomed-{k}"), format!("the word is {} today", marked[k].2), "/notes/doomed.md"),
+            None => (format!("kept-{i}"), format!("kept chunk {i} about harbours and lanterns"), "/notes/kept.md"),
+        };
+        db.insert_document(&doc_id, &content, &meta, &zeros, Some(file_path))
+            .unwrap_or_else(|e| panic!("insert {doc_id}: {e}"));
+    }
+    if one_transaction {
+        conn.execute_batch("COMMIT").unwrap();
+    }
+    marked.iter().map(|m| memories[m.0].id.clone()).collect()
+}
 
-    let count = |bytes: &[u8]| {
-        occurrences(bytes, MEMORY_MARKER)
-            + occurrences(bytes, CHUNK_MARKER)
-            + occurrences(bytes, &MEMORY_MARKER[9..])
-            + occurrences(bytes, &CHUNK_MARKER[9..])
-    };
+/// The memory row, its word-index row, the chunk and its word-index row.
+fn purge(conn: &Connection, mem_id: &str, doc_id: &str) {
+    conn.execute("DELETE FROM memories WHERE id = ?1", [mem_id]).unwrap();
+    conn.execute("DELETE FROM memories_fts WHERE mem_id = ?1", [mem_id]).unwrap();
+    conn.execute("DELETE FROM documents WHERE doc_id = ?1", [doc_id]).unwrap();
+    conn.execute("DELETE FROM chunks_fts WHERE doc_id = ?1", [doc_id]).unwrap();
+}
+
+/// Write `rows` rows, the middle one carrying the markers, delete it,
+/// checkpoint, and return the markers' hits before and after. `PRAGMA
+/// secure_delete` is on throughout, as on every v2 connection; `option` says
+/// when FTS5's `secure-delete` is switched on, relative to the writes.
+fn marker_hits_around_a_purge(option: FtsOption, rows: usize, one_transaction: bool) -> (Hits, Hits) {
+    let dir = TempDir::new().unwrap();
+    let (path, db) = legacy_brain(&dir);
+    let conn = db.conn();
+    secure_delete_pragma_on(conn);
+
+    if option == FtsOption::BeforeRows {
+        fts_secure_delete_on(conn);
+    }
+    let doomed = write_rows(&db, rows, one_transaction, &[(rows / 2, MEMORY_MARKER, CHUNK_MARKER)]);
+    if option == FtsOption::AfterRows {
+        fts_secure_delete_on(conn);
+    }
 
     checkpoint_truncate(conn, &path);
-    let before = count(&file_bytes(&path));
-
-    conn.execute("DELETE FROM memories WHERE id = ?1", [&doomed]).unwrap();
-    conn.execute("DELETE FROM memories_fts WHERE mem_id = ?1", [&doomed]).unwrap();
-    conn.execute("DELETE FROM documents WHERE doc_id = 'doomed'", []).unwrap();
-    conn.execute("DELETE FROM chunks_fts WHERE doc_id = 'doomed'", []).unwrap();
+    let before = Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER);
+    purge(conn, &doomed[0], "doomed-0");
     checkpoint_truncate(conn, &path);
-    let after = count(&file_bytes(&path));
-
+    let after = Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER);
+    println!("probe d: option {option:?}, {rows} rows, one transaction {one_transaction}: before {before:?}, after {after:?}");
     (before, after)
+}
+
+fn fts5_secure_delete_exists() {
+    // FTS5's 'secure-delete' option needs SQLite 3.42.
+    assert!(rusqlite::version_number() >= 3_042_000, "bundled SQLite is {}", rusqlite::version());
 }
 
 #[test]
 fn d_secure_delete_leaves_no_marker_in_the_file() {
-    // FTS5's 'secure-delete' option needs SQLite 3.42.
-    assert!(rusqlite::version_number() >= 3_042_000, "bundled SQLite is {}", rusqlite::version());
+    fts5_secure_delete_exists();
 
-    let (before, after) = marker_counts_around_a_purge(true);
-    assert!(before > 0, "the markers must be findable before the delete");
-    assert_eq!(after, 0, "a deleted row's marker is still in the file");
+    let (before, after) = marker_hits_around_a_purge(FtsOption::BeforeRows, 5, false);
+    assert!(before.in_both(), "each marker must be findable before the delete: {before:?}");
+    assert_eq!(after, Hits::NONE, "a deleted row's marker is still in the file");
 
     // The option is what does it. With only PRAGMA secure_delete the tables
-    // are clean but the word indexes still hold the deleted words.
-    let (before, after) = marker_counts_around_a_purge(false);
-    assert!(before > 0);
-    assert!(after > 0, "without FTS5 secure-delete the word index was expected to keep the marker");
+    // are clean but EACH word index still holds its deleted word.
+    let (before, after) = marker_hits_around_a_purge(FtsOption::Never, 5, false);
+    assert!(before.in_both(), "{before:?}");
+    assert!(after.in_both(), "without FTS5 secure-delete each word index was expected to keep its marker: {after:?}");
+}
+
+#[test]
+fn d_rows_first_then_the_option_then_the_delete() {
+    // Migration 1's order: the word indexes already hold the rows when the
+    // option is switched on.
+    fts5_secure_delete_exists();
+    let (before, after) = marker_hits_around_a_purge(FtsOption::AfterRows, 5, false);
+    assert!(before.in_both(), "{before:?}");
+    assert_eq!(after, Hits::NONE, "rows first, then the option: the marker is still in the file");
+}
+
+#[test]
+fn d_rows_first_in_big_segments_then_the_option() {
+    fts5_secure_delete_exists();
+    // One 6,000-row transaction: the marker sits inside one large segment.
+    let (before, after) = marker_hits_around_a_purge(FtsOption::AfterRows, 6_000, true);
+    assert!(before.in_both(), "{before:?}");
+    assert_eq!(after, Hits::NONE, "6,000 rows in one segment: the marker is still in the file");
+
+    // 400 transactions: an index built by many small writes and merges.
+    let (before, after) = marker_hits_around_a_purge(FtsOption::AfterRows, 400, false);
+    assert!(before.in_both(), "{before:?}");
+    assert_eq!(after, Hits::NONE, "400 transactions: the marker is still in the file");
+}
+
+/// Delete a row with the option off, switch it on, securely delete another
+/// row, checkpoint; then `optimize` both word indexes and checkpoint again.
+/// Returns the first row's hits after the secure delete, the second row's
+/// hits then, and the first row's hits after `optimize`.
+/// `pragma_for_early_delete`: whether `PRAGMA secure_delete` is already on
+/// for the first delete. With it on, the table rows (`memories`, `documents`,
+/// the word indexes' `_content`) are zeroed, so what is left is the word
+/// indexes' segments: the question V-1 asks. With it off, as the old binary
+/// ran, free pages of ordinary tables may keep text too (spec 2.7 says
+/// nothing in version 1 removes that).
+fn old_residue(pragma_for_early_delete: bool) -> (Hits, Hits, Hits) {
+    let dir = TempDir::new().unwrap();
+    let (path, db) = legacy_brain(&dir);
+    let conn = db.conn();
+    if pragma_for_early_delete {
+        secure_delete_pragma_on(conn);
+    }
+    let ids = write_rows(
+        &db,
+        6,
+        false,
+        &[(2, EARLY_MEMORY_MARKER, EARLY_CHUNK_MARKER), (4, MEMORY_MARKER, CHUNK_MARKER)],
+    );
+    checkpoint_truncate(conn, &path);
+    assert!(Hits::in_file(&path, EARLY_MEMORY_MARKER, EARLY_CHUNK_MARKER).in_both());
+    assert!(Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER).in_both());
+
+    purge(conn, &ids[0], "doomed-0");
+    secure_delete_pragma_on(conn);
+    fts_secure_delete_on(conn);
+    purge(conn, &ids[1], "doomed-1");
+    checkpoint_truncate(conn, &path);
+    let early = Hits::in_file(&path, EARLY_MEMORY_MARKER, EARLY_CHUNK_MARKER);
+    let late = Hits::in_file(&path, MEMORY_MARKER, CHUNK_MARKER);
+
+    conn.execute("INSERT INTO memories_fts(memories_fts) VALUES('optimize')", []).unwrap();
+    conn.execute("INSERT INTO chunks_fts(chunks_fts) VALUES('optimize')", []).unwrap();
+    checkpoint_truncate(conn, &path);
+    let early_optimized = Hits::in_file(&path, EARLY_MEMORY_MARKER, EARLY_CHUNK_MARKER);
+    println!(
+        "probe d, old residue (PRAGMA secure_delete on for the first delete: {pragma_for_early_delete}): \
+         first row {early:?}, second row {late:?}, first row after optimize {early_optimized:?}"
+    );
+    (early, late, early_optimized)
+}
+
+#[test]
+fn d_text_deleted_before_the_option_stays_until_optimize() {
+    fts5_secure_delete_exists();
+    let (early, late, early_optimized) = old_residue(true);
+    assert_eq!(late, Hits::NONE, "the row deleted with the option on must be gone");
+    assert!(early.in_both(), "the row deleted before the option was expected to stay in each word index: {early:?}");
+    assert_eq!(early_optimized, Hits::NONE, "after optimize the old residue must be gone (spec 2.7, V-1)");
+
+    // As the old binary ran: PRAGMA secure_delete off for the first delete.
+    // Measured and printed only; spec 2.7 makes no claim about free pages.
+    old_residue(false);
 }
 
 // ── e ───────────────────────────────────────────────────────────────────
