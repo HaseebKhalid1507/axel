@@ -2132,11 +2132,18 @@ fn a_deleted_turn_continued_by_a_workers_report_is_born_hidden() {
     let status = axel_cmd(&world.path(), &["status"]);
     let status = String::from_utf8_lossy(&status.stdout);
     assert!(status.contains("hidden with the prompt of a turn deleted with forget --now, not proven that turn: 1"), "{status}");
-    // `restore <id>` brings it back.
     let id: String = world
         .db()
         .query_row("SELECT mem_id FROM memory_ext WHERE hidden_by = 'cli:unproven'", [], |r| r.get(0))
         .unwrap();
+    // Round 4, item 2: `status` names the archive and `show ctx-` lists the row by its id.
+    assert!(status.contains(&format!("  in ctx-{:032x} (axel-v2 show ctx-<id> lists them)", 31)), "{status}");
+    assert!(
+        shown.out.contains(&format!("      m:{id} · ")) && shown.out.contains(" · Assistant: EVENTFIRST I sent a worker"),
+        "{}",
+        shown.out
+    );
+    // `restore <id>` brings it back.
     let back = restore_ids(&world.path(), &[&id]);
     assert_eq!(back.code, 0, "{}", back.err);
     assert_eq!(visible_with(world.db(), "EVENTFIRST"), 1);

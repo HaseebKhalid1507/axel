@@ -759,6 +759,17 @@ fn brain_report(
         }
         m
     };
+    // RULING: v2 c18b review round 4, item 2: where the rows hidden as not proven are, so
+    // that `show ctx-<id>` lists their ids.
+    let unproven_archives: Vec<String> = {
+        let mut stmt = conn.prepare(
+            "SELECT origin_ref FROM memory_ext
+              WHERE hidden_ms IS NOT NULL AND hidden_by = 'cli:unproven' AND origin_kind = 'archive'
+              GROUP BY origin_ref ORDER BY MAX(hidden_ms) DESC, origin_ref LIMIT 5",
+        )?;
+        let rows = stmt.query_map([], |r| text_at(r, 0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().flatten().collect()
+    };
     let hidden_by_model = count(
         conn,
         "SELECT COUNT(*) FROM memory_ext WHERE hidden_ms IS NOT NULL AND substr(hidden_by, 1, 6) = 'model:'",
@@ -887,6 +898,7 @@ fn brain_report(
         "core_rule": { "words": screen::core_rule_words().len(), "commit": screen::core_rule_commit() },
         "pauses": pauses,
         "hidden_by": hidden_by,
+        "unproven_archives": unproven_archives,
         "hidden_by_model": hidden_by_model,
         "superseded_by_model": superseded_by_model,
         "hidden_by_model_30d": hidden_by_model_30d,
@@ -1159,6 +1171,16 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
             "hidden with the prompt of a turn deleted with forget --now, not proven that turn: {} (axel-v2 restore <id> brings one back)",
             h["unproven"]
         ));
+        let at: Vec<String> = j["unproven_archives"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(|id| format!("ctx-{}", screen::show(id, 64)))
+            .collect();
+        if !at.is_empty() {
+            l.push(format!("  in {} (axel-v2 show ctx-<id> lists them)", at.join(", ")));
+        }
     }
     let (hm, sm) = (j["hidden_by_model"].as_i64().unwrap_or(0), j["superseded_by_model"].as_i64().unwrap_or(0));
     if hm > 0 || sm > 0 {

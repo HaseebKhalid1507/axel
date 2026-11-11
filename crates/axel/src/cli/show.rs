@@ -372,6 +372,39 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     Ok(OK)
 }
 
+/// The rows of one archive hidden as `cli:unproven` now, oldest first:
+/// `m:<id> · <date> · <first line of its reply>`.
+fn unproven_rows(conn: &Connection, scope_dir: &str, archive_id: &str) -> Result<Vec<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.mem_id, e.created_ms, m.content, e.turn_key, m.sensitivity
+           FROM memory_ext e JOIN memories m ON m.id = e.mem_id
+          WHERE e.origin_kind = 'archive' AND e.origin_ref = ?1 AND m.project_key = ?2
+            AND e.hidden_ms IS NOT NULL AND e.hidden_by = ?3
+          ORDER BY e.created_ms, e.vid",
+    )?;
+    let rows = stmt.query_map(params![archive_id, scope_dir, crate::index_archives::UNPROVEN], |r| {
+        Ok((
+            crate::brain_v2::text_at(r, 0)?.unwrap_or_default(),
+            r.get::<_, Option<i64>>(1)?,
+            crate::brain_v2::text_at(r, 2)?.unwrap_or_default(),
+            crate::brain_v2::text_at(r, 3)?,
+            crate::brain_v2::text_at(r, 4)?,
+        ))
+    })?;
+    let mut lines = Vec::new();
+    for row in rows {
+        let (id, created_ms, content, turn_key, sensitivity) = row?;
+        let when = created_ms.map(date).unwrap_or_else(|| "no date".to_string());
+        let text = if sensitivity.as_deref() == Some("secret") {
+            "(a secret memory; its text is not shown)".to_string()
+        } else {
+            crate::screen::show(crate::cli::forget::reply_line(&content, turn_key.as_deref()), 120)
+        };
+        lines.push(format!("m:{} · {when} · {text}", one(&id)));
+    }
+    Ok(lines)
+}
+
 /// The `archive_index` rows of one archive, and the turns it leaves out.
 // SPEC: 3729 says `show ctx-<id>` "gives their positions". Version 1 records how many
 // units an archive left out (`forget_units`) and the marks it gave, not the positions of
@@ -418,6 +451,14 @@ fn show_archive(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
                 out,
                 "    turns hidden because they have the prompt of a deleted turn and their text does not prove them that turn: {cli_unproven} (\"axel-v2 restore <id>\" brings one back)"
             )?;
+        }
+        // RULING: v2 c18b review round 4, item 2: the ids, so that one can be brought back.
+        let unproven = unproven_rows(conn, scope_dir, &archive_id)?;
+        if !unproven.is_empty() {
+            writeln!(out, "    hidden now as not proven ({}):", unproven.len())?;
+            for line in &unproven {
+                writeln!(out, "      {line}")?;
+            }
         }
         if *keep == 1 {
             writeln!(out, "    the forget rules are off for this file (restore --forget-turns)")?;

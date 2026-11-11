@@ -201,7 +201,7 @@ fn twin_line(row: &RowInfo) -> String {
 /// row, a note) the first non-empty line.
 // RULING: v2 c18b review round 3, item 5: a prompt may hold a line that starts with
 // "Assistant"; the key tells where the prompt ends.
-fn reply_line<'a>(content: &'a str, turn_key: Option<&str>) -> &'a str {
+pub(crate) fn reply_line<'a>(content: &'a str, turn_key: Option<&str>) -> &'a str {
     const SPLIT: &str = "\nAssistant: ";
     let first_line = |text: &'a str| text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let Some(prompt) = content.strip_prefix("User: ") else { return first_line(content) };
