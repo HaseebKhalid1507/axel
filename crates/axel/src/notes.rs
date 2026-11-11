@@ -10,6 +10,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NoteRecord {
@@ -34,8 +35,25 @@ pub struct NotesFile {
     /// What `lstat` gave before the read.
     pub size: u64,
     pub mtime_ns: i64,
-    /// Section 2.6, step 2: already filtered.
+    /// Section 2.6, step 2: already filtered; an id on two live lines is the later line.
     pub live: Vec<NoteRecord>,
+    // RULING: wave2-c7 review B2: the reader returns the tombstoned ids and the bad lines.
+    /// Every id a tombstone line names, in file order, each once, whatever its project.
+    pub tombstoned: Vec<String>,
+    /// Lines that are not UTF-8, not JSON or not a JSON object, skipped.
+    pub bad: Vec<BadLine>,
+    /// The file does not end with a line break and its last line is not a JSON object.
+    pub torn_tail: bool,
+    /// JSON objects that are neither a record nor a tombstone (core skips them too).
+    pub skipped_records: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BadLine {
+    /// Counted from 1.
+    pub line: usize,
+    /// The first 16 hex characters of the SHA-256 of the line's bytes, without its line break.
+    pub hash: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -43,9 +61,6 @@ pub enum NotesError {
     /// The size moved under the read: try next tick.
     #[error("notes file changed during the read")]
     Changed,
-    /// `note_files.ok = 0` with this reason.
-    #[error("line {line}: {reason}")]
-    BadLine { line: usize, reason: String },
     #[error("notes file: {0}")]
     Io(String),
 }
@@ -135,62 +150,88 @@ pub fn read_file(path: &Path, project_key: &str) -> Result<NotesFile, NotesError
     {
         return Err(NotesError::Changed);
     }
-    let live = parse(&bytes, project_key)?;
-    Ok(NotesFile {
-        size: before.len(),
-        mtime_ns: mtime_ns(&before),
-        live,
-    })
+    Ok(parse(&bytes, project_key, before.len(), mtime_ns(&before)))
 }
 
-/// One line that is not a JSON object (not UTF-8, not JSON, or JSON that is not an object)
-/// abandons the file, except a last line with no line break: a torn append, ignored.
-// SPEC: 1901-1905 against the task brief ("a line that is not UTF-8 or not JSON is skipped
-// and counted, never fatal", as the newer core does): the spec's rule is kept, because
-// skipping would remove a note's row on a damaged read (test 21) and `NotesFile` has no
-// count. A JSON object that is not a valid record is skipped, as core skips it.
-fn parse(bytes: &[u8], project_key: &str) -> Result<Vec<NoteRecord>, NotesError> {
-    let mut tombstoned: HashSet<String> = HashSet::new();
-    let mut live: Vec<NoteRecord> = Vec::new();
-    let mut slot: HashMap<String, usize> = HashMap::new();
-    let ends_with_break = bytes.last() == Some(&b'\n');
-    let mut lines: Vec<&[u8]> = bytes.split(|b| *b == b'\n').collect();
-    if ends_with_break || bytes.is_empty() {
-        lines.pop(); // the empty piece after the last break
+/// The first 16 hex characters of the SHA-256 of `raw`.
+fn line_hash(raw: &[u8]) -> String {
+    let digest = Sha256::digest(raw);
+    digest[..8].iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// What one line is, once it is known to be a JSON object.
+enum Parsed {
+    Tombstone(String),
+    Record(CoreRecord),
+    /// An object that is neither (core skips it).
+    Neither,
+}
+
+fn classify(value: &serde_json::Value) -> Parsed {
+    if let Ok(tomb) = TombstoneLine::deserialize(value) {
+        return Parsed::Tombstone(tomb.tombstone);
     }
-    let last = lines.len();
-    for (index, raw) in lines.into_iter().enumerate() {
-        let number = index + 1;
-        let torn = number == last && !ends_with_break;
-        let bad = |reason: &str| NotesError::BadLine {
-            line: number,
-            reason: reason.to_string(),
-        };
-        let line = match std::str::from_utf8(raw) {
-            Ok(line) => line,
-            Err(_) if torn => continue,
-            Err(_) => return Err(bad("not UTF-8")),
-        };
-        if line.trim().is_empty() {
-            continue;
+    match CoreRecord::deserialize(value) {
+        Ok(rec) => Parsed::Record(rec),
+        Err(_) => Parsed::Neither,
+    }
+}
+
+// RULING: wave2-c7 review B1: a line that is not UTF-8, not JSON or not a JSON object is
+// skipped and returned in `bad`, never fatal: core heals a torn tail by writing a line break
+// in front of the next record, so an old fragment stays a bad middle line for good, and
+// core's readers skip it. A last line with no line break that is not an object is the torn
+// tail: neither a record nor in `bad`. One with no break that is an object is read as core
+// reads it (core's next append writes the break in front of its own line).
+fn parse(bytes: &[u8], project_key: &str, size: u64, mtime_ns: i64) -> NotesFile {
+    let mut out = NotesFile {
+        size,
+        mtime_ns,
+        live: Vec::new(),
+        tombstoned: Vec::new(),
+        bad: Vec::new(),
+        torn_tail: false,
+        skipped_records: 0,
+    };
+    let mut tombstoned: HashSet<String> = HashSet::new();
+    let mut slot: HashMap<String, usize> = HashMap::new();
+    // RULING: wave2-c7 review B3: the lines are iterated, not collected.
+    let mut pieces = bytes.split(|b| *b == b'\n').enumerate().peekable();
+    while let Some((index, raw)) = pieces.next() {
+        let last = pieces.peek().is_none();
+        if last && raw.is_empty() {
+            break; // the empty piece after the final line break, or an empty file
         }
-        let value: serde_json::Value = match serde_json::from_str(line) {
-            Ok(value) => value,
-            Err(_) if torn => continue,
-            Err(e) => return Err(bad(&format!("not JSON: {e}"))),
+        let line = std::str::from_utf8(raw).ok();
+        if line.is_some_and(|line| line.trim().is_empty()) {
+            continue; // blank, as core skips it
+        }
+        let value = line
+            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(serde_json::Value::is_object);
+        let Some(value) = value else {
+            if last {
+                out.torn_tail = true;
+            } else {
+                out.bad.push(BadLine {
+                    line: index + 1,
+                    hash: line_hash(raw),
+                });
+            }
+            continue;
         };
-        if !value.is_object() {
-            if torn {
+        let rec = match classify(&value) {
+            Parsed::Tombstone(id) => {
+                if tombstoned.insert(id.clone()) {
+                    out.tombstoned.push(id);
+                }
                 continue;
             }
-            return Err(bad("not a JSON object"));
-        }
-        if let Ok(tomb) = TombstoneLine::deserialize(&value) {
-            tombstoned.insert(tomb.tombstone);
-            continue;
-        }
-        let Ok(rec) = CoreRecord::deserialize(&value) else {
-            continue;
+            Parsed::Neither => {
+                out.skipped_records += 1;
+                continue;
+            }
+            Parsed::Record(rec) => rec,
         };
         if rec.project.as_deref() != Some(project_key) {
             continue;
@@ -219,13 +260,13 @@ fn parse(bytes: &[u8], project_key: &str) -> Result<Vec<NoteRecord>, NotesError>
             },
         };
         match slot.get(&id) {
-            Some(&at) => live[at] = note,
+            Some(&at) => out.live[at] = note,
             None => {
-                slot.insert(id, live.len());
-                live.push(note);
+                slot.insert(id, out.live.len());
+                out.live.push(note);
             }
         }
     }
-    live.retain(|note| !tombstoned.contains(&note.id));
-    Ok(live)
+    out.live.retain(|note| !tombstoned.contains(&note.id));
+    out
 }
