@@ -2335,3 +2335,56 @@ fn the_archive_and_capture_cut_and_compose_a_turn_alike_so_the_deleted_turn_is_t
     let world = newline_case(Order::After);
     assert_eq!(left_counts(world.db(), &Arch::new(51, "s-newline", T0)), (0, 1));
 }
+
+/// The archived rows of `a` whose text holds `marker`, hidden by a model 25 hours ago.
+fn model_hid(world: &Indexed, marker: &str) -> String {
+    let id: String = world.db().query_row("SELECT id FROM memories WHERE instr(content, ?1) > 0", [marker], |r| r.get(0)).unwrap();
+    tx(world.db(), || {
+        store::hide(world.db(), &id, "model:s-row").unwrap();
+        world.db().execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![now_ms() - 25 * HOUR_MS, id]).unwrap();
+    });
+    id
+}
+
+/// v2 c18b review round 3, item 4: an archived row deleted by its own id is hashed as it
+/// is stored, so a reply that holds the tools heading is not split there, and a copy of the
+/// turn in another archive of its window is taken.
+#[test]
+fn an_archived_row_deleted_by_id_is_hashed_as_stored_and_its_copy_is_taken() {
+    const P: &str = "show me how the archived rows of a turn are laid out in the brain";
+    let answer = "ROWHEAD every row is laid out like this\n\n[tools]\nROWTAIL and the tool lines come under that heading";
+    let mut world = Indexed::new();
+    let x = Arch::new(71, "s-row", T0).turn(P, answer).about("upload queue");
+    world.file(&x);
+    world.scan();
+    let id = model_hid(&world, "ROWHEAD");
+    let run = forget_cmd(&world.path(), &[&id], true, false, "y\n");
+    assert!(run.out.contains("Deleted 1 memories for good."), "{}{}", run.out, run.err);
+    let y = Arch::new(70, "s-row", T0 - 1_000).turn(P, answer).about("deploy window");
+    world.file(&y);
+    world.scan();
+    assert!(visible_with(world.db(), "deploy window") > 0, "the copy was not indexed: the test proves nothing");
+    assert_eq!(rows_with(world.db(), "ROWHEAD"), 0, "the copy of the deleted row was not taken");
+}
+
+/// v2 c18b review round 3, item 4: two archived turns of one file with the same prompt,
+/// both deleted by id, keep a `cli` row each (they share the chat, the key and the time),
+/// and the copies of both are taken.
+#[test]
+fn two_deleted_turns_of_one_archive_with_one_prompt_keep_a_mark_each() {
+    const P: &str = "continue with the plan we made for the ledger migration";
+    let mut world = Indexed::new();
+    let x = Arch::new(73, "s-row", T0).turn(P, &reply("TWINA")).turn(P, &reply("TWINB")).about("upload queue");
+    world.file(&x);
+    world.scan();
+    let (a, b) = (model_hid(&world, "TWINA"), model_hid(&world, "TWINB"));
+    let run = forget_cmd(&world.path(), &[&a, &b], true, false, "y\n");
+    assert!(run.out.contains("Deleted 2 memories for good."), "{}{}", run.out, run.err);
+    assert_eq!(count(world.db(), "SELECT COUNT(*) FROM forgotten_turns WHERE source = 'cli'"), 2);
+    let y = Arch::new(72, "s-row", T0 - 1_000).turn(P, &reply("TWINA")).turn(P, &reply("TWINB")).about("deploy window");
+    world.file(&y);
+    world.scan();
+    assert!(visible_with(world.db(), "deploy window") > 0, "the copy was not indexed: the test proves nothing");
+    assert_eq!(rows_with(world.db(), "TWINA"), 0);
+    assert_eq!(rows_with(world.db(), "TWINB"), 0, "the second turn's copy was not taken");
+}

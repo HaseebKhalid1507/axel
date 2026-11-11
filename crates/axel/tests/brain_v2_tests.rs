@@ -1556,7 +1556,7 @@ fn t23_migration_1_is_the_block() {
     let sql_of = |name: &str| -> String {
         conn.query_row("SELECT sql FROM sqlite_master WHERE name = ?1", [name], |r| r.get(0)).unwrap()
     };
-    assert!(sql_of("forgotten_turns").contains("UNIQUE (logical, source, from_ms, turn_key, archive_id)"));
+    assert!(sql_of("forgotten_turns").contains("UNIQUE (logical, source, from_ms, turn_key, archive_id, text_hash)"));
     assert_eq!(count(conn, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'suppressed_turns'"), 0);
     for column in ["forget_units", "keep_forget_turns", "unmatched_hidden", "win_no", "part_no"] {
         assert_eq!(

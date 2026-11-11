@@ -107,7 +107,7 @@ CREATE TABLE IF NOT EXISTS forgotten_turns(
   text_hash  TEXT NOT NULL DEFAULT '',   -- cli: the deleted turn's text, hashed (index_archives::TurnText); no text is kept
   cut_hash   TEXT NOT NULL DEFAULT '',   -- cli: the same of its first 4096 bytes when it is longer ('' when not)
   added_ms   INTEGER NOT NULL,
-  UNIQUE (logical, source, from_ms, turn_key, archive_id)   -- the upsert's conflict target (R3-2e)
+  UNIQUE (logical, source, from_ms, turn_key, archive_id, text_hash)   -- the upsert's conflict target (R3-2e); a cli row's text hash too (v2 c18b review round 3, item 4)
 );
 CREATE INDEX IF NOT EXISTS idx_forgotten_chat ON forgotten_turns(logical, from_ms);
 

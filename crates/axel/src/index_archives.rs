@@ -809,7 +809,7 @@ fn index_archive(
                     "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, scope_dir,
                                                  archive_id, head, tail, added_ms)
                      VALUES (?1, ?2, 'archive', ?3, ?4, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(logical, source, from_ms, turn_key, archive_id) DO UPDATE
+                     ON CONFLICT(logical, source, from_ms, turn_key, archive_id, text_hash) DO UPDATE
                         SET head = max(head, excluded.head), tail = max(tail, excluded.tail)",
                     params![
                         a.logical,
@@ -882,11 +882,7 @@ fn index_archive(
             }
             let (letter, class) = kind_of(unit);
             let pos = format!("{letter}{}.{}", unit.source_index, unit.block_index);
-            let content = if unit.aux.is_empty() {
-                unit.body.clone()
-            } else {
-                format!("{}\n\n[tools]\n{}", unit.body, unit.aux)
-            };
+            let content = stored_content(unit);
             let new = NewRow {
                 id: archive::unit_id(at.scope_dir, &a.id, unit),
                 class,
@@ -2062,10 +2058,19 @@ struct Forgot {
 }
 
 impl Forgot {
-    /// True when this row's key rule takes a unit with this body: any row with the key,
-    /// except a `cli` row, which takes only the turn it stands for.
-    fn takes_body(&self, body: &str) -> bool {
-        self.source != "cli" || self.text.takes(body)
+    /// True when this row's key rule takes this unit: any row with the key, except a `cli`
+    /// row, which takes only the turn it stands for.
+    fn takes_unit(&self, unit: &Unit) -> bool {
+        self.source != "cli" || self.text.takes(&unit.body) || self.text.takes_stored(&stored_content(unit))
+    }
+}
+
+/// The content of an archived unit's row: its body, then its tool lines under a heading.
+fn stored_content(unit: &Unit) -> String {
+    if unit.aux.is_empty() {
+        unit.body.clone()
+    } else {
+        format!("{}{TOOLS_PART}{}", unit.body, unit.aux)
     }
 }
 
@@ -2100,9 +2105,19 @@ const TOOLS_PART: &str = "\n\n[tools]\n";
 
 /// hex(sha256("axel/turntext/1" || 0 || normalise(text)))[..32].
 pub fn turn_text_hash(text: &str) -> String {
+    hash_in(b"axel/turntext/1\0", text)
+}
+
+/// hex(sha256("axel/turnrow/1" || 0 || normalise(content)))[..32]: of an archived row's
+/// content as it is stored. Another domain than `turn_text_hash`, so that the two never meet.
+fn stored_hash(content: &str) -> String {
+    hash_in(b"axel/turnrow/1\0", content)
+}
+
+fn hash_in(domain: &[u8], text: &str) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    hasher.update(b"axel/turntext/1\0");
+    hasher.update(domain);
     hasher.update(archive::normalise(text).as_bytes());
     hex::encode(hasher.finalize())[..32].to_string()
 }
@@ -2135,12 +2150,18 @@ impl TurnText {
         TurnText { whole: turn_text_hash(text), cut }
     }
 
-    /// Of an archived row's content: its body, before the tool lines its unit added.
-    // SPEC: a row does not say where its body ends when the body itself holds the tools
-    // heading; the last one is taken (the tool lines are one per call and hold none). A
-    // wrong split only makes the mark take less.
+    /// Of an archived row's content, exactly as it is stored (its body, then its tool lines
+    /// under their heading): it takes a unit whose row would hold the same content.
+    // RULING: v2 c18b review round 3, item 4. Not split at a heading: a body or a tool line
+    // can hold the heading's text, and a split there misses the turn.
     pub fn of_archived(content: &str) -> TurnText {
-        TurnText::of(content.rfind(TOOLS_PART).map_or(content, |at| &content[..at]))
+        TurnText { whole: stored_hash(content), cut: String::new() }
+    }
+
+    /// True when an archived row's stored content (or a unit's, `stored_content`) is the
+    /// row this was made `of_archived`.
+    pub fn takes_stored(&self, content: &str) -> bool {
+        !self.whole.is_empty() && stored_hash(content) == self.whole
     }
 
     /// True when a unit's body is this turn.
@@ -2156,7 +2177,8 @@ impl TurnText {
     /// True when an archived row's content is this turn: its body is whatever comes before
     /// one of its tools headings, or all of it.
     pub fn takes_row(&self, content: &str) -> bool {
-        content.match_indices(TOOLS_PART).map(|(at, _)| at).chain([content.len()]).any(|end| self.takes(&content[..end]))
+        self.takes_stored(content)
+            || content.match_indices(TOOLS_PART).map(|(at, _)| at).chain([content.len()]).any(|end| self.takes(&content[..end]))
     }
 }
 
@@ -2209,7 +2231,7 @@ fn left_out(units: &[Unit], marks: &[Forgot], place: &Place) -> Vec<bool> {
     let near = |m: &Forgot| m.to_ms > place.stretch.0 && m.from_ms <= place.stretch.1;
     for (unit, left) in units.iter().zip(out.iter_mut()) {
         if let Some(key) = unit.turn_key.as_deref().filter(|k| !k.is_empty()) {
-            *left = marks.iter().any(|m| m.turn_key == key && near(m) && m.takes_body(&unit.body));
+            *left = marks.iter().any(|m| m.turn_key == key && near(m) && m.takes_unit(unit));
         }
     }
     let of_file = |file: Option<&ChatFile>, head: bool| {
@@ -2601,11 +2623,12 @@ fn mark_turn(
     let key = turn_key.unwrap_or("");
     let to_ms = to_ms.max(from_ms);
 
+    let text_hash = if source == "cli" { text.whole.as_str() } else { "" };
     let covered_to: Option<i64> = conn
         .query_row(
             "SELECT to_ms FROM forgotten_turns
-              WHERE logical = ?1 AND source = ?2 AND from_ms = ?3 AND turn_key = ?4 AND archive_id = ''",
-            params![logical, source, from_ms, key],
+              WHERE logical = ?1 AND source = ?2 AND from_ms = ?3 AND turn_key = ?4 AND archive_id = '' AND text_hash = ?5",
+            params![logical, source, from_ms, key, text_hash],
             |r| r.get(0),
         )
         .optional()?;
@@ -2620,16 +2643,15 @@ fn mark_turn(
         params![logical, source, from_ms],
         |r| r.get(0),
     )?;
-    // A `cli` row keeps the text it was first written with: a second turn with the same
-    // chat, key and moment is the same turn.
+    // RULING: v2 c18b review round 3, item 4. The text's hash is in the conflict key: two
+    // archived turns of one file share the chat, the key and the moment (the file's time),
+    // and each deleted turn keeps a row of its own.
     conn.execute(
         "INSERT INTO forgotten_turns(logical, session_id, source, turn_key, from_ms, to_ms, added_ms, text_hash, cut_hash)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-         ON CONFLICT(logical, source, from_ms, turn_key, archive_id) DO UPDATE
+         ON CONFLICT(logical, source, from_ms, turn_key, archive_id, text_hash) DO UPDATE
             SET to_ms = max(to_ms, excluded.to_ms),
-                session_id = COALESCE(forgotten_turns.session_id, excluded.session_id),
-                text_hash = CASE WHEN forgotten_turns.text_hash = '' THEN excluded.text_hash ELSE forgotten_turns.text_hash END,
-                cut_hash = CASE WHEN forgotten_turns.text_hash = '' THEN excluded.cut_hash ELSE forgotten_turns.cut_hash END",
+                session_id = COALESCE(forgotten_turns.session_id, excluded.session_id)",
         params![
             logical,
             session_id,
@@ -2638,7 +2660,7 @@ fn mark_turn(
             from_ms,
             to_ms,
             chrono::Utc::now().timestamp_millis(),
-            if source == "cli" { text.whole.as_str() } else { "" },
+            text_hash,
             if source == "cli" { text.cut.as_str() } else { "" },
         ],
     )?;
