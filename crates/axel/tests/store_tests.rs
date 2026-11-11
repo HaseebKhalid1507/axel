@@ -418,6 +418,15 @@ fn s2_t10_nothing_else_keeps_the_text() {
     // A recall-log row that names it as a pick, and one that names another row.
     let named = log_row(conn, "chat-x", "aaaaaaaaaaaaaaaa", &format!(r#"{{"picks":[{{"n":1,"ref":"m:{doomed}","kind":"note"}}]}}"#));
     let other = log_row(conn, "chat-x", "bbbbbbbbbbbbbbbb", r#"{"picks":[{"n":1,"ref":"m:mem_kept0","kind":"note"}]}"#);
+    // RULING: wave3-c11 ruling 7: the marker is also in the row's vector, in the
+    // `query_preview` of the log row that names it, and in a row the row writer wrote.
+    let vector: Vec<u8> = MARKER.as_bytes().iter().copied().cycle().take(384 * 4).collect();
+    assert_eq!(
+        conn.execute("UPDATE memory_ext SET embed_model = 'hash-384', embedding = ?1 WHERE mem_id = ?2", params![vector, doomed]).unwrap(),
+        1
+    );
+    conn.execute("UPDATE recall_log SET query_preview = ?1 WHERE id = ?2", params![format!("where is {MARKER} kept"), named]).unwrap();
+    put(&brain, &row("mem_marked", "note", "tool", &format!("the row writer's row says {MARKER} as well")));
     // A memory that names it in `supersedes`, and one that does not.
     let mut naming = row("mem_naming", "correction", "tool", "the word changed last week, says the harbour master");
     naming.links.supersedes = vec![doomed.clone(), "mem_kept1".to_string()];
@@ -427,14 +436,19 @@ fn s2_t10_nothing_else_keeps_the_text() {
 
     checkpoint_truncate(conn, &path);
     assert!(hits_in_file(&path, MARKER) > 0, "the marker must be in the file first");
-    assert_eq!(word_hits(conn, "memories_fts", MARKER), 1);
+    assert_eq!(word_hits(conn, "memories_fts", MARKER), 2);
     assert_eq!(word_hits(conn, "chunks_fts", MARKER), 1);
+    assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM memory_ext WHERE instr(embedding, CAST('{MARKER}' AS BLOB)) > 0")), 1);
 
     // Nothing but `purge_many` deletes: a plain delete is stopped by the guard.
     let refused = conn.execute("DELETE FROM memories WHERE id = ?1", [&doomed]).unwrap_err();
     assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
 
-    assert_eq!(tx(conn, || store::purge(conn, &doomed, true, true).unwrap()), 1);
+    let both = vec![doomed.clone(), "mem_marked".to_string()];
+    assert_eq!(tx(conn, || store::purge_many(conn, &both, true, true).unwrap()), 2);
+    // The log is truncated by hand: the code has no checkpoint to call yet. It is the
+    // indexer's, after a forget, with the commit that first calls `purge_many` from it
+    // (ruling 3); until then the text can stay in `brain.r8-wal` after a purge.
     checkpoint_truncate(conn, &path);
 
     // In no table, in neither word index, and not in the file's bytes.
@@ -444,6 +458,8 @@ fn s2_t10_nothing_else_keeps_the_text() {
         ("memories", "abstract_text"),
         ("documents", "content"),
         ("nodes", "content"),
+        ("recall_log", "query_preview"),
+        ("recall_log", "detail"),
     ] {
         let sql = format!("SELECT COUNT(*) FROM {table} WHERE instr({column}, '{MARKER}') > 0");
         assert_eq!(count(conn, &sql), 0, "{table}.{column}");
@@ -463,6 +479,8 @@ fn s2_t10_nothing_else_keeps_the_text() {
     ] {
         assert_eq!(count_id(conn, sql, &doomed), 0, "{sql}");
     }
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem_marked'"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE embedding IS NOT NULL"), 0, "the vector went with its row");
     // The tombstone of an old row that has no project.
     assert_eq!(
         text_of(conn, "SELECT project_key FROM memory_tombstones WHERE id = ?1", &doomed).as_deref(),
@@ -490,7 +508,7 @@ fn s2_t10_nothing_else_keeps_the_text() {
 
     // An id that is not there purges nothing and writes no tombstone.
     assert_eq!(tx(conn, || store::purge(conn, "mem_nobody", true, true).unwrap()), 0);
-    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 2);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
 }
 
@@ -596,6 +614,11 @@ fn s2_t32_purge_many_and_the_log_and_the_scrub() {
     let mut c = row("mem_c", "correction", "tool", "the limit is seven retries, not five");
     c.links.supersedes = vec!["mem_b".to_string()];
     put(&brain, &c);
+    // F names B in `contradicts` and in `confirmed_by`, beside a row that stays.
+    let mut f = row("mem_f", "note", "tool", "a row that contradicts and is confirmed by the five");
+    f.links.contradicts = vec!["mem_b".to_string(), "mem_e".to_string()];
+    f.links.confirmed_by = vec!["mem_e".to_string(), "mem_b".to_string()];
+    put(&brain, &f);
     let mut d = row("mem_d", "note", "tool", "a row whose links name none of the three");
     d.links.contradicts = vec!["mem_e".to_string()];
     d.links.confirmed_by = vec!["mem_e".to_string()];
@@ -613,6 +636,11 @@ fn s2_t32_purge_many_and_the_log_and_the_scrub() {
     assert_eq!(tx(conn, || store::purge(conn, "mem_b", false, true).unwrap()), 1);
     assert_eq!(text_of(conn, "SELECT superseded_by FROM memories WHERE id = ?1", "mem_a"), None);
     assert_eq!(text_of(conn, "SELECT supersedes FROM memories WHERE id = ?1", "mem_c").as_deref(), Some("[]"));
+    for column in ["contradicts", "confirmed_by"] {
+        let sql = format!("SELECT {column} FROM memories WHERE id = ?1");
+        assert_eq!(text_of(conn, &sql, "mem_f").as_deref(), Some(r#"["mem_e"]"#), "{column} still names the purged row");
+    }
+    assert_eq!(text_of(conn, "SELECT supersedes FROM memories WHERE id = ?1", "mem_f").as_deref(), Some("[]"));
     assert_eq!(whole(conn, "mem_d"), d_before, "a row with links to none of them has the bytes it had");
     assert_eq!(whole(conn, "mem_e"), e_before);
     assert_eq!(saved(conn, "mem_a"), a_text);
@@ -896,9 +924,10 @@ fn s5_t13_the_daily_cap() {
     }
     let now = now_ms();
     assert_eq!(store::model_changes_since(conn, "chat-one", now - DAY_MS).unwrap(), (10, 0));
-    // The eleventh is refused, and changes nothing.
+    // RULING: wave3-c11 ruling 7: `cap_allows` answers no for the eleventh, and that is all
+    // this test proves. That the refused call then hides nothing is the tool's to enforce and
+    // to test (commit 18a calls `cap_allows` after `begin_write_front`, before `hide`).
     assert!(!store::cap_allows(conn, "chat-one", now, 1).unwrap(), "the daily cap: the eleventh must be refused");
-    assert_eq!(hidden_by(conn, "mem_10"), None);
 
     // Another chat is not limited.
     assert!(store::cap_allows(conn, "chat-two", now, 1).unwrap());
@@ -1728,4 +1757,286 @@ fn a_second_supersede_changes_nothing() {
     assert_eq!(tx(conn, || store::restore(conn, "mem_old").unwrap()), 1);
     assert_eq!(tx(conn, || store::supersede(conn, "mem_old", "mem_second").unwrap()), 1);
     assert_eq!(text_of(conn, "SELECT superseded_by FROM memories WHERE id = ?1", "mem_old").as_deref(), Some("mem_second"));
+}
+
+// ── Ruling 7 of the commit 11 review: the tests its answer 8 asked for ─────
+
+#[test]
+fn clear_pause_brings_a_twin_back_with_its_capture() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &capture_row("mem_s1", TURN_KEY));
+    put(&brain, &capture_row("mem_s2", "1234123412341234"));
+    assert_eq!(tx(conn, || store::set_pause(conn, "chat-s", Some("session-s"), "learning", "cli").unwrap()), 2);
+    // During the pause an archive of the chat is indexed: the row of the first turn is
+    // born hidden as the twin of its hidden capture.
+    let (hidden_at, _) = mark_of(conn, "mem_s1");
+    let mut twin = archive_row("mem_arch", "cccc1111cccc1111cccc1111cccc1111", TURN_KEY);
+    twin.hidden = Some((hidden_at.unwrap(), "twin:mem_s1".to_string()));
+    put(&brain, &twin);
+    let twin_text = saved(conn, "mem_arch");
+    assert!(returned(conn).is_empty());
+
+    assert_eq!(tx(conn, || store::clear_pause(conn, "chat-s", Some("session-s"), "learning").unwrap()), 2);
+
+    // The first turn is back once, as its archived row; the second as its capture.
+    assert_eq!(returned(conn), vec!["mem_arch".to_string(), "mem_s2".to_string()], "resume left the twin hidden");
+    assert_eq!(mark_of(conn, "mem_arch"), (None, None));
+    assert_eq!(saved(conn, "mem_arch"), twin_text);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories WHERE id = 'mem_s1'"), 0, "the capture the archive replaced is gone");
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE hidden_ms IS NOT NULL"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM chat_pauses"), 0);
+}
+
+#[test]
+fn restore_of_a_twin_whose_capture_is_gone_or_visible() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    let archive = "dddd1111dddd1111dddd1111dddd1111";
+
+    // The capture never existed in this brain.
+    let mut orphan = archive_row("mem_orphan", archive, "aaaa000000000001");
+    orphan.hidden = Some((now_ms(), "twin:mem_nobody".to_string()));
+    put(&brain, &orphan);
+    // The capture was hidden with its twin, then forgotten for good.
+    put(&brain, &capture_row("mem_cap", TURN_KEY));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_cap", "cli").unwrap()), 1);
+    let mut left = archive_row("mem_left", archive, TURN_KEY);
+    left.hidden = Some((now_ms(), "twin:mem_cap".to_string()));
+    put(&brain, &left);
+    assert_eq!(tx(conn, || store::purge(conn, "mem_cap", true, true).unwrap()), 1);
+    assert_eq!(hidden_by(conn, "mem_left").as_deref(), Some("twin:mem_cap"), "a purge unhides nothing");
+    // The capture is there and visible.
+    put(&brain, &capture_row("mem_seen", "aaaa000000000002"));
+    let mut beside = archive_row("mem_beside", archive, "aaaa000000000002");
+    beside.hidden = Some((now_ms(), "twin:mem_seen".to_string()));
+    put(&brain, &beside);
+    let seen = whole(conn, "mem_seen");
+    let texts: Vec<String> = ["mem_orphan", "mem_left", "mem_beside"].iter().map(|id| saved(conn, id)).collect();
+    assert_eq!(returned(conn), vec!["mem_seen".to_string()]);
+
+    // Each comes back alone, by its own id.
+    for (id, text) in ["mem_orphan", "mem_left", "mem_beside"].iter().zip(&texts) {
+        assert_eq!(tx(conn, || store::restore(conn, id).unwrap()), 1, "{id}");
+        assert_eq!(mark_of(conn, id), (None, None), "{id}");
+        assert_eq!(&saved(conn, id), text);
+    }
+    assert_eq!(whole(conn, "mem_seen"), seen, "a visible capture is not touched");
+    assert_eq!(mark_of(conn, "mem_seen"), (None, None));
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 4);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 1);
+}
+
+#[test]
+fn an_error_inside_purge_many_leaves_no_purge_row_and_the_next_purge_works() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_x", "note", "tool", "the row whose purge stops half way"));
+    put(&brain, &row("mem_y", "note", "tool", "a neighbour"));
+    shadow(&path, "mem_x", "the shadow document of mem_x");
+    let state = |c: &Connection| {
+        let mut out = vec![whole(c, "mem_x"), whole(c, "mem_y")];
+        for table in ["memories", "memories_fts", "memory_ext", "documents", "chunks_fts", "memory_tombstones", "axel_purge"] {
+            out.push(format!("{table}={}", count(c, &format!("SELECT COUNT(*) FROM {table}"))));
+        }
+        out
+    };
+    let before = state(conn);
+
+    // The front thread's connection; its purge fails at step 5, after the purge row, the
+    // tombstone and the delete of the row itself.
+    let front = brain_v2::connect(&path, Role::Front).unwrap();
+    front
+        .execute_batch(
+            "CREATE TEMP TRIGGER the_purge_stops BEFORE DELETE ON documents
+             BEGIN SELECT RAISE(ABORT, 'the purge stops here, says the test'); END;",
+        )
+        .unwrap();
+    let writing = AtomicBool::new(false);
+    let handler = || -> axel::error::Result<usize> {
+        let _guard = brain_v2::begin_write_front(&front, &writing)?;
+        let gone = match store::purge(&front, "mem_x", true, true) {
+            Ok(n) => n,
+            Err(e) => {
+                // The failed call took its own writes back, the purge row among them.
+                assert!(!front.is_autocommit());
+                assert_eq!(count(&front, "SELECT COUNT(*) FROM axel_purge"), 0, "the purge row outlived the failed purge");
+                assert_eq!(state(&front), before);
+                return Err(e);
+            }
+        };
+        front.execute_batch("COMMIT")?;
+        Ok(gone)
+    };
+    let failed = handler().unwrap_err();
+    assert!(failed.to_string().contains("the purge stops here, says the test"), "{failed}");
+    assert!(front.is_autocommit(), "the guard closed the transaction");
+    assert!(!writing.load(Ordering::SeqCst));
+
+    // Nothing is in the file, and the delete guard is closed for every connection.
+    for c in [conn, &front] {
+        assert_eq!(state(c), before);
+        let refused = c.execute("DELETE FROM memories WHERE id = 'mem_y'", []).unwrap_err();
+        assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
+    }
+
+    // A later purge, in a fresh transaction, works: on that connection and on another.
+    front.execute_batch("DROP TRIGGER the_purge_stops").unwrap();
+    assert_eq!(handler().unwrap(), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories WHERE id = 'mem_x'"), 0);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM documents"), 0);
+    assert_eq!(tx(conn, || store::purge(conn, "mem_y", false, true).unwrap()), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
+}
+
+#[test]
+fn a_secret_row_is_inserted_hidden_restored_and_purged() {
+    let dir = TempDir::new().unwrap();
+    let (path, brain) = open(&dir);
+    let conn = &brain.conn;
+    let body = "the zebrafinch code for the harbour gate is four words long";
+    let mut new = row("mem_secret", "note", "tool", body);
+    new.title = "kingfisher ledger".to_string();
+    new.sensitivity = Sensitivity::Secret;
+    put(&brain, &new);
+
+    // The body is saved; it is copied nowhere: an empty abstract, a title-only word row.
+    assert_eq!(text_of(conn, "SELECT content FROM memories WHERE id = ?1", "mem_secret").as_deref(), Some(body));
+    assert_eq!(text_of(conn, "SELECT sensitivity FROM memories WHERE id = ?1", "mem_secret").as_deref(), Some("secret"));
+    assert_eq!(
+        text_of(conn, "SELECT abstract_text FROM memories WHERE id = ?1", "mem_secret").as_deref(),
+        Some(""),
+        "the abstract of a secret row holds its body"
+    );
+    assert_eq!(
+        conn.query_row("SELECT abstract || '|' || content FROM memories_fts WHERE mem_id = 'mem_secret'", [], |r| r.get::<_, String>(0)).unwrap(),
+        "|"
+    );
+    assert_eq!(word_hits(conn, "memories_fts", "zebrafinch"), 0);
+    assert_eq!(word_hits(conn, "memories_fts", "kingfisher"), 1);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_ext WHERE mem_id = 'mem_secret'"), 1);
+    let read = MemoryStorage::open_existing(&path).unwrap().get_memory("mem_secret").unwrap().unwrap();
+    assert!(brain.signer.as_ref().unwrap().verify(&read));
+    let text = saved(conn, "mem_secret");
+
+    assert_eq!(tx(conn, || store::hide(conn, "mem_secret", "cli").unwrap()), 1);
+    assert!(!is_returned(conn, "mem_secret"));
+    assert_eq!(saved(conn, "mem_secret"), text);
+    assert_eq!(tx(conn, || store::restore(conn, "mem_secret").unwrap()), 1);
+    assert!(is_returned(conn, "mem_secret"));
+    assert_eq!(saved(conn, "mem_secret"), text);
+    assert_eq!(word_hits(conn, "memories_fts", "zebrafinch"), 0);
+
+    assert_eq!(tx(conn, || store::purge(conn, "mem_secret", true, true).unwrap()), 1);
+    for table in ["memories", "memories_fts", "memory_ext"] {
+        assert_eq!(count(conn, &format!("SELECT COUNT(*) FROM {table}")), 0, "{table}");
+    }
+    assert_eq!(word_hits(conn, "memories_fts", "kingfisher"), 0);
+    checkpoint_truncate(conn, &path);
+    let bytes = std::fs::read(&path).unwrap();
+    assert!(!bytes.windows(10).any(|w| w == b"zebrafinch"), "the secret body is still in the file");
+}
+
+#[test]
+fn a_tombstone_carries_the_rows_own_project_key() {
+    const OTHER: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_one", "note", "tool", "a row of the first project"));
+    let mut two = row("mem_two", "note", "tool", "a row of the second project");
+    two.project_key = OTHER;
+    put(&brain, &two);
+    put(&brain, &row("mem_three", "note", "tool", "a row that is replaced, not forgotten"));
+    let key = |id: &str| -> Option<String> {
+        conn.query_row("SELECT project_key FROM memory_tombstones WHERE id = ?1", [id], |r| r.get(0)).ok()
+    };
+
+    let ids = vec!["mem_one".to_string(), "mem_two".to_string()];
+    assert_eq!(tx(conn, || store::purge_many(conn, &ids, true, true).unwrap()), 2);
+    assert_eq!(key("mem_one").as_deref(), Some(PROJECT), "the tombstone does not carry the row's project");
+    assert_eq!(key("mem_two").as_deref(), Some(OTHER));
+    // Replaced: no tombstone, and the id can be written again.
+    assert_eq!(tx(conn, || store::purge(conn, "mem_three", false, false).unwrap()), 1);
+    assert_eq!(key("mem_three"), None);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 2);
+
+    // A tombstoned id is never written again, in either project.
+    for (id, project) in [("mem_one", OTHER), ("mem_two", PROJECT)] {
+        let mut again = row(id, "note", "tool", "the same id once more");
+        again.project_key = project;
+        assert_eq!(tx(conn, || store::insert_row(conn, None, &again).unwrap()), Inserted::Tombstoned);
+    }
+    put(&brain, &row("mem_three", "note", "tool", "the replacement of the replaced row"));
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 1);
+}
+
+#[test]
+fn forget_scoped_is_stopped_by_the_delete_guard_on_a_v2_brain() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    put(&brain, &row("mem_kept", "note", "tool", "the heron row the old forget may not delete"));
+    let mut naming = row("mem_naming", "note", "tool", "a row that names it");
+    naming.links.contradicts = vec!["mem_kept".to_string()];
+    put(&brain, &naming);
+    let state = || {
+        let mut out = vec![whole(conn, "mem_kept"), whole(conn, "mem_naming")];
+        for table in ["memories", "memories_fts", "memory_ext", "memory_tombstones", "axel_purge"] {
+            out.push(format!("{table}={}", count(conn, &format!("SELECT COUNT(*) FROM {table}"))));
+        }
+        out.push(format!("heron={}", word_hits(conn, "memories_fts", "heron")));
+        out
+    };
+    let before = state();
+
+    let refused = axel::project_memory::forget_scoped(conn, "mem_kept", PROJECT).unwrap_err();
+    assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
+    assert!(conn.is_autocommit(), "its transaction is rolled back");
+    assert_eq!(state(), before, "the word row, the tombstone and the links are as they were");
+
+    // The way a row leaves a v2 brain.
+    assert_eq!(tx(conn, || store::purge(conn, "mem_kept", true, true).unwrap()), 1);
+    assert_eq!(text_of(conn, "SELECT contradicts FROM memories WHERE id = ?1", "mem_naming").as_deref(), Some("[]"));
+}
+
+#[test]
+fn purge_many_with_ids_that_name_each_other_in_their_link_arrays() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    for id in ["mem_a", "mem_b", "mem_c", "mem_k"] {
+        put(&brain, &row(id, "note", "tool", &format!("what {id} says")));
+    }
+    let link = |id: &str, supersedes: &str, contradicts: &str, confirmed_by: &str| {
+        let n = conn
+            .execute(
+                "UPDATE memories SET supersedes = ?1, contradicts = ?2, confirmed_by = ?3 WHERE id = ?4",
+                params![supersedes, contradicts, confirmed_by, id],
+            )
+            .unwrap();
+        assert_eq!(n, 1);
+    };
+    // A and B name each other; C names both, and K; K names nobody.
+    link("mem_a", r#"["mem_b"]"#, "[]", r#"["mem_b","mem_a"]"#);
+    link("mem_b", "[]", r#"["mem_a"]"#, r#"["mem_a"]"#);
+    link("mem_c", r#"["mem_a","mem_b","mem_k"]"#, r#"["mem_b"]"#, r#"["mem_k","mem_a"]"#);
+    let k = whole(conn, "mem_k");
+    let c_text = saved(conn, "mem_c");
+
+    let ids = vec!["mem_a".to_string(), "mem_b".to_string()];
+    assert_eq!(tx(conn, || store::purge_many(conn, &ids, true, true).unwrap()), 2);
+
+    let arrays = ["supersedes", "contradicts", "confirmed_by"]
+        .map(|column| text_of(conn, &format!("SELECT {column} FROM memories WHERE id = ?1"), "mem_c").unwrap());
+    assert_eq!(arrays, [r#"["mem_k"]"#.to_string(), "[]".to_string(), r#"["mem_k"]"#.to_string()]);
+    assert_eq!(saved(conn, "mem_c"), c_text);
+    assert_eq!(whole(conn, "mem_k"), k);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memories"), 2);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM memory_tombstones"), 2);
+    assert_eq!(count(conn, "SELECT COUNT(*) FROM axel_purge"), 0);
 }
