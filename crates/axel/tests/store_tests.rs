@@ -1551,7 +1551,7 @@ fn old_remember(path: &Path, words: &[&str]) -> std::process::Output {
 fn the_old_remember_command_and_a_version_1_brain() {
     // The gate in `main` runs before `remember` and refuses a version 1 brain with
     // `V1Brain` ("axel-v2 does not change it"): that is what "as before" is in this binary.
-    // The command's own check lets a version 1 brain through to the old code.
+    // `remember` has no version 1 branch of its own any more: this gate is the only answer.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("axel.r8");
     drop(axel::r8::Brain::create(&path, Some("old")).unwrap());
