@@ -141,11 +141,8 @@ pub struct RecallConfig {
     /// `Status.model_loaded`, set by the caller. `from_ext` leaves it false, and with it
     /// false no `embed_query` is made: recall runs on words alone.
     pub model_loaded: bool,
-    // RULING: wave 4 ruling R-15 item 5: the home is `ExtConfig.home` once that field
-    // exists (R-12b adds it). Until then this is `$HOME` when the process has one; with
-    // none (the host starts the extension with an empty environment) a file's folder is
-    // shown as its absolute path. Display only: nothing is found or scoped by it.
-    /// What `~` stands for in a label.
+    /// What `~` stands for in a label: `from_ext` takes `ExtConfig.home`, the home the
+    /// config's own paths were read with. Display only: nothing is found or scoped by it.
     pub home: Option<PathBuf>,
 }
 
@@ -178,7 +175,7 @@ impl RecallConfig {
             max_chars: cfg.recall_max_chars,
             exclude_paths: both_forms(&cfg.recall_exclude_paths),
             model_loaded: false,
-            home: std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from),
+            home: Some(cfg.home.clone()).filter(|h| !h.as_os_str().is_empty()),
         }
     }
 }

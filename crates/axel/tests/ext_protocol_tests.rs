@@ -20,7 +20,9 @@ use axel::ext::types::{
     Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status,
     TestHooks,
 };
-use axel::project_memory::{RecordLinks, Sensitivity};
+use axel::project_memory::{RecordLinks, Retention, ScopedDescriptor, Sensitivity};
+use axel::recall::{Origin, Pick, RecallConfig};
+use axel::retrieval::ScoreParts;
 use axel::store::{self, Inserted, NewRow};
 use axel::error::AxelError;
 use axel::ext::types::IndexerCtx;
@@ -2199,5 +2201,38 @@ fn f2_a_carry_that_takes_the_budget_leaves_recall_none_of_it() {
         .collect();
     assert_eq!(outcomes, ["timeout"], "recall worked a budget of its own after the rpc thread's had passed");
     holder.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
+fn f3_a_label_takes_its_home_from_the_config_not_from_home() {
+    let dirs = Dirs::new();
+    let ext = dirs.ext_config("off");
+    assert_eq!(ext.home, dirs.path());
+    assert_ne!(std::env::var_os("HOME").as_deref(), Some(dirs.path().as_os_str()));
+    let cfg = RecallConfig::from_ext(&ext, now_ms());
+    assert_eq!(cfg.home.as_deref(), Some(dirs.path()));
+    let file = dirs.path().join("notes").join("deploy.md");
+    let pick = Pick {
+        n: 1,
+        r#ref: "doc:notes::deploy".to_string(),
+        descriptor: ScopedDescriptor {
+            id: "doc:notes::deploy".to_string(),
+            project_key: String::new(),
+            title: "deploy".to_string(),
+            snippet: Some("the deploy notes".to_string()),
+            category: "note".to_string(),
+            tags: Vec::new(),
+            created: String::new(),
+            sensitivity: Sensitivity::Normal,
+            retention: Retention::Standard,
+            provenance: file.to_string_lossy().into_owned(),
+            links: RecordLinks::default(),
+        },
+        reasons: Vec::new(),
+        parts: ScoreParts::default(),
+        origin: Origin::Document,
+        date: None,
+    };
+    assert_eq!(axel::inject::who(&pick, &cfg, None), "file in ~/notes: deploy.md");
 }
 
