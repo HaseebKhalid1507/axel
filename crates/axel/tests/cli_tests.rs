@@ -2180,9 +2180,10 @@ fn newline_case(order: Order) -> Indexed {
     let mut world = Indexed::new();
     let mut chat = Chat::new(&world, "s-newline");
     let at = T0 - 100_000;
+    // Round 3, item 3: a reply that starts with a blank line too.
     chat.user(&format!("{P}\n"), at);
-    chat.says(&world, &long, false, at + 1_000);
-    let a = Arch::new(51, "s-newline", T0).turn(&format!("{P}\n"), &long).about("upload queue");
+    chat.says(&world, &format!("\n\n{long}"), false, at + 1_000);
+    let a = Arch::new(51, "s-newline", T0).turn(&format!("{P}\n"), &format!("\n\n{long}")).about("upload queue");
     delete_the_capture(&mut world, &[&a], order);
     world
 }
@@ -2290,4 +2291,47 @@ fn forget_now_of_an_archived_row_hides_the_rest_of_its_split_turn() {
     assert_eq!(hidden_by_with(world.db(), "SPLITSECOND"), [Some("cli:unproven".to_string())]);
     let counted: i64 = world.db().query_row("SELECT cli_unproven FROM archive_index WHERE archive_id = ?1", [&b.id], |r| r.get(0)).unwrap();
     assert_eq!(counted, 1);
+}
+
+/// Rows whose text holds the marker, hidden or not.
+fn rows_with(conn: &Connection, marker: &str) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM memories WHERE instr(content, ?1) > 0", [marker], |r| r.get(0)).unwrap()
+}
+
+/// A harness note after a line break in the middle of a turn (after a round of tools).
+fn harness_case(order: Order) -> Indexed {
+    const P: &str = "check the release notes and fix any typos you find in them";
+    const NOTE: &str = "\n[Host harness note, not a new user request] keep going until the work is done";
+    let mut world = Indexed::new();
+    let mut chat = Chat::new(&world, "s-harness");
+    let at = T0 - 100_000;
+    chat.user(P, at);
+    chat.says(&world, "HARNESSFIRST I am reading the release notes now", true, at + 1_000);
+    chat.user(NOTE, at + 2_000);
+    chat.says(&world, "HARNESSSECOND I fixed three typos in the release notes", false, at + 3_000);
+    let mut a = Arch::new(61, "s-harness", T0).user(P);
+    a.items.push(json!({"role": "assistant", "content": [
+        {"type": "text", "text": "HARNESSFIRST I am reading the release notes now"},
+        {"type": "tool_use", "id": "toolu_03", "name": "read", "input": {"path": "NOTES.md"}},
+    ]}));
+    a.items.push(json!({"role": "user", "content": [{"type": "tool_result", "tool_use_id": "toolu_03", "content": "ok"}]}));
+    let a = a.user(NOTE).says("HARNESSSECOND I fixed three typos in the release notes").about("upload queue");
+    delete_the_capture(&mut world, &[&a], order);
+    world
+}
+
+/// v2 c18b review round 3, item 3: the archive reads a harness note after a line break as
+/// capture does (no prompt), and composes the turn as capture does (prompt and blocks
+/// trimmed): the deleted turn's archived form is proven and taken, not merely hidden.
+#[test]
+fn the_archive_and_capture_cut_and_compose_a_turn_alike_so_the_deleted_turn_is_taken() {
+    for order in [Order::Before, Order::After] {
+        let world = harness_case(order);
+        assert_eq!(rows_with(world.db(), "HARNESSFIRST"), 0, "harness, {order:?}");
+        assert_eq!(rows_with(world.db(), "HARNESSSECOND"), 0, "harness, {order:?}: the rest of the turn is a row of its own");
+        let world = newline_case(order);
+        assert_eq!(rows_with(world.db(), "NLSTEP1 "), 0, "newline, {order:?}: not proven");
+    }
+    let world = newline_case(Order::After);
+    assert_eq!(left_counts(world.db(), &Arch::new(51, "s-newline", T0)), (0, 1));
 }

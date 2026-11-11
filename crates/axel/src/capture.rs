@@ -307,11 +307,16 @@ impl CaptureState {
                 buf.blanked += redacted.blanked as u64;
                 // SPEC: 3407 says "append" and not what stands between two responses: a
                 // line break.
-                if !buf.assistant.is_empty() && !redacted.text.is_empty() && buf.assistant.len() < MAX_TEXT_BYTES {
-                    buf.assistant.push('\n');
+                // RULING: v2 c18b review round 3, item 3: each response joins the reply as
+                // an archived unit joins its text blocks (`archive::reply_block`): trimmed,
+                // and nothing for white space alone.
+                if let Some(block) = archive::reply_block(&redacted.text) {
+                    if !buf.assistant.is_empty() && buf.assistant.len() < MAX_TEXT_BYTES {
+                        buf.assistant.push('\n');
+                    }
+                    let room = MAX_TEXT_BYTES - buf.assistant.len();
+                    buf.assistant.push_str(cut(block, room));
                 }
-                let room = MAX_TEXT_BYTES - buf.assistant.len();
-                buf.assistant.push_str(cut(&redacted.text, room));
             }
         }
         if has_tool_use {
@@ -526,7 +531,9 @@ pub fn write_turn(
             title: turn.prompt.split_whitespace().take(TITLE_WORDS).collect::<Vec<_>>().join(" "),
             abstract_text: String::new(),
             // `insert_row` redacts title and content before anything is stored.
-            content: format!("User: {}\nAssistant: {}", turn.prompt, turn.reply),
+            // RULING: v2 c18b review round 3, item 3: composed as an archived unit is (the
+            // prompt trimmed), so that the hash of a deleted turn's text meets its unit's.
+            content: archive::exchange_text(&turn.prompt, &turn.reply),
             tags: vec![format!("session:{}", turn.session_id), format!("turn:{}", turn.turn_key)],
             created_ms: turn.at_ms,
             time_source: "exact",

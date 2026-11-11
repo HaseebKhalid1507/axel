@@ -11,6 +11,7 @@ use std::path::Path;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
+use crate::capture::{host_message, HostMessage};
 use crate::screen;
 
 /// A version 1 file is at most 16 MiB.
@@ -581,7 +582,15 @@ enum UserText<'a> {
 }
 
 /// Rule 1: what a `user` text block is.
+// RULING: v2 c18b review round 3, item 3. What the host wrote is told by capture's
+// `host_message` (one list, white space before the mark skipped), so that the archive and
+// capture cut a chat into the same turns: a harness note after a line break opens no span.
 fn classify(text: &str) -> UserText<'_> {
+    let text = match host_message(text) {
+        Some(HostMessage::Event) => text.trim_start(),
+        Some(HostMessage::Aside) => return UserText::Skip,
+        None => text,
+    };
     if text.starts_with("<event ") {
         let tag_end = text.find('>').unwrap_or(text.len());
         let tag = &text[..tag_end];
@@ -597,15 +606,10 @@ fn classify(text: &str) -> UserText<'_> {
     }
     // SPEC: 1574: a text block of white space alone is no prompt (it would end the span of
     // the prompt before it and take its reply); it is passed over.
-    if text.starts_with("[Request interrupted")
-        || text.starts_with(CONTINUATION)
-        || text.starts_with("[Host context advisory")
-        // RULING: v2 archives round 6, item 2. Core's nudge, "not a new user request", is
-        // no prompt (capture's `host_message` lists it): it opens no span, and a forget call
-        // that answers it goes with the prompt of the turn.
-        || text.starts_with("[Host harness note")
-        || text.trim().is_empty()
-    {
+    // RULING: v2 archives round 6, item 2. Core's nudge, "not a new user request", is no
+    // prompt: it opens no span, and a forget call that answers it goes with the prompt of
+    // the turn (`host_message` lists it, with the continuation and the advisory).
+    if text.starts_with("[Request interrupted") || text.trim().is_empty() {
         return UserText::Skip;
     }
     UserText::Human
@@ -749,8 +753,8 @@ fn spans<'a>(a: &'a LiveArchive, policy: &ArchivePolicy) -> Vec<Span<'a>> {
                     current.tools.push((name, input_head));
                     current.forget |= policy.is_forget_tool(name);
                 }
-                (Role::Assistant, Block::Text(text)) if !text.trim().is_empty() => {
-                    current.texts.push((source_index, block_index, text.trim()));
+                (Role::Assistant, Block::Text(text)) if reply_block(text).is_some() => {
+                    current.texts.push((source_index, block_index, reply_block(text).unwrap_or_default()));
                 }
                 (Role::Assistant, Block::Text(_)) => {}
                 (Role::User, Block::Text(text)) => match classify(text) {
@@ -869,6 +873,20 @@ fn forget_spans(spans: &[Span<'_>]) -> (Vec<bool>, Vec<(usize, usize)>) {
 // Units
 // ---------------------------------------------------------------------------------------
 
+/// The text of one exchange, as an archived unit and a capture both compose it: the prompt
+/// trimmed, then the reply (`reply_block`s joined by a line break).
+// RULING: v2 c18b review round 3, item 3: one composition, so that a white space difference
+// does not move where a long turn is cut, and the cut hash of a deleted turn holds.
+pub fn exchange_text(prompt: &str, reply: &str) -> String {
+    format!("User: {}\nAssistant: {reply}", prompt.trim())
+}
+
+/// One text block of a reply as the reply holds it: trimmed; `None` when it is white space
+/// alone (it adds nothing, not even a line break).
+pub fn reply_block(text: &str) -> Option<&str> {
+    Some(text.trim()).filter(|t| !t.is_empty())
+}
+
 /// Cut at `max` bytes on a char boundary.
 fn cut(mut s: String, max: usize) -> String {
     if s.len() > max {
@@ -919,10 +937,7 @@ pub fn extract_units(a: &LiveArchive, policy: &ArchivePolicy) -> Vec<Unit> {
                         source_index,
                         block_index,
                         title: title_of(shown),
-                        body: cut(
-                            format!("User: {shown}\nAssistant: {}", redact(&reply)),
-                            BODY_BYTES,
-                        ),
+                        body: cut(exchange_text(shown, &redact(&reply)), BODY_BYTES),
                         aux: aux(),
                         turn_key: Some(turn_key(&prompt)),
                     });
