@@ -770,6 +770,8 @@ fn brain_report(
         let rows = stmt.query_map([], |r| text_at(r, 0))?;
         rows.collect::<rusqlite::Result<Vec<_>>>()?.into_iter().flatten().collect()
     };
+    // RULING: v2 c18b review round 4, item 5: the files no forget mark reaches.
+    let mtime_files = count(conn, "SELECT COUNT(*) FROM archive_index WHERE state = 'indexed' AND time_source = 'mtime'")?;
     let hidden_by_model = count(
         conn,
         "SELECT COUNT(*) FROM memory_ext WHERE hidden_ms IS NOT NULL AND substr(hidden_by, 1, 6) = 'model:'",
@@ -899,6 +901,7 @@ fn brain_report(
         "pauses": pauses,
         "hidden_by": hidden_by,
         "unproven_archives": unproven_archives,
+        "mtime_files": mtime_files,
         "hidden_by_model": hidden_by_model,
         "superseded_by_model": superseded_by_model,
         "hidden_by_model_30d": hidden_by_model_30d,
@@ -1182,6 +1185,10 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
             l.push(format!("  in {} (axel-v2 show ctx-<id> lists them)", at.join(", ")));
         }
     }
+    l.push(format!(
+        "archive files timed by their modification time (no forget mark reaches them; forget --now hides their rows with a deleted turn's prompt): {}",
+        j["mtime_files"]
+    ));
     let (hm, sm) = (j["hidden_by_model"].as_i64().unwrap_or(0), j["superseded_by_model"].as_i64().unwrap_or(0));
     if hm > 0 || sm > 0 {
         let recent = j["hidden_by_model_30d"].as_i64().unwrap_or(0) + j["superseded_by_model_30d"].as_i64().unwrap_or(0);

@@ -2517,3 +2517,46 @@ fn a_model_or_pause_hide_of_a_same_key_row_gives_way_to_cli_unproven() {
         assert_eq!(hidden_by_with(world.db(), "YIELDOTHER"), [Some("cli:unproven".to_string())], "{by}: replaced file {unproven}");
     }
 }
+
+/// v2 c18b review round 4, item 5: a file timed by its `mtime` (its record has no time) is
+/// outside every mark; `forget --now` hides its rows with the deleted turn's prompt, proven
+/// or not, and lists them; `status` counts such files.
+#[test]
+fn forget_now_hides_the_same_key_rows_of_a_file_timed_by_its_mtime() {
+    const PROMPT: &str = "continue with the plan we made for the ledger migration";
+    let mut world = Indexed::new();
+    let old = Arch::new(71, "s-untimed", T0)
+        .turn(PROMPT, &reply("UNTIMEDOTHER"))
+        .turn(PROMPT, &reply("UNTIMEDGONE"))
+        .about("deploy window");
+    let mut record: Value = serde_json::from_str(&old.json(&scope())).unwrap();
+    record.as_object_mut().unwrap().remove("created_ms");
+    let dir = world.tmp.path().join("base").join("context-archives").join(scope()).join("s000001");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{}.json", old.id)), record.to_string()).unwrap();
+    world.scan();
+    let source: String = world.db().query_row("SELECT time_source FROM archive_index", [], |r| r.get(0)).unwrap();
+    assert_eq!(source, "mtime", "the test proves nothing");
+    assert_eq!(visible_with(world.db(), "UNTIMED"), 2);
+    let status = axel_cmd(&world.path(), &["status"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("archive files timed by their modification time (no forget mark reaches them; forget --now hides their rows with a deleted turn's prompt): 1"), "{status}");
+
+    let mut cap = capture("mem_cap_untimed", "s-untimed", &key_of(PROMPT));
+    cap.project = scope();
+    cap.created_ms = T0 + 5_000;
+    cap.content = format!("User: {PROMPT}\nAssistant: {}", reply("UNTIMEDGONE"));
+    cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+    world.put(&cap);
+    let run = forget_cmd(&world.path(), &["mem_cap_untimed"], true, false, "y\n");
+    assert_eq!(run.code, 0, "{}{}", run.out, run.err);
+    let doubt = run.out.find("they will be hidden, not deleted:").unwrap_or_else(|| panic!("{}", run.out));
+    let mut stmt = world.db().prepare("SELECT id FROM memories WHERE instr(content, 'UNTIMED') > 0").unwrap();
+    let ids: Vec<String> = stmt.query_map([], |r| r.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+    assert_eq!(ids.len(), 2);
+    for id in &ids {
+        assert!(run.out[doubt..].contains(&format!("m:{id}")), "{id} was not listed: {}", run.out);
+    }
+    assert_eq!(visible_with(world.db(), "UNTIMED"), 0, "{}", run.out);
+    assert_eq!(hidden_by_with(world.db(), "UNTIMED"), [Some("cli:unproven".to_string()), Some("cli:unproven".to_string())]);
+}

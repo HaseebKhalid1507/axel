@@ -2762,6 +2762,19 @@ fn mark_turn(
             for (id, archive_id) in all_keyed.iter().filter(|(_, archive_id)| near.contains(archive_id.as_str())) {
                 doubt.extend(rest_of(conn, scope_dir, &files, archive_id, id)?);
             }
+            // RULING: v2 c18b review round 4, item 5. A file timed by its `mtime` has no place
+            // among the chat's files (`chat_files`) and no mark reaches it: its rows with the
+            // key, proven or not, are hidden, never taken.
+            let untimed: HashSet<String> = ids_of(
+                conn,
+                "SELECT archive_id FROM archive_index
+                  WHERE scope_dir = ?1 AND state = 'indexed' AND time_source = 'mtime'
+                    AND ((?2 <> '' AND logical = ?2) OR (?3 IS NOT NULL AND session_id = ?3))",
+                params![scope_dir, logical, session_id],
+            )?
+            .into_iter()
+            .collect();
+            doubt.extend(all_keyed.iter().filter(|(_, archive_id)| untimed.contains(archive_id)).map(|(id, _)| id.clone()));
         }
         purged.extend(purge_left_out_by(conn, scope_dir, &targets, source == "cli", &mut vids)?);
         if source == "cli" {
