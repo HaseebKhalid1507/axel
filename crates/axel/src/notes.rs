@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 use serde::{Deserialize, Deserializer};
@@ -137,21 +137,6 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 // RULING: wave2-c7 review B3: over 4,000 notes at core's 16 KiB limit (`store.rs:96`).
 pub const MAX_FILE_BYTES: u64 = 64 * 1024 * 1024;
 
-// `O_NOFOLLOW | O_NONBLOCK`. The crate has no `libc`; these are the values of the targets
-// it is built for, and any other target does not compile rather than open without them.
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "x86_64", target_arch = "x86", target_arch = "riscv64")
-))]
-const OPEN_FLAGS: i32 = 0o400000 | 0o4000;
-#[cfg(all(
-    target_os = "linux",
-    any(target_arch = "aarch64", target_arch = "arm", target_arch = "powerpc64")
-))]
-const OPEN_FLAGS: i32 = 0o100000 | 0o4000;
-#[cfg(target_os = "macos")]
-const OPEN_FLAGS: i32 = 0x0100 | 0x0004;
-
 /// The same file, unchanged: device, inode, size and time.
 fn same(a: &std::fs::Metadata, b: &std::fs::Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino() && a.len() == b.len() && mtime_ns(a) == mtime_ns(b)
@@ -169,11 +154,9 @@ pub fn read_file(path: &Path, project_key: &str) -> Result<NotesFile, NotesError
     }
     // RULING: wave2-c7 review B4: a link or a FIFO swapped in after the lstat neither is
     // followed nor blocks, and the handle is checked against the lstat BEFORE the read.
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(OPEN_FLAGS)
-        .open(path)
-        .map_err(io)?;
+    // (`fs_open::open_no_wait`: O_NOFOLLOW | O_NONBLOCK from `libc`, shared with the archive
+    // reader.)
+    let file = crate::fs_open::open_no_wait(path).map_err(io)?;
     let opened = file.metadata().map_err(io)?;
     // SPEC: 1899-1900 names the size only; a different device or inode (the path replaced
     // between the lstat and the open) or time is treated as a change too.

@@ -76,7 +76,10 @@ CREATE TABLE IF NOT EXISTS note_files(
   path TEXT PRIMARY KEY, project_key TEXT NOT NULL,
   size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
   ok INTEGER NOT NULL DEFAULT 1, reason TEXT,
-  live_count INTEGER NOT NULL DEFAULT 0, scanned_ms INTEGER NOT NULL
+  live_count INTEGER NOT NULL DEFAULT 0, scanned_ms INTEGER NOT NULL,
+  -- the hashes of the lines the last pass could not parse, sorted, comma-joined; NULL = none
+  -- (ruling on wave 2's review of commit 7: deletion by absence waits only while this changes)
+  bad_lines TEXT, bad_lines_changed_ms INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chat_pauses(  -- section 4
