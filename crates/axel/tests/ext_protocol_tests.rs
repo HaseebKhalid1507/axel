@@ -1194,7 +1194,7 @@ fn r1_a_healthy_process_says_ready_removes_old_files_at_start_and_its_own_at_a_c
     let said = wait_status_file(&dirs, "ready", Duration::from_secs(15));
     let mut keys: Vec<&str> = said.as_object().unwrap().keys().map(String::as_str).collect();
     keys.sort_unstable();
-    assert_eq!(keys, ["mode", "pid", "reason", "reason_at", "started_ms", "written_ms"]);
+    assert_eq!(keys, ["mode", "pid", "reason", "reason_at", "start_ticks", "started_ms", "written_ms"]);
     assert_eq!((&said["reason"], &said["reason_at"]), (&json!("None"), &Value::Null), "{said}");
     assert_eq!(said["pid"], std::process::id());
     assert_eq!(std::fs::metadata(status_file(&dirs)).unwrap().permissions().mode() & 0o777, 0o600);
