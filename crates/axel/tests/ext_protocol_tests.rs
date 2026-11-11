@@ -1011,13 +1011,14 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
         insert_memory(&conn, "mem_c", None, None, false);
         (a, b)
     };
-    let (b, status) = boot(Some(Embedder::hashing()), TestHooks::default());
+    // The batch takes 300 ms, so it is still with the embed thread at the second pump.
+    let (b, status) = boot(Some(Embedder::hashing()), TestHooks { embed_sleep_ms: 300, ..TestHooks::default() });
     let (mut ctx, jobs_rx, vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
     assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Replace(items)) if items.is_empty()));
 
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(status.vectors_waiting.load(Ordering::Relaxed), 2, "a secret row is never embedded");
-    assert!(ctx.bulk_out);
+    assert_eq!(ctx.embed.backlog(), 2);
     // While the batch is out, nothing is offered a second time.
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     let Ok(Job::Embedded { model, vectors }) = jobs_rx.recv_timeout(Duration::from_secs(10)) else {
@@ -1029,7 +1030,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert!(vectors.iter().all(|(k, _)| *k != VecKey::Mem(vid_a)));
 
     indexer_start::on_embedded(&mut ctx, &model, vectors.clone()).unwrap();
-    assert!(!ctx.bulk_out);
+    assert_eq!(ctx.embed.backlog(), 0);
     let Ok(VecDelta::Upsert(items)) = vec_rx.try_recv() else { panic!("no Upsert") };
     assert_eq!(items.len(), 2);
     let item_b = items.iter().find(|i| i.key == VecKey::Mem(vid_b)).unwrap();
@@ -1054,7 +1055,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert!(vec_rx.try_recv().is_err());
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(status.vectors_waiting.load(Ordering::Relaxed), 0);
-    assert!(!ctx.bulk_out);
+    assert_eq!(ctx.embed.backlog(), 0);
 
     // A degraded process writes nothing: not a vector, not its status row.
     insert_memory(&conn, "mem_d", None, None, false);
@@ -1063,7 +1064,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     indexer_start::on_embedded(&mut ctx, "hash-384", vec![(VecKey::Mem(vid_a), unit(9))]).unwrap();
     indexer_start::write_status(&mut ctx).unwrap();
     indexer_start::pump_embeddings(&mut ctx).unwrap();
-    assert!(!ctx.bulk_out);
+    assert_eq!(ctx.embed.backlog(), 0);
     assert_eq!(status.status_written_ms.load(Ordering::Relaxed), written);
     let secret: Option<Vec<u8>> =
         conn.query_row("SELECT embedding FROM memory_ext WHERE vid = ?1", [vid_a], |r| r.get(0)).unwrap();
@@ -1090,7 +1091,7 @@ fn a_model_that_is_not_the_brains_runs_on_words_alone() {
     assert!(!status.model_loaded.load(Ordering::Relaxed));
     assert!(vec_rx.try_recv().is_err(), "no vector of another model is loaded");
     indexer_start::pump_embeddings(&mut ctx).unwrap();
-    assert!(!ctx.bulk_out);
+    assert_eq!(ctx.embed.backlog(), 0);
     assert!(jobs_rx.recv_timeout(Duration::from_millis(100)).is_err(), "nothing is embedded");
     let row = status_row(&dirs.brain()).unwrap();
     assert_eq!(row["model_loaded"], false);
@@ -1515,4 +1516,59 @@ fn r9_an_embed_thread_held_inside_a_batch_is_stuck_and_a_query_gets_none_at_once
     }
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert!(status.model_loaded.load(Ordering::Relaxed));
+}
+
+// ── Wave 3 rulings 10 and 11 ────────────────────────────────────────────────
+
+#[test]
+fn r10_two_threads_at_the_log_limit_lose_no_generation() {
+    const LIMIT: u64 = 2048;
+    let dirs = Dirs::new();
+    let folder = dirs.path().join("logs");
+    let log = server::Log::new(&folder, LIMIT);
+    let old = folder.join("extension.log.1");
+    let writers: Vec<_> = (0..4)
+        .map(|n| {
+            let (log, old) = (log.clone(), old.clone());
+            std::thread::spawn(move || {
+                let mut short = 0u32;
+                for i in 0..1500 {
+                    log.line(&format!("writer {n} line {i:05} of the log at its limit"));
+                    // Whenever there is a kept generation, it is a whole one.
+                    if std::fs::metadata(&old).is_ok_and(|m| m.len() <= LIMIT) {
+                        short += 1;
+                    }
+                }
+                short
+            })
+        })
+        .collect();
+    let short: u32 = writers.into_iter().map(|w| w.join().unwrap()).sum();
+    assert_eq!(short, 0, "extension.log.1 was seen {short} times holding less than a full file");
+    assert!(std::fs::metadata(&old).unwrap().len() > LIMIT);
+    assert!(std::fs::metadata(folder.join("extension.log")).map(|m| m.len()).unwrap_or(0) < LIMIT + 4096);
+}
+
+#[test]
+fn r10_the_stop_flag_ends_an_indexer_loop_whose_queue_is_full() {
+    let dirs = Dirs::new();
+    // Every job takes 50 ms: the 1,024 queued would take 51 s.
+    let (b, _status) = boot(None, TestHooks { indexer_sleep_ms: 50, ..TestHooks::default() });
+    let (ctx, jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    let job = || Job::Forgotten { id: "id".into(), kind: "other".into(), project_key: "p0123456789abcdef".into() };
+    while ctx.jobs.try_send(job()).is_ok() {}
+    assert!(ctx.jobs.try_send(Job::Shutdown).is_err(), "the queue has room for Shutdown");
+
+    let (stop, jobs) = (ctx.stop.clone(), ctx.jobs.clone());
+    let (done_tx, done) = mpsc::channel();
+    std::thread::spawn(move || {
+        indexer::run(ctx, jobs_rx);
+        let _ = done_tx.send(());
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    stop.store(true, Ordering::SeqCst);
+    let start = Instant::now();
+    done.recv_timeout(Duration::from_secs(3)).expect("the loop went on after the stop flag");
+    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    drop(jobs);
 }

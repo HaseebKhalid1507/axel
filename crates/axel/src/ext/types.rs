@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8};
 use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use axel_memkoshi::security::MemorySigner;
 use rusqlite::Connection;
@@ -188,8 +189,15 @@ pub struct IndexerCtx {
     pub jobs: SyncSender<Job>,
     pub status: Arc<Status>,
     pub mode: Arc<AtomicU8>,
-    pub last_run: HashMap<&'static str, i64>,
-    pub bulk_out: bool,
+    /// When each call of the tick last ran, on a monotonic clock (wave 3, 12b ruling 10).
+    pub last_run: HashMap<&'static str, Instant>,
+    /// When `ensure_open` last tried the brain.
+    pub open_tried: Option<Instant>,
+    /// What the front thread has been sent: count and highest id of the visible embedded
+    /// documents, then of the memory rows. `None` until a `Replace` has gone.
+    pub vectors_sent: Option<[i64; 4]>,
+    /// Set by `serve` before it tells the threads to end; the loop looks at it every turn.
+    pub stop: Arc<AtomicBool>,
     /// Device and inode of the brain file when it was opened (wave 3, 12b ruling 5).
     pub brain_file: Option<(u64, u64)>,
     pub clock: Clock,
@@ -261,6 +269,8 @@ pub struct TestHooks {
     pub embed_sleep_ms: u64,
     /// Replaces the 60 s after which a batch still running is a hang.
     pub embed_stuck_limit_ms: Option<u64>,
+    /// Replaces the 60 s between two attempts to open the brain.
+    pub open_retry_ms: Option<u64>,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.

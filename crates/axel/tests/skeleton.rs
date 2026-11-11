@@ -102,7 +102,9 @@ fn indexer_ctx(test: TestHooks, conn: Option<Connection>) -> (IndexerCtx, Receiv
         status: Arc::new(Status::default()),
         mode: Arc::new(AtomicU8::new(Mode::Ready as u8)),
         last_run: HashMap::new(),
-        bulk_out: false,
+        open_tried: None,
+        vectors_sent: None,
+        stop: Arc::new(AtomicBool::new(false)),
         brain_file: None,
         clock: Arc::new(|| 1_000),
         test,
@@ -355,7 +357,6 @@ fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
     // The first tick runs all eight calls; a second at the same time runs none.
     indexer::tick(&mut ctx);
     assert_eq!(ctx.last_run.len(), 8);
-    assert!(ctx.last_run.values().all(|&t| t == 1_000));
     indexer::tick(&mut ctx);
     assert_eq!(ctx.status.panics.load(Ordering::Relaxed), 1);
     assert_eq!(ctx.status.write_errors.load(Ordering::Relaxed), 0);
@@ -363,14 +364,23 @@ fn the_indexer_dispatch_and_tick_do_zero_work_and_survive_a_panic() {
 
 #[test]
 fn the_indexer_loop_ends_on_shutdown_and_on_the_job_limit() {
-    let (ctx, jobs_rx) = indexer_ctx(TestHooks::default(), None);
+    // The loop opens the brain its config names: one under a temporary folder.
+    let dir = tempfile::TempDir::new().unwrap();
+    let in_dir = |ctx: &mut IndexerCtx, name: &str| {
+        ctx.cfg.data_dir = dir.path().join(name);
+        ctx.cfg.brain = ctx.cfg.data_dir.join("brain.r8");
+        ctx.cfg.base = dir.path().join("base");
+    };
+    let (mut ctx, jobs_rx) = indexer_ctx(TestHooks::default(), None);
+    in_dir(&mut ctx, "one");
     ctx.jobs.try_send(Job::Shutdown).unwrap();
     indexer::run(ctx, jobs_rx);
 
-    let (ctx, jobs_rx) = indexer_ctx(
+    let (mut ctx, jobs_rx) = indexer_ctx(
         TestHooks { indexer_stop_after_jobs: Some(2), ..TestHooks::default() },
         None,
     );
+    in_dir(&mut ctx, "two");
     ctx.jobs.try_send(Job::Tick).unwrap();
     ctx.jobs.try_send(Job::Tick).unwrap();
     indexer::run(ctx, jobs_rx);

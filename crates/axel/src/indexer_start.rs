@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection, ErrorCode, OpenFlags, OptionalExtension};
 use serde_json::json;
@@ -20,19 +20,11 @@ use crate::r8::{DEFAULT_EMBEDDER, EMBEDDING_DIM};
 use crate::vindex::{VecDelta, VecItem, VecKey, VecScope};
 
 /// The indexer retries `open_v2` this often.
-const OPEN_RETRY_MS: i64 = 60_000;
+const OPEN_RETRY_MS: u64 = 60_000;
 /// Rows given to the embed thread at a time, and vectors written per transaction.
 const BATCH: usize = 64;
 /// The project directory of global rows.
 const GLOBAL_DIR: &str = "p0000000000000000";
-
-// What this file keeps in `IndexerCtx.last_run` besides the tick's own times: when the
-// brain was last tried, and what was last sent to the front thread (`resync_vectors`).
-const K_OPEN: &str = "indexer_start::open";
-const K_DOCS: &str = "vectors_sent::docs";
-const K_DOC_MAX: &str = "vectors_sent::doc_max";
-const K_MEMS: &str = "vectors_sent::mems";
-const K_MEM_MAX: &str = "vectors_sent::mem_max";
 
 const DOCS_WHERE: &str =
     "hidden IS NULL AND COALESCE(json_extract(metadata, '$.type'), '') <> 'memory'";
@@ -54,7 +46,9 @@ pub fn open_ctx(cfg: ExtConfig, boot: Boot) -> (IndexerCtx, Receiver<Job>, Recei
         status: boot.status,
         mode: Arc::new(AtomicU8::new(Mode::Starting as u8)),
         last_run: Default::default(),
-        bulk_out: false,
+        open_tried: None,
+        vectors_sent: None,
+        stop: Arc::new(AtomicBool::new(false)),
         brain_file: None,
         clock: boot.clock,
         test: boot.test,
@@ -96,11 +90,12 @@ pub fn ensure_open(ctx: &mut IndexerCtx) {
             _ => {}
         }
     }
-    let now = (ctx.clock)();
-    if ctx.last_run.get(K_OPEN).is_some_and(|&last| now - last < OPEN_RETRY_MS) {
+    // RULING: wave3-c12b ruling 10. A monotonic clock, not the wall clock.
+    let retry = Duration::from_millis(ctx.test.open_retry_ms.unwrap_or(OPEN_RETRY_MS));
+    if ctx.open_tried.is_some_and(|tried| tried.elapsed() < retry) {
         return;
     }
-    ctx.last_run.insert(K_OPEN, now);
+    ctx.open_tried = Some(Instant::now());
 
     match open(ctx) {
         Ok(()) => {
@@ -345,9 +340,7 @@ fn send_all(ctx: &mut IndexerCtx) -> Result<()> {
     }
     // Recorded only when it was sent: a front thread that is gone has been sent nothing.
     if ctx.vec_tx.send(VecDelta::Replace(items)).is_ok() {
-        for (key, value) in [K_DOCS, K_DOC_MAX, K_MEMS, K_MEM_MAX].into_iter().zip(sig) {
-            ctx.last_run.insert(key, value);
-        }
+        ctx.vectors_sent = Some(sig);
     }
     Ok(())
 }
@@ -361,8 +354,7 @@ pub fn resync_vectors(ctx: &mut IndexerCtx) -> Result<()> {
     }
     let (Some(conn), Some(model)) = (ctx.conn.as_ref(), ctx.embed.model_id()) else { return Ok(()) };
     let now = signature(conn, model)?;
-    let sent = [K_DOCS, K_DOC_MAX, K_MEMS, K_MEM_MAX].map(|k| ctx.last_run.get(k).copied());
-    if sent.iter().zip(now).all(|(sent, now)| *sent == Some(now)) {
+    if ctx.vectors_sent == Some(now) {
         return Ok(());
     }
     send_all(ctx)
@@ -382,9 +374,11 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
     ctx.status.vectors_waiting.store(waiting.max(0) as u64, Ordering::Relaxed);
     let usable = model_usable(ctx)?;
     ctx.status.model_loaded.store(usable, Ordering::Relaxed);
-    // The embed thread's bulk queue takes whatever it is given: rows still in flight are
+    // The embed thread's bulk queue takes whatever it is given: rows it still holds are
     // not offered a second time.
-    if !usable || ctx.bulk_out || waiting == 0 || mode_of(ctx) != Some(Mode::Ready) {
+    // RULING: wave3-c12b ruling 11. `backlog()`, not a flag of this thread's: it is 0 again
+    // when the embed thread has ended or has dropped a batch.
+    if !usable || ctx.embed.backlog() > 0 || waiting == 0 || mode_of(ctx) != Some(Mode::Ready) {
         return Ok(());
     }
     let mut stmt = conn.prepare(
@@ -398,18 +392,13 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
         })?
         .collect::<rusqlite::Result<Vec<(VecKey, String)>>>()?;
     drop(stmt);
-    if !items.is_empty() {
-        ctx.embed.submit_bulk(items);
-        ctx.bulk_out = true;
-    }
+    ctx.embed.submit_bulk(items);
     Ok(())
 }
 
 /// `Job::Embedded` (called by `indexer::dispatch`): the vectors are written, 64 per
 /// transaction, and the same vectors go to the front thread as a `VecDelta::Upsert`.
 pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<f32>)>) -> Result<()> {
-    // First, so that nothing below can leave the pump waiting for ever.
-    ctx.bulk_out = false;
     if mode_of(ctx) != Some(Mode::Ready) || ctx.embed.model_id() != Some(model) || !model_usable(ctx)? {
         return Ok(());
     }
@@ -472,11 +461,9 @@ pub fn on_embedded(ctx: &mut IndexerCtx, model: &str, vectors: Vec<(VecKey, Vec<
         let count = items.len() as i64;
         let highest = items.iter().map(|i| if let VecKey::Mem(v) = i.key { v } else { 0 }).max().unwrap_or(0);
         if ctx.vec_tx.send(VecDelta::Upsert(items)).is_ok() {
-            if let Some(mems) = ctx.last_run.get_mut(K_MEMS) {
-                *mems += count;
-            }
-            if let Some(max) = ctx.last_run.get_mut(K_MEM_MAX) {
-                *max = (*max).max(highest);
+            if let Some(sent) = ctx.vectors_sent.as_mut() {
+                sent[2] += count;
+                sent[3] = sent[3].max(highest);
             }
         }
     }

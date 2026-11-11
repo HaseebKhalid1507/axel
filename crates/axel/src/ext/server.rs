@@ -101,11 +101,13 @@ pub fn unavailable_reason(status: &Status, mode: &AtomicU8) -> &'static str {
 pub struct Log {
     path: PathBuf,
     limit: u64,
+    /// Held by the one thread of this process that is renaming the file.
+    renaming: Arc<AtomicBool>,
 }
 
 impl Log {
     pub fn new(data_dir: &Path, limit: u64) -> Log {
-        Log { path: data_dir.join("extension.log"), limit }
+        Log { path: data_dir.join("extension.log"), limit, renaming: Arc::new(AtomicBool::new(false)) }
     }
 
     pub fn line(&self, text: &str) {
@@ -125,10 +127,19 @@ impl Log {
         let _ = file.write_all(format!("{ms} {text}\n").as_bytes());
         let len = file.metadata().map(|m| m.len()).unwrap_or(0);
         drop(file);
-        if len > self.limit {
-            let mut old = self.path.clone().into_os_string();
-            old.push(".1");
-            let _ = std::fs::rename(&self.path, old);
+        // RULING: wave3-c12b ruling 10. One thread renames at a time, and it looks at the
+        // size again once it is the one: a second thread that saw the same full file would
+        // otherwise put the few lines of the new file over the generation just kept. A
+        // thread that finds the flag taken does not wait; the next line looks again.
+        if len > self.limit && self.renaming.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst).is_ok()
+        {
+            let still = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+            if still > self.limit {
+                let mut old = self.path.clone().into_os_string();
+                old.push(".1");
+                let _ = std::fs::rename(&self.path, old);
+            }
+            self.renaming.store(false, Ordering::SeqCst);
         }
     }
 }
@@ -737,7 +748,9 @@ impl<W: Write> Pump<W> {
                     status: st.status.clone(),
                     mode: st.mode.clone(),
                     last_run: HashMap::new(),
-                    bulk_out: false,
+                    open_tried: None,
+                    vectors_sent: None,
+                    stop: stop.clone(),
                     brain_file: None,
                     clock: st.clock.clone(),
                     test: st.test.clone(),

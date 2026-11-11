@@ -3,17 +3,22 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::error::Result;
 use crate::ext::types::{IndexerCtx, Job, Mode};
 use crate::{brain_v2, capture, docsync, index_archives, index_notes, indexer_start, recall};
 
-/// Returns on `Job::Shutdown`, when every sender is gone, and when
+/// Returns on `Job::Shutdown`, when `ctx.stop` is set, when every sender is gone, and when
 /// `ctx.test.indexer_stop_after_jobs` jobs have been taken.
 pub fn run(mut ctx: IndexerCtx, rx: Receiver<Job>) {
     let mut jobs: u64 = 0;
     loop {
+        // RULING: wave3-c12b ruling 10. `Job::Shutdown` goes to the back of the queue and is
+        // dropped when the queue is full; the flag is seen at the next turn either way.
+        if ctx.stop.load(Ordering::SeqCst) {
+            return;
+        }
         indexer_start::ensure_open(&mut ctx);
         match rx.recv_timeout(Duration::from_secs(1)) {
             Ok(Job::Shutdown) => return,
@@ -109,11 +114,13 @@ pub fn tick(ctx: &mut IndexerCtx) {
 /// `every_ms` ago. The time is recorded before the call, so a call that panics waits its
 /// interval like any other.
 fn due(ctx: &mut IndexerCtx, name: &'static str, every_ms: i64) -> bool {
-    let now = (ctx.clock)();
+    // RULING: wave3-c12b ruling 10. A monotonic clock: the wall clock set back an hour
+    // would stop every call for an hour.
+    let every = Duration::from_millis(every_ms.max(0) as u64);
     match ctx.last_run.get(name) {
-        Some(&last) if now - last < every_ms => false,
+        Some(last) if last.elapsed() < every => false,
         _ => {
-            ctx.last_run.insert(name, now);
+            ctx.last_run.insert(name, Instant::now());
             true
         }
     }
