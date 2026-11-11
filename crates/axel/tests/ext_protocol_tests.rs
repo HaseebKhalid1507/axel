@@ -1437,3 +1437,31 @@ fn r6_a_look_that_cannot_read_the_brain_is_not_ready_and_open_v2_does_not_run() 
         .unwrap();
     assert_eq!(rows, 0, "the brain was written by a process that could not read its base");
 }
+
+// ── Wave 3 ruling 7: a forget mark that could not get the write lock ────────
+
+// `mark_forgotten_turn` is a stub until commit 18a, so what is seen here is the front
+// thread's log: the mark is kept, and written once the lock is free.
+#[test]
+fn r7_a_forget_mark_that_could_not_get_the_write_lock_is_written_when_it_is_free() {
+    let dirs = Dirs::new();
+    let mut host = Host::ready(&dirs, None, TestHooks::default());
+    let holder = Connection::open(dirs.brain()).unwrap();
+    holder.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    // Core's forget ran in chat S; the next forwarded call carries it to the front thread.
+    assert_eq!(host.hook("on_memory_forgotten", "session-S"), continues());
+    assert_eq!(host.hook("before_message", "session-S"), continues());
+    wait_for_log(&dirs, "front carry: forget mark not written, kept");
+    // Still locked: tried between calls and after this one, and still kept.
+    std::thread::sleep(Duration::from_millis(600));
+    host.wait_until("the front thread is free again", |h| h.hook("on_session_start", "other") == continues());
+    assert!(!read_log(&dirs).contains("forget marks written late"));
+
+    holder.execute_batch("ROLLBACK").unwrap();
+    assert_eq!(host.hook("before_message", "session-S"), continues());
+    let log = wait_for_log(&dirs, "front carry: forget marks written late: 1");
+    assert_eq!(log.matches("forget mark not written, kept").count(), 1, "{log}");
+    assert!(!log.contains("session-S"), "{log}");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}

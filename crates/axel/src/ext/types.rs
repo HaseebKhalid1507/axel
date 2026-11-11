@@ -149,6 +149,15 @@ impl DegradedReason {
     }
 }
 
+/// What `mark_forgotten_turn` is given for one session of `Carry.forgot`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForgetMark {
+    pub session_id: String,
+    pub from_ms: i64,
+    pub to_ms: i64,
+    pub turn_key: Option<String>,
+}
+
 pub struct FrontState {
     pub cfg: ExtConfig,
     pub conn: Option<Connection>,
@@ -162,6 +171,8 @@ pub struct FrontState {
     pub mode: Arc<AtomicU8>,
     pub forum_on: bool,
     pub filed: HashMap<String, (i64, Option<Vec<String>>)>,
+    /// Forget marks that could not get the write lock, oldest first (wave 3, 12b ruling 7).
+    pub forget_marks: Vec<ForgetMark>,
     pub clock: Clock,
     pub test: Arc<TestHooks>,
     /// Section 7, "the indexer stands aside".

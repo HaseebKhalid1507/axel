@@ -80,6 +80,7 @@ fn front_state(test: TestHooks) -> (FrontState, Receiver<Job>) {
         mode: Arc::new(AtomicU8::new(Mode::Ready as u8)),
         forum_on: false,
         filed: HashMap::new(),
+        forget_marks: Vec::new(),
         clock: Arc::new(|| 1_000),
         test,
         writing: Arc::new(AtomicBool::new(false)),

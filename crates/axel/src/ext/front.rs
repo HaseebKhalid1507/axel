@@ -16,7 +16,7 @@ use crate::embed::EmbedService;
 use crate::ext::config::ExtConfig;
 use crate::ext::server::{self, degrade, log_line, JOB_QUEUE};
 use crate::ext::types::{
-    Boot, Caller, Carry, DegradedReason, FrontState, HookEvent, HookOut, Job, Mode, ToolError,
+    Boot, Caller, Carry, DegradedReason, ForgetMark, FrontState, HookEvent, HookOut, Job, Mode, ToolError,
 };
 use crate::ext::{hooks, tools};
 use crate::r8::EMBEDDING_DIM;
@@ -24,6 +24,8 @@ use crate::recall::View;
 use crate::vindex::{ExactIndex, VecDelta};
 use crate::{index_archives, project};
 
+/// Forget marks kept for a later try (wave 3, 12b ruling 7).
+const FORGET_MARKS_KEPT: usize = 256;
 /// How long the loop waits for a call before it looks after its own state.
 const IDLE: Duration = Duration::from_millis(250);
 
@@ -74,6 +76,7 @@ pub(crate) fn new_state(
         mode,
         forum_on,
         filed: HashMap::new(),
+        forget_marks: Vec::new(),
         clock: boot.clock,
         test: boot.test,
         writing: Arc::new(AtomicBool::new(false)),
@@ -175,6 +178,7 @@ pub fn run(mut st: FrontState, calls: Receiver<FrontCall>, replies: Sender<Front
                 if replies.send(FrontReply { seq, answer }).is_err() {
                     return;
                 }
+                retry_forget_marks(&mut st);
             }
             Err(RecvTimeoutError::Timeout) => idle(&mut st),
             Err(RecvTimeoutError::Disconnected) => return,
@@ -195,6 +199,7 @@ fn idle(st: &mut FrontState) {
     while let Ok(delta) = st.vec_rx.try_recv() {
         st.index.apply(delta);
     }
+    retry_forget_marks(st);
 }
 
 /// One call. The `Carry` first, before anything else.
@@ -242,32 +247,75 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
 /// `mark_forgotten_turn` inside `begin_write_front`.
 fn mark_forgotten(st: &mut FrontState, session_id: &str) {
     let now = (st.clock)();
-    let pending = st.capture.suppress(session_id);
-    if !is_ready(st) {
+    let (from_ms, turn_key) = match st.capture.suppress(session_id) {
+        Some((started_ms, key)) => (started_ms, Some(key)),
+        None => (now, None),
+    };
+    if !is_ready(st) || st.conn.is_none() {
+        return;
+    }
+    let mark = ForgetMark { session_id: session_id.to_string(), from_ms, to_ms: now, turn_key };
+    if write_forget_mark(st, &mark) {
+        return;
+    }
+    // RULING: wave3-c12b ruling 7. The `Carry` is gone, so nothing else holds this session:
+    // the mark is kept and tried again. At most `FORGET_MARKS_KEPT` wait; one more gives up
+    // the oldest, so a brain that stays locked cannot grow the list without end.
+    if st.forget_marks.len() >= FORGET_MARKS_KEPT {
+        st.forget_marks.remove(0);
+        log_line("front carry: forget mark given up (too many waiting)");
+    }
+    st.forget_marks.push(mark);
+    log_line("front carry: forget mark not written, kept");
+}
+
+/// True when the mark is in the brain.
+fn write_forget_mark(st: &FrontState, mark: &ForgetMark) -> bool {
+    let Some(conn) = st.conn.as_ref() else { return false };
+    let logical = project::logical(&mark.session_id);
+    let Ok(guard) = brain_v2::begin_write_front(conn, &st.writing) else { return false };
+    let marked = index_archives::mark_forgotten_turn(
+        conn,
+        &logical,
+        Some(&mark.session_id),
+        "call",
+        mark.from_ms,
+        mark.to_ms,
+        mark.turn_key.as_deref(),
+    );
+    let ended = match marked {
+        Ok(_) => conn.execute_batch("COMMIT").is_ok(),
+        Err(_) => false,
+    };
+    if !ended {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    drop(guard);
+    ended
+}
+
+/// After each call's answer has been sent, and between calls: the kept marks, oldest
+/// first, until one cannot be written. The lock is asked for without waiting, so a brain
+/// that is still locked costs this thread nothing.
+fn retry_forget_marks(st: &mut FrontState) {
+    if st.forget_marks.is_empty() || !is_ready(st) {
         return;
     }
     let Some(conn) = st.conn.as_ref() else { return };
-    let (from_ms, turn_key) = match &pending {
-        Some((started_ms, key)) => (*started_ms, Some(key.as_str())),
-        None => (now, None),
-    };
-    let logical = project::logical(session_id);
-    let guard = match brain_v2::begin_write_front(conn, &st.writing) {
-        Ok(guard) => guard,
-        Err(_) => {
-            log_line("front carry: forget mark not written (no write lock)");
-            return;
-        }
-    };
-    let marked =
-        index_archives::mark_forgotten_turn(conn, &logical, Some(session_id), "call", from_ms, now, turn_key);
-    let ended = match marked {
-        Ok(_) => conn.execute_batch("COMMIT"),
-        Err(_) => conn.execute_batch("ROLLBACK").and(Err(rusqlite::Error::InvalidQuery)),
-    };
-    if ended.is_err() {
-        let _ = conn.execute_batch("ROLLBACK");
-        log_line("front carry: forget mark not written");
+    let Ok(waits_ms) = conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0)) else { return };
+    if conn.busy_timeout(Duration::ZERO).is_err() {
+        return;
     }
-    drop(guard);
+    let mut written = 0;
+    while let Some(mark) = st.forget_marks.first().cloned() {
+        if !write_forget_mark(st, &mark) {
+            break;
+        }
+        st.forget_marks.remove(0);
+        written += 1;
+    }
+    let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
+    if written > 0 {
+        log_line(&format!("front carry: forget marks written late: {written}"));
+    }
 }
