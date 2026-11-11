@@ -1,0 +1,9 @@
+{"namespace":"project-p11","timestamp_ms":6912000000,"content":"expired by record retention","tags":[],"id":"mem-exp","project":"p11","retention":{"max_age_days":5}}
+{"namespace":"project-p11","timestamp_ms":864000000,"content":"expired by global age","tags":[],"id":"mem-old","project":"p11"}
+{"namespace":"project-p11","timestamp_ms":8553600000,"content":"fresh survivor","tags":[],"id":"mem-new","project":"p11"}
+{"namespace":"project-p11","timestamp_ms":8553600000,"content":"tombstoned body","tags":[],"id":"mem-dead","project":"p11"}
+{"tombstone":"mem-dead","timestamp_ms":8553600000}
+{"namespace":"session-notes","timestamp_ms":123,"content":"legacy body","tags":["@user"]}
+{"tombstone":"mem-live","timestamp_ms":30}
+not json
+{"namespace":"trunc

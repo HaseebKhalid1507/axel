@@ -68,7 +68,8 @@ pub enum NotesError {
     Io(String),
 }
 
-// Core's `MemoryRecord` (store.rs:9-39), read side only.
+// Core's `MemoryRecord` (store.rs:9-40 at a373ff06), read side only. No
+// `deny_unknown_fields`, as in core.
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct CoreRecord {
@@ -119,7 +120,7 @@ enum CoreRetention {
     MaxAgeDays(u32),
 }
 
-// Core's `TombstoneLine` (store.rs:521-525).
+// Core's `TombstoneLine` (store.rs:799-803 at a373ff06).
 #[derive(Deserialize)]
 #[allow(dead_code)]
 struct TombstoneLine {
@@ -209,11 +210,14 @@ enum Parsed {
     Neither,
 }
 
-fn classify(value: &serde_json::Value) -> Parsed {
-    if let Ok(tomb) = TombstoneLine::deserialize(value) {
+/// Core's order (`store.rs:866-873` at a373ff06): a tombstone first, then a record, each
+/// parsed from the text, so a repeated key is refused as serde's derive refuses it, and an
+/// unknown key is accepted as core accepts it (neither struct denies unknown fields).
+fn classify(line: &str) -> Parsed {
+    if let Ok(tomb) = serde_json::from_str::<TombstoneLine>(line) {
         return Parsed::Tombstone(tomb.tombstone);
     }
-    match CoreRecord::deserialize(value) {
+    match serde_json::from_str::<CoreRecord>(line) {
         Ok(rec) => Parsed::Record(rec),
         Err(_) => Parsed::Neither,
     }
@@ -248,10 +252,12 @@ fn parse(bytes: &[u8], project_key: &str, size: u64, mtime_ns: i64) -> NotesFile
         if line.is_some_and(|line| line.trim().is_empty()) {
             continue; // blank, as core skips it
         }
-        let value = line
-            .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-            .filter(serde_json::Value::is_object);
-        let Some(value) = value else {
+        // RULING: wave2-c7 review B5: `Value` only answers "is this line an object"; the
+        // text itself is then parsed as core parses it.
+        let object = line.filter(|line| {
+            serde_json::from_str::<serde_json::Value>(line).is_ok_and(|value| value.is_object())
+        });
+        let Some(line) = object else {
             if last {
                 out.torn_tail = true;
             } else {
@@ -262,7 +268,7 @@ fn parse(bytes: &[u8], project_key: &str, size: u64, mtime_ns: i64) -> NotesFile
             }
             continue;
         };
-        let rec = match classify(&value) {
+        let rec = match classify(line) {
             Parsed::Tombstone(id) => {
                 if tombstoned.insert(id.clone()) {
                     out.tombstoned.push(id);
@@ -281,11 +287,9 @@ fn parse(bytes: &[u8], project_key: &str, size: u64, mtime_ns: i64) -> NotesFile
         let Some(id) = rec.id else {
             continue;
         };
-        // SPEC: core's timestamp is u64, the declared field i64: a value past i64::MAX is
-        // not a record this reader can keep, and is skipped.
-        let Ok(timestamp_ms) = i64::try_from(rec.timestamp_ms) else {
-            continue;
-        };
+        // RULING: wave2-c7 review B5 (the timestamp): core's field is u64, the declared one
+        // i64; a value past i64::MAX saturates, and the note is kept as core keeps it.
+        let timestamp_ms = i64::try_from(rec.timestamp_ms).unwrap_or(i64::MAX);
         let note = NoteRecord {
             id: id.clone(),
             content: rec.content,

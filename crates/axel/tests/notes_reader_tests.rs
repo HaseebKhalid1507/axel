@@ -348,3 +348,55 @@ fn more_bytes_than_the_size_is_changed() {
     }
     assert_eq!(read_within(path, 5), Err(NotesError::Changed));
 }
+
+/// RULING: wave2-c7 review B5: the line's text is parsed as core parses it. A repeated key
+/// is refused (core's derive refuses it): not a note, not a tombstone, not damage. An unknown
+/// key is accepted, as core accepts it.
+#[test]
+fn a_repeated_key_is_refused_and_an_unknown_key_accepted_as_core_does() {
+    let tmp = TempDir::new().unwrap();
+    let twice = format!(
+        r#"{{"namespace":"project-{KEY}","timestamp_ms":1,"content":"a","content":"b","tags":[],"id":"mem-twice","project":"{KEY}"}}"#
+    );
+    let tomb_twice = r#"{"tombstone":"mem-a","tombstone":"mem-b","timestamp_ms":2}"#;
+    let unknown = format!(
+        r#"{{"namespace":"project-{KEY}","timestamp_ms":3,"content":"kept","tags":[],"id":"mem-new","project":"{KEY}","later_field":{{"x":[1]}}}}"#
+    );
+    let body = format!("{}\n{twice}\n{tomb_twice}\n{unknown}\n", line("mem-a", 1, "alpha"));
+    let got = notes::read_file(&temp_file(&tmp, body.as_bytes()), KEY).unwrap();
+    assert_eq!(ids(&got.live), ["mem-a", "mem-new"]);
+    assert!(got.tombstoned.is_empty());
+    assert!(got.bad.is_empty());
+    assert_eq!(got.skipped_records, 2);
+}
+
+/// RULING: wave2-c7 review B5 (the timestamp): above `i64::MAX` saturates; above `u64::MAX`
+/// is not a record in core either.
+#[test]
+fn a_timestamp_above_i64_max_saturates() {
+    let tmp = TempDir::new().unwrap();
+    let body = format!(
+        "{}\n{}\n{}\n",
+        line("mem-big", u64::MAX, "big"),
+        line("mem-edge", i64::MAX as u64 + 1, "edge"),
+        line("mem-a", 1, "alpha").replace(":1,", ":18446744073709551616,")
+    );
+    let got = notes::read_file(&temp_file(&tmp, body.as_bytes()), KEY).unwrap();
+    assert_eq!(ids(&got.live), ["mem-big", "mem-edge"]);
+    assert!(got.live.iter().all(|n| n.timestamp_ms == i64::MAX));
+    assert_eq!(got.skipped_records, 1);
+}
+
+/// Core's own test lines (`fixtures/notes/README.md`), read through this reader.
+#[test]
+fn core_test_lines_read_as_core_reads_them() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/notes/core-a373ff06.jsonl");
+    let got = notes::read_file(&path, "p11").unwrap();
+    assert_eq!(ids(&got.live), ["mem-exp", "mem-old", "mem-new"]);
+    assert_eq!(got.live[0].max_age_days, Some(5));
+    assert_eq!(got.live[0].timestamp_ms, 80 * 86_400_000);
+    assert_eq!(got.tombstoned, ["mem-dead", "mem-live"]);
+    assert_eq!(got.bad, [bad(8, b"not json")]);
+    assert!(got.torn_tail);
+    assert_eq!(got.skipped_records, 0);
+}
