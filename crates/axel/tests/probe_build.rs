@@ -1,8 +1,9 @@
 //! Build probe for the v2 rewrite: assumptions the plan rests on, settled
 //! here before anything depends on them. No production code is exercised
-//! that this file adds; the tables come from the existing definitions
-//! (`r8.rs`, `project_memory.rs`, velocirag's `db.rs`) and the v2 statements
-//! are copied from the spec as text.
+//! that this file adds; the old tables come from the existing definitions
+//! (`r8.rs`, `project_memory.rs`, velocirag's `db.rs`) and the v2 tables from
+//! `fixtures/schema_v2.sql`, the spec's block marked "migration 1" pasted
+//! whole. The few other v2 statements are copied from the spec as text.
 //!
 //! | # | assumption |
 //! |---|---|
@@ -11,7 +12,7 @@
 //! | c | recall generators a and c run as written on the existing tables |
 //! | d | FTS5 `secure-delete` + `PRAGMA secure_delete` leave no trace of a deleted row |
 //! | e | the `kv` guard triggers stop `INSERT OR REPLACE … '2'`, and let `'3'` through |
-//! | f | `AFTER DELETE ON memories` fires on a delete, not on `INSERT OR REPLACE` |
+//! | f | on the store's own connection: its `INSERT OR REPLACE` fires neither delete trigger; a plain delete is stopped by the guard unless `axel_purge` has its row |
 //! | g | `json_set` and `json_extract` exist in the bundled SQLite |
 //! | h | `instr(supersedes, '"<id>"')` finds an id in the arrays the store writes |
 //! | i | the cost of an exact scan of 25,000 vectors (`#[ignore]`, prints ms) |
@@ -32,26 +33,10 @@ use velocirag::embedder::Embedder;
 
 // ── v2 statements, as the spec has them ─────────────────────────────────
 
-const MEMORY_EXT_SQL: &str = "
-CREATE TABLE IF NOT EXISTS memory_ext(
-  vid          INTEGER PRIMARY KEY,
-  mem_id       TEXT NOT NULL UNIQUE,
-  origin_kind  TEXT NOT NULL,
-  origin_ref   TEXT NOT NULL DEFAULT '',
-  unit_pos     TEXT,
-  session_id   TEXT,
-  logical      TEXT,
-  content_hash TEXT NOT NULL,
-  created_ms   INTEGER NOT NULL,
-  time_source  TEXT NOT NULL DEFAULT 'exact',
-  hidden_ms    INTEGER,
-  hidden_by    TEXT,
-  embed_model  TEXT,
-  embedding    BLOB
-);
-CREATE TRIGGER IF NOT EXISTS memories_ad_ext AFTER DELETE ON memories
-  BEGIN DELETE FROM memory_ext WHERE mem_id = OLD.id; END;
-";
+/// Migration 1's definitions: the spec's block, pasted whole (the one copy).
+/// It runs on a brain that already has `memories`, `kv`, `documents` and the
+/// two word indexes; `legacy_brain` makes them.
+const SCHEMA_V2_SQL: &str = include_str!("fixtures/schema_v2.sql");
 
 const DOCUMENTS_V2_SQL: &str = "
 ALTER TABLE documents ADD COLUMN source_mtime_ms INTEGER;
@@ -59,15 +44,7 @@ ALTER TABLE documents ADD COLUMN hidden TEXT;
 ";
 
 const KV_GUARD_MESSAGE: &str = "this brain belongs to Axel v2; use the axel-v2 binary";
-
-const KV_GUARD_SQL: &str = "
-CREATE TRIGGER IF NOT EXISTS kv_v2_guard_insert BEFORE INSERT ON kv
-  WHEN NEW.key = 'schema_version' AND CAST(NEW.value AS INTEGER) < 3
-  BEGIN SELECT RAISE(ABORT, 'this brain belongs to Axel v2; use the axel-v2 binary'); END;
-CREATE TRIGGER IF NOT EXISTS kv_v2_guard_update BEFORE UPDATE ON kv
-  WHEN NEW.key = 'schema_version' AND CAST(NEW.value AS INTEGER) < 3
-  BEGIN SELECT RAISE(ABORT, 'this brain belongs to Axel v2; use the axel-v2 binary'); END;
-";
+const DELETE_GUARD_MESSAGE: &str = "this brain belongs to Axel v2; delete with axel-v2 forget";
 
 /// Section 3, generator a: memory, by words.
 const GENERATOR_A: &str = "
@@ -278,7 +255,7 @@ fn c_generators_a_and_c_run_on_the_existing_tables() {
     let dir = TempDir::new().unwrap();
     let (_path, db) = legacy_brain(&dir);
     let conn = db.conn();
-    conn.execute_batch(MEMORY_EXT_SQL).unwrap();
+    conn.execute_batch(SCHEMA_V2_SQL).unwrap();
     conn.execute_batch(DOCUMENTS_V2_SQL).unwrap();
 
     // Generator a, five rows.
@@ -462,7 +439,7 @@ fn e_kv_guard_refuses_schema_version_2_even_with_or_replace() {
     // What today's code wrote when it opened the file (db.rs, init_schema).
     assert_eq!(version(conn), "2");
 
-    conn.execute_batch(KV_GUARD_SQL).unwrap();
+    conn.execute_batch(SCHEMA_V2_SQL).unwrap();
     let write = |conn: &Connection, value: &str| {
         conn.execute(
             "INSERT OR REPLACE INTO kv (key, value) VALUES ('schema_version', ?1)",
@@ -506,41 +483,68 @@ fn e_kv_guard_refuses_schema_version_2_even_with_or_replace() {
 // ── f ───────────────────────────────────────────────────────────────────
 
 #[test]
-fn f_after_delete_fires_on_delete_and_not_on_or_replace() {
+fn f_store_replace_passes_the_delete_guard_and_a_plain_delete_does_not() {
     let dir = TempDir::new().unwrap();
     let (path, db) = legacy_brain(&dir);
-    let conn = db.conn();
-    conn.execute_batch(MEMORY_EXT_SQL).unwrap();
+    drop(db);
 
+    // ONE connection for everything below: the store's own. The pragma is
+    // read, the block runs and every write is made on it.
+    let storage = MemoryStorage::open_existing(&path).unwrap();
+    let conn = storage.conn();
     let recursive: i64 = conn.query_row("PRAGMA recursive_triggers", [], |r| r.get(0)).unwrap();
-    assert_eq!(recursive, 0, "recursive triggers are off by default in this build");
+    assert_eq!(recursive, 0, "recursive triggers are off on the store's connection");
+    conn.execute_batch(SCHEMA_V2_SQL).unwrap();
+
+    let purge_rows = |conn: &Connection| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM axel_purge", [], |r| r.get(0)).unwrap()
+    };
+    let memory_rows = |conn: &Connection, id: &str| -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM memories WHERE id = ?1", [id], |r| r.get(0)).unwrap()
+    };
 
     let memory = Memory::new(MemoryCategory::Events, "probe", "kept", "a row that is replaced");
     project_memory::store_scoped(conn, &memory, &scope(PROJECT)).unwrap();
     adopt(conn, &memory.id, None);
 
-    // The store's own INSERT OR REPLACE (memkoshi storage.rs) and its own
-    // DELETE, on its own connection.
-    let storage = MemoryStorage::open_existing(&path).unwrap();
+    // 1. The store's INSERT OR REPLACE (memkoshi storage.rs:182) over an
+    //    existing row, with no axel_purge row: it succeeds, the guard does
+    //    not fire, and neither does memories_ad_ext.
+    assert_eq!(purge_rows(conn), 0);
     storage.store_memory(&memory).unwrap();
-    assert_eq!(ext_rows(conn, &memory.id), 1, "INSERT OR REPLACE must not fire the delete trigger");
+    assert_eq!(memory_rows(conn, &memory.id), 1);
+    assert_eq!(ext_rows(conn, &memory.id), 1, "INSERT OR REPLACE must not fire the delete triggers");
+    assert_eq!(purge_rows(conn), 0, "the replace leaves no axel_purge row");
 
-    assert!(storage.delete_memory(&memory.id).unwrap());
-    assert_eq!(ext_rows(conn, &memory.id), 0, "a plain DELETE must fire it");
+    // 2. A plain DELETE without the row aborts with the guard's message, and
+    //    changes nothing.
+    let delete = |conn: &Connection, id: &str| conn.execute("DELETE FROM memories WHERE id = ?1", [id]);
+    let refused = delete(conn, &memory.id).unwrap_err();
+    assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
+    assert_eq!(refused.sqlite_error_code(), Some(ErrorCode::ConstraintViolation));
+    assert_eq!(memory_rows(conn, &memory.id), 1);
+    assert_eq!(ext_rows(conn, &memory.id), 1);
+    // The store's own delete is the same statement and is stopped the same way.
+    let refused = storage.delete_memory(&memory.id).unwrap_err();
+    assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
 
-    // The first half holds only while recursive triggers stay off: a
-    // connection that turns them on loses the memory_ext row on a replace.
+    // 3. The same delete passes with the row, and memories_ad_ext takes the
+    //    memory_ext row with it.
+    conn.execute("INSERT INTO axel_purge(one) VALUES (1)", []).unwrap();
+    assert_eq!(delete(conn, &memory.id).unwrap(), 1);
+    assert_eq!(memory_rows(conn, &memory.id), 0);
+    assert_eq!(ext_rows(conn, &memory.id), 0, "a plain DELETE must fire memories_ad_ext");
+    conn.execute("DELETE FROM axel_purge", []).unwrap();
+
+    // Part 1 holds only while recursive triggers stay off: with them on, the
+    // replace's implicit delete fires the guard and the store's write aborts.
     let other = Memory::new(MemoryCategory::Events, "probe", "lost", "a row that is replaced");
     project_memory::store_scoped(conn, &other, &scope(PROJECT)).unwrap();
     adopt(conn, &other.id, None);
     conn.execute_batch("PRAGMA recursive_triggers = ON").unwrap();
-    conn.execute(
-        "INSERT OR REPLACE INTO memories (id, category, topic, title, content, created)
-         VALUES (?1, 'events', 'probe', 'lost', 'replaced', '2026-01-01T00:00:00Z')",
-        [&other.id],
-    )
-    .unwrap();
-    assert_eq!(ext_rows(conn, &other.id), 0);
+    let refused = storage.store_memory(&other).unwrap_err();
+    assert!(refused.to_string().contains(DELETE_GUARD_MESSAGE), "{refused}");
+    assert_eq!(ext_rows(conn, &other.id), 1);
 }
 
 // ── g ───────────────────────────────────────────────────────────────────
