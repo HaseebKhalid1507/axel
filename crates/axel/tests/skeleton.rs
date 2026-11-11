@@ -30,7 +30,6 @@ use axel::ext::types::{
 };
 use axel::ext::{front, hooks, tools, tools_core, tools_forum};
 use axel::recall::{self, RecallConfig, RecallRequest, RecallTrace, View};
-use axel::store::{self, Inserted};
 use axel::vindex::{ExactIndex, VecDelta, VecKey, VecScope};
 use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project};
 
@@ -181,38 +180,6 @@ fn every_stub_gives_its_fixed_answer() {
     assert!(project::resolve(Some("/nonexistent/skeleton")).is_none());
 
     // store, index_archives
-    let ids = vec!["mem_1".to_string()];
-    assert_eq!(store::purge_many(&conn, &ids, true, true).unwrap(), 0);
-    assert_eq!(store::purge(&conn, "mem_1", false, false).unwrap(), 0);
-    assert_eq!(store::hide(&conn, "mem_1", "cli").unwrap(), 0);
-    assert_eq!(store::restore(&conn, "mem_1").unwrap(), 0);
-    assert_eq!(store::set_pause(&conn, "l", Some("s1"), "learning", "cli").unwrap(), 0);
-    assert_eq!(store::clear_pause(&conn, "l", Some("s1"), "learning").unwrap(), 0);
-    assert_eq!(store::model_changes_since(&conn, "s1", 0).unwrap(), (0, 0));
-    let row = store::NewRow {
-        id: "mem_1".to_string(),
-        class: "note",
-        project_key: "p0000000000000000",
-        title: String::new(),
-        abstract_text: String::new(),
-        content: String::new(),
-        tags: Vec::new(),
-        created_ms: 0,
-        time_source: "record",
-        sensitivity: axel::project_memory::Sensitivity::Normal,
-        provenance: String::new(),
-        expires_ms: None,
-        importance: 0.5,
-        origin_kind: "tool",
-        origin_ref: "s1",
-        unit_pos: None,
-        session_id: None,
-        logical: None,
-        links: Default::default(),
-        turn_key: None,
-        hidden: None,
-    };
-    assert_eq!(store::insert_row(&conn, None, &row).unwrap(), Inserted::Exists);
     assert!(index_archives::mark_forgotten_turn(&conn, "l", Some("s1"), "tool", 0, 1, None)
         .unwrap()
         .is_empty());

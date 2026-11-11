@@ -489,7 +489,7 @@ pub fn store_scoped_typed_with_links(
     migrate(conn)?;
     conn.execute_batch("BEGIN IMMEDIATE")?;
     let result = (|| -> Result<()> {
-        insert_scoped_row(conn, memory, scope, Some(record_class), links)?;
+        insert_scoped_typed(conn, memory, scope, record_class, links)?;
         for target in &links.supersedes {
             conn.execute(
                 "UPDATE memories SET superseded_by = ?1, invalidated_at = ?2
@@ -515,6 +515,26 @@ pub fn store_scoped_typed_with_links(
             Err(e)
         }
     }
+}
+
+/// The rows of one typed memory (the `memories` row and its word row), inside the caller's
+/// transaction: `validate_scope` and the insert, without the `synchronous=FULL`, the
+/// `migrate` and the `BEGIN` of [`store_scoped_typed_with_links`]. It marks no superseded
+/// row. `store::insert_row` is its v2 caller.
+pub fn insert_scoped_typed(
+    conn: &Connection,
+    memory: &Memory,
+    scope: &MemoryScope,
+    record_class: &str,
+    links: &RecordLinks,
+) -> Result<()> {
+    validate_scope(scope)?;
+    if record_class.trim().is_empty() {
+        return Err(AxelError::Memory(
+            "store_scoped_typed: empty record class".into(),
+        ));
+    }
+    insert_scoped_row(conn, memory, scope, Some(record_class), links)
 }
 
 /// Store many memories in one transaction (crash-safe: all or nothing).
@@ -809,15 +829,7 @@ pub fn forget_scoped(conn: &Connection, id: &str, project_key: &str) -> Result<b
         if owned.is_none() {
             return Ok(false);
         }
-        conn.execute(
-            "INSERT OR REPLACE INTO memory_tombstones (id, project_key, deleted_at)
-             VALUES (?1, ?2, ?3)",
-            params![id, project_key, Utc::now().to_rfc3339()],
-        )?;
-        conn.execute(
-            "DELETE FROM memories WHERE id = ?1 AND project_key = ?2",
-            params![id, project_key],
-        )?;
+        delete_rows(conn, &[id.to_string()], Some(project_key))?;
         // Scrub graph edges to the forgotten id; rebuilding the search index
         // must never make a tombstoned record reachable through a survivor.
         let mut stmt = conn.prepare(
@@ -859,7 +871,6 @@ pub fn forget_scoped(conn: &Connection, id: &str, project_key: &str) -> Result<b
                 params![supersedes, contradicts, confirmed_by, id, survivor],
             )?;
         }
-        conn.execute("DELETE FROM memories_fts WHERE mem_id = ?1", params![id])?;
         Ok(true)
     })();
     match result {
@@ -872,6 +883,43 @@ pub fn forget_scoped(conn: &Connection, id: &str, project_key: &str) -> Result<b
             Err(e)
         }
     }
+}
+
+/// Deletes the rows `ids` and their word rows, inside the caller's transaction, once for
+/// the whole set. `tombstone_as`: `None` writes no tombstone; `Some(key)` writes one per
+/// row that exists, with the row's own `project_key`, or `key` for a row that has none.
+/// Returns the number of `memories` rows deleted.
+///
+/// The ids are put into the temp table `purge_ids` (emptied first, so only `ids` go) and
+/// left there for the caller. On a v2 brain the delete guard stops this outside
+/// `store::purge_many`.
+pub fn delete_rows(conn: &Connection, ids: &[String], tombstone_as: Option<&str>) -> Result<usize> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS purge_ids(id TEXT PRIMARY KEY);
+         DELETE FROM temp.purge_ids;",
+    )?;
+    {
+        let mut insert = conn.prepare("INSERT OR IGNORE INTO temp.purge_ids(id) VALUES (?1)")?;
+        for id in ids {
+            insert.execute([id])?;
+        }
+    }
+    conn.execute(
+        "DELETE FROM memories_fts WHERE mem_id IN (SELECT id FROM temp.purge_ids)",
+        [],
+    )?;
+    if let Some(key) = tombstone_as {
+        conn.execute(
+            "INSERT OR REPLACE INTO memory_tombstones (id, project_key, deleted_at)
+             SELECT id, COALESCE(NULLIF(project_key, ''), ?1), ?2 FROM memories
+              WHERE id IN (SELECT id FROM temp.purge_ids)",
+            params![key, Utc::now().to_rfc3339()],
+        )?;
+    }
+    Ok(conn.execute(
+        "DELETE FROM memories WHERE id IN (SELECT id FROM temp.purge_ids)",
+        [],
+    )?)
 }
 
 /// Rebuild the lexical index from live rows only. Graph links remain attached

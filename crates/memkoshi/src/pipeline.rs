@@ -71,11 +71,9 @@ impl MemoryPipeline {
         // Category is enforced by the type system; the check exists for
         // parity with the Python source where category was a string.
 
-        let text_to_check = format!("{} {} {}", memory.title, memory.topic, memory.content).to_lowercase();
-        for pat in INJECTION_PATTERNS {
-            if text_to_check.contains(pat) {
-                errors.push(format!("content contains injection pattern: {pat:?}"));
-            }
+        let text_to_check = format!("{} {} {}", memory.title, memory.topic, memory.content);
+        if let Some(pat) = Self::injection_phrase(&text_to_check) {
+            errors.push(format!("content contains injection pattern: {pat:?}"));
         }
 
         if errors.is_empty() {
@@ -83,6 +81,13 @@ impl MemoryPipeline {
         } else {
             Err(errors)
         }
+    }
+
+    /// The first known instruction phrase in `text`, checked on the lowercased text;
+    /// `None` when it holds none. The phrase is returned so a caller can name it.
+    pub fn injection_phrase(text: &str) -> Option<&'static str> {
+        let lower = text.to_lowercase();
+        INJECTION_PATTERNS.iter().copied().find(|pat| lower.contains(pat))
     }
 
     /// Return `true` if `memory` looks like a duplicate of any record in
