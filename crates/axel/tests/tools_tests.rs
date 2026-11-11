@@ -19,6 +19,7 @@ use axel::capture::{self, CompletedTurn, Written};
 use axel::ext::config::ExtConfig;
 use axel::ext::rpc::{write_frame, FrameReader};
 use axel::ext::server::{serve, BUSY_TEXT};
+use axel::ext::front::{WaitBack};
 use axel::ext::tools_core::{self, NOT_AGAIN, WORKER_REFUSAL};
 use axel::ext::tools_forum::NO_CALLER;
 use axel::ext::types::{Boot, Caller, FrontState, HookEvent, HookOut, Job, Mode, ServeEnd, Status, TestHooks, ToolError};
@@ -1998,6 +1999,11 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
 
 // ── The second look at 18a (v2 c18a review round 2, items 1 to 5) ──────────
 
+/// The front connection's wait for the write lock, in ms.
+fn wait_of(st: &FrontState) -> i64 {
+    st.conn.as_ref().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap()
+}
+
 // RULING: v2 c18a review round 2, item 2: a hidden row of any origin keeps R-9g's answer.
 #[test]
 fn rr2_a_hidden_note_file_row_is_not_brought_back_by_saying_it_again() {
@@ -2038,4 +2044,30 @@ fn rr3_a_text_held_by_a_secret_or_local_only_row_is_not_saved_again_and_no_row_i
     // A visible row of the same text beside the secret one is still the answer.
     lab.put(&row("mem_visiblesame00001", "note", &dir_a, "tool", secret));
     assert_eq!(lab.remember(&s, secret), "mem_visiblesame00001");
+}
+
+// RULING: v2 c18a review round 2, item 4: the wait is put back by a drop guard, by a panic
+// too. No test hook of these files panics inside `write_by` or `retry_forget_marks`
+// (`panic_tool` panics before the tool runs), so the guard is tested as a unit.
+#[test]
+fn rr4_the_wait_is_put_back_when_the_work_under_the_guard_panics() {
+    let mut lab = Lab::new();
+    let own = wait_of(&lab.st);
+    assert!(own > 0);
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let st = WaitBack::shorten(&lab.st, |waits| waits / 3).unwrap();
+        assert_eq!(wait_of(&st), own / 3);
+        panic!("inside the write");
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(wait_of(&lab.st), own, "a panic left the wait shortened");
+
+    let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut st = WaitBack::shorten(&mut lab.st, |_| Duration::ZERO).unwrap();
+        assert_eq!(wait_of(&st), 0);
+        st.forget_marks.clear();
+        panic!("inside the retry");
+    }));
+    assert!(panicked.is_err());
+    assert_eq!(wait_of(&lab.st), own, "a panic left the wait at zero");
 }

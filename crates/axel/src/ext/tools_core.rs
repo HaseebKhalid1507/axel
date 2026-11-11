@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 
 use crate::chat_history::CLASS_EPISODIC_TURN;
 use crate::error::AxelError;
-use crate::ext::front::{self, view_for, MarkEnd};
+use crate::ext::front::{self, view_for, MarkEnd, WaitBack};
 use crate::ext::server::log_line;
 use crate::ext::tools_forum::NO_CALLER;
 use crate::ext::types::{Caller, DegradedReason, FrontState, ToolError};
@@ -235,12 +235,10 @@ fn write_by<T>(st: &FrontState, deadline: Instant, work: impl FnOnce(&Connection
     if left.is_zero() {
         return Err(ToolError::Busy);
     }
-    let conn = connection(st)?;
-    let waits_ms: u64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).map_err(sql(st, false))?;
-    conn.busy_timeout(left.min(Duration::from_millis(waits_ms))).map_err(sql(st, false))?;
-    let out = write(st, work);
-    let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
-    out
+    connection(st)?;
+    // RULING: v2 c18a review round 2, item 4: put back by the guard, by a panic too.
+    let st = WaitBack::shorten(st, |waits| left.min(waits)).map_err(sql(st, false))?;
+    write(&st, work)
 }
 
 /// The system clock: `hide` and `supersede` stamp it themselves, so the cap and every time

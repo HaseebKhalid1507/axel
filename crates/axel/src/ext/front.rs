@@ -3,6 +3,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, TrySendError};
@@ -266,6 +267,45 @@ fn apply_carry(st: &mut FrontState, carry: &Carry) {
     }
 }
 
+/// The connection's wait for the write lock, shortened for a while and put back when this
+/// is dropped, by a panic too. With no connection there is nothing to shorten or put back.
+// RULING: v2 c18a review round 2, item 4.
+pub struct WaitBack<S: Deref<Target = FrontState>> {
+    st: S,
+    waits: Option<Duration>,
+}
+
+impl<S: Deref<Target = FrontState>> WaitBack<S> {
+    /// `to` is given the connection's own wait and returns the one to use meanwhile.
+    pub fn shorten(st: S, to: impl FnOnce(Duration) -> Duration) -> rusqlite::Result<Self> {
+        let Some(conn) = st.conn.as_ref() else { return Ok(Self { st, waits: None }) };
+        let waits = Duration::from_millis(conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))?);
+        conn.busy_timeout(to(waits))?;
+        Ok(Self { st, waits: Some(waits) })
+    }
+}
+
+impl<S: Deref<Target = FrontState>> Deref for WaitBack<S> {
+    type Target = FrontState;
+    fn deref(&self) -> &FrontState {
+        &self.st
+    }
+}
+
+impl<S: DerefMut<Target = FrontState>> DerefMut for WaitBack<S> {
+    fn deref_mut(&mut self) -> &mut FrontState {
+        &mut self.st
+    }
+}
+
+impl<S: Deref<Target = FrontState>> Drop for WaitBack<S> {
+    fn drop(&mut self) {
+        if let (Some(waits), Some(conn)) = (self.waits, self.st.conn.as_ref()) {
+            let _ = conn.busy_timeout(waits);
+        }
+    }
+}
+
 /// Section 4, "the live call", for one session of `Carry.forgot`, and for the model's
 /// `forget` tool (`tools_core::mark_turn`): `capture.suppress`, then `write_forget_mark`.
 /// A mark that is not written now is kept. Returns what became of the try.
@@ -483,14 +523,9 @@ fn retry_forget_marks(st: &mut FrontState) {
     if st.forget_marks.is_empty() || !is_ready(st) || !connect(st) {
         return;
     }
-    let Some(conn) = st.conn.as_ref() else { return };
-    let Ok(waits_ms) = conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0)) else { return };
-    if conn.busy_timeout(Duration::ZERO).is_err() {
-        return;
-    }
-    retry_written(st);
-    if let Some(conn) = st.conn.as_ref() {
-        let _ = conn.busy_timeout(Duration::from_millis(waits_ms));
+    // RULING: v2 c18a review round 2, item 4: the wait is put back by `WaitBack`.
+    if let Ok(mut st) = WaitBack::shorten(st, |_| Duration::ZERO) {
+        retry_written(&mut st);
     }
 }
 
