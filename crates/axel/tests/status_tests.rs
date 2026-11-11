@@ -583,6 +583,24 @@ fn a_status_file_whose_pid_is_not_alive_is_not_ready() {
     assert_eq!(status_json(&path).0, 0);
 }
 
+// RULING: wave 5 fix round of 21, finding 7: an alive pid whose process started after the
+// file's `started_ms` is another process that was given the same number.
+#[test]
+fn a_status_file_whose_pid_was_reused_by_a_later_process_is_not_ready() {
+    let dir = TempDir::new().unwrap();
+    let path = new_brain(&dir);
+    let pid = std::process::id();
+    let old = json!({
+        "pid": pid, "version": "test", "mode": "degraded", "reason": "FrontStopped", "reason_at": null,
+        "written_ms": now_ms(), "started_ms": now_ms() - DAY_MS,
+    });
+    std::fs::write(dir.path().join(format!("extension.{pid}.status")), old.to_string()).unwrap();
+    let (code, v) = status_json(&path);
+    assert_eq!(v["extension"]["running"], json!(false), "{v:#}");
+    assert_eq!(v["extension"]["stale_status_files"][0]["pid"], json!(pid), "{v:#}");
+    assert_eq!(code, 0, "{v:#}");
+}
+
 #[test]
 fn two_live_processes_are_listed_and_the_worst_is_on_top() {
     let dir = TempDir::new().unwrap();

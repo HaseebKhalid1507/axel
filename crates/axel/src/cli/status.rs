@@ -323,6 +323,36 @@ fn pid_alive(pid: u32) -> bool {
     rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
 }
 
+/// RULING: wave 5 fix round of 21, finding 7: the process now holding `pid` started after
+/// the file's `started_ms`, so it is another process (Linux: `/proc/<pid>/stat` field 22,
+/// clock ticks after `btime`). Elsewhere, or when it cannot be read, false.
+fn started_after(pid: u32, started_ms: i64) -> bool {
+    // `btime` is whole seconds, and the file is written after the process starts.
+    const SLACK_MS: i64 = 2_000;
+    let Some(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok() else { return false };
+    // Field 2 is `(comm)`, which may hold spaces and `)`: count from the last `)`.
+    let Some(ticks) = stat
+        .rsplit_once(')')
+        .and_then(|(_, rest)| rest.split_whitespace().nth(19))
+        .and_then(|t| t.parse::<i64>().ok())
+    else {
+        return false;
+    };
+    let Some(btime) = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {
+        s.lines().find_map(|l| l.strip_prefix("btime ").and_then(|v| v.trim().parse::<i64>().ok()))
+    }) else {
+        return false;
+    };
+    // SAFETY: sysconf only reads a constant of the system.
+    // `c_long` is `i64` on 64-bit Linux and `i32` on 32-bit.
+    #[allow(clippy::useless_conversion)]
+    let hz = i64::from(unsafe { libc::sysconf(libc::_SC_CLK_TCK) });
+    if hz <= 0 {
+        return false;
+    }
+    btime * 1000 + ticks * 1000 / hz > started_ms + SLACK_MS
+}
+
 fn mode_rank(mode: &str) -> u8 {
     match mode {
         "degraded" => 2,
@@ -370,6 +400,10 @@ fn status_files(dir: &Path, now: i64) -> Files {
         };
         if !pid_alive(pid) {
             stale.push(json!({ "pid": pid, "why": "not alive" }));
+            continue;
+        }
+        if body["started_ms"].as_i64().is_some_and(|started| started_after(pid, started)) {
+            stale.push(json!({ "pid": pid, "why": "pid reused by a later process" }));
             continue;
         }
         let written = body["written_ms"]
