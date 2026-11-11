@@ -682,6 +682,21 @@ impl<W: Write> Pump<W> {
         self.live.is_some() && !self.front_gone && self.mode.load(Ordering::SeqCst) == Mode::Ready as u8
     }
 
+    /// `ready()`, after waiting up to `until` while the brain is still opening. Nothing is
+    /// waited for once the mode is `Degraded` (the open failed) or before `initialize`.
+    // RULING: v2 real-binaries round, item 1: a call in the first moments of a process was
+    // refused with `starting` while the brain was a few hundred ms from open.
+    fn ready_by(&mut self, until: Instant) -> bool {
+        while self.live.is_some()
+            && !self.front_gone
+            && self.mode.load(Ordering::SeqCst) == Mode::Starting as u8
+            && Instant::now() < until
+        {
+            thread::sleep(Duration::from_millis(5));
+        }
+        self.ready()
+    }
+
     // ── initialize ──────────────────────────────────────────────────────────
 
     /// Answered from the config alone, before the brain is open. The tools are declared
@@ -826,15 +841,18 @@ impl<W: Write> Pump<W> {
             _ => {}
         }
 
+        let before_message = kind == "before_message";
+        let wait = if before_message { self.budget_ms } else { HOOK_WAIT_MS };
+        // The deadline this thread waits to, the brain's open included.
+        let deadline = Instant::now() + Duration::from_millis(wait);
         // Outside `Ready` every hook is `continue`.
-        if !self.ready() {
+        // RULING: v2 real-binaries round, item 1: a hook waits for an open in progress, to
+        // its own deadline.
+        if !self.ready_by(deadline) {
             self.answer(id, continue_result());
             return None;
         }
-
-        let before_message = kind == "before_message";
         let recall_allowed = self.open_until.is_none();
-        let wait = if before_message { self.budget_ms } else { HOOK_WAIT_MS };
         let label = hook_label(kind);
         let ev = HookEvent {
             kind: kind.to_string(),
@@ -846,7 +864,6 @@ impl<W: Write> Pump<W> {
         };
         // The front thread is handed the deadline this thread waits to: recall works to it,
         // whatever the `Carry` took before it (review of 15/16, the hook's deadline).
-        let deadline = Instant::now() + Duration::from_millis(wait);
         match self.forward(FrontWork::Hook { ev, recall_allowed, deadline }, deadline, label) {
             Got::Answer(FrontAnswer::Hook(out)) => {
                 if before_message {
@@ -1002,7 +1019,9 @@ impl<W: Write> Pump<W> {
             self.answer_tool(id, Err(ToolError::Invalid("tool.call needs a name".to_string())));
             return None;
         };
-        if !self.ready() {
+        // RULING: v2 real-binaries round, item 1: a tool waits up to its own wait for an
+        // open in progress, then has that wait again for its answer.
+        if !self.ready_by(Instant::now() + Duration::from_millis(TOOL_WAIT_MS)) {
             let reason = unavailable_reason(&self.status, &self.mode).to_string();
             self.answer_tool(id, Err(ToolError::Unavailable(reason)));
             return None;

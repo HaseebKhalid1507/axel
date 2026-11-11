@@ -97,6 +97,9 @@ pub fn ensure_open(ctx: &mut IndexerCtx) {
         return;
     }
     ctx.open_tried = Some(Instant::now());
+    if ctx.test.open_sleep_ms > 0 {
+        std::thread::sleep(Duration::from_millis(ctx.test.open_sleep_ms));
+    }
 
     match open(ctx) {
         Ok(()) => {

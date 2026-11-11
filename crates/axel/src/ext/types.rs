@@ -375,6 +375,8 @@ pub struct TestHooks {
     pub open_retry_ms: Option<u64>,
     /// Replaces the 10 minutes the breaker stays open.
     pub breaker_open_ms: Option<u64>,
+    /// The indexer sleeps this long before each attempt to open the brain.
+    pub open_sleep_ms: u64,
 }
 
 /// What `serve` returns; `run` exits 0, 0, 70.

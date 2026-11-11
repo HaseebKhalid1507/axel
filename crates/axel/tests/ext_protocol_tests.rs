@@ -2571,3 +2571,19 @@ fn a_brain_of_an_older_shape_degrades_with_its_reason() {
     assert_eq!(host.close(), ServeEnd::InputClosed);
     assert_eq!(sha256(&dirs.brain()), before, "the brain was written");
 }
+
+/// Real-binaries round, item 1: a tool called while the brain is still opening waits for
+/// the open and is answered by the tool, not refused as `starting`.
+// RULING: v2 real-binaries round, item 1
+#[test]
+fn rb1_a_tool_called_while_the_brain_opens_waits_for_it() {
+    let dirs = Dirs::new();
+    let mut host = Host::start(None, TestHooks { open_sleep_ms: 400, ..TestHooks::default() });
+    host.call("initialize", json!({"config": dirs.config("off")}));
+    let (answer, took) = host.timed("tool.call", json!({"name": "search", "input": {"query": "retry limit"}, "session_id": "s-tool", "cwd": null}));
+    let text = answer["result"]["content"].as_str().unwrap_or("").to_string();
+    assert!(!text.contains("starting"), "refused while opening: {answer}");
+    assert_eq!(text, NO_CALLER, "{answer}");
+    assert!(took >= Duration::from_millis(200), "the brain was open already: {took:?}");
+    assert_eq!(host.close(), ServeEnd::InputClosed);
+}
