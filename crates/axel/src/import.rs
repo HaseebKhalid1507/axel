@@ -545,10 +545,13 @@ fn destination(brain: &BrainArg, sources: &[(&Path, &str)]) -> Res<(PathBuf, Vec
         ));
     }
     let dest = resolve(&brain.path)?;
+    // The same file by another name (a hard link, a bind mount) is the same file.
+    let dest_id = fs::metadata(&dest).ok().map(|m| (m.dev(), m.ino()));
     let mut resolved = Vec::new();
     for (path, flag) in sources {
         let source = source_file(path, flag)?;
-        if source == dest {
+        let source_id = fs::metadata(&source).ok().map(|m| (m.dev(), m.ino()));
+        if source == dest || (dest_id.is_some() && dest_id == source_id) {
             return Err(stop(
                 EXIT_REFUSED,
                 format!("the destination {} is the file given as {flag}; a source is never written", dest.display()),
@@ -1263,10 +1266,12 @@ fn upgrade(
     seam("checkpoint", db)?;
     let verdict = integrity(conn)?;
     if verdict != ["ok"] {
+        // Not the source's fault: its copy passed its own check in step 4.
         return Err(stop(
-            EXIT_SOURCE,
+            EXIT_FAILED,
             format!(
-                "the integrity check of the new brain did not answer ok: {}",
+                "the integrity check of the new brain did not answer ok: {}; the source is fine (its copy passed \
+                 its own check) and the new brain is not made",
                 verdict.first().map(String::as_str).unwrap_or("no answer")
             ),
         ));
@@ -1485,17 +1490,19 @@ fn open_synaps(path: &Path) -> Res<Connection> {
 /// Forum posts and forum tombstones of `brain.r8` → the new brain.
 pub fn synaps(brain: &BrainArg, opts: &SynapsOpts) -> Outcome {
     let mut rep = Report::new();
-    let result = synaps_steps(brain, opts, &mut rep);
+    let mut reads = Vec::new();
+    let result = synaps_steps(brain, opts, &mut rep, &mut reads).map_err(|e| torn(e, &reads));
     finish("migrate synaps", rep, None, result)
 }
 
-fn synaps_steps(brain: &BrainArg, opts: &SynapsOpts, rep: &mut Report) -> Res<u8> {
+fn synaps_steps(brain: &BrainArg, opts: &SynapsOpts, rep: &mut Report, reads: &mut Vec<(PathBuf, SourceStat)>) -> Res<u8> {
     let map = parse_map(&opts.map)?;
     let (dest, sources) = existing_destination(brain, &[(opts.from.as_path(), "--from")])?;
     let source = &sources[0];
     rep.insert("destination".into(), json!(shown(&dest)));
 
     let before = SourceStat::read(source)?;
+    reads.push((source.clone(), before.clone()));
     let read = {
         let conn = open_synaps(source)?;
         read_synaps(&conn, source)?
@@ -1742,6 +1749,24 @@ fn must_be_axel(conn: &Connection, schema: &str, source: &Path) -> Res<()> {
     Ok(())
 }
 
+/// A failure of SQLite or of the disk while a source was read in place (immutable, no lock)
+/// is what a writer that checkpointed into it mid-read leaves (wave5-c19-review finding 12):
+/// when a source is not what it was, the failure is the source's, exit 3.
+fn torn(e: Stop, reads: &[(PathBuf, SourceStat)]) -> Stop {
+    if e.code != EXIT_FAILED {
+        return e;
+    }
+    for (path, before) in reads {
+        if SourceStat::read(path).map_or(true, |now| now != *before) {
+            return stop(
+                EXIT_SOURCE,
+                format!("the source {} changed while it was read; nothing was changed ({})", path.display(), e.message),
+            );
+        }
+    }
+    e
+}
+
 /// The count `migrate init` recorded for a table, when there is one.
 fn recorded_count(conn: &Connection, table: &str) -> rusqlite::Result<Option<i64>> {
     conn.query_row(
@@ -1783,7 +1808,8 @@ impl Items {
 pub fn verify(brain: &BrainArg, opts: &VerifyOpts) -> Outcome {
     let mut rep = Report::new();
     let mut temp = None;
-    let result = verify_steps(brain, opts, &mut rep, &mut temp);
+    let mut reads = Vec::new();
+    let result = verify_steps(brain, opts, &mut rep, &mut temp, &mut reads).map_err(|e| torn(e, &reads));
     finish("migrate verify", rep, temp, result)
 }
 
@@ -1809,7 +1835,13 @@ fn missing_keys(src: &Connection, dst: &Connection, table: &str, keys: &[String]
     Ok(missing)
 }
 
-fn verify_steps(brain: &BrainArg, opts: &VerifyOpts, rep: &mut Report, temp: &mut Option<Temp>) -> Res<u8> {
+fn verify_steps(
+    brain: &BrainArg,
+    opts: &VerifyOpts,
+    rep: &mut Report,
+    temp: &mut Option<Temp>,
+    reads: &mut Vec<(PathBuf, SourceStat)>,
+) -> Res<u8> {
     let map = parse_map(&opts.map)?;
     let (dest, sources) =
         existing_destination(brain, &[(opts.from_axel.as_path(), "--from-axel"), (opts.from_synaps.as_path(), "--from-synaps")])?;
@@ -1817,9 +1849,14 @@ fn verify_steps(brain: &BrainArg, opts: &VerifyOpts, rep: &mut Report, temp: &mu
     rep.insert("destination".into(), json!(shown(&dest)));
 
     let found = axel_source(axel_path, &dest, ".verify-", rep, temp)?;
+    if !found.copied {
+        reads.push((axel_path.clone(), found.stat.clone()));
+    }
     let src = open_synaps(&found.db)?;
     must_be_axel(&src, "main", axel_path)?;
+    seam("opened", axel_path)?;
     let synaps_stat = SourceStat::read(synaps_path)?;
+    reads.push((synaps_path.clone(), synaps_stat.clone()));
     let synaps_read = {
         let conn = open_synaps(synaps_path)?;
         read_synaps(&conn, synaps_path)?
@@ -1943,23 +1980,29 @@ fn verify_steps(brain: &BrainArg, opts: &VerifyOpts, rep: &mut Report, temp: &mu
     }
 
     // Usage and derived: at least the count `init` recorded.
+    // RULING: wave5-c19-review finding 5 (not changed in this round): this floor assumes the
+    // new brain has only grown since `init`. That holds at the first cutover only: normal v2
+    // use deletes usage rows (purges, `consolidate`, velocirag's vanished files), so a
+    // `verify` at a second cutover can fail here without a loss.
     let new_tables: BTreeSet<String> = plain_tables(&dst, "main")?.into_iter().collect();
-    for table in plain_tables(&src, "main")? {
+    let source_tables = plain_tables(&src, "main")?;
+    for table in &source_tables {
         if NOT_USAGE.contains(&table.as_str()) {
             continue;
         }
-        let in_source = count(&src, "main", &table)?;
-        if !new_tables.contains(&table) {
+        let in_source = count(&src, "main", table)?;
+        let recorded = if has_table(&dst, "main", "import_log")? { recorded_count(&dst, table)? } else { None };
+        if !new_tables.contains(table) {
+            let bar = recorded.unwrap_or(in_source);
             items.add(
-                &table,
-                Some(in_source == 0),
-                format!("the new brain has no such table; the source has {in_source} row(s)"),
-                json!({ "source": in_source }),
+                table,
+                Some(bar == 0),
+                format!("the new brain has no such table; {bar} row(s) needed, the source has {in_source}"),
+                json!({ "class": "usage", "new_brain": null, "recorded": recorded, "source": in_source }),
             );
             continue;
         }
-        let in_new = count(&dst, "main", &table)?;
-        let recorded = recorded_count(&dst, &table)?;
+        let in_new = count(&dst, "main", table)?;
         let bar = recorded.unwrap_or(in_source);
         let gained = (in_source - bar).max(0);
         let mut line = format!(
@@ -1973,11 +2016,34 @@ fn verify_steps(brain: &BrainArg, opts: &VerifyOpts, rep: &mut Report, temp: &mu
             ));
         }
         items.add(
-            &table,
+            table,
             Some(in_new >= bar),
             line,
             json!({ "class": "usage", "new_brain": in_new, "recorded": recorded, "source": in_source, "source_gained": gained }),
         );
+    }
+    // A table `init` counted that the source no longer has: still held to that count.
+    if has_table(&dst, "main", "import_log")? {
+        let mut stmt = dst.prepare(
+            "SELECT substr(item, 7), rows_in FROM import_log
+              WHERE item LIKE 'count:%' AND id IN (SELECT MAX(id) FROM import_log GROUP BY item) ORDER BY item",
+        )?;
+        let recorded: Vec<(String, i64)> = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?;
+        for (table, bar) in recorded {
+            if NOT_USAGE.contains(&table.as_str()) || source_tables.contains(&table) {
+                continue;
+            }
+            let in_new = if new_tables.contains(&table) { Some(count(&dst, "main", &table)?) } else { None };
+            items.add(
+                &table,
+                Some(in_new.unwrap_or(0) >= bar),
+                format!(
+                    "migrate init recorded {bar} row(s) and the source no longer has this table; the new brain has {}",
+                    in_new.map_or("no such table".to_string(), |n| format!("{n} row(s)"))
+                ),
+                json!({ "class": "usage", "new_brain": in_new, "recorded": bar, "source": null, "gone_from_source": true }),
+            );
+        }
     }
 
     // The new brain itself.
@@ -2126,7 +2192,8 @@ fn names(ids: &[String]) -> String {
 pub fn catch_up(brain: &BrainArg, opts: &CatchUpOpts) -> Outcome {
     let mut rep = Report::new();
     let mut temp = None;
-    let result = catch_up_steps(brain, opts, &mut rep, &mut temp);
+    let mut reads = Vec::new();
+    let result = catch_up_steps(brain, opts, &mut rep, &mut temp, &mut reads).map_err(|e| torn(e, &reads));
     finish("migrate catch-up", rep, temp, result)
 }
 
@@ -2140,7 +2207,13 @@ fn id_column(conn: &Connection, sql: &str) -> rusqlite::Result<Vec<String>> {
     rows.collect()
 }
 
-fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: &mut Option<Temp>) -> Res<u8> {
+fn catch_up_steps(
+    brain: &BrainArg,
+    opts: &CatchUpOpts,
+    rep: &mut Report,
+    temp: &mut Option<Temp>,
+    reads: &mut Vec<(PathBuf, SourceStat)>,
+) -> Res<u8> {
     let (dest, sources) = existing_destination(brain, &[(opts.from_axel.as_path(), "--from-axel")])?;
     let source = &sources[0];
     rep.insert("destination".into(), json!(shown(&dest)));
@@ -2148,6 +2221,9 @@ fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: 
         source_file(watch, "--watch")?;
     }
     let found = axel_source(source, &dest, ".catchup-", rep, temp)?;
+    if !found.copied {
+        reads.push((source.clone(), found.stat.clone()));
+    }
     let watch = watch_detail(opts.watch.as_deref().unwrap_or(source.as_path()))?;
     watch_compared(opts.watch.as_deref(), source, &found.stat, rep);
 
@@ -2156,6 +2232,7 @@ fn catch_up_steps(brain: &BrainArg, opts: &CatchUpOpts, rep: &mut Report, temp: 
     conn.execute("ATTACH DATABASE ?1 AS src", [file_uri(&found.db, "mode=ro&immutable=1")])
         .map_err(|e| stop(EXIT_SOURCE, format!("{} cannot be attached: {e}", source.display())))?;
     must_be_axel(&conn, "src", source)?;
+    seam("opened", source)?;
 
     // The column lists, before anything is changed.
     let mut differ = Vec::new();

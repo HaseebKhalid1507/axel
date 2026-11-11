@@ -1711,3 +1711,120 @@ fn f8_a_watched_file_that_differs_from_the_source_is_said() {
     assert_eq!(state(&fx.old), watched_before_catch_up);
     assert_ne!(watched_before, watched_before_catch_up);
 }
+
+/// Finding 9: a usage table the destination lacks fails `verify` when `init` recorded rows
+/// in it, even if the source has none left.
+#[test]
+fn f9_verify_fails_a_missing_table_that_init_counted() {
+    let fx = fx();
+    let (_, map) = migrated(&fx);
+    change_axel(&fx.old, |conn| conn.execute_batch("DELETE FROM events").unwrap());
+    Connection::open(&fx.new).unwrap().execute_batch("DROP TABLE events").unwrap();
+    let out = fx.verify(&[&map]);
+    show("verify, a counted table is missing", &out);
+    assert_eq!(out.code, 1, "{}", out.report);
+    assert_eq!(shortfalls(&out.report), ["events"]);
+    assert_eq!(item(&out.report, "events")["recorded"], 1);
+}
+
+/// Finding 9: a table `init` counted that the source no longer has is still checked, and
+/// said.
+#[test]
+fn f9_verify_reports_a_counted_table_gone_from_the_source() {
+    let fx = fx();
+    let (_, map) = migrated(&fx);
+    change_axel(&fx.old, |conn| conn.execute_batch("DROP TABLE sessions").unwrap());
+    let out = fx.verify(&[&map]);
+    assert_eq!(out.code, 0, "{}", out.report);
+    let sessions = item(&out.report, "sessions");
+    assert_eq!(sessions["gone_from_source"], true, "{sessions}");
+    assert_eq!(sessions["ok"], true);
+    Connection::open(&fx.new).unwrap().execute_batch("DELETE FROM sessions").unwrap();
+    let out = fx.verify(&[&map]);
+    assert_eq!(out.code, 1, "{}", out.report);
+    assert_eq!(shortfalls(&out.report), ["sessions"]);
+}
+
+/// Finding 10: the source under another name (a hard link) is the source.
+#[test]
+fn f10_a_destination_that_is_a_hard_link_of_the_source_is_refused() {
+    let fx = fx();
+    make_axel(&fx.old);
+    fs::hard_link(&fx.old, &fx.new).unwrap();
+    let before = state(&fx.old);
+    let mut opts = fx.init_opts(&fx.old);
+    opts.replace = true;
+    opts.even_if_running = true;
+    let out = import::init(&fx.dest(), &opts);
+    assert_eq!(out.code, 2, "{}", out.report);
+    assert!(out.report["error"].as_str().unwrap().contains("a source is never written"), "{}", out.report);
+    assert_eq!(state(&fx.old), before);
+    assert_eq!(listing(fx.new.parent().unwrap()), ["brain.r8"]);
+}
+
+/// Finding 11: the temporary directory of a process that is alive is left: pid 1's, and
+/// this process's own.
+#[test]
+fn f11_temporaries_of_live_processes_are_left() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let folder = fx.new.parent().unwrap().to_path_buf();
+    let own = format!(".init-{}-1", std::process::id());
+    for name in [".init-1-1", own.as_str()] {
+        fs::create_dir(folder.join(name)).unwrap();
+        fs::write(folder.join(name).join("axel.r8"), b"in use").unwrap();
+    }
+    let out = fx.init(&fx.old);
+    assert_eq!(out.code, 0, "{}", out.report);
+    assert!(folder.join(".init-1-1/axel.r8").exists());
+    assert!(folder.join(&own).join("axel.r8").exists());
+    assert!(out.report.get("stale_temporaries_deleted").is_none(), "{}", out.report);
+    assert_eq!(out.report["temporaries_left"].as_array().unwrap().len(), 2, "{}", out.report);
+}
+
+/// Overwrites every page of a database after the first, keeping its size.
+fn tear(path: &Path) {
+    let mut bytes = fs::read(path).unwrap();
+    for b in &mut bytes[4096..] {
+        *b = 0xAB;
+    }
+    fs::write(path, &bytes).unwrap();
+}
+
+/// Finding 12: a source that is written while it is read in place, so that SQLite fails
+/// on it, is exit 3, not 5.
+#[test]
+fn f12_a_source_torn_while_read_is_exit_3() {
+    let fx = fx();
+    let (_, map) = migrated(&fx);
+    let out = with_seam(|point, source| { if point == "opened" { tear(source) } false }, || fx.verify(&[&map]));
+    show("verify, the source torn while read", &out);
+    assert_eq!(out.code, 3, "{}", out.report);
+    let error = out.report["error"].as_str().unwrap();
+    assert!(error.starts_with(&format!("the source {} changed while it was read; nothing was changed", fx.old.display())), "{error}");
+
+    let other = self::fx();
+    make_axel(&other.old);
+    assert_eq!(other.init(&other.old).code, 0);
+    let hash = sha(&other.new);
+    let out = with_seam(|point, source| { if point == "opened" { tear(source) } false }, || other.catch_up());
+    assert_eq!(out.code, 3, "{}", out.report);
+    settle(&other.new);
+    assert_eq!(sha(&other.new), hash, "catch-up changed the new brain");
+}
+
+/// Finding 14: the new brain's own integrity failure is not the source's: exit 5, and the
+/// message says the source is fine and nothing was put at the destination.
+#[test]
+fn f14_the_new_brains_own_integrity_failure_is_exit_5() {
+    let fx = fx();
+    make_axel(&fx.old);
+    let out = with_seam(|point, db| { if point == "checkpoint" { damage_an_index(db) } false }, || fx.init(&fx.old));
+    show("init, the new brain fails its integrity check", &out);
+    assert_eq!(out.code, 5, "{}", out.report);
+    let error = out.report["error"].as_str().unwrap();
+    assert!(error.starts_with("the integrity check of the new brain did not answer ok: "), "{error}");
+    assert!(error.contains("the source is fine (its copy passed its own check) and the new brain is not made"), "{error}");
+    assert!(error.ends_with(&format!("Nothing was put at {}.", fx.new.display())), "{error}");
+    assert!(listing(fx.new.parent().unwrap()).is_empty());
+}
