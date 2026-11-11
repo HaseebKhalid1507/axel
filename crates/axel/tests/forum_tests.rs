@@ -332,7 +332,7 @@ fn tombstone(fx: &Fx, id: &str) -> Tomb {
 fn purge_pending(fx: &Fx) -> bool {
     fx.db()
         .query_row(
-            "SELECT EXISTS(SELECT 1 FROM context_data WHERE key = 'purge_pending' AND layer = 'axel' AND value = '1')",
+            "SELECT EXISTS(SELECT 1 FROM context_data WHERE key = 'purge_pending' AND layer = 'axel')",
             [],
             |r| r.get(0),
         )
