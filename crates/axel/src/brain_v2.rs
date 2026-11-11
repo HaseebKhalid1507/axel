@@ -207,6 +207,35 @@ pub fn file_id(_path: &Path) -> Option<(u64, u64)> {
     None
 }
 
+/// True when `path` certainly no longer names the file `id`: a stat that gives another file,
+/// or none (`NotFound`).
+// RULING: v2 r5 round 2, item 1. Any other failed stat (EIO, ESTALE, EACCES: a network or
+// FUSE file system, a parent made unreadable) says nothing about the file: it is not taken
+// as replaced, and is looked at again next time. Said once in the log.
+#[cfg(unix)]
+pub fn moved(path: &Path, id: (u64, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    static SAID: AtomicBool = AtomicBool::new(false);
+    match std::fs::metadata(path) {
+        Ok(m) => (m.dev(), m.ino()) != id,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => true,
+        Err(e) => {
+            if !SAID.swap(true, Ordering::Relaxed) {
+                crate::ext::server::log_line(&format!(
+                    "brain file could not be looked at ({:?}): not taken as replaced",
+                    e.kind()
+                ));
+            }
+            false
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn moved(_path: &Path, _id: (u64, u64)) -> bool {
+    false
+}
+
 /// What `open_v2` recorded for the file of `conn`; `None` when it opened no such file.
 fn recorded(conn: &Connection) -> Option<(u64, u64)> {
     let name = conn.path().filter(|name| !name.is_empty())?;
@@ -217,7 +246,7 @@ fn recorded(conn: &Connection) -> Option<(u64, u64)> {
 /// another file, or none.
 pub fn replaced(conn: &Connection) -> bool {
     match (recorded(conn), conn.path()) {
-        (Some(id), Some(name)) => file_id(Path::new(name)) != Some(id),
+        (Some(id), Some(name)) => moved(Path::new(name), id),
         _ => false,
     }
 }
@@ -241,7 +270,8 @@ fn connect_raw(path: &Path, role: Role, check: bool, record: bool) -> Result<Con
     // RULING: v2 r5. Here, before anything is read: a connection that has read nothing
     // closes without touching the file or its `-wal`.
     if record {
-        if file_id(path) != before {
+        // RULING: v2 r5 round 2, item 1.
+        if before.is_some_and(|id| moved(path, id)) {
             return Err(AxelError::BrainChanged);
         }
         let name = conn.path().unwrap_or_default().to_string();

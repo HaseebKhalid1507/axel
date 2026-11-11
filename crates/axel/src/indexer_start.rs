@@ -177,7 +177,8 @@ fn recorded_base_unopened(path: &Path) -> Result<Option<String>> {
 /// True when the path no longer names the file that was opened.
 fn brain_file_changed(ctx: &IndexerCtx) -> bool {
     match ctx.brain_file {
-        Some(opened) => brain_v2::file_id(&ctx.cfg.brain) != Some(opened),
+        // RULING: v2 r5 round 2, item 1. Only another file, or none, is a change.
+        Some(opened) => brain_v2::moved(&ctx.cfg.brain, opened),
         None => false,
     }
 }

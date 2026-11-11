@@ -1522,6 +1522,70 @@ fn r5_a_replaced_brain_gets_no_new_connection_and_no_write_through_an_old_one() 
     brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
 }
 
+// RULING: v2 r5 round 2, item 1. A stat that fails for another reason than `NotFound`
+// (here EACCES: the brain's folder made unreadable) says nothing about the file: the open
+// connections stay usable, nothing is refused and the process is not degraded.
+#[test]
+fn r5_r2_1_a_stat_that_fails_without_not_found_is_not_a_replaced_brain() {
+    use std::os::unix::fs::PermissionsExt;
+    struct Restore(PathBuf);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o755));
+        }
+    }
+    let dirs = Dirs::new();
+    let brain = brain_v2::open_v2(&dirs.brain(), &OpenOpts { agent: None, model: "hash-384", dim: 384, upgrade_v1: false })
+        .unwrap();
+    let front = brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
+    let writing = AtomicBool::new(false);
+    let (b, status) = boot(None, TestHooks::default());
+    let (mut ctx, _jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("off"), b);
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+
+    let folder = dirs.brain().parent().unwrap().to_path_buf();
+    std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let restore = Restore(folder);
+    match std::fs::metadata(dirs.brain()) {
+        Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+        other => {
+            eprintln!("skipped: the stat did not fail with EACCES here (root?): {other:?}");
+            return;
+        }
+    }
+
+    assert!(!brain_v2::replaced(&brain.conn) && !brain_v2::replaced(&front));
+    brain_v2::begin_write(&brain.conn).unwrap();
+    brain.conn.execute("INSERT INTO context_data(key, value, layer) VALUES('r5r2', 'indexer', 'test')", []).unwrap();
+    brain.conn.execute_batch("COMMIT").unwrap();
+    let guard = brain_v2::begin_write_front(&front, &writing).unwrap();
+    front.execute("INSERT INTO context_data(key, value, layer) VALUES('r5r2f', 'front', 'test')", []).unwrap();
+    front.execute_batch("COMMIT").unwrap();
+    drop(guard);
+    assert!(!indexer_start::degrade_if_replaced(&ctx));
+    let mut ran = false;
+    indexer::guarded(&mut ctx, |c| {
+        ran = true;
+        let conn = c.conn.as_ref().unwrap();
+        brain_v2::begin_write(conn)?;
+        conn.execute("INSERT INTO context_data(key, value, layer) VALUES('r5r2i', 'guarded', 'test')", [])?;
+        conn.execute_batch("COMMIT")?;
+        Ok(())
+    });
+    assert!(ran, "a handler was refused on a file that could not be looked at");
+    assert_eq!(ctx.mode.load(Ordering::SeqCst), Mode::Ready as u8);
+    assert_eq!(DegradedReason::from_u8(status.reason.load(Ordering::SeqCst)), DegradedReason::None);
+
+    drop(restore);
+    let n: i64 = front
+        .query_row("SELECT count(*) FROM context_data WHERE key IN ('r5r2', 'r5r2f', 'r5r2i')", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(n, 3, "a write did not land");
+    // The path names the file again: still the one opened.
+    assert!(!brain_v2::replaced(&brain.conn));
+    brain_v2::connect(&dirs.brain(), brain_v2::Role::Front).unwrap();
+}
+
 #[test]
 fn r6_a_look_that_cannot_read_the_brain_is_not_ready_and_open_v2_does_not_run() {
     let dirs = Dirs::new();
