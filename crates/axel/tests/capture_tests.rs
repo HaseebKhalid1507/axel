@@ -1534,3 +1534,32 @@ fn review_2_a_turn_that_is_not_stored_takes_its_log_rows() {
     assert_eq!(write(&brain, &cfg, &kept), Written::Stored);
     assert_eq!(log_times(conn, "kept"), [at]);
 }
+
+/// Item 5 (finding 5): a hook that arrives while the mode is not `Ready` is answered
+/// without work, and the chat's pending turn is let go: a later reply does not pair with it.
+#[test]
+fn review_5_a_hook_answered_without_work_lets_the_pending_turn_go() {
+    use axel::ext::front::{FrontAnswer, FrontCall, FrontWork};
+    use axel::ext::types::{Carry, HookOut};
+
+    let lab = Lab::new();
+    let (_ctx, mut st, jobs, status, _kept) = threads(&lab, "turns");
+    let cwd = lab.project("alpha");
+    user(&mut st, "S", &cwd, PROMPT, 1_000);
+    user(&mut st, "T", &cwd, PROMPT, 1_000);
+
+    st.mode.store(Mode::Starting as u8, Ordering::SeqCst);
+    let ev = hook("on_message_complete", Some("S"), Some(&cwd), Some(REPLY), json!({ "has_tool_use": false }), 2_000);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    let call = FrontCall { seq: 1, carry: Carry::default(), work: FrontWork::Hook { ev, recall_allowed: true, deadline } };
+    assert!(matches!(front::handle(&mut st, call), FrontAnswer::Hook(HookOut::Continue)));
+    assert!(!st.capture.is_pending("S"), "the turn of the unanswered hook is still pending");
+    assert!(st.capture.is_pending("T"), "another chat's turn");
+
+    st.mode.store(Mode::Ready as u8, Ordering::SeqCst);
+    assistant(&mut st, "S", &cwd, "A reply to a later prompt the capture never saw.", false, 3_000);
+    assert!(next_capture(&jobs).is_none(), "a later reply paired with the old prompt");
+    assert_eq!(dropped(&status), 1, "the turn let go is counted");
+    assistant(&mut st, "T", &cwd, REPLY, false, 3_000);
+    assert_eq!(next_capture(&jobs).unwrap().session_id, "T");
+}

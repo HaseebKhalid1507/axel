@@ -217,6 +217,7 @@ pub fn handle(st: &mut FrontState, call: FrontCall) -> FrontAnswer {
     match call.work {
         FrontWork::Hook { ev, recall_allowed, deadline } => {
             if !ready {
+                if let Some(sid) = ev.session_id.as_deref() { st.capture.drop_session(sid); }
                 return FrontAnswer::Hook(HookOut::Continue);
             }
             // RULING: v2 front follow-up, item 2. Recall works to the rpc thread's deadline,
