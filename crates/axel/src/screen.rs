@@ -311,9 +311,12 @@ fn is_word(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
 }
 
-/// `[A-Za-z0-9+=_-]`
+/// `[A-Za-z0-9+_-]`
+// RULING: screen measurement, ruling 2: `=` is not in the class. A name in front of `=` is
+// not part of a token (`NAME=value` keeps `NAME=`), and its capitals do not make a one-case
+// value mixed.
 fn is_long(b: u8) -> bool {
-    is_word(b) || b == b'+' || b == b'='
+    is_word(b) || b == b'+'
 }
 
 /// `[A-Za-z0-9._~+/=-]`
@@ -612,15 +615,32 @@ fn bearer(b: &[u8], i: usize) -> Option<Span> {
     (end - start >= 20).then(|| Span { start, end, hit: hit("named_value", Some("bearer")) })
 }
 
-/// A run of at least 32 of `[A-Za-z0-9+=_-]` with at least 3 lowercase letters, 3 uppercase
-/// letters and 3 digits.
+/// A run of at least 32 of `[A-Za-z0-9+_-]` with at least 3 lowercase letters, 3 uppercase
+/// letters and 2 digits, in which at least one piece mixes cases. Up to two `=` directly
+/// after the run are blanked with it.
 fn long_token(b: &[u8], start: usize, end: usize) -> Option<Span> {
     if end - start < 32 {
         return None;
     }
-    let count = |class: fn(&u8) -> bool| b[start..end].iter().filter(|c| class(c)).count();
-    (count(u8::is_ascii_lowercase) >= 3 && count(u8::is_ascii_uppercase) >= 3 && count(u8::is_ascii_digit) >= 3)
-        .then(|| Span { start, end, hit: hit("long_token", None) })
+    let run = &b[start..end];
+    let count = |class: fn(&u8) -> bool| run.iter().filter(|c| class(c)).count();
+    // RULING: screen measurement, ruling 4: 2 digits are enough (it was 3).
+    if count(u8::is_ascii_lowercase) < 3 || count(u8::is_ascii_uppercase) < 3 || count(u8::is_ascii_digit) < 2 {
+        return None;
+    }
+    // RULING: screen measurement, ruling 3: a run in which no piece mixes cases is a slug (a
+    // dated Title-Case name, a model file name), not a token. Pieces lie between `-` and
+    // `_`; a piece of fewer than 4 characters is not looked at; a piece mixes cases when it
+    // has a lowercase letter, and an uppercase letter after its first character.
+    let mixes = |piece: &[u8]| {
+        piece.len() >= 4 && piece.iter().any(u8::is_ascii_lowercase) && piece[1..].iter().any(u8::is_ascii_uppercase)
+    };
+    if !run.split(|&c| c == b'-' || c == b'_').any(mixes) {
+        return None;
+    }
+    // RULING: screen measurement, ruling 2: base64 padding belongs to the token.
+    let padding = b[end..].iter().take(2).take_while(|&&c| c == b'=').count();
+    Some(Span { start, end: end + padding, hit: hit("long_token", None) })
 }
 
 // ---------------------------------------------------------------------------------------
@@ -760,6 +780,83 @@ mod tests {
             let r = redact(text);
             assert!(r.text == *expected, "case {case}: wrong text");
             assert!(r.blanked == *blanked && r.hits.len() == *blanked, "case {case}: blanked {}", r.blanked);
+        }
+    }
+
+    // RULING: screen measurement, rulings 2, 3 and 4. Every token is joined from halves.
+    #[test]
+    fn long_token_takes_keys_and_leaves_names_slugs_and_ids() {
+        let hex = "0a1b2c3d4e5f6789";
+        let slug = mk(&["2025-11-03-Axel-V2", "-Design-Review-Notes"]);
+        let model = mk(&["Gemma-12B-A1B-", "Instructions-Q4_K_M"]);
+        assert_eq!(model.len(), 33, "the model file name is 33 characters");
+        let tool_id = mk(&["call=toolu_01", "Xk7Pq2Wm9Zr", "4Tn6Bv8Hs3L"]);
+        assert_eq!(tool_id.len() - 5, 30, "the tool-use id is 30 characters after the =");
+        let one_digit = mk(&["AbCdEfGhIjKlMnOp", "QrStUvWxYzAbCdE7"]);
+        assert_eq!(one_digit.len(), 32);
+        let kept: Vec<(&str, String)> = vec![
+            ("dated title-case name", slug),
+            ("model file name", model),
+            ("name and 24 hex", format!("SOME_NAME={}", &hex.repeat(2)[..24])),
+            ("sha and 40 hex", format!("SHA={}", &hex.repeat(3)[..40])),
+            ("sha and 64 hex", format!("SHA={}", hex.repeat(4))),
+            ("tool-use id", tool_id),
+            ("32 with one digit", one_digit),
+        ];
+        for (case, text) in &kept {
+            let r = redact(text);
+            assert!(r.blanked == 0 && r.text == *text, "case {case}: blanked {}", r.blanked);
+        }
+
+        let mixed = mk(&["Xk7Pq2Wm9Zr4-Tn6Bv8", "Hs3Lc5_Jd1Fg0Qy8Ue2Io6Ab"]);
+        assert_eq!(mixed.len(), 43);
+        assert!(mixed.contains('-') && mixed.contains('_'));
+        let padded = mk(&["aGVsbG8gd29ybGQgdGhpcyBp", "cyBhIHRlc3QgMTIzNDU="]);
+        assert!(padded.len() == 44 && padded.ends_with('='));
+        let two_digits = mk(&["AbCdEfGhIjKlMnOp", "QrStUvWxYzAb4dE7"]);
+        assert_eq!(two_digits.len(), 32);
+        assert_eq!(two_digits.bytes().filter(u8::is_ascii_digit).count(), 2);
+        // (case, text, what is left)
+        let blanked: Vec<(&str, String, String)> = vec![
+            ("43 mixed", mixed.clone(), BLANK.into()),
+            ("name and 43 mixed", format!("state={mixed}"), format!("state={BLANK}")),
+            ("44 base64 with padding", format!("a {padded} b"), format!("a {BLANK} b")),
+            ("two = of padding, not three", format!("{mixed}==="), format!("{BLANK}=")),
+            ("32 with two digits", two_digits, BLANK.into()),
+        ];
+        for (case, text, left) in &blanked {
+            let r = redact(text);
+            assert!(r.text == *left, "case {case}: wrong text");
+            assert!(r.blanked == 1 && r.hits[0].rule == "long_token", "case {case}: blanked {}", r.blanked);
+            assert!(r.hits[0].name.is_none(), "case {case}: a name");
+        }
+    }
+
+    // RULING: screen measurement, rulings 2 to 4: the rule in numbers, so that a later change
+    // cannot quietly open a hole. Random base64url tokens; the foreman's own run of the rule
+    // gave 99.4% at 43 characters and 97.0% at 32.
+    #[test]
+    fn long_token_takes_nearly_every_random_base64url_token() {
+        const LETTERS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        const TOKENS: usize = 20_000;
+        // SplitMix64: fixed seed, the same tokens on every run.
+        let mut state = 0x5EED_0008_u64;
+        let mut next = move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for (len, at_least) in [(43usize, 98.5f64), (32, 95.0)] {
+            let mut taken = 0usize;
+            for _ in 0..TOKENS {
+                let token: String = (0..len).map(|_| LETTERS[(next() >> 58) as usize] as char).collect();
+                taken += usize::from(redact(&token).text == BLANK);
+            }
+            let percent = taken as f64 * 100.0 / TOKENS as f64;
+            println!("long_token numbers: {len} characters: {taken} of {TOKENS} blanked, {percent:.2}%");
+            assert!(percent >= at_least, "{len} characters: {percent:.2}% blanked, under {at_least}%");
         }
     }
 

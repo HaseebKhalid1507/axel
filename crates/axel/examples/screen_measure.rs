@@ -50,11 +50,6 @@ fn shape(text: &str) -> String {
         .collect()
 }
 
-/// The length in characters of the longest piece between `-` and `_`.
-fn longest_piece(text: &str) -> usize {
-    text.split(['-', '_']).map(|piece| piece.chars().count()).max().unwrap_or(0)
-}
-
 #[derive(Default)]
 struct Rule {
     hits: u64,
@@ -65,7 +60,6 @@ struct Rule {
     endings: BTreeMap<String, u64>,
     /// `long_token` only.
     with_separator: u64,
-    short_pieces: u64,
     /// `key_block` only: the bytes blanked by each hit.
     bytes: Vec<usize>,
 }
@@ -118,7 +112,6 @@ impl Stats {
             *rule.shapes.entry(line).or_default() += 1;
             if hit.rule == "long_token" {
                 rule.with_separator += u64::from(blanked.contains(['-', '_']));
-                rule.short_pieces += u64::from(longest_piece(blanked) < 20);
             }
             if hit.rule == "key_block" {
                 rule.bytes.push(range.len());
@@ -218,7 +211,6 @@ impl Stats {
             let _ = writeln!(out, "== {key}: {} hits", rule.hits);
             if key == "long_token" {
                 let _ = writeln!(out, "  hits whose shape contains - or _:                           {}", rule.with_separator);
-                let _ = writeln!(out, "  hits whose longest piece between - and _ is under 20 chars:  {}", rule.short_pieces);
             }
             if !rule.bytes.is_empty() {
                 let mut bytes = rule.bytes.clone();
@@ -288,10 +280,6 @@ mod tests {
         let long = "Ab1-".repeat(40);
         assert_eq!(shape(&long), "Aa9-".repeat(15));
         assert_eq!(shape(&"é".repeat(100)).chars().count(), SHAPE_CHARS);
-
-        assert_eq!(longest_piece("2025-11-03_Design-Notes"), 6);
-        assert_eq!(longest_piece("nodashes"), 8);
-        assert_eq!(longest_piece(""), 0);
     }
 
     /// (case, the text with a made-up token, the secret part of it, the rule). Joined from
@@ -324,7 +312,7 @@ mod tests {
         for (_, text, _, _) in tokens() {
             stats.take(&format!("QUOKKO zeppelin {text} gondola WOMBIT"), false);
         }
-        stats.take("2025-11-03-Dated-Title-Case-Design-Review-Notes-V2.md", true);
+        stats.take(&["Wk3Tn8Pd5Lg2", "-", "Rc6Mf1Hs4Bv7Zj5Qy0Wn", ".md"].concat(), true);
         stats.take("nothing here", false);
         let report = stats.report();
 
@@ -336,14 +324,14 @@ mod tests {
             assert!(report.contains(&format!("== {rule}: ")), "case {case}: {rule} is not in the report");
         }
         let long = &stats.rules["long_token"];
-        assert_eq!((long.hits, long.in_names, long.with_separator, long.short_pieces), (2, 1, 2, 1));
+        assert_eq!((long.hits, long.in_names, long.with_separator), (2, 1, 2));
         assert_eq!(stats.rules["named_value"].endings.get("token"), Some(&1));
         assert_eq!(stats.rules["key_block"].bytes.len(), 1);
         assert!(report.contains("bytes blanked per hit: min "));
-        assert!(report.contains("9999-99-99-Aaaaa-Aaaaa-Aaaa-Aaaaaa-Aaaaaa-Aaaaa-A9"));
+        assert!(report.contains("Aa9Aa9Aa9Aa9-Aa9Aa9Aa9Aa9Aa9Aa9Aa\n"));
         assert!(!report.contains(".aa"), "the report holds what stood after a token");
 
-        for word in ["QUOKKO", "WOMBIT", "zeppelin", "gondola", "postgres", "host/db", "Dated", "Design"] {
+        for word in ["QUOKKO", "WOMBIT", "zeppelin", "gondola", "postgres", "host/db", "Wk3T", "Qy0W"] {
             assert!(!report.contains(word), "the report holds the text around a token: {word}");
         }
         // No four characters in a row of a token that hold a letter or a digit.
