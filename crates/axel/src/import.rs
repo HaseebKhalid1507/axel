@@ -1180,17 +1180,18 @@ fn upgrade(
     rep.insert("watch".into(), watch.clone());
     rep.insert("tables".into(), json!(copy.counts));
 
-    // SPEC: 1518-1522 with ruling 2 of the task: `unreadable_memories` counts a row whose
-    // `id`, `content` OR `title` is not text. Adoption skips on another test (`id` or
-    // `content` not text, or not UTF-8) and its number is printed beside it.
-    let unreadable: i64 = conn.query_row(
+    // RULING: wave5-c19-review finding 6: `unreadable_memories` is adoption's count (`id`
+    // or `content` not text, or not UTF-8), the number the status row shows under the same
+    // name. Ruling 2 of the task's count (`id`, `content` OR `title` not text, spec
+    // 1518-1522) is printed as `memories_not_text`.
+    let not_text: i64 = conn.query_row(
         "SELECT COUNT(*) FROM memories
           WHERE typeof(id) <> 'text' OR typeof(content) <> 'text' OR typeof(title) <> 'text'",
         [],
         |r| r.get(0),
     )?;
-    rep.insert("unreadable_memories".into(), json!(unreadable));
-    rep.insert("adoption_skipped_memories".into(), json!(brain.unreadable_memories));
+    rep.insert("unreadable_memories".into(), json!(brain.unreadable_memories));
+    rep.insert("memories_not_text".into(), json!(not_text));
     let fts = column_names(conn, "main", "memories_fts")?;
     rep.insert("memories_fts_columns".into(), json!(fts));
     rep.insert("memories_fts_columns_ok".into(), json!(fts == ["mem_id", "title", "abstract", "content"]));

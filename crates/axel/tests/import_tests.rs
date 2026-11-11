@@ -511,7 +511,7 @@ fn t09_init_carries_the_log_and_leaves_read_only_sources_as_they_were() {
     drop(conn);
 
     assert_eq!(out.report["unreadable_memories"], 0);
-    assert_eq!(out.report["adoption_skipped_memories"], 0);
+    assert_eq!(out.report["memories_not_text"], 0);
     assert_eq!(out.report["memories_fts_columns_ok"], true);
     assert_eq!(out.report["integrity_check"], "ok");
     assert_eq!(fs::metadata(&fx.new).unwrap().mode() & 0o777, 0o600);
@@ -969,8 +969,11 @@ fn r2_init_counts_memories_whose_id_content_or_title_is_not_text() {
     let out = fx.init(&fx.old);
     show("init, rows that are not text", &out);
     assert_eq!(out.code, 0, "{}", out.report);
-    assert_eq!(out.report["unreadable_memories"], 2);
-    assert_eq!(out.report["adoption_skipped_memories"], 1);
+    // Adoption's count, the number `status` shows under this name (finding 6)…
+    assert_eq!(out.report["unreadable_memories"], 1);
+    // …and the rows whose id, content or title is not text.
+    assert_eq!(out.report["memories_not_text"], 2);
+    assert!(out.report.get("adoption_skipped_memories").is_none());
     let conn = Connection::open(&fx.new).unwrap();
     // Both rows are in the new brain as they were.
     assert_eq!(count(&conn, "SELECT COUNT(*) FROM memories"), 5);
