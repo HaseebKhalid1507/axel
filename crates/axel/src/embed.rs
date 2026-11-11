@@ -84,9 +84,25 @@ pub struct BulkRow {
 // text was read, and comes back with its vectors.
 /// What a finished bulk carries beside its vectors: for each `vid` that was sent, the
 /// `mem_id` and `content_hash` the row had then.
-#[derive(Debug, Default)]
+///
+/// It also holds the batch's place in `backlog()`: the count comes off when this is dropped,
+/// which is when the indexer has finished with the job (or the job was thrown away), not
+/// when the job was put on the queue.
+// RULING: wave4 R-12b item 5. A count taken off at the hand-over let the pump offer the same
+// rows again while their vectors waited behind another job. The ruling names a method
+// `done(n)`; a drop does the same and cannot be forgotten on a path that skips the handler
+// (a degraded process, a shutdown, a panic).
+#[derive(Debug)]
 pub struct BatchOut {
     rows: HashMap<i64, (String, String)>,
+    counted: usize,
+    backlog: Arc<AtomicUsize>,
+}
+
+impl Drop for BatchOut {
+    fn drop(&mut self) {
+        unlog(&self.backlog, self.counted);
+    }
 }
 
 impl BatchOut {
@@ -202,8 +218,9 @@ impl EmbedService {
     }
 
     // RULING: wave2-c9 review finding 4: the depth of the bulk queue, for the indexer's pump.
-    /// Texts accepted by `submit_bulk` and not yet handed to the indexer's queue or dropped
-    /// (a failed batch, an indexer that is gone, an embed thread that ended).
+    /// Texts accepted by `submit_rows` or `submit_bulk` whose `Job::Embedded` the indexer has
+    /// not finished with, and which were not dropped (a failed batch, an indexer that is
+    /// gone, an embed thread that ended).
     pub fn backlog(&self) -> usize {
         self.backlog.load(Ordering::SeqCst)
     }
@@ -252,7 +269,7 @@ fn run<E>(
     jobs: SyncSender<Job>,
     test: Arc<TestHooks>,
     model: String,
-    backlog: &AtomicUsize,
+    backlog: &Arc<AtomicUsize>,
     batch: &BatchClock,
 ) where
     E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>>,
@@ -276,7 +293,7 @@ fn run<E>(
     let mut open = true;
 
     loop {
-        flush(&jobs, &mut pending, backlog);
+        flush(&jobs, &mut pending);
 
         // Take every request that has arrived; block only when there is nothing to do.
         let mut first = None;
@@ -333,7 +350,7 @@ fn run<E>(
             if pending.is_empty() {
                 return;
             }
-            flush(&jobs, &mut pending, backlog);
+            flush(&jobs, &mut pending);
             if !pending.is_empty() {
                 thread::sleep(RETRY_SEND);
             }
@@ -342,15 +359,12 @@ fn run<E>(
 }
 
 /// Hands finished bulks to the indexer's queue, oldest first, until it is full. A send that
-/// fails as disconnected drops the job: the indexer is gone.
-fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>, backlog: &AtomicUsize) {
+/// fails as disconnected drops the job: the indexer is gone. The backlog is not touched
+/// here: a job takes its count with it (`BatchOut`).
+fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>) {
     while let Some(job) = pending.pop_front() {
-        let n = match &job {
-            Job::Embedded { vectors, .. } => vectors.len(),
-            _ => 0,
-        };
         match jobs.try_send(job) {
-            Ok(()) | Err(TrySendError::Disconnected(_)) => unlog(backlog, n),
+            Ok(()) | Err(TrySendError::Disconnected(_)) => {}
             Err(TrySendError::Full(job)) => {
                 pending.push_front(job);
                 return;
@@ -361,7 +375,7 @@ fn flush(jobs: &SyncSender<Job>, pending: &mut VecDeque<Job>, backlog: &AtomicUs
 
 /// Embeds one batch of the oldest bulk request. Returns the `Job::Embedded` of a
 /// `submit_bulk` request it finished; a finished `embed_wait` is answered here.
-fn step<E>(embed: &mut E, bulks: &mut VecDeque<Bulk>, model: &str, backlog: &AtomicUsize) -> Option<Job>
+fn step<E>(embed: &mut E, bulks: &mut VecDeque<Bulk>, model: &str, backlog: &Arc<AtomicUsize>) -> Option<Job>
 where
     E: FnMut(&[&str]) -> Option<Vec<Vec<f32>>>,
 {
@@ -401,7 +415,8 @@ where
         BulkTo::Rows(keys, rows) => {
             let vectors: Vec<(VecKey, Vec<f32>)> =
                 keys.into_iter().zip(bulk.done).filter(|(_, v)| !v.is_empty()).collect();
-            Some(Job::Embedded { model: model.to_string(), vectors, out: Some(Arc::new(BatchOut { rows })) })
+            let out = BatchOut { rows, counted: vectors.len(), backlog: backlog.clone() };
+            Some(Job::Embedded { model: model.to_string(), vectors, out: Some(Arc::new(out)) })
         }
     }
 }

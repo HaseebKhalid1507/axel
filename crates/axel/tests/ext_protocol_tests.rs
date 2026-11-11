@@ -1043,7 +1043,12 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert!(vectors.iter().all(|(k, _)| *k != VecKey::Mem(vid_a)));
 
     indexer_start::on_embedded(&mut ctx, &model, vectors.clone(), out.as_deref()).unwrap();
-    assert_eq!(ctx.embed.backlog(), 0);
+    // The job is finished with when it is dropped, as `indexer::dispatch` drops it.
+    assert_eq!(ctx.embed.backlog(), 2);
+    let out_kept = out.clone();
+    drop(out);
+    assert_eq!(ctx.embed.backlog(), 2, "a clone of the job still holds the count");
+    let out = out_kept;
     let Ok(VecDelta::Upsert(items)) = vec_rx.try_recv() else { panic!("no Upsert") };
     assert_eq!(items.len(), 2);
     let item_b = items.iter().find(|i| i.key == VecKey::Mem(vid_b)).unwrap();
@@ -1066,6 +1071,8 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     assert!(vec_rx.try_recv().is_err());
     indexer_start::on_embedded(&mut ctx, &model, vectors, out.as_deref()).unwrap();
     assert!(vec_rx.try_recv().is_err());
+    drop(out);
+    assert_eq!(ctx.embed.backlog(), 0);
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(status.vectors_waiting.load(Ordering::Relaxed), 0);
     assert_eq!(ctx.embed.backlog(), 0);
@@ -1074,7 +1081,7 @@ fn the_backlog_is_embedded_once_written_and_sent_to_the_front_thread() {
     insert_memory(&conn, "mem_d", None, None, false);
     let written = status.status_written_ms.load(Ordering::Relaxed);
     degrade(&ctx.status, &ctx.mode, DegradedReason::BrainChanged, None);
-    indexer_start::on_embedded(&mut ctx, "hash-384", vec![(VecKey::Mem(vid_a), unit(9))], out.as_deref()).unwrap();
+    indexer_start::on_embedded(&mut ctx, "hash-384", vec![(VecKey::Mem(vid_a), unit(9))], None).unwrap();
     indexer_start::write_status(&mut ctx).unwrap();
     indexer_start::pump_embeddings(&mut ctx).unwrap();
     assert_eq!(ctx.embed.backlog(), 0);
@@ -1915,4 +1922,41 @@ fn w4_4_a_row_made_secret_or_rewritten_while_its_text_is_embedded_gets_no_vector
     assert_eq!(stored_vector(&conn, "mem_secret"), None, "a secret row got a vector");
     assert_eq!(stored_vector(&conn, "mem_rewritten"), None, "a rewritten row got the vector of its old text");
     assert!(matches!(vec_rx.try_recv(), Ok(VecDelta::Upsert(items)) if items.len() == 1));
+}
+
+// ── Wave 4, R-12b item 5: the backlog goes down when the job is done ────────
+
+#[test]
+fn w4_5_rows_whose_vectors_wait_in_the_queue_are_not_offered_a_second_time() {
+    let dirs = Dirs::new();
+    let conn = make_brain(&dirs.brain());
+    for id in ["mem_a", "mem_b", "mem_c"] {
+        insert_memory(&conn, id, None, None, false);
+    }
+    let (b, _status) = boot(Some(Embedder::hashing()), TestHooks::default());
+    let (mut ctx, jobs_rx, _vec_rx) = indexer_start::open_ctx(dirs.ext_config("hash"), b);
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+
+    // The job is on the indexer's queue, behind whatever else is there: taken off the
+    // queue and not yet handled, as it is while another job runs.
+    let Ok(job) = jobs_rx.recv_timeout(Duration::from_secs(10)) else { panic!("no Job::Embedded") };
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(ctx.embed.backlog(), 3, "the count came off when the job was queued");
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    assert!(jobs_rx.recv_timeout(Duration::from_millis(500)).is_err(), "the same rows were embedded twice");
+
+    // Handled the way the loop handles it: the count comes off, and nothing waits.
+    indexer::dispatch(&mut ctx, job);
+    assert_eq!(ctx.embed.backlog(), 0);
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM memory_ext WHERE embedding IS NULL", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+
+    // A job thrown away unhandled (a degraded process runs no handler) gives its count back too.
+    insert_memory(&conn, "mem_d", None, None, false);
+    indexer_start::pump_embeddings(&mut ctx).unwrap();
+    let Ok(job) = jobs_rx.recv_timeout(Duration::from_secs(10)) else { panic!("no Job::Embedded") };
+    assert_eq!(ctx.embed.backlog(), 1);
+    degrade(&ctx.status, &ctx.mode, DegradedReason::BrainNotReady, None);
+    indexer::dispatch(&mut ctx, job);
+    assert_eq!(ctx.embed.backlog(), 0);
+    assert_eq!(stored_vector(&conn, "mem_d"), None);
 }

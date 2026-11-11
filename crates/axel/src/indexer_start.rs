@@ -377,7 +377,8 @@ pub fn pump_embeddings(ctx: &mut IndexerCtx) -> Result<()> {
     // The embed thread's bulk queue takes whatever it is given: rows it still holds are
     // not offered a second time.
     // RULING: wave3-c12b ruling 11. `backlog()`, not a flag of this thread's: it is 0 again
-    // when the embed thread has ended or has dropped a batch.
+    // when the embed thread has ended or has dropped a batch, and (wave4 R-12b item 5) when
+    // `on_embedded` has finished with the job, not when the job was queued.
     if !usable || ctx.embed.backlog() > 0 || waiting == 0 || mode_of(ctx) != Some(Mode::Ready) {
         return Ok(());
     }
