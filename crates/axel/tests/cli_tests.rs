@@ -1492,6 +1492,96 @@ fn restore_forget_turns_does_not_offer_what_a_cli_mark_leaves_out() {
     assert_eq!(dump(world.db(), "SELECT * FROM archive_index ORDER BY rel_name"), before);
 }
 
+/// An answer to `[y/N]` that does `meanwhile` first: what another writer does while the
+/// question waits.
+struct Meanwhile<'a> {
+    meanwhile: Option<Box<dyn FnOnce() + 'a>>,
+    answer: Cursor<Vec<u8>>,
+}
+
+impl std::io::Read for Meanwhile<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::BufRead::fill_buf(self)?;
+        std::io::Read::read(&mut self.answer, buf)
+    }
+}
+
+impl std::io::BufRead for Meanwhile<'_> {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        if let Some(meanwhile) = self.meanwhile.take() {
+            meanwhile();
+        }
+        self.answer.fill_buf()
+    }
+    fn consume(&mut self, n: usize) {
+        self.answer.consume(n)
+    }
+}
+
+/// `forget --now <ids>`, answered "y" after `meanwhile` ran.
+fn forget_now_meanwhile<'a>(path: &Path, ids: &[&str], meanwhile: impl FnOnce() + 'a) -> Ran {
+    let args = forget::Args { ids: strings(ids), now: true, hidden: false };
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let mut input = Meanwhile { meanwhile: Some(Box::new(meanwhile)), answer: Cursor::new(b"y\n".to_vec()) };
+    let code = {
+        let mut term = Term { out: &mut out, err: &mut err, input: &mut input };
+        forget::run_with(&args, path, &forget::Bases::default(), &mut term).unwrap()
+    };
+    Ran { code, out: String::from_utf8(out).unwrap(), err: String::from_utf8(err).unwrap() }
+}
+
+/// v2 c18b review round 2, item 5: a twin of the capture that appears while the question
+/// waits was not listed: nothing is deleted, the exit is 75, and a second run lists it.
+#[test]
+fn forget_now_deletes_nothing_when_a_twin_appears_while_it_asks() {
+    let w = World::new();
+    let mut cap = capture("mem_cap_race", "s-race", "abababababababab");
+    cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+    w.put(&cap);
+    let before = dump(w.db(), "SELECT * FROM memories ORDER BY id");
+    let run = forget_now_meanwhile(&w.path, &["mem_cap_race"], || w.put(&twin_of(&cap, "mem_twin_race", "0123456789abcdef0123456789abcdef")));
+    assert_eq!(run.code, 75, "{}{}", run.out, run.err);
+    assert!(run.err.contains("the brain changed while you read; nothing was deleted; run it again"), "{}", run.err);
+    assert!(!run.out.contains("Deleted"), "{}", run.out);
+    assert!(w.has("mem_cap_race") && w.has("mem_twin_race"));
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM memory_tombstones"), 0);
+    assert_eq!(count(w.db(), "SELECT COUNT(*) FROM forgotten_turns"), 0);
+    assert_eq!(dump(w.db(), "SELECT * FROM memories WHERE id <> 'mem_twin_race' ORDER BY id"), before);
+
+    let again = forget_cmd(&w.path, &["mem_cap_race"], true, false, "y\n");
+    assert!(again.out.contains("with it, its archived row (the same text): m:mem_twin_race"), "{}", again.out);
+    assert!(again.out.contains("Deleted 2 memories for good."), "{}{}", again.out, again.err);
+}
+
+/// v2 c18b review round 2, item 5: a row the mark would take that was not listed (here an
+/// archived turn whose text became the deleted turn's while the question waited): nothing is
+/// deleted.
+#[test]
+fn forget_now_deletes_nothing_when_the_mark_would_take_a_row_it_did_not_list() {
+    const PROMPT: &str = "continue with the plan we made for the ledger migration";
+    let mut world = Indexed::new();
+    let old = Arch::new(26, "s-drift", T0).turn(PROMPT, &reply("DRIFTOTHER")).about("deploy window");
+    world.file(&old);
+    world.scan();
+    let other_row: String =
+        world.db().query_row("SELECT id FROM memories WHERE content LIKE '%DRIFTOTHER%'", [], |r| r.get(0)).unwrap();
+    let mut cap = capture("mem_cap_drift", "s-drift", &key_of(PROMPT));
+    cap.project = scope();
+    cap.created_ms = T0 + 500_000;
+    cap.content = format!("User: {PROMPT}\nAssistant: {}", reply("DRIFTGONE"));
+    cap.hidden = Some((now_ms() - 25 * HOUR_MS, "cli".to_string()));
+    world.put(&cap);
+    let run = forget_now_meanwhile(&world.path(), &["mem_cap_drift"], || {
+        world.db().execute("UPDATE memories SET content = ?1 WHERE id = ?2", params![cap.content, other_row]).unwrap();
+    });
+    assert!(!run.out.contains(&format!("m:{other_row}")), "the row was listed: the test proves nothing: {}", run.out);
+    assert_eq!(run.code, 75, "{}{}", run.out, run.err);
+    assert!(run.err.contains("nothing was deleted; run it again"), "{}", run.err);
+    let has = |id: &str| count(world.db(), &format!("SELECT COUNT(*) FROM memories WHERE id = '{id}'")) == 1;
+    assert!(has("mem_cap_drift") && has(&other_row));
+    assert_eq!(count(world.db(), "SELECT COUNT(*) FROM forgotten_turns"), 0);
+}
+
 /// v2 c18b review round 2, item 1: a `cli` mark takes only the deleted turn. An archive of
 /// its window indexed after the purge holds it and another turn with the same prompt: the
 /// deleted one is left out, the other is a row. No text is in the mark.

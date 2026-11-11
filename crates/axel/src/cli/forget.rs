@@ -37,6 +37,12 @@ pub const DEFAULT_MIN_HIDDEN_HOURS: u64 = 24;
 
 const HOUR_MS: i64 = 60 * 60 * 1000;
 
+/// What `forget --now` says when the rows it would delete are not the rows it listed.
+pub const CHANGED: &str = "the brain changed while you read; nothing was deleted; run it again";
+
+/// The exit code of a brain that is busy or changed under the command: try again.
+pub const AGAIN: u8 = 75;
+
 /// The Synaps bases whose `config` may set the wait, beside the one the brain records.
 #[derive(Clone, Debug, Default)]
 pub struct Bases {
@@ -239,7 +245,6 @@ struct Purged {
     shadows: i64,
     back: usize,
     left_out: Vec<String>,
-    changed: Vec<String>,
     /// Each deleted turn (a capture or an archived row) and the Synaps archive that still
     /// holds it, when one is known.
     in_synaps: Vec<(String, Option<String>)>,
@@ -385,7 +390,16 @@ fn forget_now(
     }
 
     // 4. One transaction: the purge, the forget marks, the purge mark.
-    let purged = write(conn, || purge(conn, &ripe, &twins))?;
+    // RULING: v2 c18b review round 2, item 5. Inside it, the rows, their twins and what the
+    // mark takes are read again; anything that is not what was listed rolls it back.
+    let listed: Vec<String> = taken.iter().map(|r| r.id.clone()).collect();
+    let purged = match write(conn, || purge(conn, &ripe, &twins, Some(&listed))) {
+        Err(e) if e.to_string().contains(CHANGED) => {
+            writeln!(term.err, "{CHANGED}")?;
+            return Ok(AGAIN);
+        }
+        other => other?,
+    };
     // RULING: v2 c18b review, item 5. The rows are gone once that COMMIT holds: nothing
     // after it can turn the result into an error (a retry would only find "not found").
     // The "Deleted" line comes first; every later write, the cache file and the checkpoint
@@ -418,9 +432,6 @@ fn after_purge(conn: &Connection, path: &Path, purged: &Purged, term: &mut Term)
 }
 
 fn said_after(purged: &Purged, log_clear: bool, term: &mut Term) -> Result<()> {
-    for id in &purged.changed {
-        writeln!(term.out, "  m:{}: changed since it was listed; left as it is.", one(id))?;
-    }
     // RULING: v2 c18b review, item 4: a deleted turn is still in Synaps's own archive.
     for (id, archive) in &purged.in_synaps {
         match archive {
@@ -530,7 +541,7 @@ fn mark_takes(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Resul
     if let Err(e) = crate::brain_v2::begin_write(conn) {
         return Err(busy_or(e));
     }
-    let taken = purge(conn, ripe, twins).map(|p| p.left_out);
+    let taken = purge(conn, ripe, twins, None).map(|p| p.left_out);
     if !conn.is_autocommit() {
         conn.execute_batch("ROLLBACK")?;
     }
@@ -549,19 +560,39 @@ fn busy_or(e: crate::error::AxelError) -> crate::error::AxelError {
     }
 }
 
-/// Inside the caller's transaction. A row that changed since it was listed (restored,
-/// gone) is left as it is.
-fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Purged> {
+/// Inside the caller's transaction. With `listed`, the ids of the rows the mark took when
+/// the list was made, anything that is not as listed (a named row, its twins and whether
+/// each is proven, what the mark takes) is the error `CHANGED`, and the caller rolls back.
+/// Without it (the dry run), a row that changed is left as it is.
+fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>], listed: Option<&[String]>) -> Result<Purged> {
+    let changed = || Err(crate::error::AxelError::Other(CHANGED.into()));
     let mut ids: Vec<String> = Vec::new();
-    let mut changed = Vec::new();
     // `(logical, session_id, turn_key, created_ms, text)` of each turn deleted by its own id.
     let mut marks: Vec<(String, Option<String>, String, i64, index_archives::TurnText)> = Vec::new();
     // The twins left hidden, with their key: the forget mark below must not take them.
     let mut kept: Vec<(String, Option<String>)> = Vec::new();
     for (row, its) in ripe.iter().zip(twins) {
         if hidden_ms_of(conn, &row.id)? != Some(row.hidden_ms) {
-            changed.push(row.id.clone());
+            if listed.is_some() {
+                return changed();
+            }
             continue;
+        }
+        if listed.is_some() {
+            let fresh = row_info(conn, &row.id)?;
+            let now = match &fresh {
+                Some(fresh) => twins_of(conn, fresh)?,
+                None => return changed(),
+            };
+            let shape = |twins: &mut dyn Iterator<Item = &Twin>| {
+                let mut shape: Vec<(String, bool)> = twins.map(|t| (t.row.id.clone(), t.proven)).collect();
+                shape.sort();
+                shape
+            };
+            let now = shape(&mut now.iter().filter(|t| !ripe.iter().any(|r| r.id == t.row.id)));
+            if now != shape(&mut its.iter()) {
+                return changed();
+            }
         }
         ids.push(row.id.clone());
         for twin in its {
@@ -596,7 +627,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
         }
     }
     if ids.is_empty() {
-        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), changed, in_synaps: Vec::new() });
+        return Ok(Purged { deleted: 0, shadows: 0, back: 0, left_out: Vec::new(), in_synaps: Vec::new() });
     }
     let mut in_synaps = Vec::new();
     for (row, its) in ripe.iter().zip(twins) {
@@ -636,6 +667,16 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
     for (id, key) in &kept {
         conn.execute("UPDATE memory_ext SET turn_key = ?2 WHERE mem_id = ?1", params![id, key])?;
     }
+    if let Some(listed) = listed {
+        let (mut took, mut was) = (left_out.clone(), listed.to_vec());
+        took.sort();
+        took.dedup();
+        was.sort();
+        was.dedup();
+        if took != was {
+            return changed();
+        }
+    }
     // RULING: wave 4, rules for wave 5: every caller that forgets text writes the purge
     // mark in its own transaction. `checkpoint` below takes it away again when it could
     // clear the log itself.
@@ -650,7 +691,7 @@ fn purge(conn: &Connection, ripe: &[RowInfo], twins: &[Vec<Twin>]) -> Result<Pur
             back += 1;
         }
     }
-    Ok(Purged { deleted, shadows, back, left_out, changed, in_synaps })
+    Ok(Purged { deleted, shadows, back, left_out, in_synaps })
 }
 
 fn wal_len(path: &Path) -> u64 {
