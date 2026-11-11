@@ -386,6 +386,9 @@ fn clear_shadow(conn: &Connection, id: &str) -> Result<()> {
 // SPEC: 3202 gives the statement without `AND hidden_ms IS NULL`. A second hide of a hidden
 // row would overwrite who hid it and when (a `twin:` mark among them), and restore could
 // no longer bring back what the first hide hid: it changes nothing here.
+// RULING: wave3-c11 ruling 1: the one exception is a `pause` mark. A hide by anyone but a
+// pause takes it over (`hidden_by` and `hidden_ms` become the new hide's), so `resume`,
+// which restores only rows still marked `pause`, leaves the row hidden.
 pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
     if hidden_by.trim().is_empty() {
         return Err(AxelError::Memory("hide: empty hidden_by".into()));
@@ -393,7 +396,8 @@ pub fn hide(conn: &Connection, id: &str, hidden_by: &str) -> Result<usize> {
     atomic(conn, || {
         let now = now_ms();
         let mut hidden = conn.execute(
-            "UPDATE memory_ext SET hidden_ms = ?1, hidden_by = ?2 WHERE mem_id = ?3 AND hidden_ms IS NULL",
+            "UPDATE memory_ext SET hidden_ms = ?1, hidden_by = ?2
+              WHERE mem_id = ?3 AND (hidden_ms IS NULL OR (hidden_by = 'pause' AND ?2 <> 'pause'))",
             params![now, hidden_by, id],
         )?;
         if hidden == 0 {

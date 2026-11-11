@@ -138,6 +138,12 @@ fn set_hidden_ms(conn: &Connection, id: &str, ms: i64) {
     assert_eq!(conn.execute("UPDATE memory_ext SET hidden_ms = ?1 WHERE mem_id = ?2", params![ms, id]).unwrap(), 1);
 }
 
+/// `(hidden_ms, hidden_by)` of one row.
+fn mark_of(conn: &Connection, id: &str) -> (Option<i64>, Option<String>) {
+    conn.query_row("SELECT hidden_ms, hidden_by FROM memory_ext WHERE mem_id = ?1", [id], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap_or_else(|e| panic!("mark_of {id}: {e}"))
+}
+
 /// An old memory, written the way the old binary writes one: no project, no word row.
 /// `adopt_orphans` gives it its `memory_ext` row and its word row.
 fn old_memory(path: &Path, conn: &Connection, title: &str, content: &str) -> String {
@@ -1114,4 +1120,70 @@ fn injection_phrase_names_the_phrase() {
     assert!(errors.iter().any(|e| e.contains("ignore previous instructions")), "{errors:?}");
     memory.content = "This text is long enough to pass the length rule, and says nothing else at all.".to_string();
     assert!(MemoryPipeline::new().validate(&memory).is_ok());
+}
+
+// ── Ruling 1 of the commit 11 review: a hide takes over a `pause` mark ──────
+
+#[test]
+fn a_hide_takes_over_a_pause_mark_and_no_other() {
+    let dir = TempDir::new().unwrap();
+    let (_path, brain) = open(&dir);
+    let conn = &brain.conn;
+    for id in ["mem_s1", "mem_s2", "mem_s3", "mem_s4"] {
+        let mut new = row(id, "episodic_turn", "capture", &format!("User: a turn | Assistant: the answer of {id}"));
+        new.session_id = Some("session-s");
+        new.logical = Some("chat-s");
+        new.origin_ref = "session-s";
+        put(&brain, &new);
+    }
+    let texts: Vec<String> = ["mem_s1", "mem_s2", "mem_s3", "mem_s4"].iter().map(|id| saved(conn, id)).collect();
+    let long_ago = now_ms() - 3 * DAY_MS;
+
+    // A model hid one before the pause; the pause hides the other three.
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s4", "model:session-s").unwrap()), 1);
+    set_hidden_ms(conn, "mem_s4", long_ago);
+    assert_eq!(tx(conn, || store::set_pause(conn, "chat-s", Some("session-s"), "learning", "cli").unwrap()), 3);
+    for id in ["mem_s1", "mem_s2", "mem_s3"] {
+        set_hidden_ms(conn, id, long_ago);
+        assert_eq!(mark_of(conn, id), (Some(long_ago), Some("pause".to_string())));
+    }
+
+    // The owner hides one capture by id: the hide takes the mark over, who and when.
+    let before = now_ms();
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s2", "cli").unwrap()), 1, "a hide of a paused row is dropped");
+    let (ms, by) = mark_of(conn, "mem_s2");
+    assert_eq!(by.as_deref(), Some("cli"));
+    assert!(ms.unwrap() >= before, "hidden_ms is the new hide's");
+    // Taken over once: the next hide is a second hide like any other.
+    let taken = mark_of(conn, "mem_s2");
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s2", "model:session-s").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_s2"), taken);
+
+    // A second hide by a model on a row a model hid changes nothing.
+    let model_mark = (Some(long_ago), Some("model:session-s".to_string()));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s4", "model:session-t").unwrap()), 0);
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s4", "model:session-s").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_s4"), model_mark);
+    // A pause on a row a model hid changes nothing, by either way a pause hides.
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s4", "pause").unwrap()), 0);
+    assert_eq!(tx(conn, || store::set_pause(conn, "chat-s", Some("session-s"), "learning", "cli").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_s4"), model_mark);
+    // A pause does not take over a pause, nor the owner's hide.
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s3", "pause").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_s3"), (Some(long_ago), Some("pause".to_string())));
+    assert_eq!(tx(conn, || store::hide(conn, "mem_s2", "pause").unwrap()), 0);
+    assert_eq!(mark_of(conn, "mem_s2"), taken);
+
+    // Resume: the two rows still marked `pause` return; the two hidden by id stay hidden.
+    assert_eq!(tx(conn, || store::clear_pause(conn, "chat-s", Some("session-s"), "learning").unwrap()), 2);
+    assert_eq!(returned(conn), vec!["mem_s1".to_string(), "mem_s3".to_string()]);
+    assert_eq!(mark_of(conn, "mem_s2"), taken, "the row the owner hid during the pause came back");
+    assert_eq!(mark_of(conn, "mem_s4"), model_mark);
+    for (id, text) in ["mem_s1", "mem_s2", "mem_s3", "mem_s4"].iter().zip(&texts) {
+        assert_eq!(&saved(conn, id), text, "{id}: no saved text changed");
+    }
+
+    // It is an ordinary hide now: restore by id brings it back.
+    assert_eq!(tx(conn, || store::restore(conn, "mem_s2").unwrap()), 1);
+    assert!(is_returned(conn, "mem_s2"));
 }
