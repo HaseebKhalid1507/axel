@@ -428,6 +428,12 @@ pub fn class_weight(category: &str) -> f64 {
         CLASS_ENTITY_FACT => 0.6,
         CLASS_TOOL_OUTCOME => 0.5,
         CLASS_EPISODIC_TURN => 0.4,
+        // v2 (section 3): the kinds the brain holds besides JR's eight.
+        "note" => 0.85,
+        "preferences" => 0.85,
+        "entities" => 0.6,
+        "events" | "cases" | "patterns" => 0.5,
+        "document" => 0.45,
         // Non-chat-history categories still rank, just with low class weight.
         _ => 0.3,
     }
@@ -464,6 +470,9 @@ pub struct RecallCandidate {
     pub lexical_match: bool,
     /// Produced by the bounded recency-window fallback generator.
     pub recency_fallback: bool,
+    /// v2 (section 3): the share of the query's words found in the record, `0.0..=1.0`.
+    /// `None` scores as before: 1 when `lexical_match`, else 0.
+    pub lexical_score: Option<f64>,
 }
 
 fn model_visible(d: &ScopedDescriptor) -> bool {
@@ -501,6 +510,7 @@ fn push_candidates(
             class_weight: class_weight(&d.category),
             lexical_match,
             recency_fallback,
+            lexical_score: None,
             descriptor: d,
         });
     }

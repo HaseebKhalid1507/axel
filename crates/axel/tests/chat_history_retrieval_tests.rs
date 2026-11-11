@@ -205,6 +205,7 @@ fn secret_record_is_never_a_candidate_or_selected_even_on_lexical_match() {
         class_weight: 1.0,
         lexical_match: true,
         recency_fallback: false,
+        lexical_score: None,
     };
     let selected = rank_and_select(vec![smuggled], None, 8);
     assert!(

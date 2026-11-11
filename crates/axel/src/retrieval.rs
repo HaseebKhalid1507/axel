@@ -44,10 +44,8 @@ const W_RECENCY: f64 = 0.5;
 /// is exhausted.
 pub const LOCAL_EMBEDDING_TIMEOUT: Duration = Duration::from_millis(250);
 
-// SPEC: 2457 says this file exports `ScoreParts { lexical, semantic, session, class,
-// recency, total }`, and `recall::Pick` (2327) has a field of it, so commit 3 declares the
-// struct here, in a file that is commit 15's. The field type is not written; `f64` is
-// assumed. `score_parts` (2458) is commit 15's.
+/// What one candidate scored, signal by signal, before the weights; `total` is the weighted
+/// sum the ranker sorted by. The recall log shows these numbers.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize)]
 pub struct ScoreParts {
     pub lexical: f64,
@@ -88,10 +86,41 @@ fn model_visible(d: &ScopedDescriptor) -> bool {
     d.sensitivity == Sensitivity::Normal && d.retention.model_visible()
 }
 
+/// The lexical signal: the caller's share of matched words when it gave one, else 1 for a
+/// lexical match and 0 for none (as before v2).
+fn lexical_signal(c: &RecallCandidate) -> f64 {
+    c.lexical_score.unwrap_or(if c.lexical_match { 1.0 } else { 0.0 })
+}
+
 fn score(c: &RecallCandidate, affinity: bool) -> f64 {
-    let lexical = if c.lexical_match { 1.0 } else { 0.0 };
+    let lexical = lexical_signal(c);
     let session = if affinity { 1.0 } else { 0.0 };
     W_LEXICAL * lexical + W_SESSION * session + W_CLASS * c.class_weight + W_RECENCY * c.recency
+}
+
+// SPEC: 5918 writes `score_parts(c: &Candidate, affinity: f64, semantic: Option<f64>)`; 3174
+// writes `score_parts(c, affinity, semantic)`. There is no type `Candidate`, and the ranker's
+// affinity is a `bool` (`score` above): this takes `&RecallCandidate` and a `bool`.
+/// The parts of the ranker's score for one candidate, from the same constants as `score`:
+/// `total` is exactly what `rank_and_select_hybrid` sorted this candidate by, given the same
+/// `affinity` (its own flag or the session tag) and the same semantic score (`None` is 0;
+/// clamped to `0..=1` as the ranker clamps it).
+pub fn score_parts(c: &RecallCandidate, affinity: bool, semantic: Option<f64>) -> ScoreParts {
+    let lexical = lexical_signal(c);
+    let session = if affinity { 1.0 } else { 0.0 };
+    let semantic = semantic.unwrap_or(0.0).clamp(0.0, 1.0);
+    ScoreParts {
+        lexical,
+        semantic,
+        session,
+        class: c.class_weight,
+        recency: c.recency,
+        total: W_LEXICAL * lexical
+            + W_SESSION * session
+            + W_CLASS * c.class_weight
+            + W_RECENCY * c.recency
+            + W_SEMANTIC * semantic,
+    }
 }
 
 fn reasons_for(c: &RecallCandidate, affinity: bool) -> Vec<RankReason> {
@@ -345,12 +374,12 @@ impl DiversityClass {
     fn of(category: &str) -> Option<Self> {
         match category {
             CLASS_DECISION => Some(Self::Decision),
-            CLASS_PREFERENCE => Some(Self::Preference),
-            CLASS_EPISODIC_TURN | CLASS_CONVERSATION_SUMMARY | CLASS_TOOL_OUTCOME => {
+            CLASS_PREFERENCE | "preferences" => Some(Self::Preference),
+            CLASS_EPISODIC_TURN | CLASS_CONVERSATION_SUMMARY | CLASS_TOOL_OUTCOME | "events" | "cases" => {
                 Some(Self::Episode)
             }
             CLASS_UNRESOLVED_TASK => Some(Self::UnresolvedTask),
-            CLASS_ENTITY_FACT | CLASS_CORRECTION => Some(Self::Fact),
+            CLASS_ENTITY_FACT | CLASS_CORRECTION | "note" | "document" | "entities" => Some(Self::Fact),
             _ => None,
         }
     }
@@ -623,6 +652,7 @@ mod local_embedding_tests {
             class_weight: 0.5,
             lexical_match: true,
             recency_fallback: false,
+            lexical_score: None,
         }
     }
 
@@ -758,5 +788,111 @@ mod local_embedding_tests {
         assert_eq!(selected.metadata.fallback_note, None);
         assert_eq!(selected.records[0].0.id, "semantic-best");
         assert!(selected.records[0].1.contains(&RankReason::SemanticMatch));
+    }
+}
+
+#[cfg(test)]
+mod score_parts_tests {
+    use super::*;
+    use crate::chat_history::class_weight;
+    use crate::project_memory::{RecordLinks, Retention};
+
+    fn candidate(id: &str, category: &str, lexical_match: bool, lexical_score: Option<f64>, recency: f64) -> RecallCandidate {
+        RecallCandidate {
+            descriptor: ScopedDescriptor {
+                id: id.into(),
+                project_key: "project".into(),
+                // Titles that share no word, so the diversity pass drops none of them.
+                title: format!("title{id}"),
+                snippet: None,
+                category: category.into(),
+                tags: Vec::new(),
+                created: "2026-01-01T00:00:00Z".into(),
+                sensitivity: Sensitivity::Normal,
+                retention: Retention::Standard,
+                provenance: "test".into(),
+                links: RecordLinks::default(),
+            },
+            recency,
+            session_affinity: false,
+            class_weight: class_weight(category),
+            lexical_match,
+            recency_fallback: false,
+            lexical_score,
+        }
+    }
+
+    fn mixed() -> Vec<RecallCandidate> {
+        vec![
+            candidate("a", CLASS_DECISION, true, None, 0.9),
+            candidate("b", CLASS_EPISODIC_TURN, false, None, 0.2),
+            candidate("c", "note", true, Some(0.67), 0.5),
+            candidate("d", "document", false, Some(0.0), 0.0),
+            candidate("e", "entities", true, Some(0.25), 1.0),
+            candidate("f", "no_such_class", true, Some(1.0), 0.01),
+            candidate("g", CLASS_TOOL_OUTCOME, false, Some(0.5), 0.33),
+        ]
+    }
+
+    /// Section 3, test 11: `score_parts` is the ranker's own score, bit for bit.
+    #[test]
+    fn score_parts_equals_the_rankers_score_for_every_candidate_of_a_mixed_set() {
+        for c in mixed() {
+            for affinity in [false, true] {
+                for semantic in [None, Some(0.0_f64), Some(0.37), Some(1.0), Some(1.7), Some(-0.4)] {
+                    // What `rank_current_with_semantic` computes for one candidate.
+                    let ranker = score(&c, affinity) + W_SEMANTIC * semantic.unwrap_or(0.0).clamp(0.0, 1.0);
+                    let parts = score_parts(&c, affinity, semantic);
+                    assert_eq!(parts.total, ranker, "{} {affinity} {semantic:?}", c.descriptor.id);
+                    assert_eq!(parts.lexical, c.lexical_score.unwrap_or(if c.lexical_match { 1.0 } else { 0.0 }));
+                    assert_eq!(parts.session, if affinity { 1.0 } else { 0.0 });
+                    assert_eq!(parts.class, c.class_weight);
+                    assert_eq!(parts.recency, c.recency);
+                    assert!((0.0..=1.0).contains(&parts.semantic));
+                }
+            }
+        }
+    }
+
+    /// And the ranker orders by it: with one class the diversity pass keeps the score order.
+    #[test]
+    fn the_ranker_returns_one_class_in_the_order_of_score_parts() {
+        let semantic = [0.1, 0.9, 0.4, 0.0, 0.75];
+        let set: Vec<RecallCandidate> = [(true, 0.2, 0.9), (false, 0.0, 0.1), (true, 1.0, 0.5), (true, 0.6, 0.0), (false, 0.3, 0.7)]
+            .iter()
+            .enumerate()
+            .map(|(i, (m, l, r))| candidate(&format!("n{i}"), "note", *m, Some(*l), *r))
+            .collect();
+        let mut expected: Vec<(f64, String)> = set
+            .iter()
+            .zip(semantic)
+            .map(|(c, s)| (score_parts(c, false, Some(s)).total, c.descriptor.id.clone()))
+            .collect();
+        expected.sort_by(|a, b| b.0.total_cmp(&a.0));
+        let got = rank_current_with_semantic(set, None, 8, Some(&semantic));
+        let got: Vec<String> = got.into_iter().map(|(d, _)| d.id).collect();
+        assert_eq!(got, expected.into_iter().map(|(_, id)| id).collect::<Vec<_>>());
+    }
+
+    /// The four edits leave an existing caller's score as it was.
+    #[test]
+    fn a_candidate_without_a_lexical_score_scores_as_before() {
+        let with = candidate("a", CLASS_DECISION, true, None, 0.5);
+        let without = candidate("b", CLASS_DECISION, false, None, 0.5);
+        assert!((score(&with, false) - score(&without, false) - W_LEXICAL).abs() < 1e-12);
+        assert_eq!(class_weight("note"), 0.85);
+        assert_eq!(class_weight("preferences"), 0.85);
+        assert_eq!(class_weight("entities"), 0.6);
+        assert_eq!(class_weight("events"), 0.5);
+        assert_eq!(class_weight("cases"), 0.5);
+        assert_eq!(class_weight("patterns"), 0.5);
+        assert_eq!(class_weight("document"), 0.45);
+        assert_eq!(DiversityClass::of("note"), Some(DiversityClass::Fact));
+        assert_eq!(DiversityClass::of("document"), Some(DiversityClass::Fact));
+        assert_eq!(DiversityClass::of("entities"), Some(DiversityClass::Fact));
+        assert_eq!(DiversityClass::of("preferences"), Some(DiversityClass::Preference));
+        assert_eq!(DiversityClass::of("events"), Some(DiversityClass::Episode));
+        assert_eq!(DiversityClass::of("cases"), Some(DiversityClass::Episode));
+        assert_eq!(DiversityClass::of("patterns"), None);
     }
 }

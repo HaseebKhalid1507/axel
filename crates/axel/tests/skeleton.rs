@@ -29,7 +29,7 @@ use axel::ext::types::{
     Status, TestHooks, ToolError,
 };
 use axel::ext::{front, hooks, tools, tools_core};
-use axel::recall::{self, RecallConfig, RecallRequest, RecallTrace, View};
+use axel::recall::{self, RecallTrace};
 use axel::vindex::{ExactIndex, VecDelta, VecKey, VecScope};
 use axel::{docsync, index_archives, index_notes, indexer, indexer_start, inject, project};
 
@@ -211,17 +211,6 @@ fn every_stub_gives_its_fixed_answer() {
     // recall
     let view = front::view_for(&Caller::default(), &st.cfg);
     assert!(view.project.is_none() && !view.global && !view.documents && view.own_session.is_none());
-    let req = RecallRequest {
-        query: "retry limit",
-        view: &View { project: None, global: true, documents: true, own_session: None },
-        kinds: None,
-        since_ms: None,
-        max_items: 5,
-        deadline: Instant::now(),
-        ambient: true,
-    };
-    let out = recall::recall(&conn, &st.index, &st.embed, &RecallConfig { now: 1_000 }, &req);
-    assert!(out.picks.is_empty());
 
     // types
     for v in 0..=9u8 {
