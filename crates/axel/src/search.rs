@@ -5,6 +5,7 @@
 //! The HNSW vector index is built in memory from stored embeddings on first
 //! search, then persisted to disk for fast warm starts on subsequent opens.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use velocirag::db::Database;
@@ -29,14 +30,15 @@ pub struct BrainSearch {
     cache_path: PathBuf,
     /// Set to true when the live index has been modified since the last save.
     cache_stale: bool,
-    /// `PRAGMA data_version` when the vectors of other writers were read (the warm load,
-    /// or `build_index`); `None` while nothing has been read.
-    read_version: Option<i64>,
+    /// The `documents` ids whose vectors are in `index`.
+    ids: HashSet<i64>,
 }
 
-/// `PRAGMA data_version`: it changes when another connection commits to the file.
-fn data_version(conn: &rusqlite::Connection) -> Option<i64> {
-    conn.query_row("PRAGMA data_version", [], |r| r.get(0)).ok()
+/// The ids of every row of `documents`: the rows that have a vector.
+fn document_ids(conn: &rusqlite::Connection) -> rusqlite::Result<HashSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM documents")?;
+    let ids = stmt.query_map([], |r| r.get::<_, i64>(0))?.collect();
+    ids
 }
 
 impl BrainSearch {
@@ -175,7 +177,6 @@ impl BrainSearch {
 
         // Try to load a warm index from disk if it exists and the vector
         // count matches what the database currently holds.
-        let version = data_version(db.conn());
         let (index, index_built) = if cache_path.exists() {
             let db_count = db
                 .document_count()
@@ -206,6 +207,8 @@ impl BrainSearch {
             (idx, false)
         };
 
+        // A warm file was written when its vectors were those of `documents` (`save_cache`).
+        let ids = if index_built { document_ids(db.conn()).map_err(AxelError::Db)? } else { HashSet::new() };
         Ok(Self {
             db,
             embedder,
@@ -213,7 +216,7 @@ impl BrainSearch {
             index_built,
             cache_path,
             cache_stale: false,
-            read_version: if index_built { version } else { None },
+            ids,
         })
     }
 
@@ -228,8 +231,6 @@ impl BrainSearch {
             return Ok(());
         }
 
-        // Before the read: a commit between the two then counts as one after it.
-        self.read_version = data_version(self.db.conn());
         let embeddings = self.db.load_all_embeddings()
             .map_err(|e| AxelError::Search(format!("Failed to load embeddings: {e}")))?;
 
@@ -240,6 +241,7 @@ impl BrainSearch {
         for (key, embedding) in &embeddings {
             self.index.add(*key as u64, embedding)
                 .map_err(|e| AxelError::Search(format!("Failed to add to index: {e}")))?;
+            self.ids.insert(*key);
         }
 
         self.index_built = true;
@@ -271,18 +273,19 @@ impl BrainSearch {
     }
 
     /// Writes `<brain>.r8.hnsw`, the one way every save goes (`build_index`, `flush`, the
-    /// flush on drop): only when no other writer has committed since the vectors were
-    /// read; else the file is deleted, and the next open builds the index again.
+    /// flush on drop): only when the index holds the vectors of `documents`, no more and no
+    /// fewer (every id it holds is a row there, and it holds as many vectors as there are
+    /// rows); else the file is deleted, and the next open builds the index again.
     // RULING: v2 c18b review round 3, item 6. A `forget --now` that commits and removes the
     // file between this handle's read and its save would find the file written back with
-    // a deleted vector. `PRAGMA data_version` does not move for this handle's own commits
-    // (`index_document`), so `index` and `index-sync` still save.
+    // a deleted vector.
+    // RULING: v2 c18b review round 4, item 3: the test is what the file holds, not whether
+    // another connection committed: `AxelBrain` writes through three connections, and a
+    // `remember` must not cost the next search a rebuild.
     fn save_cache(&self) -> std::result::Result<(), String> {
-        let unchanged = match self.read_version {
-            Some(read) => data_version(self.db.conn()) == Some(read),
-            None => true,
-        };
-        if unchanged {
+        let docs = document_ids(self.db.conn()).map_err(|e| e.to_string())?;
+        let same = self.index.len() == docs.len() && self.ids.len() == docs.len() && self.ids.is_subset(&docs);
+        if same {
             return self.index.save(&self.cache_path).map_err(|e| e.to_string());
         }
         match std::fs::remove_file(&self.cache_path) {
@@ -339,6 +342,7 @@ impl BrainSearch {
         // Add to live index so it's searchable immediately.
         self.index.add(rowid as u64, &embedding)
             .map_err(|e| AxelError::Search(format!("Index add failed: {e}")))?;
+        self.ids.insert(rowid);
 
         self.index_built = true; // mark as built since we have at least one vector
         self.cache_stale = true; // on-disk cache is now behind the live index
@@ -658,14 +662,15 @@ mod tests {
         (dir, path, reader)
     }
 
-    /// v2 c18b review round 3, item 6: a handle whose vectors were read before another
-    /// writer committed does not write the cache file back, on `flush` or on drop.
+    /// v2 c18b review round 3, item 6, round 4, item 3: a handle that holds the vector of a
+    /// row another connection purged does not write the cache file back, on `flush` or on
+    /// drop.
     #[test]
-    fn a_save_after_another_writer_committed_deletes_the_cache_file() {
+    fn a_save_after_another_connection_purged_a_row_deletes_the_cache_file() {
         let (_dir, path, mut reader) = read_then_cache_removed();
         let cache = path.with_extension("r8.hnsw");
         let other = rusqlite::Connection::open(&path).unwrap();
-        other.execute("INSERT INTO context_data(key, value, layer) VALUES ('k', 'v', 'test')", []).unwrap();
+        other.execute("DELETE FROM documents WHERE doc_id = 'a'", []).unwrap();
         reader.index_document("c", "gamma document", None, None).unwrap();
         reader.flush().unwrap();
         assert!(!cache.exists(), "flush wrote the cache back after another writer's commit");
@@ -673,6 +678,77 @@ mod tests {
         std::fs::write(&cache, b"old").unwrap();
         drop(reader);
         assert!(!cache.exists(), "the drop wrote the cache back, or left an old one");
+    }
+
+    /// The same count is not enough: another connection purges a row and writes another,
+    /// and the handle that holds the purged row's vector does not write the file.
+    #[test]
+    fn a_save_with_the_same_count_but_a_purged_row_deletes_the_cache_file() {
+        let (_dir, path, mut reader) = read_then_cache_removed();
+        let cache = path.with_extension("r8.hnsw");
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .execute_batch(
+                "INSERT INTO documents(doc_id, content, metadata, embedding, file_path, indexed_at)
+                   SELECT 'z', content, metadata, embedding, file_path, indexed_at FROM documents WHERE doc_id = 'b';
+                 DELETE FROM documents WHERE doc_id = 'a';",
+            )
+            .unwrap();
+        reader.index_document("c", "gamma document", None, None).unwrap();
+        std::fs::write(&cache, b"old").unwrap();
+        drop(reader);
+        assert!(!cache.exists(), "the drop wrote the cache back, or left an old one");
+    }
+
+    /// An index that lacks a row another connection wrote is not written either.
+    #[test]
+    fn a_save_that_lacks_a_row_another_connection_wrote_deletes_the_cache_file() {
+        let (_dir, path, mut reader) = read_then_cache_removed();
+        let cache = path.with_extension("r8.hnsw");
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other
+            .execute(
+                "INSERT INTO documents(doc_id, content, metadata, embedding, file_path, indexed_at)
+                   SELECT 'z', content, metadata, embedding, file_path, indexed_at FROM documents WHERE doc_id = 'b'",
+                [],
+            )
+            .unwrap();
+        reader.index_document("c", "gamma document", None, None).unwrap();
+        reader.flush().unwrap();
+        assert!(!cache.exists(), "flush wrote a cache that lacks a row");
+    }
+
+    /// Another connection's commit that leaves `documents` as the index holds it does not
+    /// stop the save (round 4, item 3).
+    #[test]
+    fn a_save_after_another_connection_committed_elsewhere_writes_the_cache_file() {
+        let (_dir, path, mut reader) = read_then_cache_removed();
+        let other = rusqlite::Connection::open(&path).unwrap();
+        other.execute("INSERT INTO context_data(key, value, layer) VALUES ('k', 'v', 'test')", []).unwrap();
+        reader.index_document("c", "gamma document", None, None).unwrap();
+        reader.flush().unwrap();
+        assert!(path.with_extension("r8.hnsw").exists());
+    }
+
+    /// v2 c18b review round 4, item 3: a `remember` (written through `AxelBrain`'s other
+    /// connections) after a search keeps the file, and the next search loads it warm.
+    #[test]
+    fn remember_after_a_search_keeps_the_cache_and_the_next_search_does_not_rebuild() {
+        use axel_memkoshi::memory::{Memory, MemoryCategory};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("brain.r8");
+        let remember = |text: &str| {
+            let mut brain = crate::brain::AxelBrain::open_or_create_with(&path, None, Embedder::hashing()).unwrap();
+            brain.search_mut().search("anything at all", 3).unwrap();
+            brain.remember_full(Memory::new(MemoryCategory::Events, "harbour", text, text)).unwrap();
+        };
+        remember("the harbour ferry runs on the winter schedule from November");
+        remember("the harbour ferry stops at the island twice a day in winter");
+        let cache = path.with_extension("r8.hnsw");
+        assert!(cache.exists(), "the remember deleted the cache file");
+        let search = open_hashing(&path).unwrap();
+        assert!(search.index_built, "the next search would rebuild the index");
+        assert_eq!(search.index.len(), 2);
     }
 
     /// The handle's own commits do not stop its save (`index`, `index-sync`).
