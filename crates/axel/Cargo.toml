@@ -16,7 +16,8 @@ axel-memkoshi = { path = "../memkoshi" }
 rusqlite = { workspace = true }
 usearch = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
+# raw_value: synaps_export carries a note's record fields byte for byte.
+serde_json = { workspace = true, features = ["raw_value"] }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 dirs = { workspace = true }
