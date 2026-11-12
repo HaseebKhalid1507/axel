@@ -521,6 +521,17 @@ fn s5_t01_four_tools_declared_and_the_old_required_arguments_accepted() {
     assert_eq!(required("remember"), json!(["content"]));
     assert_eq!(required("recall"), json!([]));
 
+    // RULING: v2 golden-spin round, item 3. What `search` covers and memory_search does
+    // not, inside the 256 bytes core's `search_tools` matches.
+    let description = |name: &str| -> String {
+        tools_core::tools().into_iter().find(|t| t["name"] == name).unwrap()["description"].as_str().unwrap().to_string()
+    };
+    let search = description("search");
+    assert!(search.starts_with("Search everything Axel holds: the user's notes files, earlier chats and saved memories"), "{search}");
+    assert!(search.contains("an empty memory_search does not mean Axel has nothing"), "{search}");
+    assert!(search.as_bytes()[..256].windows(6).any(|w| w == b"memory"), "{search}");
+    assert!(description("recall").ends_with("From Axel's brain, which memory_search does not cover."));
+
     let mut lab = Lab::new();
     let chat = lab.chat(&lab.a.clone(), "S");
     lab.ok("search", json!({ "query": "x" }), &chat);
