@@ -384,10 +384,10 @@ fn open_immutable(source: &Path) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )
     .map_err(|e| {
-        ExportError::Source(format!(
-            "{} cannot be opened ({e}); a symbolic link to the file is refused: give the file's real path.",
-            source.display()
-        ))
+        // The link is named only when the file is one now (swapped in since the check).
+        let link = fs::symlink_metadata(source).is_ok_and(|m| m.file_type().is_symlink());
+        let why = if link { "; it is a symbolic link, which is refused: give the file's real path" } else { "" };
+        ExportError::Source(format!("{} cannot be opened ({e}){why}.", source.display()))
     })
 }
 
