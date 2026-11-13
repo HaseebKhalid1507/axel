@@ -31,7 +31,7 @@ use axel::store::{self, cap_refusal, Inserted, NewRow, GLOBAL_KEY};
 use axel::vindex::{VecDelta, VecItem, VecKey, VecScope};
 use axel::{archive, indexer, indexer_start, project};
 use axel_memkoshi::storage::MemoryStorage;
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 use velocirag::embedder::Embedder;
@@ -1677,13 +1677,25 @@ fn s4_t12_iii_a_memory_forgotten_carried_to_the_next_call_marks_the_pending_turn
     let answer = host.tool("search", "Q", json!({ "query": "eel trap sluice" }));
     assert_eq!(answer["result"]["is_error"], false, "{answer}");
     let conn = host.conn();
-    let marked: (i64, String) = conn
-        .query_row(
-            "SELECT to_ms, turn_key FROM forgotten_turns WHERE source = 'call' AND logical = ?1",
-            [project::logical("S")],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .expect("no call row for S");
+    // The carry asks for the lock without waiting (front.rs `mark_carried`): when the
+    // indexer holds it at that moment the mark is kept and written right after the answer
+    // or at the next idle turn (`retry_forget_marks`). So the row is waited for.
+    let start = Instant::now();
+    let marked: (i64, String) = loop {
+        let row = conn
+            .query_row(
+                "SELECT to_ms, turn_key FROM forgotten_turns WHERE source = 'call' AND logical = ?1",
+                [project::logical("S")],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        if let Some(row) = row {
+            break row;
+        }
+        assert!(start.elapsed() < Duration::from_secs(10), "no call row for S");
+        std::thread::sleep(Duration::from_millis(20));
+    };
     assert_eq!(marked.1, recall::query_hash(prompt));
     std::thread::sleep(Duration::from_millis(5));
     for session in ["S", "T"] {
