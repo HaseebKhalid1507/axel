@@ -28,11 +28,18 @@ on any other system stops with one line: `axel builds on Linux and macOS only`.
 ## Requirements
 
 - **Linux or macOS.** The macOS build compiles but has not been run on a Mac yet.
+- **What the ONNX Runtime library needs.** Axel links the prebuilt ONNX Runtime of the `ort`
+  crate, both in the prebuilt binary and in a `cargo install` build, so these hold for both:
+  - Linux: glibc 2.39 or newer and libstdc++ 13.2 or newer (Ubuntu 24.04, Debian 13 or
+    newer), on x86_64 or aarch64.
+  - x86_64: a CPU with AVX2 (x86-64-v3: Intel Haswell, AMD Zen or newer). Without it ort
+    warns, and Axel will likely crash with an illegal instruction.
+  - macOS: 13.4 or newer, Apple Silicon only.
 - **Synaps 0.12.0 or newer.** Axel uses the hooks `on_context_archived` and
   `on_memory_forgotten`, the `cwd` Synaps sends with each hook and tool call, and the
   `caller` field of `tool.call`. All four are in Synaps's development branch and ship first
   in 0.12.0. Axel does not check Synaps's version; on an older Synaps see the notes below.
-- **To build from source** (only where there is no prebuilt binary, below): Rust with
+- **To build from source** (instead of the prebuilt binary, below): Rust with
   cargo, and a C and C++ compiler (SQLite and the vector index are
   compiled in). The build downloads the ONNX Runtime library once (the `ort` crate's
   prebuilt binaries).
@@ -51,13 +58,17 @@ synaps daemon reload
 ```
 
 The installer has prebuilt binaries for Linux on x86_64 and aarch64 (glibc) and for macOS
-on Apple Silicon. There is none for Intel Macs or musl Linux (Alpine): the ONNX Runtime
-library Axel links has no prebuilt build for them. There, and anywhere else, build from
-source instead of the first line:
+on Apple Silicon. To build from source instead (same requirements), replace the first line
+with:
 
 ```bash
 cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.0 --locked axel
 ```
+
+Intel Macs, musl Linux (Alpine) and Linux older than glibc 2.39 are not covered: `ort` has
+no prebuilt ONNX Runtime for them, so neither the installer nor a plain `cargo install`
+works there. A source build linked against an ONNX Runtime you built yourself
+(`ORT_LIB_LOCATION`, see <https://ort.pyke.io/setup/linking>) may, but is untested.
 
 Step by step:
 

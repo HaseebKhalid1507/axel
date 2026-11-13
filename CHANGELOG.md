@@ -33,13 +33,17 @@ The first release of Axel (0.1.0): one local brain for Synaps, run as a Synaps e
   and tool `cwd`, and the `tool.call` `caller`).
 - To build: Rust with cargo, a C and C++ compiler; the build downloads the ONNX Runtime
   library once.
+- The prebuilt ONNX Runtime (linked by the prebuilt binaries and by `cargo install` alike):
+  Linux glibc >= 2.39 and libstdc++ >= 13.2 (Ubuntu 24.04+, Debian 13+); an AVX2 CPU on
+  x86_64 (x86-64-v3); macOS 13.4 or newer.
 
 ### Known limits
 
 - macOS is built but has not been run on a Mac.
 - Prebuilt binaries (shell installer) for x86_64 and aarch64 Linux (glibc) and Apple Silicon
-  macOS only: no Intel Mac and no musl build, which ONNX Runtime has no prebuilt library for.
-  Elsewhere, `cargo install`.
+  macOS only. Intel Macs, musl Linux and glibc older than 2.39 have no prebuilt ONNX
+  Runtime, so `cargo install` does not work there either without an ONNX Runtime built by
+  hand (`ORT_LIB_LOCATION`), which is untested.
 - On a Synaps without the two hooks, the plugin does not load until they are removed from
   `plugin.json` by hand; archives are then picked up by the background scan, up to 10
   minutes late. Without `caller`, every tool refuses; recall and capture still work.
