@@ -28,7 +28,7 @@ use crate::ext::types::{Caller, DegradedReason, FrontState, ToolError};
 use crate::project_memory::{RecordLinks, Retention, ScopedDescriptor, Sensitivity};
 use crate::recall::{self, Kind, Origin, Pick, RecallConfig, RecallRequest, View, PASSAGE_CHARS};
 use crate::retrieval::ScoreParts;
-use crate::store::{self, Inserted, NewRow, CAP_REFUSAL, GLOBAL_KEY};
+use crate::store::{self, cap_refusal, Inserted, NewRow, GLOBAL_KEY};
 use crate::vindex::{VecDelta, VecKey};
 use crate::{archive, brain_v2, inject, project, screen};
 
@@ -552,7 +552,7 @@ fn remember(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<Strin
         if !replaced.is_empty()
             && !store::cap_allows(conn, session_id, system_ms(), replaced.len()).map_err(db(st, true))?
         {
-            return Err(ToolError::Refused(CAP_REFUSAL.to_string()));
+            return Err(ToolError::Refused(cap_refusal()));
         }
 
         let id = Memory::generate_id();
@@ -599,8 +599,9 @@ fn remember(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<Strin
 
     let answer = match saved {
         Saved::Hidden { id, hidden_ms } => format!(
-            "This was hidden on {} and stays hidden; the user can restore it with \"axel-v2 restore {}\".",
+            "This was hidden on {} and stays hidden; the user can restore it with \"{} restore {}\".",
             day(hidden_ms),
+            crate::cmd_name(),
             screen::show(&id, FIELD_CHARS)
         ),
         Saved::Exists { id } => {
@@ -853,14 +854,16 @@ fn notice(conn: &Connection, view: &View, now_ms: i64) -> rusqlite::Result<Optio
     if hidden + superseded > 0 {
         let first = [hidden_first, superseded_first].into_iter().flatten().min().unwrap_or(now_ms);
         line.push_str(&format!(
-            " {hidden} memories are hidden and {superseded} superseded by the assistant, {} of them in the last 30 days; the user can undo that with \"axel-v2 restore --by-model --since {}\".",
+            " {hidden} memories are hidden and {superseded} superseded by the assistant, {} of them in the last 30 days; the user can undo that with \"{} restore --by-model --since {}\".",
             hidden_recent + superseded_recent,
+            crate::cmd_name(),
             day(first)
         ));
     }
     if turns > 0 {
         line.push_str(&format!(
-            " {turns} turns left out by forget calls, {turns_recent} in the last 30 days; \"axel-v2 status\" lists them."
+            " {turns} turns left out by forget calls, {turns_recent} in the last 30 days; \"{cmd} status\" lists them.",
+            cmd = crate::cmd_name()
         ));
     }
     Ok(Some(line))
@@ -892,7 +895,8 @@ fn recall_tool(st: &mut FrontState, input: &Value, caller: &Caller) -> Result<St
             if !text.is_empty() {
                 let date = updated.map(|u| screen::show(&u, 40)).filter(|u| !u.is_empty());
                 let label = format!(
-                    "handoff written with \"axel handoff set\" · {}",
+                    "handoff written with \"{} handoff set\" · {}",
+                    crate::cmd_name(),
                     date.unwrap_or_else(|| "date unknown".to_string())
                 );
                 head.push(format!("[{}] {text}", screen::show(&label, LABEL_CHARS)));
@@ -998,7 +1002,7 @@ fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str,
             _ => return Err(ToolError::Refused(NOT_FOUND.to_string())),
         }
         if !store::cap_allows(conn, session_id, system_ms(), 1).map_err(db(st, true))? {
-            return Err(ToolError::Refused(CAP_REFUSAL.to_string()));
+            return Err(ToolError::Refused(cap_refusal()));
         }
         if store::hide(conn, id, &hidden_by).map_err(db(st, true))? == 0 {
             return Err(ToolError::Refused(NOT_FOUND.to_string()));
@@ -1009,7 +1013,8 @@ fn hide_one(st: &mut FrontState, session_id: &str, caller: &Caller, given: &str,
     st.index.apply(VecDelta::Remove(vec![VecKey::Mem(vid)]));
     let id = screen::show(id, FIELD_CHARS);
     Ok(format!(
-        "Hidden m:{id}. It is no longer recalled. Nothing was deleted: the user can restore it with \"axel-v2 restore {id}\"."
+        "Hidden m:{id}. It is no longer recalled. Nothing was deleted: the user can restore it with \"{cmd} restore {id}\".",
+        cmd = crate::cmd_name()
     ))
 }
 
@@ -1038,7 +1043,8 @@ fn stop_chat(st: &FrontState, session_id: &str, what: &str, deadline: Instant) -
         text.push_str(&format!(" {hidden} recent turns of it were hidden with it."));
     }
     text.push_str(&format!(
-        " What was archived before stays. Only the user can turn it back on, with \"axel-v2 resume {}\"{}.",
+        " What was archived before stays. Only the user can turn it back on, with \"{} resume {}\"{}.",
+        crate::cmd_name(),
         screen::show(session_id, FIELD_CHARS),
         if what == "recall" { "" } else { ", which also brings those turns back" }
     ));

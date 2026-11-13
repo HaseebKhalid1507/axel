@@ -109,7 +109,7 @@ pub fn boot(path: &Path, term: &mut Term) -> Result<u8> {
     }
 
     if !has_content {
-        writeln!(term.err, "Brain is empty. Use `axel remember` or `axel index` to add content.")?;
+        writeln!(term.err, "Brain is empty. Use `{cmd} remember` or `{cmd} index` to add content.", cmd = crate::cmd_name())?;
     }
     let (total, saved_total): (i64, i64) = conn.query_row(
         "SELECT COUNT(*), COALESCE(SUM(origin_kind IN ('tool', 'cli', 'legacy') AND hidden_ms IS NULL), 0) FROM memory_ext",

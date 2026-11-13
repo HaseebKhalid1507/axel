@@ -185,8 +185,9 @@ pub fn find_all(conn: &Connection, given: &[String], err: &mut dyn Write) -> Res
         if g.starts_with("ctx-") {
             writeln!(
                 err,
-                "{}: that is a Synaps archive; forget it in Synaps with memory_forget, or bring back the turns it left out with \"axel-v2 restore --forget-turns {}\"",
+                "{}: that is a Synaps archive; forget it in Synaps with memory_forget, or bring back the turns it left out with \"{} restore --forget-turns {}\"",
                 one(g),
+                crate::cmd_name(),
                 one(g)
             )?;
             ok = false;
@@ -473,7 +474,8 @@ fn show_archive(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
         if *cli_unproven > 0 {
             writeln!(
                 out,
-                "    turns hidden because they have the prompt of a deleted turn and their text does not prove them that turn: {cli_unproven} (\"axel-v2 restore <id>\" brings one back)"
+                "    turns hidden because they have the prompt of a deleted turn and their text does not prove them that turn: {cli_unproven} (\"{cmd} restore <id>\" brings one back)",
+                cmd = crate::cmd_name()
             )?;
         }
         // RULING: v2 c18b review round 4, item 2: the ids, so that one can be brought back.

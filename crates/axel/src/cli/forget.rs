@@ -69,11 +69,11 @@ pub fn run(args: &Args, brain: &BrainArg) -> Result<ExitCode> {
 
 pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Result<u8> {
     if args.hidden && !args.now {
-        writeln!(term.err, "--hidden goes with --now: \"axel-v2 forget --now --hidden\"")?;
+        writeln!(term.err, "--hidden goes with --now: \"{} forget --now --hidden\"", crate::cmd_name())?;
         return Ok(USAGE);
     }
     if args.ids.is_empty() && !args.hidden {
-        writeln!(term.err, "name the rows to forget: \"axel-v2 forget <id>...\" (or \"axel-v2 forget --now --hidden\")")?;
+        writeln!(term.err, "name the rows to forget: \"{cmd} forget <id>...\" (or \"{cmd} forget --now --hidden\")", cmd = crate::cmd_name())?;
         return Ok(USAGE);
     }
     let conn = open_to_read(path)?;
@@ -102,7 +102,7 @@ pub fn run_with(args: &Args, path: &Path, bases: &Bases, term: &mut Term) -> Res
     if args.now {
         for given in &args.ids {
             if !ids.iter().any(|id| id == bare(given)) {
-                writeln!(term.err, "{}: --now needs the whole id of the row (\"axel-v2 show {}\" gives it)", one(given), one(given))?;
+                writeln!(term.err, "{}: --now needs the whole id of the row (\"{} show {}\" gives it)", one(given), crate::cmd_name(), one(given))?;
                 refused = true;
             }
         }
@@ -149,7 +149,8 @@ fn hide_all(conn: &Connection, rows: &[RowInfo], term: &mut Term) -> Result<u8> 
         }
         writeln!(
             term.out,
-            "Hidden m:{id}. It is no longer recalled. Nothing was deleted: restore it with \"axel-v2 restore {id}\"."
+            "Hidden m:{id}. It is no longer recalled. Nothing was deleted: restore it with \"{cmd} restore {id}\".",
+            cmd = crate::cmd_name()
         )?;
         // RULING: v2 c18b review, item 1. What was hidden with it is shown, with its date
         // and first line: rows with the same prompt are not always the same turn.
@@ -157,7 +158,8 @@ fn hide_all(conn: &Connection, rows: &[RowInfo], term: &mut Term) -> Result<u8> 
         if !twins.is_empty() {
             writeln!(
                 term.out,
-                "  Hidden with it, archived rows of the chat with the same prompt (\"axel-v2 restore {id}\" brings them back too):"
+                "  Hidden with it, archived rows of the chat with the same prompt (\"{cmd} restore {id}\" brings them back too):",
+                cmd = crate::cmd_name()
             )?;
             for twin in &twins {
                 writeln!(term.out, "    {}", twin_line(&twin.row))?;
@@ -298,10 +300,11 @@ fn forget_now(
             let ids: Vec<String> = visible.iter().map(|r| format!("m:{}", one(&r.id))).collect();
             writeln!(
                 term.err,
-                "the brain is busy (the extension or another command is writing to it); nothing was deleted, but {} {} hidden first and {} hidden (\"axel-v2 restore <id>\" undoes that); try again in a moment",
+                "the brain is busy (the extension or another command is writing to it); nothing was deleted, but {} {} hidden first and {} hidden (\"{} restore <id>\" undoes that); try again in a moment",
                 ids.join(", "),
                 if ids.len() == 1 { "was" } else { "were" },
-                if ids.len() == 1 { "stays" } else { "stay" }
+                if ids.len() == 1 { "stays" } else { "stay" },
+                crate::cmd_name()
             )?;
             Ok(AGAIN)
         }
@@ -375,9 +378,10 @@ fn delete_hidden(
             } else {
                 writeln!(
                     term.out,
-                    "    not proven the same turn; left hidden (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it too): {}",
+                    "    not proven the same turn; left hidden (\"{cmd} restore {id}\" brings it back; \"{cmd} forget --now {id}\" deletes it too): {}",
                     twin_line(&twin.row),
-                    id = one(&twin.row.id)
+                    id = one(&twin.row.id),
+                    cmd = crate::cmd_name()
                 )?;
             }
         }
@@ -412,7 +416,8 @@ fn delete_hidden(
         // takes only copies of the turns named, so this is true of those turns only.
         writeln!(
             term.out,
-            "  No command brings these copies back into the brain while the mark stands: \"axel-v2 restore --forget-turns ctx-…\" obeys it too. Other turns with the same prompt stay."
+            "  No command brings these copies back into the brain while the mark stands: \"{} restore --forget-turns ctx-…\" obeys it too. Other turns with the same prompt stay.",
+            crate::cmd_name()
         )?;
     }
     // RULING: v2 c18b review round 3, item 2: what has the prompt of a deleted turn, near
@@ -434,9 +439,10 @@ fn delete_hidden(
             };
             writeln!(
                 term.out,
-                "    {} (\"axel-v2 restore {id}\" brings it back; \"axel-v2 forget --now {id}\" deletes it once it has been hidden {hours} h{was})",
+                "    {} (\"{cmd} restore {id}\" brings it back; \"{cmd} forget --now {id}\" deletes it once it has been hidden {hours} h{was})",
                 twin_line(row),
-                id = one(&row.id)
+                id = one(&row.id),
+                cmd = crate::cmd_name()
             )?;
         }
     }

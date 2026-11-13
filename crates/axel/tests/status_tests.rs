@@ -309,11 +309,11 @@ fn exit_1_and_a_first_line_naming_the_kind_on_a_missing_file() {
     let (code, text) = status_text(&path);
     assert_eq!(code, 1);
     let first = text.lines().next().unwrap();
-    assert!(first.starts_with(&format!("no v2 brain at {}", path.display())), "{text}");
+    assert!(first.starts_with(&format!("no brain at {}", path.display())), "{text}");
     let (code, v) = status_json(&path);
     assert_eq!(code, 1);
     assert_eq!(v["brain"]["kind"], json!("NoBrain"));
-    assert!(v["brain"]["error"].as_str().unwrap().starts_with("no v2 brain at"));
+    assert!(v["brain"]["error"].as_str().unwrap().starts_with("no brain at"));
     assert!(!path.exists(), "status created the brain");
     assert!(folder(dir.path()).is_empty(), "{:?}", folder(dir.path()));
 }
@@ -326,7 +326,7 @@ fn exit_1_and_a_first_line_naming_the_kind_on_a_version_1_file() {
     let before = folder(dir.path());
     let (code, text) = status_text(&path);
     assert_eq!(code, 1);
-    assert!(text.lines().next().unwrap().starts_with("this is a version 1 brain"), "{text}");
+    assert!(text.lines().next().unwrap().starts_with("this is the old Axel brain"), "{text}");
     let (code, v) = status_json(&path);
     assert_eq!(code, 1);
     assert_eq!(v["brain"]["kind"], json!("V1Brain"));
@@ -533,7 +533,7 @@ fn old_brain_written_after_import_by_its_wal_alone() {
         text.contains(&format!("the old brain {p} was written after the import (")),
         "{text}"
     );
-    assert!(text.contains(&format!("\"axel-v2 migrate catch-up --from-axel {p}\" brings over what was saved there")), "{text}");
+    assert!(text.contains(&format!("\"axel migrate catch-up --from-axel {p}\" brings over what was saved there")), "{text}");
 
     // A new record (a catch-up) taken now ends the line.
     record_import(&path, &old, Some(&wal));

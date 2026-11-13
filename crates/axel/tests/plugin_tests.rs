@@ -166,6 +166,27 @@ fn install_command_override_refused() {
     assert!(!plugins.exists());
 }
 
+/// Command hints name the binary as it was run: `axel`, or the name of a link to it.
+#[test]
+fn hints_use_the_name_the_binary_was_run_as() {
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("my-axel");
+    std::os::unix::fs::symlink(bin(), &link).unwrap();
+    for (program, name) in [(bin(), "axel"), (link, "my-axel")] {
+        let out = Command::new(&program)
+            .arg("--brain")
+            .arg(tmp.path().join("unused-brain.r8"))
+            .arg("restore")
+            .env_remove("AXEL_BRAIN")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1));
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(err.contains(&format!("\"{name} init\" makes an empty one")), "{name}: {err}");
+        assert!(err.contains(&format!("\"{name} migrate init --from-axel")), "{name}: {err}");
+    }
+}
+
 /// No personal path is compiled in: no `/home/` literal anywhere under `src/`.
 #[test]
 fn no_home_literal_in_src() {

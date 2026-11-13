@@ -26,7 +26,7 @@ pub mod why;
 
 pub fn ensure_brain(path: &Path) -> Result<()> {
     if !path.exists() {
-        eprintln!("No brain at {}. Run `axel init` first.", path.display());
+        eprintln!("No brain at {}. Run `{} init` first.", path.display(), crate::cmd_name());
         std::process::exit(1);
     }
     Ok(())

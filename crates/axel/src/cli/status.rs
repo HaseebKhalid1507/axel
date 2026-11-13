@@ -455,15 +455,16 @@ fn status_files(dir: &Path, now: i64) -> Files {
 }
 
 /// What a person does about a reason.
-fn hint(reason: &str) -> Option<&'static str> {
+fn hint(reason: &str) -> Option<String> {
+    let cmd = crate::cmd_name();
     Some(match reason {
-        "FrontStopped" | "IndexerStopped" | "BrainChanged" => "restart Synaps",
-        "BrainDamaged" => "the file is kept as it is; restore it from a backup of the brain",
-        "BrainTooNew" => "this brain was written by a newer axel-v2; install that one",
-        "OtherBase" => "this brain records another Synaps base",
-        "BrainOldShape" => crate::brain_v2::OLD_SHAPE,
-        "V1Brain" => "this is a version 1 brain; \"axel-v2 migrate init --from-axel <it>\" makes a v2 copy",
-        "NoBrain" | "BrainNotReady" => "retried every 60 s",
+        "FrontStopped" | "IndexerStopped" | "BrainChanged" => "restart Synaps".into(),
+        "BrainDamaged" => "the file is kept as it is; restore it from a backup of the brain".into(),
+        "BrainTooNew" => "this brain was written by a newer Axel; install that one".into(),
+        "OtherBase" => "this brain records another Synaps base".into(),
+        "BrainOldShape" => crate::brain_v2::old_shape(),
+        "V1Brain" => format!("this is the old Axel brain (axel.r8); \"{cmd} migrate init --from-axel <it>\" makes a brain from it"),
+        "NoBrain" | "BrainNotReady" => "retried every 60 s".into(),
         _ => return None,
     })
 }
@@ -1172,8 +1173,9 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
     // RULING: v2 c18b review round 3, item 1: one count.
     if h["unproven"].as_i64().unwrap_or(0) > 0 {
         l.push(format!(
-            "hidden with the prompt of a turn deleted with forget --now, not proven that turn: {} (axel-v2 restore <id> brings one back)",
-            h["unproven"]
+            "hidden with the prompt of a turn deleted with forget --now, not proven that turn: {} ({} restore <id> brings one back)",
+            h["unproven"],
+            crate::cmd_name()
         ));
         let at: Vec<String> = j["unproven_archives"]
             .as_array()
@@ -1183,7 +1185,7 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
             .map(|id| format!("ctx-{}", screen::show(id, 64)))
             .collect();
         if !at.is_empty() {
-            l.push(format!("  in {} (axel-v2 show ctx-<id> lists them)", at.join(", ")));
+            l.push(format!("  in {} ({} show ctx-<id> lists them)", at.join(", "), crate::cmd_name()));
         }
     }
     l.push(format!(
@@ -1212,8 +1214,9 @@ fn text(j: &Value, path: &Path, check: bool) -> Vec<String> {
     if o["written_after_import"] == json!(true) {
         let p = s(&o["path"]);
         l.push(format!(
-            "the old brain {p} was written after the import ({}); \"axel-v2 migrate catch-up --from-axel {p}\" brings over what was saved there",
-            s(&o["date"])
+            "the old brain {p} was written after the import ({}); \"{cmd} migrate catch-up --from-axel {p}\" brings over what was saved there",
+            s(&o["date"]),
+            cmd = crate::cmd_name()
         ));
     }
     let fo = &j["forum"];

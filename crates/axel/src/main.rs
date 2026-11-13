@@ -175,6 +175,8 @@ fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::S
 }
 
 fn main() -> ExitCode {
+    // Command hints name the binary as it was run (`axel`, or `axel-v2` beside an old one).
+    axel::set_cmd_name(std::env::args_os().next().as_deref());
     // Parsed in two steps so that `main` can see where `--brain` came from (B-2b).
     let matches = Cli::command().get_matches();
     let from_env = matches.value_source("brain") == Some(ValueSource::EnvVariable);
@@ -766,9 +768,10 @@ fn cmd_remember(
     match same {
         Same::Hidden(id, ms) => {
             eprintln!(
-                "This text was hidden on {} (m:{}) and stays hidden; \"axel-v2 restore {}\" brings it back. Nothing was stored.",
+                "This text was hidden on {} (m:{}) and stays hidden; \"{} restore {}\" brings it back. Nothing was stored.",
                 show::day(ms),
                 show::one(&id),
+                axel::cmd_name(),
                 show::one(&id)
             );
             return Ok(ExitCode::FAILURE);
@@ -925,7 +928,7 @@ fn cmd_stats(cli: &Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
     } else if consolidation_runs == 0 {
-        println!("\n  ⚠ No consolidation runs recorded — run `axel consolidate` to start");
+        println!("\n  ⚠ No consolidation runs recorded — run `{} consolidate` to start", axel::cmd_name());
     }
 
     // Excitability distribution warning

@@ -18,9 +18,25 @@ use crate::error::{Result, VelociError};
 
 const HF_BASE: &str = "https://huggingface.co";
 
-/// The command that puts the model files in place. Every message that tells
-/// a person how to get a model takes the name from here.
-pub const FETCH_COMMAND: &str = "axel-v2 model fetch";
+/// The command that puts the model files in place, under the default program
+/// name. Every message that tells a person how to get a model takes the name
+/// from [`fetch_command`], which is this unless [`set_program_name`] ran.
+pub const FETCH_COMMAND: &str = "axel model fetch";
+
+static PROGRAM: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// The name the program was run as (`axel`, or `axel-v2`); the first call wins.
+pub fn set_program_name(name: &str) {
+    let _ = PROGRAM.set(name.to_string());
+}
+
+/// The fetch command under the name the program was run as.
+pub fn fetch_command() -> String {
+    match PROGRAM.get() {
+        Some(name) => format!("{name} model fetch"),
+        None => FETCH_COMMAND.to_string(),
+    }
+}
 
 /// While true, nothing in this crate downloads a model.
 static OFFLINE: AtomicBool = AtomicBool::new(true);
@@ -143,8 +159,9 @@ pub fn model_files_in(dir: &Path) -> Option<PathBuf> {
 pub(crate) fn missing_model_message(dir: &Path) -> String {
     format!(
         "the model files are not in {}. Copy model.onnx (or onnx/model.onnx) and tokenizer.json \
-         into it, or run \"{FETCH_COMMAND}\".",
-        dir.display()
+         into it, or run \"{}\".",
+        dir.display(),
+        fetch_command()
     )
 }
 

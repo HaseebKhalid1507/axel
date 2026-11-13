@@ -63,8 +63,9 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     if !known && !args.force {
         writeln!(
             term.err,
-            "no capture, archive or recall of chat {} is in the brain: check the session id (\"axel-v2 pause --force …\" pauses it anyway). Nothing was changed.",
-            show::one(session_id)
+            "no capture, archive or recall of chat {} is in the brain: check the session id (\"{} pause --force …\" pauses it anyway). Nothing was changed.",
+            show::one(session_id),
+            crate::cmd_name()
         )?;
         return Ok(FAILED);
     }
@@ -86,6 +87,6 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
             _ => writeln!(term.out, "Recall is paused for chat {shown}: nothing is recalled into it.")?,
         }
     }
-    writeln!(term.out, "Lift it with \"axel-v2 resume {shown} {}\".", args.what)?;
+    writeln!(term.out, "Lift it with \"{} resume {shown} {}\".", crate::cmd_name(), args.what)?;
     Ok(OK)
 }

@@ -94,7 +94,7 @@ mod offline_download_tests {
             ensure_model_in(&models, &EMBEDDER_MODEL).unwrap_err().to_string(),
             format!(
                 "Embedding error: the model files are not in {}. Copy model.onnx (or onnx/model.onnx) \
-                 and tokenizer.json into it, or run \"axel-v2 model fetch\".",
+                 and tokenizer.json into it, or run \"axel model fetch\".",
                 folder.display()
             )
         );
@@ -147,7 +147,8 @@ mod offline_download_tests {
 
     #[test]
     fn the_fetch_command_is_the_installed_name() {
-        assert_eq!(FETCH_COMMAND, "axel-v2 model fetch");
+        assert_eq!(FETCH_COMMAND, "axel model fetch");
+        assert_eq!(crate::download::fetch_command(), FETCH_COMMAND, "no test sets the program name");
     }
 
     // The files are empty stand-ins: these functions only check existence.

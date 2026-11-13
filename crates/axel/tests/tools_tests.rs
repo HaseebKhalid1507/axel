@@ -27,7 +27,7 @@ use axel::ext::{front, tools};
 use axel::forum::Author;
 use axel::project_memory::{RecordLinks, Sensitivity};
 use axel::recall::{self, RecallTrace};
-use axel::store::{self, Inserted, NewRow, CAP_REFUSAL, GLOBAL_KEY};
+use axel::store::{self, cap_refusal, Inserted, NewRow, GLOBAL_KEY};
 use axel::vindex::{VecDelta, VecItem, VecKey, VecScope};
 use axel::{archive, indexer, indexer_start, project};
 use axel_memkoshi::storage::MemoryStorage;
@@ -783,7 +783,7 @@ fn s5_t06_forget_by_id_hides_and_restore_brings_back() {
     let answer = lab.ok("forget", json!({ "id": format!("m:{id}"), "reason": "the user asked" }), &chat);
     assert_eq!(
         answer,
-        format!("Hidden m:{id}. It is no longer recalled. Nothing was deleted: the user can restore it with \"axel-v2 restore {id}\".")
+        format!("Hidden m:{id}. It is no longer recalled. Nothing was deleted: the user can restore it with \"axel restore {id}\".")
     );
     assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memories WHERE id = ?1", &id), 1);
     assert_eq!(hidden_by(lab.conn(), &id), Some("model:S".to_string()));
@@ -924,7 +924,7 @@ fn s5_t08_stop_learning_pauses_this_chat_only_and_no_input_removes_it() {
     let chat = lab.chat(&lab.a.clone(), "S");
     let answer = lab.ok("forget", json!({ "stop": "learning" }), &chat);
     assert!(answer.starts_with("Axel stopped learning from this chat."), "{answer}");
-    assert!(answer.contains("\"axel-v2 resume S\""), "{answer}");
+    assert!(answer.contains("\"axel resume S\""), "{answer}");
     let pauses: Vec<(String, String)> = {
         let mut stmt = lab.conn().prepare("SELECT logical, what FROM chat_pauses").unwrap();
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?))).unwrap().map(Result::unwrap).collect()
@@ -1088,7 +1088,7 @@ fn s4_t12_an_unknown_id_and_a_call_past_the_cap_are_marked_too_and_two_calls_are
     let first = call_row(lab.conn(), "S");
     assert_eq!(first.len(), 1, "an unknown id marks the turn");
     std::thread::sleep(Duration::from_millis(5));
-    assert_eq!(lab.refused("forget", json!({ "id": format!("m:{last}") }), &chat), CAP_REFUSAL);
+    assert_eq!(lab.refused("forget", json!({ "id": format!("m:{last}") }), &chat), cap_refusal());
     let second = call_row(lab.conn(), "S");
     assert_eq!(second.len(), 1, "two calls in one turn are one row");
     assert_eq!(second[0].0, at);
@@ -1254,7 +1254,7 @@ fn s5_t13_the_daily_cap() {
         json!({ "content": "the eider raft is counted in march", "supersedes": [format!("m:{}", ids[9]), format!("m:{}", ids[10])] }),
         &s,
     );
-    assert_eq!(refused, CAP_REFUSAL);
+    assert_eq!(refused, cap_refusal());
     assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows, "a row was stored");
     assert_eq!(snapshot(lab.conn()), before);
     // A stop call does not count.
@@ -1263,7 +1263,7 @@ fn s5_t13_the_daily_cap() {
     // The tenth succeeds, the eleventh is refused and changes nothing.
     lab.ok("forget", json!({ "id": format!("m:{}", ids[9]) }), &s);
     let before = snapshot(lab.conn());
-    assert_eq!(lab.refused("forget", json!({ "id": format!("m:{}", ids[10]) }), &s), CAP_REFUSAL);
+    assert_eq!(lab.refused("forget", json!({ "id": format!("m:{}", ids[10]) }), &s), cap_refusal());
     let rows_only = |s: &str| s.lines().take(2).collect::<Vec<_>>().join("\n");
     assert_eq!(rows_only(&snapshot(lab.conn())), rows_only(&before));
     assert_eq!(hidden_by(lab.conn(), &ids[10]), None);
@@ -1301,7 +1301,7 @@ fn s5_t13_the_cap_is_read_inside_the_hiding_transaction() {
         &s,
     );
     committer.join().unwrap();
-    assert_eq!(refused, Err(ToolError::Refused(CAP_REFUSAL.to_string())));
+    assert_eq!(refused, Err(ToolError::Refused(cap_refusal())));
     let (hidden, superseded) = store::model_changes_since(lab.conn(), "S", 0).unwrap();
     assert_eq!(hidden + superseded, 10, "the two calls together passed the cap");
 }
@@ -1351,14 +1351,14 @@ fn s5_t14_the_first_line_of_recall_counts_what_the_assistant_hid() {
     let since = day(now_ms() - 365 * DAY);
     assert_eq!(
         first(&mut lab),
-        format!("Note: 4 memories are hidden and 1 superseded by the assistant, 4 of them in the last 30 days; the user can undo that with \"axel-v2 restore --by-model --since {since}\".")
+        format!("Note: 4 memories are hidden and 1 superseded by the assistant, 4 of them in the last 30 days; the user can undo that with \"axel restore --by-model --since {since}\".")
     );
     for id in [saved.as_str(), capture, "mem_shelduckold00001", replaced.as_str()] {
         assert!(lab.restore(id) >= 1, "{id}");
     }
     assert_eq!(
         first(&mut lab),
-        format!("Note: 1 memories are hidden and 0 superseded by the assistant, 0 of them in the last 30 days; the user can undo that with \"axel-v2 restore --by-model --since {since}\".")
+        format!("Note: 1 memories are hidden and 0 superseded by the assistant, 0 of them in the last 30 days; the user can undo that with \"axel restore --by-model --since {since}\".")
     );
     assert_eq!(hidden_by(lab.conn(), "mem_shelduckarch0001"), None, "the twin is visible");
     assert_eq!(count_id(lab.conn(), "SELECT COUNT(*) FROM memories WHERE id = ?1", capture), 0, "the capture is gone");
@@ -1387,7 +1387,7 @@ fn s5_t15_what_was_hidden_is_not_brought_back_by_saying_it_again() {
     let answer = lab.ok("remember", json!({ "content": text }), &t);
     assert_eq!(
         answer,
-        format!("This was hidden on {} and stays hidden; the user can restore it with \"axel-v2 restore {id}\".", day(now_ms()))
+        format!("This was hidden on {} and stays hidden; the user can restore it with \"axel restore {id}\".", day(now_ms()))
     );
     assert_eq!(count(lab.conn(), "SELECT COUNT(*) FROM memories"), rows);
     assert_eq!(hidden_by(lab.conn(), &id), Some("model:S".to_string()));
@@ -1498,13 +1498,13 @@ fn s5_t21_the_forget_turn_notice() {
     archive_index(lab.conn(), &dir_a, "R", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa2", now_ms() - 40 * DAY, 2);
     archive_index(lab.conn(), &dir_b, "Q", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb1", now_ms() - HOUR, 7);
     let first = |lab: &mut Lab| lab.recall(&s).lines().next().unwrap().to_string();
-    assert_eq!(first(&mut lab), "Note: 5 turns left out by forget calls, 3 in the last 30 days; \"axel-v2 status\" lists them.");
+    assert_eq!(first(&mut lab), "Note: 5 turns left out by forget calls, 3 in the last 30 days; \"axel status\" lists them.");
     let id = lab.remember(&s, "the turnstone flips weed on the strandline");
     lab.ok("forget", json!({ "id": format!("m:{id}") }), &s);
     assert_eq!(
         first(&mut lab),
         format!(
-            "Note: 1 memories are hidden and 0 superseded by the assistant, 1 of them in the last 30 days; the user can undo that with \"axel-v2 restore --by-model --since {}\". 5 turns left out by forget calls, 3 in the last 30 days; \"axel-v2 status\" lists them.",
+            "Note: 1 memories are hidden and 0 superseded by the assistant, 1 of them in the last 30 days; the user can undo that with \"axel restore --by-model --since {}\". 5 turns left out by forget calls, 3 in the last 30 days; \"axel status\" lists them.",
             day(now_ms())
         )
     );

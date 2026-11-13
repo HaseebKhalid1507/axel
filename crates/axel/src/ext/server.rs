@@ -75,7 +75,7 @@ pub fn unavailable_text(reason: &str) -> String {
     if reason == "BrainOldShape" {
         return format!(
             "Axel is unavailable: BrainOldShape (the brain {}). Synaps itself is not affected.",
-            crate::brain_v2::OLD_SHAPE
+            crate::brain_v2::old_shape()
         );
     }
     format!("Axel is unavailable: {reason}. Synaps itself is not affected.")

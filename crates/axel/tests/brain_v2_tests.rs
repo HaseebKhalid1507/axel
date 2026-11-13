@@ -890,7 +890,7 @@ fn t17_a_version_1_brain_is_refused() {
     }
     match brain_v2::require_v2(&old) {
         Err(e @ AxelError::V1Brain(_)) => {
-            assert!(e.to_string().starts_with("this is a version 1 brain (axel.r8)"), "{e}");
+            assert!(e.to_string().starts_with("this is the old Axel brain (axel.r8)"), "{e}");
         }
         other => panic!("expected V1Brain, got {other:?}"),
     }
@@ -903,7 +903,7 @@ fn t17_a_version_1_brain_is_refused() {
     match brain_v2::require_v2(&missing) {
         Err(e @ AxelError::NoBrain(_)) => {
             let text = e.to_string();
-            assert!(text.contains("axel-v2 init") && text.contains("axel-v2 migrate init"), "{text}");
+            assert!(text.contains("\"axel init\"") && text.contains("\"axel migrate init"), "{text}");
         }
         other => panic!("expected NoBrain, got {other:?}"),
     }
@@ -1739,7 +1739,7 @@ fn a_v2_brain_of_the_pre_round_3_shape_is_refused_unchanged() {
         let before = std::fs::read(&path).unwrap();
         for result in [brain_v2::connect(&path, Role::Cli).map(drop), brain_v2::open_v2(&path, &opts(false)).map(drop)] {
             let error = result.expect_err(name).to_string();
-            assert!(error.contains("made by an older build of axel-v2") && error.contains("make it again"), "{name}: {error}");
+            assert!(error.contains("made by an older build of Axel") && error.contains("make it again"), "{name}: {error}");
         }
         assert_eq!(std::fs::read(&path).unwrap(), before, "{name}: the file was changed");
     }

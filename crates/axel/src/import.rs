@@ -223,7 +223,7 @@ fn finish(command: &str, mut rep: Report, mut temp: Option<Temp>, result: Res<u8
     out.insert("ok".into(), json!(code == EXIT_OK));
     out.insert("exit".into(), json!(code));
     if let Some(e) = &error {
-        eprintln!("axel-v2 {command}: {e}");
+        eprintln!("{} {command}: {e}", crate::cmd_name());
         out.insert("error".into(), json!(e));
     }
     for (k, v) in rep {

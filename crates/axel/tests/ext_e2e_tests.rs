@@ -789,13 +789,13 @@ fn s1_t17_every_gated_subcommand_refuses_a_version_1_brain_and_leaves_it_unchang
     let out = axel(dir, &["status"], Some(&old));
     assert_eq!(out.status.code(), Some(1), "status on a version 1 brain");
     let first = text(&out.stdout).lines().next().unwrap_or("").to_string();
-    assert!(first.starts_with("this is a version 1 brain"), "status's first line: {first}");
+    assert!(first.starts_with("this is the old Axel brain"), "status's first line: {first}");
     assert_eq!(sha256(&old), hash, "status changed the version 1 brain");
     assert_eq!(files_under(&dir.join("old")), folder, "status left a file beside the version 1 brain");
 
     // `synaps-export` reads a brain it is given; the gate does not refuse it.
     let out = axel(dir, &["--brain", old.to_str().unwrap(), "synaps-export", "--out", dir.join("export").to_str().unwrap()], None);
-    assert!(!text(&out.stderr).contains("this is a version 1 brain"), "synaps-export was refused: {}", text(&out.stderr));
+    assert!(!text(&out.stderr).contains("this is the old Axel brain"), "synaps-export was refused: {}", text(&out.stderr));
     assert_eq!(files_under(&dir.join("old")), folder, "synaps-export left a file beside its source");
     assert_eq!(sha256(&old), hash, "synaps-export changed its source");
 
@@ -806,7 +806,7 @@ fn s1_t17_every_gated_subcommand_refuses_a_version_1_brain_and_leaves_it_unchang
         let out = axel(dir, &args, Some(&old));
         let said = text(&out.stderr);
         assert!(!out.status.success(), "{args:?} on a version 1 brain exited 0");
-        assert!(said.contains("this is a version 1 brain"), "{args:?} did not give the gate's message: {said}");
+        assert!(said.contains("this is the old Axel brain"), "{args:?} did not give the gate's message: {said}");
         assert_eq!(sha256(&old), hash, "{args:?} changed the version 1 brain");
         // SQLite's own side files may appear (the gate reads a file in WAL mode); nothing else
         // does, and the log stays empty.
@@ -820,7 +820,7 @@ fn s1_t17_every_gated_subcommand_refuses_a_version_1_brain_and_leaves_it_unchang
         let said = text(&out.stderr);
         assert!(!out.status.success(), "{args:?} on a missing brain exited 0");
         assert!(
-            said.contains("axel-v2 init") && said.contains("axel-v2 migrate init"),
+            said.contains("\"axel init\"") && said.contains("\"axel migrate init"),
             "{args:?} on a missing brain does not name both ways to make one: {said}"
         );
         assert!(!missing.parent().unwrap().exists(), "{args:?} created the missing brain's folder");

@@ -42,10 +42,10 @@ pub enum AxelError {
     // The brain kinds of v2 (B3-3b). Nobody edits this file after commit 3.
     // SPEC: the document gives the text of NoBrain (893) and of V1Brain (879-881) only; the
     // other five messages are commit 3's wording.
-    #[error("no v2 brain at {}. \"axel-v2 init\" makes an empty one; \"axel-v2 migrate init --from-axel <axel.r8>\" makes one from the old brain.", .0.display())]
+    #[error("no brain at {}. \"{cmd} init\" makes an empty one; \"{cmd} migrate init --from-axel <axel.r8>\" makes one from the old Axel brain.", .0.display(), cmd = crate::cmd_name())]
     NoBrain(PathBuf),
 
-    #[error("this is a version 1 brain (axel.r8). It is the rollback copy and axel-v2 does not change it. \"axel-v2 migrate init --from-axel <it>\" makes a v2 copy.")]
+    #[error("this is the old Axel brain (axel.r8). It is the rollback copy and this Axel does not change it. \"{cmd} migrate init --from-axel <it>\" makes a brain from it.", cmd = crate::cmd_name())]
     V1Brain(PathBuf),
 
     #[error("the brain is at version {file} and this binary knows version {binary}; it is not written")]

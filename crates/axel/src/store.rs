@@ -30,7 +30,12 @@ pub const GLOBAL_KEY: &str = "p0000000000000000";
 pub const MODEL_DAILY_CAP: usize = 10;
 pub const CAP_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
 /// The refusal of a `forget` with `id`, or of a `remember` with `supersedes`, past the cap.
-pub const CAP_REFUSAL: &str = "limit reached: this chat has hidden or superseded 10 memories in 24 hours. Ask the user to run \"axel-v2 forget <id>\".";
+pub fn cap_refusal() -> String {
+    format!(
+        "limit reached: this chat has hidden or superseded 10 memories in 24 hours. Ask the user to run \"{} forget <id>\".",
+        crate::cmd_name()
+    )
+}
 
 const ORIGIN_KINDS: [&str; 6] = ["archive", "note_file", "capture", "tool", "cli", "legacy"];
 const TIME_SOURCES: [&str; 4] = ["exact", "archive", "observed", "mtime"];
@@ -759,7 +764,7 @@ pub fn model_changes_since(conn: &Connection, session_id: &str, since_ms: i64) -
 
 /// The daily cap (R-1): may this chat's model hide or supersede `more` rows now? False
 /// when that would take the sum of the last 24 hours past `MODEL_DAILY_CAP`; the call is
-/// then refused whole with `CAP_REFUSAL`.
+/// then refused whole with `cap_refusal()`.
 pub fn cap_allows(conn: &Connection, session_id: &str, now_ms: i64, more: usize) -> Result<bool> {
     let (hidden, superseded) = model_changes_since(conn, session_id, now_ms - CAP_WINDOW_MS)?;
     Ok(hidden + superseded + more <= MODEL_DAILY_CAP)

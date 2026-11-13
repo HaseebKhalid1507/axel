@@ -745,7 +745,7 @@ fn forget_now_deletes_only_the_twin_proven_the_same_turn_and_leaves_another_turn
     let asked = run.out.find("Delete 2 memories for good? [y/N]").unwrap_or_else(|| panic!("{}", run.out));
     let left = run
         .out
-        .find("not proven the same turn; left hidden (\"axel-v2 restore mem_cont_other\" brings it back; \"axel-v2 forget --now mem_cont_other\" deletes it too): m:mem_cont_other")
+        .find("not proven the same turn; left hidden (\"axel restore mem_cont_other\" brings it back; \"axel forget --now mem_cont_other\" deletes it too): m:mem_cont_other")
         .unwrap_or_else(|| panic!("{}", run.out));
     assert!(left < asked, "{}", run.out);
     assert!(run.out.contains("Deleted 2 memories for good."), "{}", run.out);
@@ -966,7 +966,7 @@ fn restore_of_a_row_hidden_and_superseded_undoes_the_hide_and_says_how_to_undo_t
     let first = restore_ids(&w.path, &["mem_both"]);
     assert_eq!(w.hidden_by("mem_both"), None);
     assert_eq!(superseded().as_deref(), Some("mem_new"), "the restore of a hide undid a supersede too");
-    assert!(first.out.contains("still superseded by m:mem_new; \"axel-v2 restore mem_both\" again"), "{}", first.out);
+    assert!(first.out.contains("still superseded by m:mem_new; \"axel restore mem_both\" again"), "{}", first.out);
     assert_eq!(w.shadow_mark("mem_both").as_deref(), Some("memory_hidden"), "a superseded row's shadow was unmarked");
     restore_ids(&w.path, &["mem_both"]);
     assert_eq!(superseded(), None);
@@ -1473,7 +1473,7 @@ fn a_kept_archive_that_leaves_out_a_deleted_turn_is_read_again_once() {
         format!("this brings back the turns of ctx-{} a forget tool left out, the forgotten one among them; the turns deleted with forget --now stay out", a.id)
     );
     assert!(kept.out.contains(&format!("ctx-{}: 1 turns left out will be indexed", a.id)), "{}", kept.out);
-    assert!(kept.out.contains(&format!("1 turns of ctx-{} deleted with \"axel-v2 forget --now\" stay out", a.id)), "{}", kept.out);
+    assert!(kept.out.contains(&format!("1 turns of ctx-{} deleted with \"axel forget --now\" stay out", a.id)), "{}", kept.out);
 
     let mut reads = Vec::new();
     for _ in 0..3 {
@@ -1517,7 +1517,7 @@ fn restore_forget_turns_does_not_offer_what_a_cli_mark_leaves_out() {
     let of_b = restore_turns(&world.path(), &format!("ctx-{}", b.id));
     assert_eq!(of_b.code, 0, "{}", of_b.err);
     assert!(of_b.out.contains("leaves out no turn because a forget tool was called; nothing changed."), "{}", of_b.out);
-    assert!(of_b.out.contains(&format!("1 turns of ctx-{} deleted with \"axel-v2 forget --now\" stay out", b.id)), "{}", of_b.out);
+    assert!(of_b.out.contains(&format!("1 turns of ctx-{} deleted with \"axel forget --now\" stay out", b.id)), "{}", of_b.out);
     assert!(!of_b.out.contains("the forgotten one among them"), "{}", of_b.out);
     assert_eq!(dump(world.db(), "SELECT * FROM archive_index ORDER BY rel_name"), before);
 }
@@ -1875,7 +1875,7 @@ fn remember_stores_one_global_cli_row_that_recall_and_the_tool_search_of_any_pro
     // No shadow document (spec 4217-4218).
     assert_eq!(count(w.db(), "SELECT COUNT(*) FROM documents"), 0);
 
-    // `axel-v2 recall` lists it.
+    // `axel recall` lists it.
     let listed = ran("", |t| recall::boot(&w.path, t));
     assert!(listed.out.contains("winter schedule"), "{}", listed.out);
 
@@ -1963,7 +1963,7 @@ fn remember_of_a_text_saved_before_returns_that_row_and_refuses_when_it_is_hidde
     let hidden = axel_cmd(&w.path, &["remember", text]);
     assert_eq!(hidden.status.code(), Some(1));
     let said = String::from_utf8_lossy(&hidden.stderr);
-    assert!(said.contains("stays hidden") && said.contains(&format!("axel-v2 restore {id}")), "{said}");
+    assert!(said.contains("stays hidden") && said.contains(&format!("axel restore {id}")), "{said}");
     assert_eq!(cli_rows(w.db()).len(), 1, "hidden text was saved again");
     assert_eq!(w.hidden_by(&id).as_deref(), Some("cli"));
 }
@@ -1979,7 +1979,7 @@ fn remember_refuses_a_version_1_brain_as_every_other_command_does() {
     assert_eq!(remember.status.code(), Some(1));
     assert_eq!(remember.status.code(), memories.status.code());
     let said = String::from_utf8_lossy(&remember.stderr);
-    assert!(said.contains("this is a version 1 brain"), "{said}");
+    assert!(said.contains("this is the old Axel brain"), "{said}");
     assert_eq!(said, String::from_utf8_lossy(&memories.stderr));
     assert_eq!(std::fs::read(&path).unwrap(), before);
 }
@@ -2138,7 +2138,7 @@ fn a_deleted_turn_continued_by_a_workers_report_is_born_hidden() {
         .query_row("SELECT mem_id FROM memory_ext WHERE hidden_by = 'cli:unproven'", [], |r| r.get(0))
         .unwrap();
     // Round 4, item 2: `status` names the archive and `show ctx-` lists the row by its id.
-    assert!(status.contains(&format!("  in ctx-{:032x} (axel-v2 show ctx-<id> lists them)", 31)), "{status}");
+    assert!(status.contains(&format!("  in ctx-{:032x} (axel show ctx-<id> lists them)", 31)), "{status}");
     assert!(
         shown.out.contains(&format!("      m:{id} · ")) && shown.out.contains(" · Assistant: EVENTFIRST I sent a worker"),
         "{}",
@@ -2309,7 +2309,7 @@ fn forget_now_of_an_archived_row_hides_the_rest_of_its_split_turn() {
     let listed = run.out.find(&format!("m:{second} \u{b7} ")).unwrap_or_else(|| panic!("{}", run.out));
     let asked = run.out.find("Delete 1 memories for good and hide 1 more? [y/N]").unwrap_or_else(|| panic!("{}", run.out));
     assert!(doubt < listed && listed < asked, "{}", run.out);
-    assert!(run.out.contains(&format!("\"axel-v2 restore {second}\" brings it back; \"axel-v2 forget --now {second}\" deletes it once it has been hidden 24 h")), "{}", run.out);
+    assert!(run.out.contains(&format!("\"axel restore {second}\" brings it back; \"axel forget --now {second}\" deletes it once it has been hidden 24 h")), "{}", run.out);
     assert!(run.out.contains("1 archived rows with the prompt of a deleted turn are hidden, as listed above."), "{}", run.out);
     assert!(!world.has_row(&first));
     assert_eq!(visible_with(world.db(), "SPLITSECOND"), 0, "the rest of the deleted turn is visible");

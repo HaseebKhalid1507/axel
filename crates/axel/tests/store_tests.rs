@@ -915,7 +915,7 @@ fn s5_t13_the_daily_cap() {
         put(&brain, &row(&format!("mem_{i:02}"), "note", "tool", &format!("saved row {i}")));
     }
     assert_eq!(store::MODEL_DAILY_CAP, 10);
-    assert!(store::CAP_REFUSAL.starts_with("limit reached: this chat has hidden or superseded 10 memories in 24 hours."));
+    assert!(store::cap_refusal().starts_with("limit reached: this chat has hidden or superseded 10 memories in 24 hours."));
 
     // Ten hides by id from one chat succeed.
     for i in 0..10 {
@@ -1550,7 +1550,7 @@ fn old_remember(path: &Path, words: &[&str]) -> std::process::Output {
 #[test]
 fn the_old_remember_command_and_a_version_1_brain() {
     // The gate in `main` runs before `remember` and refuses a version 1 brain with
-    // `V1Brain` ("axel-v2 does not change it"): that is what "as before" is in this binary.
+    // `V1Brain` ("this Axel does not change it"): that is what "as before" is in this binary.
     // `remember` has no version 1 branch of its own any more: this gate is the only answer.
     let dir = TempDir::new().unwrap();
     let path = dir.path().join("axel.r8");
@@ -1560,7 +1560,7 @@ fn the_old_remember_command_and_a_version_1_brain() {
     let out = old_remember(&path, &["the", "harbour", "office", "opens", "at", "nine", "every", "day"]);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!out.status.success());
-    assert!(stderr.contains("this is a version 1 brain"), "{stderr}");
+    assert!(stderr.contains("this is the old Axel brain"), "{stderr}");
     assert!(!stderr.contains("this brain is version 2"), "{stderr}");
     assert_eq!(file_bytes(&path), before);
 }

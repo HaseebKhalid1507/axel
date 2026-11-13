@@ -2564,7 +2564,7 @@ fn a_brain_of_an_older_shape_degrades_with_its_reason() {
     let mut host = Host::start(Some(Embedder::hashing()), TestHooks::default());
     host.call("initialize", json!({"config": dirs.config("hash")}));
     let text = host.wait_degraded();
-    assert!(text.starts_with("Axel is unavailable: BrainOldShape (the brain was made by an older build of axel-v2"), "{text}");
+    assert!(text.starts_with("Axel is unavailable: BrainOldShape (the brain was made by an older build of Axel"), "{text}");
     assert!(text.contains("Move it aside and make it again"), "{text}");
     assert_eq!(DegradedReason::from_u8(host.status.reason.load(Ordering::SeqCst)), DegradedReason::BrainOldShape);
     assert_eq!(wait_status_file(&dirs, "degraded", Duration::from_secs(5))["reason"], "BrainOldShape");

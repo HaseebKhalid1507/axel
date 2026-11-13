@@ -27,7 +27,7 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     let limit = i64::try_from(args.limit).unwrap_or(i64::MAX);
     let rows = rows_where(&conn, "ORDER BY m.created DESC, m.id LIMIT ?1", [limit])?;
     if rows.is_empty() {
-        writeln!(term.err, "No memories stored yet. Use `axel remember` to add some.")?;
+        writeln!(term.err, "No memories stored yet. Use `{} remember` to add some.", crate::cmd_name())?;
         return Ok(FAILED);
     }
     for row in &rows {

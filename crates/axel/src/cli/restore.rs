@@ -59,7 +59,8 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     if forms != 1 || (args.since.is_some() && !args.by_model) || (args.yes && !args.by_model) {
         writeln!(
             term.err,
-            "give one of: ids (\"axel-v2 restore <id>...\"), \"--by-model --since <date> [--yes]\", \"--forget-turns ctx-<id>\""
+            "give one of: ids (\"{} restore <id>...\"), \"--by-model --since <date> [--yes]\", \"--forget-turns ctx-<id>\"",
+            crate::cmd_name()
         )?;
         return Ok(USAGE);
     }
@@ -120,8 +121,9 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
         if let Some(by) = now.as_ref().and_then(|row| row.superseded_by.as_deref()) {
             writeln!(
                 term.out,
-                "  m:{id} is still superseded by m:{}; \"axel-v2 restore {id}\" again undoes that too.",
-                one(by)
+                "  m:{id} is still superseded by m:{}; \"{cmd} restore {id}\" again undoes that too.",
+                one(by),
+                cmd = crate::cmd_name()
             )?;
         }
     }
@@ -207,7 +209,7 @@ fn by_model(conn: &Connection, since: i64, yes: bool, term: &mut Term) -> Result
                 }
                 Some(model) if model.starts_with("model:") => {}
                 Some(other) if row.hidden_ms.is_some() => {
-                    line.push_str(&format!("; still hidden (by {}: \"axel-v2 restore {}\" undoes that)", one(other), one(&row.id)));
+                    line.push_str(&format!("; still hidden (by {}: \"{} restore {}\" undoes that)", one(other), crate::cmd_name(), one(&row.id)));
                 }
                 _ => {}
             }
@@ -242,7 +244,8 @@ fn forget_turns(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
     // mark. What is said counts them as staying out, never as coming back.
     let staying = if deleted > 0 {
         format!(
-            "{deleted} turns of ctx-{id} deleted with \"axel-v2 forget --now\" stay out: no command brings them back."
+            "{deleted} turns of ctx-{id} deleted with \"{cmd} forget --now\" stay out: no command brings them back.",
+            cmd = crate::cmd_name()
         )
     } else {
         String::new()
@@ -316,7 +319,7 @@ fn forget_turns(conn: &Connection, given: &str, term: &mut Term) -> Result<u8> {
         writeln!(term.out, "Neighbouring archives of this chat that still leave turns out:")?;
         for (other, n) in &near {
             let other = one(other);
-            writeln!(term.out, "  ctx-{other}: {n} turns (\"axel-v2 restore --forget-turns ctx-{other}\")")?;
+            writeln!(term.out, "  ctx-{other}: {n} turns (\"{cmd} restore --forget-turns ctx-{other}\")", cmd = crate::cmd_name())?;
         }
     }
     Ok(OK)

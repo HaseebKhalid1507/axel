@@ -93,7 +93,8 @@ pub fn run_with(args: &Args, path: &Path, term: &mut Term) -> Result<u8> {
     } else if kinds.contains(&"learning") {
         writeln!(
             term.out,
-            "Archives sealed during the pause stay unindexed; \"axel-v2 resume {shown} learning --catch-up\" indexes them."
+            "Archives sealed during the pause stay unindexed; \"{cmd} resume {shown} learning --catch-up\" indexes them.",
+            cmd = crate::cmd_name()
         )?;
     }
     Ok(OK)
