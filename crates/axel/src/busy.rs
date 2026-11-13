@@ -7,6 +7,16 @@
 //! that it must stay inside. [`set`] installs a handler with the same steps that stops when
 //! the wall clock says the wait is over.
 //!
+//! What one wait is. SQLite calls the handler with a count that is 0 at the first call and
+//! goes up by one with each call after; it puts the count back to 0 only at the start of a
+//! step and at the end of a prepare, not at the start of a prepare. So a count that follows
+//! the previous one is not proof of the same wait: a prepare that waits after a step that
+//! waited and got its lock goes on with the step's count. A call therefore goes on with the
+//! current wait only when its count is the previous one plus one AND it comes within
+//! [`GAP`] of the previous call's return (a retry of the same lock comes at once); anything
+//! else starts a new wait with the whole budget. The state is the connection's own, so two
+//! connections waiting on one thread do not share it.
+//!
 //! The wait is kept as the connection's client data, so [`get`] answers what `PRAGMA
 //! busy_timeout` answered before (that pragma now says 0 for a connection set here).
 
@@ -19,69 +29,169 @@ use rusqlite::{ffi, Connection};
 /// SQLite's own steps (`sqliteDefaultBusyCallback`), in milliseconds; the last repeats.
 const STEPS_MS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
 
-const KEY: &CStr = c"axel.busy_ms";
+/// The longest time between a call's return and the next call of the same wait.
+pub const GAP: Duration = Duration::from_millis(50);
 
-thread_local! {
-    /// When the current wait began. A busy handler runs on the thread of the call that
-    /// waits, and one call waits for one lock at a time.
-    static SINCE: Cell<Option<Instant>> = const { Cell::new(None) };
+const KEY: &CStr = c"axel.busy";
+
+/// One connection's wait and the state of its current wait. Owned by the connection's
+/// client data, which drops it when the connection closes or the entry is replaced.
+#[derive(Debug)]
+pub struct Wait {
+    limit: Duration,
+    /// When the current wait began.
+    since: Cell<Option<Instant>>,
+    /// The count of the previous call and the instant it returned.
+    last: Cell<Option<(c_int, Instant)>>,
 }
 
-/// `count` is 0 at the first call of a wait and goes up by one with each call after.
-unsafe extern "C" fn wait_for_lock(arg: *mut c_void, count: c_int) -> c_int {
-    let limit = Duration::from_millis(arg as usize as u64);
-    let now = Instant::now();
-    let since = SINCE
-        .try_with(|since| match since.get() {
-            Some(start) if count > 0 => start,
-            _ => {
-                since.set(Some(now));
-                now
-            }
-        })
-        .unwrap_or(now);
-    let left = limit.saturating_sub(now.duration_since(since));
-    if left.is_zero() {
-        return 0;
+impl Wait {
+    pub fn new(limit: Duration) -> Self {
+        Self { limit, since: Cell::new(None), last: Cell::new(None) }
     }
-    let step = STEPS_MS[usize::try_from(count).unwrap_or(0).min(STEPS_MS.len() - 1)];
-    std::thread::sleep(Duration::from_millis(step).min(left));
-    1
-}
 
-/// The connection waits up to `wait` (wall clock) for a lock; zero: not at all.
-pub fn set(conn: &Connection, wait: Duration) -> rusqlite::Result<()> {
-    let ms = usize::try_from(wait.as_millis()).unwrap_or(usize::MAX).min(i32::MAX as usize);
-    // SAFETY: the handle is this open connection's. The handler's argument is the wait
-    // itself, carried in the pointer's value: nothing is pointed at, nothing is freed. The
-    // client data is the same number under a key with static lifetime, with no destructor.
-    let rc = unsafe {
-        let db = conn.handle();
-        let handler: Option<unsafe extern "C" fn(*mut c_void, c_int) -> c_int> =
-            if ms == 0 { None } else { Some(wait_for_lock) };
-        let rc = ffi::sqlite3_busy_handler(db, handler, ms as *mut c_void);
-        if rc == ffi::SQLITE_OK {
-            ffi::sqlite3_set_clientdata(db, KEY.as_ptr(), ms as *mut c_void, None)
-        } else {
-            rc
+    /// The call with this count, at `now`: how long to sleep before the next try, or `None`
+    /// to give up.
+    pub fn sleep_for(&self, count: c_int, now: Instant) -> Option<Duration> {
+        let goes_on = matches!(
+            (self.since.get(), self.last.get()),
+            (Some(_), Some((prev, at))) if count > 0
+                && Some(count) == prev.checked_add(1)
+                && now.saturating_duration_since(at) <= GAP
+        );
+        if !goes_on {
+            self.since.set(Some(now));
         }
-    };
-    if rc == ffi::SQLITE_OK {
-        Ok(())
-    } else {
-        Err(rusqlite::Error::SqliteFailure(ffi::Error::new(rc), Some("busy handler".into())))
+        let since = self.since.get().unwrap_or(now);
+        let left = self.limit.saturating_sub(now.saturating_duration_since(since));
+        if left.is_zero() {
+            self.last.set(None);
+            return None;
+        }
+        let step = STEPS_MS[usize::try_from(count).unwrap_or(0).min(STEPS_MS.len() - 1)];
+        Some(Duration::from_millis(step).min(left))
+    }
+
+    /// The call with this count returned at `now`, after its sleep.
+    pub fn returned(&self, count: c_int, now: Instant) {
+        self.last.set(Some((count, now)));
     }
 }
 
-/// The wait this connection has: SQLite's own timeout when one was set after [`set`] (a
-/// non-zero `PRAGMA busy_timeout` means SQLite's handler is the one installed), else the
-/// wait [`set`] gave it.
+unsafe extern "C" fn wait_for_lock(arg: *mut c_void, count: c_int) -> c_int {
+    // SAFETY: `arg` is the `Wait` the connection's client data owns (`set`); it lives until
+    // the entry is replaced or the connection closes, and `set` installs the handler that
+    // points at the new one before any other call on the connection.
+    let wait = unsafe { &*(arg as *const Wait) };
+    match wait.sleep_for(count, Instant::now()) {
+        Some(step) => {
+            std::thread::sleep(step);
+            wait.returned(count, Instant::now());
+            1
+        }
+        None => 0,
+    }
+}
+
+unsafe extern "C" fn drop_wait(p: *mut c_void) {
+    // SAFETY: `p` came from `Box::into_raw` in `set` and SQLite calls this once for it.
+    drop(unsafe { Box::from_raw(p as *mut Wait) });
+}
+
+fn failure(rc: c_int) -> rusqlite::Error {
+    rusqlite::Error::SqliteFailure(ffi::Error::new(rc), Some("busy handler".into()))
+}
+
+/// The connection waits up to `wait` (wall clock) for a lock; zero: not at all. On an error
+/// the connection is left with no wait at all, and [`get`] says zero.
+pub fn set(conn: &Connection, wait: Duration) -> rusqlite::Result<()> {
+    // SAFETY: the handle is this open connection's, used on this thread only (`Connection`
+    // is not `Sync`), so nothing runs on it between the calls below. The client data is set
+    // first: replacing an entry frees the old `Wait` while the old handler still points at
+    // it, and the handler is moved to the new one at once. A failed `set_clientdata`
+    // (SQLITE_NOMEM, only for a key not yet there) has dropped the new `Wait` itself.
+    unsafe {
+        let db = conn.handle();
+        if wait.is_zero() {
+            ffi::sqlite3_busy_handler(db, None, std::ptr::null_mut());
+            let rc = ffi::sqlite3_set_clientdata(db, KEY.as_ptr(), std::ptr::null_mut(), None);
+            return if rc == ffi::SQLITE_OK { Ok(()) } else { Err(failure(rc)) };
+        }
+        let p = Box::into_raw(Box::new(Wait::new(wait))) as *mut c_void;
+        let rc = ffi::sqlite3_set_clientdata(db, KEY.as_ptr(), p, Some(drop_wait));
+        if rc != ffi::SQLITE_OK {
+            ffi::sqlite3_busy_handler(db, None, std::ptr::null_mut());
+            return Err(failure(rc));
+        }
+        let rc = ffi::sqlite3_busy_handler(db, Some(wait_for_lock), p);
+        if rc != ffi::SQLITE_OK {
+            ffi::sqlite3_busy_handler(db, None, std::ptr::null_mut());
+            ffi::sqlite3_set_clientdata(db, KEY.as_ptr(), std::ptr::null_mut(), None);
+            return Err(failure(rc));
+        }
+    }
+    Ok(())
+}
+
+/// The wait this connection has: SQLite's own timeout when one is in force (a non-zero
+/// `PRAGMA busy_timeout` means SQLite's handler is the one installed), else the wait [`set`]
+/// gave it, else zero.
 pub fn get(conn: &Connection) -> Duration {
     let pragma: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap_or(0);
     if pragma > 0 {
         return Duration::from_millis(u64::try_from(pragma).unwrap_or(0));
     }
-    // SAFETY: reads the client data `set` stored, a number in a pointer's value.
-    let ms = unsafe { ffi::sqlite3_get_clientdata(conn.handle(), KEY.as_ptr()) } as usize;
-    Duration::from_millis(ms as u64)
+    // SAFETY: the entry, when there is one, is the `Wait` `set` stored, alive while the
+    // connection is and `conn` is borrowed.
+    unsafe {
+        let p = ffi::sqlite3_get_clientdata(conn.handle(), KEY.as_ptr()) as *const Wait;
+        p.as_ref().map_or(Duration::ZERO, |w| w.limit)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MS: Duration = Duration::from_millis(1);
+
+    #[test]
+    fn a_count_that_follows_at_once_goes_on_with_the_wait() {
+        let w = Wait::new(100 * MS);
+        let t = Instant::now();
+        assert_eq!(w.sleep_for(0, t), Some(MS));
+        w.returned(0, t + 60 * MS);
+        assert_eq!(w.sleep_for(1, t + 61 * MS), Some(2 * MS));
+        w.returned(1, t + 99 * MS);
+        assert_eq!(w.sleep_for(2, t + 100 * MS), None, "the budget is spent");
+    }
+
+    #[test]
+    fn a_count_that_does_not_follow_gets_the_whole_wait_again() {
+        let w = Wait::new(100 * MS);
+        let t = Instant::now();
+        w.sleep_for(0, t);
+        w.returned(5, t + 99 * MS);
+        // A lower count (a reset, or another statement) is a new wait.
+        assert_eq!(w.sleep_for(3, t + 100 * MS), Some(10 * MS));
+        // So is the count after a give-up.
+        let w = Wait::new(10 * MS);
+        w.sleep_for(0, t);
+        w.returned(0, t + 9 * MS);
+        assert_eq!(w.sleep_for(1, t + 10 * MS), None);
+        assert_eq!(w.sleep_for(2, t + 11 * MS), Some(5 * MS));
+    }
+
+    #[test]
+    fn a_following_count_that_comes_late_is_a_new_wait() {
+        // A step waited, got its lock, and a prepare after it waits with the next count.
+        let w = Wait::new(100 * MS);
+        let t = Instant::now();
+        w.sleep_for(0, t);
+        w.returned(7, t + 95 * MS);
+        let late = t + 95 * MS + GAP + MS;
+        assert_eq!(w.sleep_for(8, late), Some(25 * MS), "a new wait, not one already spent");
+        w.returned(8, late + 100 * MS);
+        assert_eq!(w.sleep_for(9, late + 100 * MS), None);
+    }
 }
