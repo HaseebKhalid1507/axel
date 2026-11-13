@@ -581,9 +581,12 @@ fn s8_t06_a_note_file_with_an_api_key_is_indexed_whole_and_shown_with_the_value_
     std::fs::write(&file, &text).unwrap();
     let mut ext = Ext::start(&w, "1");
     w.wait_ready("the extension is ready");
+    // The note sync stores the path under the source's resolved folder (`docsync::plan`
+    // canonicalizes each root): on macOS the temp folder `/var/...` is `/private/var/...`.
+    let stored_path = std::fs::canonicalize(&file).unwrap();
     let stored: String = wait_for("the note file is indexed", || {
         w.look()
-            .query_row("SELECT content FROM documents WHERE file_path = ?1", [file.to_string_lossy()], |r| r.get(0))
+            .query_row("SELECT content FROM documents WHERE file_path = ?1", [stored_path.to_string_lossy()], |r| r.get(0))
             .ok()
     });
     assert_eq!(stored, text, "the note file is indexed whole");
