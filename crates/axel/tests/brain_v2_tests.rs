@@ -775,8 +775,8 @@ fn t05_connect_refuses_version_0_and_begin_write_sees_a_changed_version() {
     assert_eq!(count(&conn, "PRAGMA synchronous"), 1, "Indexer: NORMAL");
     assert_eq!(count(&brain_v2::connect(&path, Role::Front).unwrap(), "PRAGMA synchronous"), 2, "Front: FULL");
     assert_eq!(count(&brain_v2::connect(&path, Role::Cli).unwrap(), "PRAGMA synchronous"), 2, "Cli: FULL");
-    assert_eq!(count(&brain_v2::connect(&path, Role::Front).unwrap(), "PRAGMA busy_timeout"), 1_500);
-    assert_eq!(count(&conn, "PRAGMA busy_timeout"), 5_000);
+    assert_eq!(axel::busy::get(&brain_v2::connect(&path, Role::Front).unwrap()), Duration::from_millis(1_500));
+    assert_eq!(axel::busy::get(&conn), Duration::from_millis(5_000));
 
     // A write works while the version is ours.
     brain_v2::begin_write(&conn).unwrap();
@@ -1766,4 +1766,44 @@ fn the_mark_key_in_another_column_order_is_accepted() {
     }
     assert!(brain_v2::connect(&path, Role::Cli).is_ok());
     assert!(brain_v2::open_v2(&path, &opts(false)).is_ok());
+}
+
+/// `busy::set`: a held write lock is waited for as long as the wall clock says, and given
+/// up at once with no wait; `busy::get` answers the wait set.
+#[test]
+fn a_busy_wait_lasts_its_time_on_the_wall_clock() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("w.db");
+    let holder = Connection::open(&path).unwrap();
+    holder.execute_batch("PRAGMA journal_mode = WAL; CREATE TABLE t(x); BEGIN IMMEDIATE;").unwrap();
+    let conn = Connection::open(&path).unwrap();
+
+    axel::busy::set(&conn, Duration::from_millis(300)).unwrap();
+    assert_eq!(axel::busy::get(&conn), Duration::from_millis(300));
+    assert_eq!(count(&conn, "PRAGMA busy_timeout"), 0, "SQLite's own handler is replaced");
+    let start = Instant::now();
+    assert!(conn.execute_batch("BEGIN IMMEDIATE").is_err());
+    let took = start.elapsed();
+    assert!(took >= Duration::from_millis(300) && took < Duration::from_millis(600), "{took:?}");
+
+    axel::busy::set(&conn, Duration::ZERO).unwrap();
+    assert_eq!(axel::busy::get(&conn), Duration::ZERO);
+    let start = Instant::now();
+    assert!(conn.execute_batch("BEGIN IMMEDIATE").is_err());
+    assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
+
+    // SQLite's own timeout set afterwards is the one `get` reports.
+    conn.busy_timeout(Duration::from_millis(250)).unwrap();
+    assert_eq!(axel::busy::get(&conn), Duration::from_millis(250));
+
+    // A lock let go during the wait is taken.
+    axel::busy::set(&conn, Duration::from_secs(5)).unwrap();
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(200));
+        holder.execute_batch("ROLLBACK").unwrap();
+    });
+    let start = Instant::now();
+    conn.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
+    assert!(start.elapsed() < Duration::from_secs(2), "{:?}", start.elapsed());
+    t.join().unwrap();
 }

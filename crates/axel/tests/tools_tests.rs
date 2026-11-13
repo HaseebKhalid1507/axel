@@ -1999,7 +1999,7 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
     let id = lab.remember(&s, "the little egret fishes in the shallow lagoon at noon");
     // The front's own wait is 1.5 s; here the mark may wait longer, so that it alone uses
     // the budget.
-    lab.st.conn.as_ref().unwrap().busy_timeout(Duration::from_secs(4)).unwrap();
+    axel::busy::set(lab.st.conn.as_ref().unwrap(), Duration::from_secs(4)).unwrap();
     let (held_tx, held_rx) = mpsc::channel();
     let brain = lab.ext.brain.clone();
     let holder = std::thread::spawn(move || {
@@ -2021,8 +2021,8 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
         count_id(lab.conn(), "SELECT COUNT(*) FROM forgotten_turns WHERE source = 'call' AND logical = ?1", &project::logical("S"))
     };
     assert_eq!(marks(&lab), 1, "the mark stands");
-    let wait: i64 = lab.st.conn.as_ref().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap();
-    assert_eq!(wait, 4_000, "the connection's own wait was not put back");
+    let wait = axel::busy::get(lab.st.conn.as_ref().unwrap());
+    assert_eq!(wait, Duration::from_secs(4), "the connection's own wait was not put back");
 
     let answer = lab.ok("forget", json!({ "id": format!("m:{id}") }), &s);
     assert!(answer.starts_with(&format!("Hidden m:{id}.")), "{answer}");
@@ -2033,7 +2033,7 @@ fn r4_a_forget_whose_mark_used_the_budget_answers_busy_before_the_hide_and_the_r
 
 /// The front connection's wait for the write lock, in ms.
 fn wait_of(st: &FrontState) -> i64 {
-    st.conn.as_ref().unwrap().query_row("PRAGMA busy_timeout", [], |r| r.get(0)).unwrap()
+    i64::try_from(axel::busy::get(st.conn.as_ref().unwrap()).as_millis()).unwrap()
 }
 
 /// One call as the rpc thread forwards it, with its `Carry`.

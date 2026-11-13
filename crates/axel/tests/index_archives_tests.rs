@@ -1603,7 +1603,7 @@ fn t34a_a_reader_blocks_the_checkpoint_the_mark_stays_and_the_next_idle_turn_fin
     assert!(purge_pending(run.db()), "the mark was removed though the log could not be truncated");
     assert!(in_file(&env.wal(), WAL_MARKER) > 0, "the reader did not hold the log: the test proves nothing");
     assert!(waited < Duration::from_secs(2), "a blocked checkpoint held the indexer for {waited:?}");
-    assert_eq!(count(run.db(), "PRAGMA busy_timeout"), 5_000, "the indexer's busy timeout was not put back");
+    assert_eq!(axel::busy::get(run.db()), Duration::from_millis(5_000), "the indexer's busy timeout was not put back");
     assert_eq!(run.errors(), 0);
 
     // The reader is done: the next idle turn finishes the work.
@@ -2717,7 +2717,7 @@ fn a_writer_blocks_the_checkpoint_and_that_is_not_a_write_error() {
     run.idle_turn();
     assert!(purge_pending(run.db()), "the mark went though another connection held the write lock");
     assert_eq!(run.errors(), 0, "a blocked checkpoint was counted as a write error");
-    assert_eq!(count(run.db(), "PRAGMA busy_timeout"), 5_000);
+    assert_eq!(axel::busy::get(run.db()), Duration::from_millis(5_000));
     writer.execute_batch("ROLLBACK").unwrap();
     run.idle_turn();
     assert!(!purge_pending(run.db()));

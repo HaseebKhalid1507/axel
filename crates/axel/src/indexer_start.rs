@@ -163,7 +163,7 @@ fn recorded_base_unopened(path: &Path) -> Result<Option<String>> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(Duration::from_millis(1_000))?;
+    crate::busy::set(&conn, Duration::from_millis(1_000))?;
     let has_table: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'context_data')",
         [],

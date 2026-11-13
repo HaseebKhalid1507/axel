@@ -14,6 +14,7 @@ pub mod retrieval;
 // v2 (spec, "Shape of the process"): one owning commit per file.
 pub mod ext;
 pub mod brain_v2;
+pub mod busy;
 pub mod store;
 pub mod project;
 pub mod archive;

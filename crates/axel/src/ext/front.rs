@@ -304,8 +304,8 @@ impl<S: Deref<Target = FrontState>> WaitBack<S> {
     /// `to` is given the connection's own wait and returns the one to use meanwhile.
     pub fn shorten(st: S, to: impl FnOnce(Duration) -> Duration) -> rusqlite::Result<Self> {
         let Some(conn) = st.conn.as_ref() else { return Ok(Self { st, waits: None }) };
-        let waits = Duration::from_millis(conn.query_row("PRAGMA busy_timeout", [], |r| r.get::<_, u64>(0))?);
-        conn.busy_timeout(to(waits))?;
+        let waits = crate::busy::get(conn);
+        crate::busy::set(conn, to(waits))?;
         Ok(Self { st, waits: Some(waits) })
     }
 }
@@ -326,7 +326,7 @@ impl<S: DerefMut<Target = FrontState>> DerefMut for WaitBack<S> {
 impl<S: Deref<Target = FrontState>> Drop for WaitBack<S> {
     fn drop(&mut self) {
         if let (Some(waits), Some(conn)) = (self.waits, self.st.conn.as_ref()) {
-            let _ = conn.busy_timeout(waits);
+            let _ = crate::busy::set(conn, waits);
         }
     }
 }
@@ -571,7 +571,7 @@ fn last_try_forget_marks(st: &mut FrontState) {
         return;
     }
     if is_ready(st) && connect(st) {
-        let waits = st.conn.as_ref().is_some_and(|conn| conn.busy_timeout(LAST_TRY_WAIT).is_ok());
+        let waits = st.conn.as_ref().is_some_and(|conn| crate::busy::set(conn, LAST_TRY_WAIT).is_ok());
         if waits {
             retry_written(st);
         }

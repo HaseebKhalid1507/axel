@@ -91,8 +91,8 @@ pub fn checkpoint_after_purge_then(ctx: &mut IndexerCtx, between: impl FnOnce())
     // indexer) and keeps every other writer out while it waits, and an idle turn comes
     // every second. So it waits 100 ms here, and the connection's own timeout is put back
     // before anything else runs.
-    let usual: i64 = conn.query_row("PRAGMA busy_timeout", [], |r| r.get(0))?;
-    conn.busy_timeout(Duration::from_millis(CHECKPOINT_WAIT_MS))?;
+    let usual = crate::busy::get(conn);
+    crate::busy::set(conn, Duration::from_millis(CHECKPOINT_WAIT_MS))?;
     let answer = conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| r.get::<_, i64>(0));
     // RULING: wave4 R-13 item 3. A busy answer is "blocked", in whichever form it comes:
     // the pragma's row with `busy` = 1, an error that says busy or locked, or the lock of
@@ -118,7 +118,7 @@ pub fn checkpoint_after_purge_then(ctx: &mut IndexerCtx, between: impl FnOnce())
             e => Err(e),
         },
     };
-    conn.busy_timeout(Duration::from_millis(usual.max(0) as u64))?;
+    crate::busy::set(conn, usual)?;
     done
 }
 

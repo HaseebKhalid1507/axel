@@ -256,7 +256,7 @@ fn open_read_only(path: &Path, real: &Path, read_only: bool) -> Result<Connectio
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(damaged)?;
-    conn.busy_timeout(Duration::from_secs(5))?;
+    crate::busy::set(&conn, Duration::from_secs(5))?;
     Ok(conn)
 }
 

@@ -817,7 +817,7 @@ fn describe_existing(dest: &Path) -> Option<String> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .ok()?;
-    conn.busy_timeout(Duration::from_millis(1_000)).ok()?;
+    crate::busy::set(&conn, Duration::from_millis(1_000)).ok()?;
     let version: i64 = conn
         .query_row("SELECT json_extract(value, '$.schema_version') FROM brain_meta WHERE key = 'meta'", [], |r| {
             r.get(0)
@@ -851,7 +851,7 @@ fn status_age_ms(dest: &Path) -> Res<Option<i64>> {
         Ok(c) => c,
         Err(e) => return Err(cannot(e.to_string())),
     };
-    let _ = conn.busy_timeout(Duration::from_millis(1_000));
+    let _ = crate::busy::set(&conn, Duration::from_millis(1_000));
     let there = match has_table(&conn, "main", "context_data") {
         Ok(there) => there,
         // Not a database: no extension can be running on it.
@@ -1872,7 +1872,7 @@ fn verify_steps(
         file_uri(&dest, "mode=ro"),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    dst.busy_timeout(Duration::from_secs(5))?;
+    crate::busy::set(&dst, Duration::from_secs(5))?;
     dst.execute_batch("PRAGMA query_only=ON")?;
 
     let mut items = Items { list: Vec::new(), failed: false };

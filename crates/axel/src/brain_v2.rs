@@ -146,7 +146,7 @@ fn peek(path: &Path) -> Result<Peek> {
     )
     .map_err(damaged)?;
     // Another process may be creating or recovering the file at this moment (finding 8).
-    conn.busy_timeout(Duration::from_secs(5))?;
+    crate::busy::set(&conn, Duration::from_secs(5))?;
     let version = user_version(&conn).map_err(damaged)?;
     // `open_v2` and `require_v2` look here first, before anything is written.
     if version == LATEST {
@@ -306,7 +306,7 @@ fn connect_raw(path: &Path, role: Role, check: bool, record: bool) -> Result<Con
         Role::Front => (1_500, "FULL"),
         Role::Cli => (5_000, "FULL"),
     };
-    conn.busy_timeout(Duration::from_millis(busy_ms))?;
+    crate::busy::set(&conn, Duration::from_millis(busy_ms))?;
     if check && user_version(&conn).map_err(damaged)? != LATEST {
         return Err(AxelError::BrainNotReady);
     }

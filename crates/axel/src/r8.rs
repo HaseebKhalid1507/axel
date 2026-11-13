@@ -133,7 +133,7 @@ impl Brain {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
         }
         let conn = Connection::open(path)?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        crate::busy::set(&conn, std::time::Duration::from_secs(5))?;
         // Two connections that switch an empty file to WAL at the same moment: one of them
         // gets `busy` at once, without the timeout. It asks again.
         let start = std::time::Instant::now();
