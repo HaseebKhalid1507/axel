@@ -4,7 +4,8 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Portable agent intelligence — search, memory, session awareness in one .r8 file"
+repository.workspace = true
+description = "One local brain for Synaps: recall, memory and search tools, and a project forum, in one SQLite file"
 
 [[bin]]
 name = "axel"

@@ -1,3 +1,5 @@
+> Historical: this describes the pre-0.1.0 design (the first Axel, axel.r8), not the current one.
+
 # Axel — Architectural Decisions
 
 ## Decision 1: ONNX Model Storage

@@ -1,4 +1,6 @@
 #!/bin/bash
+# Historical (pre-0.1.0): targets the old brain axel.r8, which 0.1.0 refuses to open.
+# 0.1.0 indexes the folders listed in ~/.config/axel/sources.toml by itself.
 # Incrementally sync all 6 jawz-search sources into the Axel brain.
 # Re-indexes only files whose mtime is newer than indexed_at, and prunes
 # DB entries whose file_path no longer exists.
