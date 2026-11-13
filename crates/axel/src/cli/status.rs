@@ -327,38 +327,83 @@ pub(crate) fn pid_alive(pid: u32) -> bool {
 /// Field 22 of `/proc/<pid>/stat`: the clock ticks after boot at which the process started.
 /// It never changes while the process lives, and no wall clock goes into it. `None` where
 /// there is no `/proc` (macOS) or it cannot be read.
+#[cfg(target_os = "linux")]
 fn start_ticks_of(path: &str) -> Option<u64> {
     let stat = std::fs::read_to_string(path).ok()?;
     // Field 2 is `(comm)`, which may hold spaces and `)`: count from the last `)`.
     stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19)).and_then(|t| t.parse().ok())
 }
 
-/// This process's start ticks, for its status file (`ext/server.rs`). Read once.
+/// The start of process `pid`: a number fixed when it started, that never changes while it
+/// lives. Linux: field 22 of `/proc/<pid>/stat`, clock ticks after boot. macOS (no `/proc`):
+/// the start time `proc_pidinfo(PROC_PIDTBSDINFO)` gives, in microseconds since the epoch,
+/// recorded by the kernel at the start and not moved by a later clock step. `None` when it
+/// cannot be read (no such process, or another user's on macOS).
+#[cfg(target_os = "linux")]
+pub fn process_start(pid: u32) -> Option<u64> {
+    start_ticks_of(&format!("/proc/{pid}/stat"))
+}
+
+#[cfg(target_os = "macos")]
+pub fn process_start(pid: u32) -> Option<u64> {
+    let pid = libc::c_int::try_from(pid).ok()?;
+    let size = libc::c_int::try_from(std::mem::size_of::<libc::proc_bsdinfo>()).ok()?;
+    // SAFETY: `proc_bsdinfo` is plain integers, so all zeroes is a valid value; the kernel
+    // writes at most `size` bytes into it and returns how many it wrote.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let wrote = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+    };
+    if wrote != size {
+        return None;
+    }
+    info.pbi_start_tvsec.checked_mul(1_000_000)?.checked_add(info.pbi_start_tvusec)
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+pub fn process_start(_pid: u32) -> Option<u64> {
+    None
+}
+
+/// This process's start (`process_start`), for its status file (`ext/server.rs`), under the
+/// key `start_ticks`. Read once.
 // RULING: v2 c18a review, item 5.
 pub fn own_start_ticks() -> Option<u64> {
     static TICKS: std::sync::OnceLock<Option<u64>> = std::sync::OnceLock::new();
-    *TICKS.get_or_init(|| start_ticks_of("/proc/self/stat"))
+    *TICKS.get_or_init(|| process_start(std::process::id()))
 }
 
 /// The process now holding `pid` is not the one that wrote the file. With the file's
-/// `start_ticks` and a readable `/proc/<pid>/stat`: they differ. Otherwise (an older
-/// extension wrote the file, or there is no `/proc`): `started_after`.
+/// `start_ticks` and a readable start of `pid`: they differ. Otherwise (an older extension
+/// wrote the file, or the start cannot be read): `started_after`.
 // RULING: v2 c18a review, item 5. Ticks, not the wall clock: a clock stepped forward after
 // the extension started moves the start `btime` gives, not the ticks.
 fn pid_reused(pid: u32, body: &Value) -> bool {
-    match (body["start_ticks"].as_u64(), start_ticks_of(&format!("/proc/{pid}/stat"))) {
+    match (body["start_ticks"].as_u64(), process_start(pid)) {
         (Some(written), Some(now)) => written != now,
         _ => body["started_ms"].as_i64().is_some_and(|started| started_after(pid, started)),
     }
 }
 
+/// The file is written after the process starts; Linux's `btime` is whole seconds.
+const SLACK_MS: i64 = 2_000;
+
+/// RULING: wave 5 fix round of 21, finding 7: the process now holding `pid` started after
+/// the file's `started_ms`, so it is another process. macOS: its start time in ms.
+/// When it cannot be read, false.
+#[cfg(target_os = "macos")]
+fn started_after(pid: u32, started_ms: i64) -> bool {
+    process_start(pid)
+        .and_then(|us| i64::try_from(us / 1000).ok())
+        .is_some_and(|start_ms| start_ms > started_ms + SLACK_MS)
+}
+
 /// RULING: wave 5 fix round of 21, finding 7: the process now holding `pid` started after
 /// the file's `started_ms`, so it is another process (Linux: `/proc/<pid>/stat` field 22,
 /// clock ticks after `btime`). Elsewhere, or when it cannot be read, false.
+#[cfg(not(target_os = "macos"))]
 fn started_after(pid: u32, started_ms: i64) -> bool {
-    // `btime` is whole seconds, and the file is written after the process starts.
-    const SLACK_MS: i64 = 2_000;
-    let Some(ticks) = start_ticks_of(&format!("/proc/{pid}/stat")).and_then(|t| i64::try_from(t).ok()) else {
+    let Some(ticks) = process_start(pid).and_then(|t| i64::try_from(t).ok()) else {
         return false;
     };
     let Some(btime) = std::fs::read_to_string("/proc/stat").ok().and_then(|s| {

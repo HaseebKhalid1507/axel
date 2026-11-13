@@ -1959,7 +1959,8 @@ fn r3_forget_of_a_chat_filed_elsewhere_hides_only_global_rows_and_still_marks_th
 }
 
 // RULING: v2 c18a review, item 5: the status file carries the process's own start ticks
-// (`/proc/self/stat` field 22), which `status` compares; `null` where there is no `/proc`.
+// (`/proc/self/stat` field 22; on macOS the start time `proc_pidinfo` gives), which `status`
+// compares.
 #[test]
 fn r5_the_status_file_carries_the_process_start_ticks() {
     let host = Host::ready(TestHooks::default());
@@ -1970,12 +1971,20 @@ fn r5_the_status_file_carries_the_process_start_ticks() {
         std::thread::sleep(Duration::from_millis(20));
     }
     let body: Value = serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
-    let own = std::fs::read_to_string("/proc/self/stat")
-        .ok()
-        .and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19)?.parse::<u64>().ok()));
-    match own {
-        Some(ticks) => assert_eq!(body["start_ticks"], json!(ticks), "{body}"),
-        None => assert_eq!(body["start_ticks"], Value::Null, "{body}"),
+    #[cfg(target_os = "linux")]
+    {
+        let own = std::fs::read_to_string("/proc/self/stat")
+            .ok()
+            .and_then(|s| s.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().nth(19)?.parse::<u64>().ok()));
+        assert_eq!(body["start_ticks"], json!(own.expect("/proc/self/stat")), "{body}");
+    }
+    // macOS: this process's start in microseconds since the epoch: before now, and not
+    // older than this test binary could be.
+    #[cfg(target_os = "macos")]
+    {
+        let us = body["start_ticks"].as_u64().unwrap_or_else(|| panic!("{body}"));
+        let now_us = u64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_micros()).unwrap();
+        assert!(us <= now_us && now_us - us < 3_600_000_000, "{us} vs now {now_us}");
     }
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }

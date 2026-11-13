@@ -821,10 +821,17 @@ fn every_entry_point_but_model_fetch_leaves_the_process_offline() {
 
 // ── The process by its start ticks (RULING: v2 c18a review, item 5) ─────────
 
-/// Field 22 of `/proc/<pid>/stat`; `None` where there is no `/proc`.
+/// Linux: field 22 of `/proc/<pid>/stat`, read here on its own. macOS has no `/proc`: the
+/// product's own reading (`proc_pidinfo`), whose value `r5_…` in `tools_tests` checks.
+#[cfg(target_os = "linux")]
 fn start_ticks(pid: u32) -> Option<u64> {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     stat.rsplit_once(')')?.1.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn start_ticks(pid: u32) -> Option<u64> {
+    axel::cli::status::process_start(pid)
 }
 
 /// A status file of `pid` that says `ready`, with these start ticks and `started_ms`.
@@ -841,12 +848,7 @@ fn ticked_status_file(dir: &Path, pid: u32, ticks: Option<u64>, started_ms: i64)
 #[test]
 fn a_live_extension_is_known_by_its_start_ticks_after_the_wall_clock_stepped() {
     let mut child = Command::new("sleep").arg("30").spawn().unwrap();
-    let Some(ticks) = start_ticks(child.id()) else {
-        // No `/proc` (macOS): the wall-clock test of finding 7 is all there is.
-        let _ = child.kill();
-        let _ = child.wait();
-        return;
-    };
+    let ticks = start_ticks(child.id()).expect("the child's start");
     let dir = TempDir::new().unwrap();
     let path = new_brain(&dir);
     ticked_status_file(dir.path(), child.id(), Some(ticks), now_ms() - DAY_MS);
