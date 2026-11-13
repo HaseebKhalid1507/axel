@@ -1,4 +1,4 @@
-#[cfg(not(unix))] compile_error!("axel v2 builds on Linux and macOS only");
+#[cfg(not(unix))] compile_error!("axel builds on Linux and macOS only");
 pub mod r8;
 pub mod error;
 pub mod config;

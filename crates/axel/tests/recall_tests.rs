@@ -1027,7 +1027,7 @@ fn t09_the_block_has_its_limits_its_frame_and_one_label_per_item() {
         ),
         (
             pick(Origin::Legacy, "mem_ee", "m:mem_ee", "events", "", Some(at(2025, 3, 1)), "old", "t"),
-            "saved before v2, 2025-03-01, m:mem_ee".to_string(),
+            "from the old Axel brain, 2025-03-01, m:mem_ee".to_string(),
         ),
         (
             pick(Origin::Cli, "mem_ff", "m:mem_ff", "events", GLOBAL_KEY, Some(at(2026, 1, 2)), "typed", "t"),
@@ -1134,7 +1134,7 @@ fn t09b_one_hit_of_each_kind_from_a_brain() {
     new.class = "events";
     new.origin_kind = "legacy";
     new.created_ms = at(2025, 5, 1);
-    add(&mut fx, new, "ibis exam study modules", "[saved before v2, 2025-05-01, m:mem_7a2b3c4d5e6f7087] Ibis exam is on May 12; study modules 7 to 11.".into());
+    add(&mut fx, new, "ibis exam study modules", "[from the old Axel brain, 2025-05-01, m:mem_7a2b3c4d5e6f7087] Ibis exam is on May 12; study modules 7 to 11.".into());
 
     let mut new = row("mem_8a2b3c4d5e6f7088", "toucan backup", "Toucan backups run at 03:00 and are kept for 14 days.");
     new.class = "events";

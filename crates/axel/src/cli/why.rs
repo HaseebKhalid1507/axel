@@ -168,7 +168,7 @@ fn who(origin: &str) -> String {
         "archive" => "earlier chat".to_string(),
         "capture" => "earlier chat, not yet archived".to_string(),
         "cli" => "saved with the axel command".to_string(),
-        "legacy" => "saved before v2".to_string(),
+        "legacy" => "from the old Axel brain".to_string(),
         "document" => "file".to_string(),
         other => other.to_string(),
     }

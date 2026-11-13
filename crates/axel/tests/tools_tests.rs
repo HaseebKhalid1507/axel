@@ -1412,7 +1412,7 @@ fn s5_t16_origin_cli_and_legacy() {
     let labels: Vec<String> = items(&recalled).into_iter().map(|(label, _)| label).collect();
     let of = |id: &str| labels.iter().find(|l| l.contains(id)).unwrap_or_else(|| panic!("{id}: {recalled}")).clone();
     assert!(of("mem_godwitcli000001").contains("saved with the axel command, by you or by an agent with a shell"));
-    assert!(of("mem_godwitlegacy0001").contains("saved before v2"));
+    assert!(of("mem_godwitlegacy0001").contains("from the old Axel brain"));
 }
 
 // ── Section 5, test 18 ──────────────────────────────────────────────────────

@@ -247,7 +247,7 @@ pub fn who(pick: &Pick, cfg: &RecallConfig, own_session: Option<&str>) -> String
         // SPEC: 3199 writes "in this project" for every Synaps note; a note filed as global
         // is shown in every project, so it says so.
         Origin::NoteFile => format!("Synaps note saved by the assistant {place}"),
-        Origin::Legacy => "saved before v2".to_string(),
+        Origin::Legacy => "from the old Axel brain".to_string(),
         Origin::Cli => "saved with the axel command, by you or by an agent with a shell".to_string(),
     }
 }
