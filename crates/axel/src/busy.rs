@@ -12,16 +12,22 @@
 //! step and at the end of a prepare, not at the start of a prepare. So a count that follows
 //! the previous one is not proof of the same wait: a prepare that waits after a step that
 //! waited and got its lock goes on with the step's count. A call therefore goes on with the
-//! current wait only when its count is the previous one plus one AND it comes within
-//! [`GAP`] of the previous call's return (a retry of the same lock comes at once); anything
-//! else starts a new wait with the whole budget. The state is the connection's own, so two
-//! connections waiting on one thread do not share it.
+//! current wait when its count is the previous one plus one AND it comes within [`GAP`] of
+//! the previous call's return (a retry of the same lock comes at once). A count that does
+//! not follow starts a new wait with the whole budget. A count that follows but comes late
+//! starts a new wait once per run of following counts, and after that goes on with the
+//! wait: the stale case needs only one, since the end of the prepare puts the count back to
+//! 0, and a genuine wait whose thread lost the CPU, or whose retry was slow, is not started
+//! again and again. So one wait lasts at most twice its budget plus one such stall (1.5 s
+//! can become about 3 s), and it always ends while the lock is held. The state is the
+//! connection's own, so two connections waiting on one thread do not share it.
 //!
 //! The budget covers the whole of one wait, including any work SQLite does between two calls
 //! of it shorter than [`GAP`]. A step that waits, works and waits again, such as
 //! `PRAGMA wal_checkpoint(TRUNCATE)` (it waits for the writer, backfills, then waits for the
 //! readers), may so report busy after a backfill, a short wait sooner than its time; when
-//! the work took longer than [`GAP`] the second wait has a budget of its own instead. Callers
+//! the work took longer than [`GAP`] the second wait has a budget of its own instead (the
+//! one new start its run of counts is allowed). Callers
 //! take busy as "blocked" and try again later, as they would anyway.
 //!
 //! The wait is kept as the connection's client data, so [`get`] answers what `PRAGMA
@@ -53,22 +59,32 @@ pub struct Wait {
     since: Cell<Option<Instant>>,
     /// The count of the previous call and the instant it returned.
     last: Cell<Option<(c_int, Instant)>>,
+    /// A late following count has started the current wait again; cleared by a count that
+    /// does not follow.
+    restarted: Cell<bool>,
 }
 
 impl Wait {
     pub fn new(limit: Duration) -> Self {
-        Self { limit, since: Cell::new(None), last: Cell::new(None) }
+        Self { limit, since: Cell::new(None), last: Cell::new(None), restarted: Cell::new(false) }
     }
 
     /// The call with this count, at `now`: how long to sleep before the next try, or `None`
     /// to give up.
     pub fn sleep_for(&self, count: c_int, now: Instant) -> Option<Duration> {
-        let goes_on = matches!(
-            (self.since.get(), self.last.get()),
-            (Some(_), Some((prev, at))) if count > 0
-                && Some(count) == prev.checked_add(1)
-                && now.saturating_duration_since(at) <= GAP
-        );
+        let follows = match (self.since.get(), self.last.get()) {
+            (Some(_), Some((prev, at))) if count > 0 && Some(count) == prev.checked_add(1) => Some(at),
+            _ => None,
+        };
+        let goes_on = match follows {
+            None => {
+                self.restarted.set(false);
+                false
+            }
+            Some(at) if now.saturating_duration_since(at) <= GAP => true,
+            // Late: a new wait the first time in this run, the same wait after that.
+            Some(_) => self.restarted.replace(true),
+        };
         if !goes_on {
             self.since.set(Some(now));
         }
@@ -190,6 +206,27 @@ mod tests {
         w.returned(0, t + 9 * MS);
         assert_eq!(w.sleep_for(1, t + 10 * MS), None);
         assert_eq!(w.sleep_for(2, t + 11 * MS), Some(5 * MS));
+    }
+
+    #[test]
+    fn a_run_of_following_counts_starts_again_once_however_late_its_calls_come() {
+        let w = Wait::new(100 * MS);
+        let t = Instant::now();
+        assert_eq!(w.sleep_for(0, t), Some(MS));
+        w.returned(0, t + MS);
+        // Late: the one new start, from t + 52 ms.
+        let first = t + MS + GAP + MS;
+        assert_eq!(w.sleep_for(1, first), Some(2 * MS));
+        w.returned(1, t + 60 * MS);
+        // Late again: the same wait, 59 ms of it spent.
+        assert_eq!(w.sleep_for(2, t + 60 * MS + GAP + MS), Some(5 * MS));
+        w.returned(2, t + 150 * MS);
+        // And it ends at its deadline, 100 ms after the new start, late calls or not.
+        assert_eq!(w.sleep_for(3, first + 100 * MS + GAP), None);
+        // A count that does not follow clears the mark: the next late one starts again.
+        assert_eq!(w.sleep_for(0, t + 400 * MS), Some(MS));
+        w.returned(0, t + 401 * MS);
+        assert_eq!(w.sleep_for(1, t + 401 * MS + GAP + MS + 90 * MS), Some(2 * MS));
     }
 
     #[test]
