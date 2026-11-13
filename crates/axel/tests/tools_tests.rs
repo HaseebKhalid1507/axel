@@ -1718,6 +1718,33 @@ fn s4_t12_iii_a_memory_forgotten_carried_to_the_next_call_marks_the_pending_turn
     assert_eq!(host.close(), ServeEnd::InputClosed);
 }
 
+/// The same carry with no other writer: the indexer is parked inside a job (it sleeps
+/// before the job, outside any transaction), so the lock is free when the carry comes and
+/// the mark is in the brain when the call is answered, not later.
+#[test]
+fn s4_t12_iv_a_carried_mark_is_written_before_the_call_is_answered_when_the_lock_is_free() {
+    let mut host = Host::ready(TestHooks { indexer_sleep_ms: 5000, ..TestHooks::default() });
+    let parked = json!({ "archive_id": "0123456789abcdef0123456789abcdef", "project_key": "p0123456789abcdef" });
+    host.hook("on_context_archived", "Z", None, parked);
+    std::thread::sleep(Duration::from_millis(500));
+    let prompt = "how deep is the water at the heron hide";
+    assert_eq!(host.hook("before_message", "S", Some(prompt), json!({})), json!({"action": "continue"}));
+    let data = json!({ "id": "mem-heronhide", "kind": "note", "project_key": "p0123456789abcdef" });
+    assert_eq!(host.hook("on_memory_forgotten", "S", None, data), json!({"action": "continue"}));
+    let answer = host.tool("search", "Q", json!({ "query": "heron hide water" }));
+    assert_eq!(answer["result"]["is_error"], false, "{answer}");
+    let key: Option<String> = host
+        .conn()
+        .query_row(
+            "SELECT turn_key FROM forgotten_turns WHERE source = 'call' AND logical = ?1",
+            [project::logical("S")],
+            |r| r.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(key.as_deref(), Some(recall::query_hash(prompt).as_str()), "the mark was not written with the call");
+}
+
 #[test]
 fn s7_t05_a_locked_brain() {
     let mut host = Host::ready(TestHooks::default());
