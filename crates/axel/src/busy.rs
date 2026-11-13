@@ -17,6 +17,13 @@
 //! else starts a new wait with the whole budget. The state is the connection's own, so two
 //! connections waiting on one thread do not share it.
 //!
+//! The budget covers the whole of one wait, including any work SQLite does between two calls
+//! of it shorter than [`GAP`]. A step that waits, works and waits again, such as
+//! `PRAGMA wal_checkpoint(TRUNCATE)` (it waits for the writer, backfills, then waits for the
+//! readers), may so report busy after a backfill, a short wait sooner than its time; when
+//! the work took longer than [`GAP`] the second wait has a budget of its own instead. Callers
+//! take busy as "blocked" and try again later, as they would anyway.
+//!
 //! The wait is kept as the connection's client data, so [`get`] answers what `PRAGMA
 //! busy_timeout` answered before (that pragma now says 0 for a connection set here).
 
