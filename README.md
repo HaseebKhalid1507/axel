@@ -258,8 +258,8 @@ its hints, by that name.
 | `axel restore <id>...` | brings back hidden memories |
 | `axel restore --by-model --since <date>` | brings back everything a model hid or superseded since that date |
 | `axel restore --forget-turns ctx-<id>` | brings back the turns an archive left out because a forget tool was called in them |
-| `axel pause <session id> [learning\|recall\|both]` | pauses one chat |
-| `axel resume <session id> [learning\|recall\|both] [--catch-up]` | lifts a pause; `--catch-up` also indexes the chat's archives sealed during it |
+| `axel pause <session id> <learning\|recall\|both> [--force]` | pauses one chat; `--force` pauses a chat the brain knows nothing of yet |
+| `axel resume <session id> <learning\|recall\|both> [--catch-up]` | lifts a pause; `--catch-up` also indexes the chat's archives sealed during it |
 | `axel migrate init --from-axel <axel.r8>` | makes the brain from the old Axel brain |
 | `axel migrate synaps --from <brain.r8>` | brings over the forum posts of Synaps's own brain |
 | `axel migrate verify --from-axel <axel.r8> --from-synaps <brain.r8>` | checks that the import is complete |
@@ -276,7 +276,7 @@ Each key below goes in `<plugins>/axel/config` (or any place listed under Config
 - Recall only: `recall = off`.
 - Learning from chats only: `capture = off`; archives only: `archives = off`.
 - The forum tools only: `forum = off`.
-- One chat: `axel pause <session id>`, or the model's `axel_forget {"stop":"both"}`.
+- One chat: `axel pause <session id> both`, or the model's `axel_forget {"stop":"both"}`.
 - The whole extension: add `axel` to `disabled_plugins` in the Synaps config, or remove the
   folder `<plugins>/axel`. Putting the old plugin folder back returns Synaps to the old
   binary and the old brain, which this version never changed.
