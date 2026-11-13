@@ -84,13 +84,26 @@ pub const MANIFEST: &str = r#"{
 }
 "#;
 
-/// The manifest with `command` set to `binary`.
+/// The manifest with `command` set to `binary`, its config descriptions naming the binary
+/// as it was run (`crate::cmd_name`).
 pub fn manifest_for(binary: &Path) -> Result<String> {
+    manifest_named(binary, crate::cmd_name())
+}
+
+/// The manifest with `command` set to `binary` and the commands `axel forget --now` and
+/// `axel handoff set` in the config descriptions written as `<name> forget --now` and
+/// `<name> handoff set`.
+pub fn manifest_named(binary: &Path, name: &str) -> Result<String> {
     let path = binary
         .to_str()
         .ok_or_else(|| AxelError::Other(format!("the binary's path is not UTF-8: {}", binary.display())))?;
     let quoted = serde_json::to_string(path)?;
-    Ok(MANIFEST.replacen(&format!("\"{MANIFEST_COMMAND}\""), &quoted, 1))
+    let name = serde_json::to_string(name)?;
+    let name = &name[1..name.len() - 1];
+    Ok(MANIFEST
+        .replacen(&format!("\"{MANIFEST_COMMAND}\""), &quoted, 1)
+        .replacen("'axel forget --now'", &format!("'{name} forget --now'"), 1)
+        .replacen("'axel handoff set'", &format!("'{name} handoff set'"), 1))
 }
 
 /// The absolute, canonical path of the running binary.

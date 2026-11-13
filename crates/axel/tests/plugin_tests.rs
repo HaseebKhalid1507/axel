@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
-use axel::cli::plugin::{manifest_for, MANIFEST, MANIFEST_COMMAND};
+use axel::cli::plugin::{manifest_for, manifest_named, MANIFEST, MANIFEST_COMMAND};
 use serde_json::Value;
 
 fn bin() -> PathBuf {
@@ -82,6 +82,38 @@ fn manifest_for_sets_only_the_command() {
     assert_eq!(got["extension"]["command"], "/opt/a \"b\"/axel");
     got["extension"]["command"] = MANIFEST_COMMAND.into();
     assert_eq!(got, serde_json::from_str::<Value>(MANIFEST).unwrap());
+}
+
+/// The config descriptions name the binary as it was run; nothing else changes.
+#[test]
+fn manifest_names_the_binary_in_config_descriptions() {
+    let desc = |text: &str, key: &str| -> String {
+        let m: Value = serde_json::from_str(text).unwrap();
+        let entry = m["extension"]["config"].as_array().unwrap().iter().find(|e| e["key"] == key).cloned();
+        entry.unwrap()["description"].as_str().unwrap().to_string()
+    };
+    let text = manifest_named(Path::new("/opt/axel"), "axel-v2").unwrap();
+    assert!(desc(&text, "forget_now_min_hidden_hours").contains("'axel-v2 forget --now'"));
+    assert!(desc(&text, "handoff_on_start").contains("'axel-v2 handoff set'"));
+    assert!(desc(MANIFEST, "forget_now_min_hidden_hours").contains("'axel forget --now'"));
+    assert!(desc(MANIFEST, "handoff_on_start").contains("'axel handoff set'"));
+    assert_eq!(text.replace("axel-v2 ", "axel "), manifest_named(Path::new("/opt/axel"), "axel").unwrap());
+    assert_eq!(manifest_for(Path::new("/opt/axel")).unwrap(), manifest_named(Path::new("/opt/axel"), "axel").unwrap());
+
+    // An installed link named axel-v2: command is the resolved binary, the texts say axel-v2.
+    let tmp = tempfile::tempdir().unwrap();
+    let link = tmp.path().join("axel-v2");
+    std::os::unix::fs::symlink(bin(), &link).unwrap();
+    let plugins = tmp.path().join("plugins");
+    let out = Command::new(&link)
+        .arg("--brain")
+        .arg(tmp.path().join("unused-brain.r8"))
+        .args(["plugin", "install", "--plugins-dir", plugins.to_str().unwrap(), "--print"])
+        .env_remove("AXEL_BRAIN")
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(String::from_utf8(out.stdout).unwrap(), manifest_named(&bin(), "axel-v2").unwrap());
 }
 
 /// Test 2.
