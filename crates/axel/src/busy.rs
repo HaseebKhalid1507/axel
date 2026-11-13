@@ -25,7 +25,10 @@
 //! take busy as "blocked" and try again later, as they would anyway.
 //!
 //! The wait is kept as the connection's client data, so [`get`] answers what `PRAGMA
-//! busy_timeout` answered before (that pragma now says 0 for a connection set here).
+//! busy_timeout` answered before (that pragma now says 0 for a connection set here). Only
+//! this module sets a connection's busy handler: rusqlite's `Connection::busy_timeout` and
+//! `Connection::busy_handler` would replace the handler and leave the client data, and
+//! `clippy.toml` refuses them outside it.
 
 use std::cell::Cell;
 use std::ffi::{c_int, c_void, CStr};

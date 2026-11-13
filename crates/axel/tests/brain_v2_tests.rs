@@ -1231,7 +1231,7 @@ fn open_source_cannot_write_lock_or_make_a_side_file() {
     let plain = plain_source(dir.path(), "plain.db");
     let (hash, before) = (main_hash(&plain), listing(dir.path()));
     let other = Connection::open(&plain).unwrap();
-    other.busy_timeout(Duration::ZERO).unwrap();
+    axel::busy::set(&other, Duration::ZERO).unwrap();
     {
         // The control: an ordinary read-only connection does hold a lock.
         let reader = Connection::open_with_flags(&plain, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
@@ -1291,7 +1291,7 @@ fn f2_the_guard_rolls_back_what_the_caller_did_not_commit() {
     drop(brain_v2::open_v2(&path, &opts(false)).unwrap());
     let front = brain_v2::connect(&path, Role::Front).unwrap();
     let other = brain_v2::connect(&path, Role::Cli).unwrap();
-    other.busy_timeout(Duration::ZERO).unwrap();
+    axel::busy::set(&other, Duration::ZERO).unwrap();
     let writing = AtomicBool::new(false);
     let put = "INSERT INTO context_data(key, value, layer) VALUES (?1, 'x', 'axel')";
     let rows = "SELECT COUNT(*) FROM context_data WHERE key = ?1";
@@ -1793,6 +1793,7 @@ fn a_busy_wait_lasts_its_time_on_the_wall_clock() {
     assert!(start.elapsed() < Duration::from_millis(100), "{:?}", start.elapsed());
 
     // SQLite's own timeout set afterwards is the one `get` reports.
+    #[allow(clippy::disallowed_methods)]
     conn.busy_timeout(Duration::from_millis(250)).unwrap();
     assert_eq!(axel::busy::get(&conn), Duration::from_millis(250));
 

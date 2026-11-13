@@ -929,7 +929,7 @@ mod tests {
         assert_eq!(user_version(conn).unwrap(), 1);
         // It left no lock behind.
         let other = Connection::open(&path).unwrap();
-        other.busy_timeout(Duration::ZERO).unwrap();
+        crate::busy::set(&other, Duration::ZERO).unwrap();
         other.execute_batch("BEGIN IMMEDIATE; ROLLBACK;").unwrap();
     }
 }

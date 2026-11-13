@@ -1648,7 +1648,7 @@ impl Host {
 
     fn conn(&self) -> Connection {
         let conn = Connection::open(&self.brain).unwrap();
-        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        axel::busy::set(&conn, Duration::from_secs(5)).unwrap();
         conn
     }
 
@@ -1729,7 +1729,7 @@ fn s7_t05_a_locked_brain() {
         let brain = brain.clone();
         let t = std::thread::spawn(move || {
             let conn = Connection::open(&brain).unwrap();
-            conn.busy_timeout(Duration::from_secs(5)).unwrap();
+            axel::busy::set(&conn, Duration::from_secs(5)).unwrap();
             conn.execute_batch("BEGIN IMMEDIATE").unwrap();
             held_tx.send(()).unwrap();
             std::thread::sleep(Duration::from_millis(ms));

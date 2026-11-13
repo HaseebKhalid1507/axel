@@ -221,7 +221,7 @@ impl World {
     fn look(&self) -> Connection {
         let conn = Connection::open_with_flags(self.brain(), OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
             .unwrap();
-        conn.busy_timeout(Duration::from_secs(5)).unwrap();
+        axel::busy::set(&conn, Duration::from_secs(5)).unwrap();
         conn
     }
 
