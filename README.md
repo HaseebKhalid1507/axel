@@ -32,7 +32,8 @@ on any other system stops with one line: `axel builds on Linux and macOS only`.
   `on_memory_forgotten`, the `cwd` Synaps sends with each hook and tool call, and the
   `caller` field of `tool.call`. All four are in Synaps's development branch and ship first
   in 0.12.0. Axel does not check Synaps's version; on an older Synaps see the notes below.
-- **To build:** Rust with cargo, and a C and C++ compiler (SQLite and the vector index are
+- **To build from source** (only where there is no prebuilt binary, below): Rust with
+  cargo, and a C and C++ compiler (SQLite and the vector index are
   compiled in). The build downloads the ONNX Runtime library once (the `ort` crate's
   prebuilt binaries).
 
@@ -42,16 +43,25 @@ If you have the old Axel (`axel.r8`, the Synaps memory backend), read
 [Upgrading from the old Axel](#upgrading-from-the-old-axel-axelr8) first.
 
 ```bash
-cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.0 --locked axel
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/axel/releases/download/v0.1.0/axel-installer.sh | sh
 axel model fetch
 axel init
 axel plugin install --plugins-dir ~/.synaps-cli/plugins
 synaps daemon reload
 ```
 
+The installer has prebuilt binaries for Linux on x86_64 and aarch64 (glibc) and for macOS
+on Apple Silicon. There is none for Intel Macs or musl Linux (Alpine): the ONNX Runtime
+library Axel links has no prebuilt build for them. There, and anywhere else, build from
+source instead of the first line:
+
+```bash
+cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.0 --locked axel
+```
+
 Step by step:
 
-1. `cargo install ... axel` builds the binary `axel` into `~/.cargo/bin`.
+1. The installer (or `cargo install`) puts the binary `axel` into `~/.cargo/bin`.
 2. `axel model fetch` downloads the embedding model (about 90 MB) into
    `~/.cache/velocirag/models/all-MiniLM-L6-v2`. It is the only command that uses the
    network. Without it Axel still works, on words alone.

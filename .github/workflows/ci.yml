@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+      - v2
+  pull_request:
+
+# Runner images and the toolchain are pinned (1.95.0, what the gate builds with), so a CI
+# break comes from a commit, not a calendar date. Every cargo invocation passes `--locked`
+# (scripts/dirty-home.sh adds it itself). rust-cache saves only from pushes, so PR runs
+# restore a warm cache without churning the cache quota.
+
+jobs:
+  clippy:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - run: cargo clippy -p axel -p axel-memkoshi -p velocirag --all-targets --locked -- -D warnings
+
+  # Linux: the suite under scripts/dirty-home.sh, as the local gate runs it: HOME and the XDG
+  # folders point into an empty temp folder, and any test that writes there fails the job.
+  # macOS: plain `cargo test`, because dirty-home.sh needs GNU find.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-15]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.event_name == 'push' }}
+      - if: runner.os == 'Linux'
+        run: bash scripts/dirty-home.sh -p axel -p axel-memkoshi -p velocirag --no-fail-fast
+      - if: runner.os == 'macOS'
+        run: cargo test -p axel -p axel-memkoshi -p velocirag --locked --no-fail-fast

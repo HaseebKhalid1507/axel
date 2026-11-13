@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Agent memory system — staging, patterns, evolution, decay"
 
+# A library of axel's; dist ships only the axel binary.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 velocirag = { path = "../velocirag" }
 rusqlite = { workspace = true }

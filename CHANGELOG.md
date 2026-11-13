@@ -1,8 +1,10 @@
 # Changelog
 
-## 0.1.0 (unreleased)
+All notable changes to this project will be documented in this file.
 
-The first release of Axel: one local brain for Synaps, run as a Synaps extension.
+## [Unreleased]
+
+The first release of Axel (0.1.0): one local brain for Synaps, run as a Synaps extension.
 
 - **Recall before each message.** Earlier chats, saved memories and notes that match a
   message are added to it (at most 5 items, 1,600 characters, 150 ms).
@@ -35,6 +37,9 @@ The first release of Axel: one local brain for Synaps, run as a Synaps extension
 ### Known limits
 
 - macOS is built but has not been run on a Mac.
+- Prebuilt binaries (shell installer) for x86_64 and aarch64 Linux (glibc) and Apple Silicon
+  macOS only: no Intel Mac and no musl build, which ONNX Runtime has no prebuilt library for.
+  Elsewhere, `cargo install`.
 - On a Synaps without the two hooks, the plugin does not load until they are removed from
   `plugin.json` by hand; archives are then picked up by the background scan, up to 10
   minutes late. Without `caller`, every tool refuses; recall and capture still work.

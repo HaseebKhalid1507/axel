@@ -6,6 +6,10 @@ authors.workspace = true
 license.workspace = true
 description = "Lightning-fast 4-layer RAG search engine for AI agents"
 
+# A library of axel's; dist ships only the axel binary.
+[package.metadata.dist]
+dist = false
+
 [dependencies]
 rusqlite = { workspace = true }
 usearch = { workspace = true }

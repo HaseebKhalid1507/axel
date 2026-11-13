@@ -1,0 +1,30 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app. Shell only: Axel does not build on Windows.
+installers = ["shell"]
+# Ship gzip tarballs (not the default .tar.xz): the shell installer extracts
+# with `tar`, and xz is absent on minimal systems.
+unix-archive = ".tar.gz"
+# Target platforms to build apps for (Rust target-triple syntax).
+# ort 2.0.0-rc.12 (download-binaries) has prebuilt ONNX Runtime for these and not for
+# x86_64-apple-darwin or any musl target, so those have no prebuilt Axel.
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+# Path that installers should place binaries in
+install-path = "CARGO_HOME"
+# Whether to install an updater program
+install-updater = false
+# A pull request builds every artifact and uploads them to the workflow run, publishing
+# nothing: that is how the release build is tried (the v2 -> main PR) before tagging.
+pr-run-mode = "upload"
+
+# macos-14 runner images are retired on 2026-11-02 (actions/runner-images#13518);
+# dist 0.31 still picks them for Apple Silicon.
+[dist.github-custom-runners]
+aarch64-apple-darwin = "macos-15"
