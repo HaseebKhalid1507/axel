@@ -73,49 +73,46 @@ fn no_home(what: &str) -> AxelError {
     AxelError::Other(format!("HOME is not set: cannot resolve {what}"))
 }
 
-/// Hardcoded fallback source list. Single source of truth — both the CLI's
-/// `load_sources()` and the MCP `axel_consolidate` handler call this when
-/// `sources.toml` is absent or unparseable.
-///
-/// The folders are under `$HOME`; without it this is an error.
-pub fn default_sources() -> Result<Vec<SourceDir>> {
-    default_sources_in(home_from_env().as_deref())
+/// The format of `sources.toml`, for the line that says no folder is listed.
+pub const SOURCES_FORMAT: &str =
+    "[[source]] entries with name = \"notes\", path = \"~/notes\", priority = \"high\"|\"medium\"|\"low\"";
+
+/// The `sources.toml` that [`load_sources`] reads (1, 2 or 3 below); `None` without a
+/// home when neither 1 nor 2 names one.
+pub fn sources_path(override_path: Option<&Path>) -> Option<PathBuf> {
+    explicit_sources_path(override_path).or_else(|| home_sources_path(home_from_env().as_deref()))
 }
 
-fn default_sources_in(home: Option<&str>) -> Result<Vec<SourceDir>> {
-    let home = home.ok_or_else(|| no_home("the default source folders"))?;
-    Ok(vec![
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/mikoshi/Notes/")), name: "mikoshi".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/")), name: "context".into(), priority: Priority::High },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/notes/")), name: "notes".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/slack/diary/")), name: "slack-diary".into(), priority: Priority::Low },
-        SourceDir { path: PathBuf::from(format!("{home}/Jawz/data/context/memories/permanent/")), name: "memories-legacy".into(), priority: Priority::Medium },
-        SourceDir { path: PathBuf::from(format!("{home}/.stelline/memkoshi/exports/")), name: "memories".into(), priority: Priority::Medium },
-    ])
+fn explicit_sources_path(override_path: Option<&Path>) -> Option<PathBuf> {
+    override_path
+        .map(PathBuf::from)
+        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from))
+}
+
+fn home_sources_path(home: Option<&str>) -> Option<PathBuf> {
+    home.map(|home| PathBuf::from(format!("{home}/.config/axel/sources.toml")))
 }
 
 /// Resolve sources from (in priority order):
 ///   1. `override_path` (e.g. `--sources` CLI flag)
 ///   2. `$AXEL_SOURCES`
 ///   3. `~/.config/axel/sources.toml`
-///   4. `default_sources()` fallback
 ///
-/// `$HOME` is needed for 3, for 4 and for a `~` in a configured path. When
-/// it is needed and not set, this is an error: no path is guessed.
+/// A file that is absent, unreadable or lists no source gives no folders: there is no
+/// built-in list. `$HOME` is needed for 3 and for a `~` in a configured path. When it is
+/// needed and not set, this is an error: no path is guessed.
 pub fn load_sources(override_path: Option<&Path>) -> Result<Vec<SourceDir>> {
-    let config_path = override_path
-        .map(PathBuf::from)
-        .or_else(|| std::env::var("AXEL_SOURCES").ok().map(PathBuf::from));
-    load_sources_from(config_path, home_from_env().as_deref())
+    load_sources_from(explicit_sources_path(override_path), home_from_env().as_deref())
 }
 
 /// [`load_sources`] with the explicit config path (1 or 2) and the home
 /// folder given by the caller.
 fn load_sources_from(config_path: Option<PathBuf>, home: Option<&str>) -> Result<Vec<SourceDir>> {
-    let config_path =
-        config_path.or_else(|| home.map(|home| PathBuf::from(format!("{home}/.config/axel/sources.toml"))));
+    let Some(config_path) = config_path.or_else(|| home_sources_path(home)) else {
+        return Err(no_home("~/.config/axel/sources.toml"));
+    };
 
-    if let Some(config_path) = config_path.filter(|path| path.exists()) {
+    if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(parsed) = content.parse::<toml::Value>() {
                 if let Some(sources) = parsed.get("source").and_then(|v| v.as_array()) {
@@ -151,7 +148,7 @@ fn load_sources_from(config_path: Option<PathBuf>, home: Option<&str>) -> Result
         }
     }
 
-    default_sources_in(home)
+    Ok(Vec::new())
 }
 
 #[cfg(test)]
@@ -161,18 +158,21 @@ mod source_tests {
     // The home folder is passed in: no test changes the process environment.
 
     #[test]
-    fn without_a_home_the_default_sources_are_an_error_not_a_guessed_path() {
-        let error = default_sources_in(None).unwrap_err().to_string();
-        assert!(error.contains("HOME is not set"), "{error}");
+    fn without_a_home_the_sources_file_is_an_error_not_a_guessed_path() {
         let error = load_sources_from(None, None).unwrap_err().to_string();
-        assert!(error.contains("HOME is not set"), "{error}");
+        assert!(error.contains("HOME is not set") && error.contains("sources.toml"), "{error}");
     }
 
     #[test]
-    fn the_default_sources_are_under_the_given_home() {
-        let sources = default_sources_in(Some("/somewhere/else")).unwrap();
-        assert_eq!(sources.len(), 6);
-        assert!(sources.iter().all(|source| source.path.starts_with("/somewhere/else")));
+    fn without_a_sources_file_there_are_no_folders() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().to_str().unwrap();
+        assert!(load_sources_from(None, Some(home)).unwrap().is_empty());
+        assert!(load_sources_from(Some(dir.path().join("absent.toml")), None).unwrap().is_empty());
+        let empty = dir.path().join("empty.toml");
+        std::fs::write(&empty, "# nothing\n").unwrap();
+        assert!(load_sources_from(Some(empty), None).unwrap().is_empty());
+        assert_eq!(home_sources_path(Some(home)), Some(dir.path().join(".config/axel/sources.toml")));
     }
 
     #[test]

@@ -428,8 +428,8 @@ fn t03_two_doc_ids_of_one_file_a_memory_and_its_shadow_and_one_exchange_in_two_a
 
     // A file indexed under two doc ids.
     let runbook = "deploy runbook: restart the gateway then purge the cache";
-    fx.put_doc("notes::deploy::runbook", runbook, Some("/home/u/Jawz/notes/deploy/runbook.md"), "{}");
-    fx.put_doc("mikoshi::runbook-copy", runbook, Some("/home/u/Jawz/notes/deploy/runbook.md"), "{}");
+    fx.put_doc("notes::deploy::runbook", runbook, Some("/home/u/vault/notes/deploy/runbook.md"), "{}");
+    fx.put_doc("mikoshi::runbook-copy", runbook, Some("/home/u/vault/notes/deploy/runbook.md"), "{}");
     let out = fx.recall("restart gateway purge cache", &chat("s1"), true);
     assert_eq!(out.picks.len(), 1, "{:?}", out.trace);
     assert_eq!(out.picks[0].origin, Origin::Document);
@@ -990,8 +990,8 @@ fn t09_the_block_has_its_limits_its_frame_and_one_label_per_item() {
     let note_id = "mem-00112233445566778899aabbccddeeff";
     let cases: [(Pick, String); 11] = [
         (
-            pick(Origin::Document, "doc:mikoshi::Projects::axel", "doc:mikoshi::Projects::axel", "document", GLOBAL_KEY, Some(at(2026, 11, 2)), "a passage", "/home/u/Jawz/mikoshi/Notes/Projects/axel.md"),
-            "file in ~/Jawz/mikoshi/Notes: Projects/axel.md, changed 2026-11-02".to_string(),
+            pick(Origin::Document, "doc:mikoshi::Projects::axel", "doc:mikoshi::Projects::axel", "document", GLOBAL_KEY, Some(at(2026, 11, 2)), "a passage", "/home/u/vault/mikoshi/Notes/Projects/axel.md"),
+            "file in ~/vault/mikoshi/Notes: Projects/axel.md, changed 2026-11-02".to_string(),
         ),
         (
             pick(Origin::Document, "doc:notes::todo", "doc:notes::todo", "document", GLOBAL_KEY, None, "a passage", "/srv/shared/notes/todo.txt"),
@@ -1066,14 +1066,14 @@ fn t09b_one_hit_of_each_kind_from_a_brain() {
         &fx.brain.conn,
         "mikoshi::Projects::axel",
         "# Axel\nThe walrus indexer reads every archive once.\nIt never deletes a file.",
-        Some("/home/u/Jawz/mikoshi/Notes/Projects/axel.md"),
+        Some("/home/u/vault/mikoshi/Notes/Projects/axel.md"),
         "{}",
         Some(at(2026, 11, 2)),
     );
     fx.plant(VecKey::Doc(id), VecScope::Documents, "the walrus indexer reads every archive once");
     picks.extend(fx.recall("walrus indexer reads archive", &chat("T"), true).picks);
     assert_eq!(picks.len(), 1);
-    expected.push("[file in ~/Jawz/mikoshi/Notes: Projects/axel.md, changed 2026-11-02] # Axel The walrus indexer reads every archive once. It never deletes a file.".into());
+    expected.push("[file in ~/vault/mikoshi/Notes: Projects/axel.md, changed 2026-11-02] # Axel The walrus indexer reads every archive once. It never deletes a file.".into());
 
     let mut add = |fx: &mut Fx, new: NewRow, query: &str, line: String| {
         fx.put(&new);

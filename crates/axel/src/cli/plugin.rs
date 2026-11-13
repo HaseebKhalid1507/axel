@@ -74,7 +74,7 @@ pub const MANIFEST: &str = r#"{
       {"key": "worker_scope",     "description": "What subagent workers can search: project (this project's chat memory only) or all (also global memories and note files).", "default": "project"},
       {"key": "forget_now_min_hidden_hours", "description": "Hours a memory must have been hidden before 'axel forget --now' will delete it. Read by that command from extension.axel.forget_now_min_hidden_hours in the Synaps config; it can lengthen the 24-hour wait, never shorten it.", "default": "24"},
       {"key": "handoff_on_start", "description": "Inject the handoff written with 'axel handoff set' at session start: on or off.", "default": "off"},
-      {"key": "sources",          "description": "Path of sources.toml listing note folders. Empty: ~/.config/axel/sources.toml, else the built-in list.", "default": ""},
+      {"key": "sources",          "description": "Path of sources.toml listing note folders. Empty: ~/.config/axel/sources.toml; without it no note folders are indexed.", "default": ""},
       {"key": "archive_events",   "description": "Comma-separated event sources to index from archives besides worker reports.", "default": ""},
       {"key": "embedder",         "description": "onnx (the local model), off (words only), or hash (tests only).", "default": "onnx"},
       {"key": "model_dir",        "description": "Folder with the model and tokenizer.json. Empty: ~/.cache/velocirag/models/all-MiniLM-L6-v2", "default": ""},

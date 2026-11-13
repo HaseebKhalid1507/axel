@@ -122,7 +122,7 @@ listed by `status`.
 | `worker_scope` | `project` | what subagent workers can search: `project` or `all` |
 | `forget_now_min_hidden_hours` | `24` | hours a memory must have been hidden before `forget --now` deletes it; `0`: at once. Read by the command only, from `<base>/config` (below) |
 | `handoff_on_start` | `off` | inject the handoff written with `axel handoff set` at session start |
-| `sources` | `~/.config/axel/sources.toml`, else the built-in list | the note folders to index |
+| `sources` | `~/.config/axel/sources.toml`; without it, no note folders | the note folders to index |
 | `archive_events` | empty | comma-separated event sources to index from archives besides worker reports |
 | `embedder` | `onnx` | `onnx` (the local model), `off` (words only), `hash` (tests only) |
 | `model_dir` | `~/.cache/velocirag/models/all-MiniLM-L6-v2` | the model folder |

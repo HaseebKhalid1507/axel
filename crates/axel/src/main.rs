@@ -168,8 +168,8 @@ fn brain_path(cli: &Cli) -> PathBuf {
 }
 
 fn load_sources(override_path: Option<&Path>) -> Result<Vec<axel::consolidate::SourceDir>, Box<dyn std::error::Error>> {
-    // Single source of truth lives in `axel::consolidate` so the MCP handler
-    // and CLI agree. An unreadable config degrades to the defaults; no HOME
+    // Single source of truth lives in `axel::consolidate` so the extension
+    // and CLI agree. An absent or unreadable config gives no folders; no HOME
     // when one is needed is an error.
     Ok(axel::consolidate::load_sources(override_path)?)
 }
@@ -464,8 +464,13 @@ fn cmd_consolidate(
 
     let mut search = BrainSearch::open(&path)?;
 
-    // Load sources from TOML config or use defaults
+    // Load sources from sources.toml; there is no built-in list.
     let sources = load_sources(sources_path)?;
+    if sources.is_empty() {
+        let file = consolidate::sources_path(sources_path)
+            .map_or_else(|| "sources.toml".to_string(), |p| p.display().to_string());
+        eprintln!("no note folders to reindex: {file} is missing or lists none; add {}", consolidate::SOURCES_FORMAT);
+    }
 
     let phases = match phase {
         Some("reindex") => [Phase::Reindex].into_iter().collect(),

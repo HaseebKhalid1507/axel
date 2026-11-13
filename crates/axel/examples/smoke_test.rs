@@ -1,4 +1,4 @@
-//! Smoke test: index real Jawz notes into a .r8 brain and search them.
+//! Smoke test: index a folder of markdown notes into a .r8 brain and search them.
 
 use std::path::Path;
 use std::time::Instant;
@@ -8,7 +8,7 @@ use axel::search::BrainSearch;
 
 fn main() {
     let notes_dir = Path::new("/tmp/axel-sandbox/notes");
-    let brain_path = Path::new("/tmp/axel-sandbox/jawz.r8");
+    let brain_path = Path::new("/tmp/axel-sandbox/smoke.r8");
 
     // Clean slate
     let _ = std::fs::remove_file(brain_path);
@@ -17,7 +17,7 @@ fn main() {
 
     // 1. Create brain
     let start = Instant::now();
-    let _brain = Brain::create(brain_path, Some("jawz")).unwrap();
+    let _brain = Brain::create(brain_path, Some("smoke")).unwrap();
     println!("✓ Brain created: {} ({:.0}ms)", brain_path.display(), start.elapsed().as_millis());
     drop(_brain);
 
@@ -92,12 +92,8 @@ fn main() {
         "VelociRAG search architecture",
         "Memkoshi memory system",
         "SynapsCLI agent runtime Rust",
-        "D&D campaign Jawz character",
-        "Haseeb internship job",
-        "Docker security lab CS646",
+        "Docker security lab",
         "homelab services pihole grafana",
-        "JR Morton MahaMedia collaboration",
-        "Dexter trading agent",
     ];
 
     println!("═══ Search Results ═══\n");
