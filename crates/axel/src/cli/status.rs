@@ -313,7 +313,8 @@ struct Files {
     stale: Vec<Value>,
 }
 
-fn pid_alive(pid: u32) -> bool {
+/// True when a process with this pid exists, or exists and is another user's (EPERM).
+pub(crate) fn pid_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else { return false };
     if pid <= 0 {
         return false;

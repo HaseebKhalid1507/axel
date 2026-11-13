@@ -576,13 +576,10 @@ fn folder_of(dest: &Path) -> PathBuf {
     }
 }
 
-/// True when a process with this pid exists. Where that cannot be told, true: a directory
-/// that may be in use is left.
+/// True when a process with this pid exists (`kill(pid, 0)`, as `status` asks). It was a
+/// look in `/proc`, which macOS has not: there every killed run's directory was kept.
 fn pid_alive(pid: u32) -> bool {
-    if !Path::new("/proc/self").exists() {
-        return true;
-    }
-    Path::new("/proc").join(pid.to_string()).exists()
+    crate::cli::status::pid_alive(pid)
 }
 
 /// Deletes the temporary directories a killed run left beside the destination, and says so.
