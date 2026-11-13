@@ -211,6 +211,11 @@ pub fn export(source: &Path, out: &Path) -> Result<Manifest> {
             source.display()
         )));
     }
+    // The file itself may not be a link (refused above); the folders above it may be
+    // (`/var` on macOS is one), so they are resolved before SQLite's NOFOLLOW, which
+    // refuses a link in any component, sees the path. As `brain_v2::open_source`.
+    let given = source;
+    let source = &resolve_parent(source)?;
     refuse_sidecars(source)?;
     check_out(out)?;
 
@@ -232,7 +237,7 @@ pub fn export(source: &Path, out: &Path) -> Result<Manifest> {
     prepare_out(out)?;
     let mut manifest = Manifest {
         source: Source {
-            path: source.to_string_lossy().into_owned(),
+            path: given.to_string_lossy().into_owned(),
             bytes: before.bytes,
             sha256: before.sha256.clone(),
         },
@@ -323,6 +328,21 @@ impl SourceStat {
     }
 }
 
+/// `source` with its folder resolved (`canonicalize`) and its last component kept.
+fn resolve_parent(source: &Path) -> Result<PathBuf> {
+    let name = source
+        .file_name()
+        .ok_or_else(|| ExportError::Source(format!("{} is not a regular file", source.display())))?;
+    let parent = match source.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p,
+        _ => Path::new("."),
+    };
+    let parent = parent
+        .canonicalize()
+        .map_err(|e| ExportError::Source(format!("{}: {e}", source.display())))?;
+    Ok(parent.join(name))
+}
+
 /// `immutable=1` would silently ignore what a `-wal` or `-journal` holds.
 fn refuse_sidecars(source: &Path) -> Result<()> {
     for suffix in ["-wal", "-journal"] {
@@ -353,8 +373,9 @@ fn open_immutable(source: &Path) -> Result<Connection> {
         }
     }
     uri.push_str("?mode=ro&immutable=1");
-    // NOFOLLOW refuses a symbolic link in ANY component of the path, not only
-    // the last one, and SQLite's own message does not say so.
+    // NOFOLLOW refuses a symbolic link in ANY component of the path; `export` hands it
+    // a path whose folders are resolved, so only a file swapped for a link since the
+    // check in `export` is refused here.
     Connection::open_with_flags(
         uri,
         OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -364,8 +385,7 @@ fn open_immutable(source: &Path) -> Result<Connection> {
     )
     .map_err(|e| {
         ExportError::Source(format!(
-            "{} cannot be opened ({e}). A symbolic link anywhere in the path is refused: \
-             give the real path (realpath), or copy the file to a directory that is not reached through a link.",
+            "{} cannot be opened ({e}); a symbolic link to the file is refused: give the file's real path.",
             source.display()
         ))
     })

@@ -749,17 +749,10 @@ fn a_refused_source_leaves_no_out_directory() {
         assert!(!fx.out.exists(), "{}", source.display());
     }
 
-    // The same good brain, reached through a linked directory.
+    // A link as the last component is refused before anything is opened.
     let real = folder.join("real");
     fs::create_dir(&real).unwrap();
     fs::copy(&fx.brain, real.join("brain.r8")).unwrap();
-    let link = folder.join("link");
-    std::os::unix::fs::symlink(&real, &link).unwrap();
-    let error = export(&link.join("brain.r8"), &fx.out).unwrap_err();
-    assert!(matches!(error, ExportError::Source(_)), "{error}");
-    assert!(error.to_string().contains("A symbolic link anywhere in the path is refused"), "{error}");
-    assert!(!fx.out.exists());
-    // A link as the last component is refused before anything is opened.
     let file_link = folder.join("linked.r8");
     std::os::unix::fs::symlink(&fx.brain, &file_link).unwrap();
     let error = export(&file_link, &fx.out).unwrap_err();
@@ -767,5 +760,20 @@ fn a_refused_source_leaves_no_out_directory() {
     assert!(!fx.out.exists());
 
     // Through the real path it exports.
-    export(&real.join("brain.r8"), &fx.out).unwrap();
+    let by_real = export(&real.join("brain.r8"), &fx.out).unwrap();
+
+    // The same brain reached through a linked directory (macOS `/var` is one) exports the
+    // same, and a non-empty `-wal` beside the real file is still found through the link.
+    let link = folder.join("link");
+    std::os::unix::fs::symlink(&real, &link).unwrap();
+    let out2 = folder.join("out-through-link");
+    let by_link = export(&link.join("brain.r8"), &out2).unwrap();
+    assert_eq!(by_link.source.path, link.join("brain.r8").to_string_lossy());
+    assert_eq!((by_link.source.bytes, &by_link.source.sha256), (by_real.source.bytes, &by_real.source.sha256));
+    assert_eq!(by_link.projects, by_real.projects);
+    fs::write(real.join("brain.r8-wal"), b"x").unwrap();
+    let out3 = folder.join("out-wal");
+    let error = export(&link.join("brain.r8"), &out3).unwrap_err();
+    assert_eq!(error.exit_code(), 3, "{error}");
+    assert!(!out3.exists());
 }
