@@ -34,7 +34,8 @@
 //! busy_timeout` answered before (that pragma now says 0 for a connection set here). Only
 //! this module sets a connection's busy handler: rusqlite's `Connection::busy_timeout` and
 //! `Connection::busy_handler` would replace the handler and leave the client data, and
-//! `clippy.toml` refuses them outside it.
+//! `clippy.toml` refuses them outside it. `PRAGMA busy_timeout = N` in SQL and a raw
+//! `ffi::sqlite3_busy_timeout` would do the same and no lint sees them; neither is used.
 
 use std::cell::Cell;
 use std::ffi::{c_int, c_void, CStr};

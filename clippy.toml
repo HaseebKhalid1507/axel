@@ -1,6 +1,8 @@
-# A connection's busy handler is set by `axel::busy` only: these replace it and leave the
-# wait `busy::get` reports. Tests that mean SQLite's own timeout say `#[allow]`.
+# A connection's busy handler is set in one place, `axel::busy` (crates/axel): these
+# replace it and leave the wait `busy::get` reports. memkoshi and velocirag set none today;
+# a crate that needs a wait goes through `axel::busy` or gets one of its own that keeps the
+# same rule. Tests that mean SQLite's own timeout say `#[allow]`.
 disallowed-methods = [
-    { path = "rusqlite::Connection::busy_timeout", reason = "use axel::busy::set (a wait on the wall clock)" },
-    { path = "rusqlite::Connection::busy_handler", reason = "use axel::busy::set (a wait on the wall clock)" },
+    { path = "rusqlite::Connection::busy_timeout", reason = "a connection's busy handler is set by axel::busy only" },
+    { path = "rusqlite::Connection::busy_handler", reason = "a connection's busy handler is set by axel::busy only" },
 ]
