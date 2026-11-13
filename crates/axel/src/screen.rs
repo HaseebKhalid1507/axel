@@ -706,7 +706,7 @@ mod tests {
             ("policy", "the password policy needs authorization from ops".into()),
             ("git hash", format!("commit {} landed", "9f2c1a7e04".repeat(4))),
             ("project dir", format!("dir {} here", "0a1b2c3d4e5f6789".repeat(4))),
-            ("path", "/home/u/Projects/SynapsCLI/crates/agent-engine/src/tools/memory.rs".into()),
+            ("path", "/srv/u/Projects/SynapsCLI/crates/agent-engine/src/tools/memory.rs".into()),
             ("archive id", "ctx-9f2c1a7e04b35d6688c1f0a2b7d94e13".into()),
         ];
         for (case, text) in &cases {

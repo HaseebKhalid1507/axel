@@ -45,8 +45,12 @@ This writes `~/.synaps-cli/plugins/axel/.synaps-plugin/plugin.json` with `comman
 absolute path of the binary you ran, with every link resolved: run it through a symlink and
 the manifest names the file the link points to. `--plugins-dir` has no default. An existing manifest is
 not replaced unless you add `--force`, which first keeps the old one as
-`plugin.json.bak-<stamp>`. `--print` prints the manifest and writes nothing. A copy of the
-manifest is in [`plugin/plugin.json`](plugin/plugin.json).
+`plugin.json.bak-<stamp>`. `--print` prints the manifest and writes nothing. `--command
+<path>` names another binary instead (for packagers); it must be absolute and exist. If the
+running binary's path cannot be found, install refuses and asks for `--command`.
+[`plugin/plugin.json`](plugin/plugin.json) is a template: the same manifest with the
+placeholder `/path/to/axel` as `command`. Do not copy it as is; `plugin install` writes the
+real one.
 
 Restart Synaps (or reload the extension). The extension starts with Synaps, answers at once,
 and indexes in the background.

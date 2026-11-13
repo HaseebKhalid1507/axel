@@ -25,23 +25,28 @@ pub enum Cmd {
         /// Print the manifest and write nothing
         #[arg(long)]
         print: bool,
+        /// Absolute path the manifest starts Axel with. Default: this binary's canonical path
+        #[arg(long, value_name = "PATH")]
+        command: Option<PathBuf>,
     },
 }
 
-/// The `command` of `MANIFEST`; `install` replaces it with the running binary's path.
-pub const MANIFEST_COMMAND: &str = "/home/haseeb/.local/bin/axel-v2";
+/// The placeholder `command` of `MANIFEST`; `install` replaces it with the running binary's
+/// path, or with `--command`.
+pub const MANIFEST_COMMAND: &str = "/path/to/axel";
 
-/// The one manifest (section 9). `plugin/plugin.json` is a copy, held equal by a test.
+/// The manifest template (section 9). `plugin/plugin.json` is a copy, held equal by a test;
+/// it is an example, never installed as is.
 pub const MANIFEST: &str = r#"{
   "name": "axel",
-  "version": "2.0.0",
+  "version": "0.1.0",
   "description": "Axel: one local brain for Synaps. Recall before each message, search and remember tools, learning from chats, the project forum. Reads Synaps's archive and note files and never writes them. Nothing leaves this machine.",
   "author": "Haseeb Khalid",
   "license": "MIT",
   "extension": {
     "protocol_version": 1,
     "runtime": "process",
-    "command": "/home/haseeb/.local/bin/axel-v2",
+    "command": "/path/to/axel",
     "args": ["extension"],
     "permissions": ["privacy.llm_content", "session.lifecycle", "tools.register"],
     "hooks": [
@@ -89,18 +94,47 @@ pub fn manifest_for(binary: &Path) -> Result<String> {
 }
 
 /// The absolute, canonical path of the running binary.
-fn running_binary() -> Result<PathBuf> {
-    Ok(std::fs::canonicalize(std::env::current_exe()?)?)
+fn running_binary() -> std::result::Result<PathBuf, String> {
+    let exe = std::env::current_exe()
+        .map_err(|e| format!("cannot find the path of this binary ({e}); pass --command <PATH>"))?;
+    let path = std::fs::canonicalize(&exe)
+        .map_err(|e| format!("cannot resolve {} ({e}); pass --command <PATH>", exe.display()))?;
+    if !path.is_absolute() {
+        return Err(format!("{} is not an absolute path; pass --command <PATH>", path.display()));
+    }
+    Ok(path)
+}
+
+/// The `command` the manifest names: `--command` as given, else the running binary.
+// SPEC: release-0.1.0 item 1 "Refuse ... if the path cannot be found or is not absolute":
+// --command must be absolute and name an existing file; it is kept as given (not
+// canonicalized), so a packager's /usr/bin/axel symlink stays a symlink.
+fn command_path(over: Option<&Path>) -> std::result::Result<PathBuf, String> {
+    let Some(path) = over else { return running_binary() };
+    if !path.is_absolute() {
+        return Err(format!("--command {} is not an absolute path", path.display()));
+    }
+    if !path.is_file() {
+        return Err(format!("--command {}: no such file", path.display()));
+    }
+    Ok(path.to_path_buf())
 }
 
 pub fn run(args: &Args, _brain: &BrainArg) -> Result<ExitCode> {
-    let Cmd::Install { plugins_dir, force, print } = &args.cmd;
+    let Cmd::Install { plugins_dir, force, print, command } = &args.cmd;
     // `--plugins-dir` has no default (section 1): the real plugins folder is never guessed.
     let Some(dir) = plugins_dir else {
         eprintln!("error: plugin install needs --plugins-dir <DIR>");
         return Ok(ExitCode::from(2));
     };
-    let text = manifest_for(&running_binary()?)?;
+    let binary = match command_path(command.as_deref()) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("error: {msg}; nothing was written");
+            return Ok(ExitCode::from(2));
+        }
+    };
+    let text = manifest_for(&binary)?;
     if *print {
         print!("{text}");
         return Ok(ExitCode::SUCCESS);

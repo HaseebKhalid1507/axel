@@ -1,13 +1,13 @@
 {
   "name": "axel",
-  "version": "2.0.0",
+  "version": "0.1.0",
   "description": "Axel: one local brain for Synaps. Recall before each message, search and remember tools, learning from chats, the project forum. Reads Synaps's archive and note files and never writes them. Nothing leaves this machine.",
   "author": "Haseeb Khalid",
   "license": "MIT",
   "extension": {
     "protocol_version": 1,
     "runtime": "process",
-    "command": "/home/haseeb/.local/bin/axel-v2",
+    "command": "/path/to/axel",
     "args": ["extension"],
     "permissions": ["privacy.llm_content", "session.lifecycle", "tools.register"],
     "hooks": [
