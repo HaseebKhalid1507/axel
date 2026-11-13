@@ -141,7 +141,7 @@ enum Commands {
     },
     /// Run as a SynapsCLI extension (JSON-RPC over stdio)
     Extension,
-    /// Make a v2 brain from the old one, bring over the forum, verify, catch up
+    /// Make the brain (brain.r8) from the old Axel brain (axel.r8), bring over the forum, verify, catch up
     Migrate(axel::cli::migrate::Args),
     /// Install the Synaps plugin manifest
     Plugin(axel::cli::plugin::Args),

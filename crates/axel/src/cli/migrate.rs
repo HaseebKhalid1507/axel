@@ -18,11 +18,11 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 pub enum Cmd {
-    /// Make a v2 brain from a copy of the old axel.r8
+    /// Make the brain (brain.r8) from a copy of the old Axel brain (axel.r8)
     Init {
         #[arg(long, value_name = "FILE")]
         from_axel: PathBuf,
-        /// Move an existing new brain aside and start again
+        /// Move an existing brain.r8 aside and start again
         #[arg(long)]
         replace: bool,
         /// With --replace: even when an extension is running on the destination
@@ -46,7 +46,7 @@ pub enum Cmd {
         #[arg(long)]
         accept_foreign: bool,
     },
-    /// Compare the new brain with both sources
+    /// Compare the brain (brain.r8) with both sources
     Verify {
         #[arg(long, value_name = "FILE")]
         from_axel: PathBuf,
