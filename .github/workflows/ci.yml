@@ -7,6 +7,9 @@ on:
       - v2
   pull_request:
 
+permissions:
+  contents: read
+
 # Runner images and the toolchain are pinned (1.95.0, what the gate builds with), so a CI
 # break comes from a commit, not a calendar date. Every cargo invocation passes `--locked`
 # (scripts/dirty-home.sh adds it itself). rust-cache saves only from pushes, so PR runs
