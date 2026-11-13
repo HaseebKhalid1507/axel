@@ -13,8 +13,9 @@ installers = ["shell"]
 # with `tar`, and xz is absent on minimal systems.
 unix-archive = ".tar.gz"
 # Target platforms to build apps for (Rust target-triple syntax).
-# ort 2.0.0-rc.12 (download-binaries) has prebuilt ONNX Runtime for these and not for
-# x86_64-apple-darwin or any musl target, so those have no prebuilt Axel.
+# ort 2.0.0-rc.13 (download-binaries, ort-sys build/download/dist.tsv) has prebuilt ONNX
+# Runtime for these and not for x86_64-apple-darwin or any musl target, so those have no
+# prebuilt Axel.
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
@@ -26,5 +27,10 @@ pr-run-mode = "upload"
 
 # macos-14 runner images are retired on 2026-11-02 (actions/runner-images#13518);
 # dist 0.31 still picks them for Apple Silicon.
+# ort's prebuilt Linux runtime needs glibc >= 2.39 and libstdc++ >= 13.2 (ort's
+# docs/core/platform.tsx at v2.0.0-rc.13), so Linux builds on Ubuntu 24.04, not dist's
+# default ubuntu-22.04.
 [dist.github-custom-runners]
 aarch64-apple-darwin = "macos-15"
+x86_64-unknown-linux-gnu = "ubuntu-24.04"
+aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
