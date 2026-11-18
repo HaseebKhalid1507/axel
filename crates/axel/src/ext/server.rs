@@ -376,6 +376,7 @@ where
         log: None,
         tools: Vec::new(),
         budget_ms: HOOK_WAIT_MS,
+        inject_forget: false,
         live: None,
         misses: 0,
         open_until: None,
@@ -440,6 +441,9 @@ struct Pump<W: Write> {
     log: Option<Log>,
     tools: Vec<Value>,
     budget_ms: u64,
+    /// `initialize.params.features` lists `inject.forget`: the core saves a `before_message`
+    /// inject unless it says `forget`, so recall's block says `forget: true`.
+    inject_forget: bool,
     live: Option<Live>,
     // The breaker: in memory, on this thread. A restart clears it.
     misses: u32,
@@ -463,6 +467,26 @@ struct Pump<W: Write> {
 
 fn continue_result() -> Value {
     json!({"action": "continue"})
+}
+
+/// Whether the core lists `inject.forget` in `initialize.params.features`. A missing or
+/// malformed list is an older core: nothing is listed.
+fn core_has_inject_forget(params: &Value) -> bool {
+    params
+        .get("features")
+        .and_then(Value::as_array)
+        .is_some_and(|f| f.iter().any(|v| v.as_str() == Some("inject.forget")))
+}
+
+/// The hook result for `out`. `forget`: recall's `before_message` block on a core with
+/// `inject.forget`, shown for this turn only (the core leaves its marker in history). A core
+/// without the feature gets exactly `{"action","content"}`, as before.
+fn hook_result(out: HookOut, forget: bool) -> Value {
+    match out {
+        HookOut::Continue => continue_result(),
+        HookOut::Inject(content) if forget => json!({"action": "inject", "content": content, "forget": true}),
+        HookOut::Inject(content) => json!({"action": "inject", "content": content}),
+    }
 }
 
 fn str_field(v: &Value, key: &str) -> Option<String> {
@@ -654,11 +678,9 @@ impl<W: Write> Pump<W> {
         }
     }
 
-    fn answer_hook(&mut self, id: Option<Value>, out: HookOut) {
-        let result = match out {
-            HookOut::Continue => continue_result(),
-            HookOut::Inject(content) => json!({"action": "inject", "content": content}),
-        };
+    /// `before_message`: whether the hook answered is `before_message` (recall's block).
+    fn answer_hook(&mut self, id: Option<Value>, out: HookOut, before_message: bool) {
+        let result = hook_result(out, before_message && self.inject_forget);
         self.answer(id, result);
     }
 
@@ -731,6 +753,7 @@ impl<W: Write> Pump<W> {
             self.log = Some(log);
             self.tools = tools::declarations(forum_on);
             self.budget_ms = cfg.recall_budget_ms;
+            self.inject_forget = core_has_inject_forget(params);
             self.status.started_ms.store((self.clock)(), Ordering::Relaxed);
             self.log(&format!(
                 "initialize pid={} forum={} warnings={}",
@@ -869,7 +892,7 @@ impl<W: Write> Pump<W> {
                 if before_message {
                     self.misses = 0;
                 }
-                self.answer_hook(id, out);
+                self.answer_hook(id, out, before_message);
                 None
             }
             // A handler that panicked: the hook is `continue` and the next call works.
@@ -1234,5 +1257,28 @@ fn start_indexer(
     if spawned.is_err() {
         log_line("indexer thread not started");
         degrade(&status_2, &mode_2, DegradedReason::IndexerStopped, Some(here(line!())));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inject_forget_is_read_from_the_features_list_only() {
+        assert!(core_has_inject_forget(&json!({"features": ["x", "inject.forget"]})));
+        assert!(!core_has_inject_forget(&json!({})));
+        assert!(!core_has_inject_forget(&json!({"features": null})));
+        assert!(!core_has_inject_forget(&json!({"features": "inject.forget"})));
+        assert!(!core_has_inject_forget(&json!({"features": ["inject.forgetful", 1]})));
+        assert!(!core_has_inject_forget(&json!({"config": {"features": ["inject.forget"]}})));
+    }
+
+    #[test]
+    fn hook_result_adds_forget_only_when_asked() {
+        let inject = || HookOut::Inject("block".to_string());
+        assert_eq!(hook_result(inject(), false), json!({"action": "inject", "content": "block"}));
+        assert_eq!(hook_result(inject(), true), json!({"action": "inject", "content": "block", "forget": true}));
+        assert_eq!(hook_result(HookOut::Continue, true), json!({"action": "continue"}));
     }
 }
