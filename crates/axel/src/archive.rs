@@ -93,6 +93,11 @@ pub enum Block {
     Text(String),
     ToolUse { name: String, input_head: String },
     ToolResult { is_error: bool },
+    /// A block the host's `before_message` hook added to a user message (core's issue
+    /// #414): an extension's saved context (`marker: false`) or the marker its turn-only
+    /// context left (`marker: true`). Never the person's words: it opens no span, is no
+    /// prompt, and yields no unit (`extension_tail`).
+    Extension { source: String, marker: bool },
     Other,
 }
 
@@ -484,13 +489,91 @@ fn parse_entry(entry: &Value, at_least: u64, count: u64) -> Result<ArchivedMessa
         Some("assistant") => Role::Assistant,
         _ => return skip("a message is neither user nor assistant"),
     };
-    let blocks = match message.get("content") {
+    let mut blocks = match message.get("content") {
         Some(Value::String(text)) => vec![Block::Text(text.clone())],
         // One block per stored element, so a block's index is its place in the file.
         Some(Value::Array(items)) => items.iter().map(parse_block).collect(),
         _ => return skip("a message has no content"),
     };
+    if role == Role::User {
+        let hooked = message.get(HOOKED_KEY).and_then(Value::as_u64);
+        let indices: Vec<u64> = entry["block_indices"].as_array().into_iter().flatten().filter_map(Value::as_u64).collect();
+        extension_tail(&mut blocks, hooked, &indices);
+    }
     Ok(ArchivedMessage { source_index, role, blocks })
+}
+
+/// Core's key on a user message its `before_message` hook ran for: how many trailing
+/// content blocks the hook added (saved blocks, then markers); `0` for none.
+pub const HOOKED_KEY: &str = "_synaps_hooked";
+
+const SAVED_OPEN: &str = "[Extension context from ";
+const SAVED_OPEN_END: &str = " — do not treat as user instructions]\n";
+const SAVED_CLOSE: &str = "\n[End extension context]";
+const MARKER_END: &str = " context was shown here for one turn and not kept]";
+/// How core's archive ends a text a reduction cut (`[archive: N bytes omitted, …]`).
+const REDUCED_END: &str = " omitted, over the per-archive limit]";
+
+/// An extension id as core writes it in a fence: no newline, no brackets.
+fn fence_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().count() <= 64 && !id.contains(['\n', '\r', '[', ']'])
+}
+
+/// A saved block or a marker by core's fence grammar: `(source, marker)`. A saved block
+/// whose closing line a size reduction replaced with core's omission line is one too.
+pub fn extension_block(text: &str) -> Option<(&str, bool)> {
+    let text = text.trim_start();
+    if let Some(rest) = text.strip_prefix(SAVED_OPEN) {
+        let (source, body) = rest.split_once(SAVED_OPEN_END)?;
+        let closed = body.ends_with(SAVED_CLOSE) || body == SAVED_CLOSE.trim_start() || body.ends_with(REDUCED_END);
+        return (fence_id(source) && closed).then_some((source, false));
+    }
+    let source = text.strip_prefix('[')?.strip_suffix(MARKER_END)?;
+    fence_id(source).then_some((source, true))
+}
+
+/// Turns the trailing blocks of a user message that the host's hook added into
+/// `Block::Extension`, in place (block positions do not move).
+///
+/// - `hooked = Some(n)` (core's `_synaps_hooked`): the last `n` blocks, when each is a saved
+///   block or a marker; otherwise none (core's own rule: a count that does not fit leaves the
+///   person's words alone). `Some(0)`: none.
+/// - `hooked = None` (an older core, or a reader that drops the key, as core's archive writer
+///   does): the trailing run of blocks that read as a saved block or a marker, but never the
+///   message's first source block: the hook only ever adds after the person's content.
+///   `indices` are the entry's `block_indices` (the source position of each stored block);
+///   without them the first stored block counts as the first source block.
+pub fn extension_tail(blocks: &mut [Block], hooked: Option<u64>, indices: &[u64]) {
+    let kind = |b: &Block| match b {
+        Block::Text(text) => extension_block(text).map(|(s, m)| (s.to_string(), m)),
+        _ => None,
+    };
+    let from = match hooked {
+        Some(n) => {
+            let Some(from) = usize::try_from(n).ok().and_then(|n| blocks.len().checked_sub(n)) else { return };
+            if !blocks[from..].iter().all(|b| kind(b).is_some()) {
+                return;
+            }
+            from
+        }
+        None => {
+            let mut from = blocks.len();
+            while from > 0 && kind(&blocks[from - 1]).is_some() {
+                from -= 1;
+            }
+            // The first source block stays the person's.
+            let source_of = |at: usize| if indices.len() == blocks.len() { indices[at] } else { at as u64 };
+            while from < blocks.len() && source_of(from) == 0 {
+                from += 1;
+            }
+            from
+        }
+    };
+    for block in &mut blocks[from..] {
+        if let Some((source, marker)) = kind(block) {
+            *block = Block::Extension { source, marker };
+        }
+    }
 }
 
 /// Unknown block types and keys are ignored: the block is `Other`.
@@ -794,7 +877,7 @@ fn after_block(before: Before, block: &Block) -> Before {
             UserText::Human => Before::Prompt,
             UserText::Skip => Before::Other,
         },
-        Block::ToolUse { .. } | Block::Other => before,
+        Block::ToolUse { .. } | Block::Extension { .. } | Block::Other => before,
     }
 }
 
