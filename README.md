@@ -50,7 +50,7 @@ If you have the old Axel (`axel.r8`, the Synaps memory backend), read
 [Upgrading from the old Axel](#upgrading-from-the-old-axel-axelr8) first.
 
 ```bash
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/axel/releases/download/v0.1.0/axel-installer.sh | sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/HaseebKhalid1507/axel/releases/download/v0.1.1/axel-installer.sh | sh
 axel model fetch
 axel init
 axel plugin install --plugins-dir ~/.synaps-cli/plugins
@@ -62,7 +62,7 @@ on Apple Silicon. To build from source instead (same requirements), replace the 
 with:
 
 ```bash
-cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.0 --locked axel
+cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.1 --locked axel
 ```
 
 Intel Macs, musl Linux (Alpine) and Linux older than glibc 2.39 are not covered: `ort` has
@@ -134,9 +134,9 @@ The old Axel kept its brain in `~/.config/axel/axel.r8` (and, with Synaps 0.11.1
 new one beside the old under another name:
 
 ```bash
-cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.0 --locked \
-  --root ~/.local/axel-0.1.0 axel
-install -m 0755 ~/.local/axel-0.1.0/bin/axel ~/.local/bin/axel-v2
+cargo install --git https://github.com/HaseebKhalid1507/axel --tag v0.1.1 --locked \
+  --root ~/.local/axel-0.1.1 axel
+install -m 0755 ~/.local/axel-0.1.1/bin/axel ~/.local/bin/axel-v2
 axel-v2 migrate init --from-axel ~/.config/axel/axel.r8
 axel-v2 plugin install --plugins-dir ~/.synaps-cli/plugins --force
 ```

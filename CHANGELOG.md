@@ -2,7 +2,11 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [0.1.1] - 2026-11-27
+
+Axel for Synaps 0.13.0, which saves extension context in the conversation by default: recall
+stays turn-only, and saved extension context in archives is never read as the person's words.
+Synaps 0.12.0 keeps working exactly as with 0.1.0.
 
 - **Recall is shown for one turn on a Synaps core with `inject.forget`.** When the core lists
   `inject.forget` in `initialize` `features` (it saves extension context by default), the
