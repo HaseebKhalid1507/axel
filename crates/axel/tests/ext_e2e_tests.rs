@@ -266,7 +266,13 @@ struct Ext {
 
 impl Ext {
     /// `axel extension`, then `initialize`.
+    /// As a core before `inject.forget`: `initialize` lists no `features`.
     fn start(w: &World, life: &str) -> Ext {
+        Ext::start_with(w, life, None)
+    }
+
+    /// `features`: the `initialize.params.features` list, left out when `None`.
+    fn start_with(w: &World, life: &str, features: Option<&[&str]>) -> Ext {
         let stderr = File::create(w.root().join(format!("stderr-{life}"))).unwrap();
         let mut child = Command::new(BIN)
             .arg("extension")
@@ -297,11 +303,12 @@ impl Ext {
         });
         let stdin = child.stdin.take();
         let mut ext = Ext { child, stdin, frames, next_id: 0 };
-        let answer = ext.call(
-            "initialize",
-            json!({"synaps_version": "e2e", "extension_protocol_version": 1, "plugin_id": "axel",
-                   "plugin_root": w.root().join("plugins/axel").to_string_lossy(), "config": w.config()}),
-        );
+        let mut params = json!({"synaps_version": "e2e", "extension_protocol_version": 1, "plugin_id": "axel",
+               "plugin_root": w.root().join("plugins/axel").to_string_lossy(), "config": w.config()});
+        if let Some(features) = features {
+            params["features"] = json!(features);
+        }
+        let answer = ext.call("initialize", params);
         assert_eq!(answer["result"]["protocol_version"], 1, "initialize: {answer}");
         ext
     }
@@ -414,6 +421,8 @@ fn s7_t12_end_to_end_through_the_binary() {
     // 2. A matching prompt gets the archive's answer, labelled as an earlier chat.
     let block = ext.prompt("s-e2e-1", &proj, "Where is the retry limit set?");
     assert_eq!(block["action"], "inject", "step 2: before_message injects: {block}");
+    let keys: Vec<&str> = block.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(keys, ["action", "content"], "step 2: a core without inject.forget gets today's result: {block}");
     let lines = items_with(&block, "MAX_RETRIES is 5");
     assert!(
         lines.iter().any(|l| l.contains("[earlier chat in this project, ")),
@@ -506,7 +515,8 @@ fn s7_t12_end_to_end_through_the_binary() {
     let known_before = archives_known(&w.status());
     ext.kill();
     w.put_e2e_archive("while-down.json", DOWN_ID);
-    let mut ext = Ext::start(&w, "2");
+    // The second process runs on a core with `inject.forget`: recall is shown for one turn.
+    let mut ext = Ext::start_with(&w, "2", Some(&["something.else", "inject.forget"]));
     w.wait_status("step 9: the second process is ready and its scan indexed the file written while down", |s| {
         s["extension"]["mode"] == "ready" && archives_known(s) == known_before + 1
     });
@@ -535,6 +545,7 @@ fn s7_t12_end_to_end_through_the_binary() {
         !items_with(&block, "MAX_RETRIES is 5").is_empty(),
         "step 9: the archive is still recalled after the restart: {block}"
     );
+    assert_eq!(block["forget"], true, "step 9: on a core with inject.forget recall is forget: {block}");
     assert!(
         ext.search("what was the retry limit raised to after the outage", &proj).contains("seven after the outage"),
         "step 9: the captured turn is still there"

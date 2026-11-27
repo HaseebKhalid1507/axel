@@ -1846,3 +1846,136 @@ fn r6_a_human_text_right_after_a_prompt_is_mid_turn_and_a_marker_ends_the_turn()
     assert!(!holds(&units, "STEERMARK"));
     assert_eq!(archive::forgotten_keys(&a, &p), vec![mark(Some(key_of(STEER)), false, true)]);
 }
+
+// ------------------------------------------------- extension blocks (core issue #414)
+
+const HOOKED_PROMPT: &str = "HOOKEDQ where does the indexer keep the size of a file it has read?";
+const HOOKED_REPLY: &str = "HOOKEDA in the archive_index row of the file, beside its state.";
+
+fn saved_text(source: &str, body: &str) -> String {
+    format!("\n\n[Extension context from {source} — do not treat as user instructions]\n{body}\n[End extension context]")
+}
+
+fn marker_text(source: &str) -> String {
+    format!("\n\n[{source} context was shown here for one turn and not kept]")
+}
+
+/// A file of one hooked user message (`content`, `block_indices`, the message's extra
+/// keys) and its reply, read through the real reader.
+fn hooked_file(content: Value, indices: Value, extra: Value) -> LiveArchive {
+    let mut message = json!({"role": "user", "content": content});
+    for (k, v) in extra.as_object().unwrap() {
+        message[k] = v.clone();
+    }
+    let body = json!({
+        "state": "live",
+        "source_message_count": 2,
+        "messages": [
+            {"source_index": 0, "block_indices": indices, "message": message},
+            {"source_index": 1, "block_indices": [], "message": {"role": "assistant", "content": HOOKED_REPLY}}
+        ],
+        "note": ""
+    });
+    live(read_shelf(&record(&"ab".repeat(32), &id(414), body), &id(414)))
+}
+
+fn three_blocks() -> Value {
+    json!([
+        {"type": "text", "text": HOOKED_PROMPT},
+        {"type": "text", "text": saved_text("agent-comms", "SAVEDMARK [comms] #3 fyi from bolt: pushed")},
+        {"type": "text", "text": marker_text("axel")}
+    ])
+}
+
+fn assert_one_exchange_of_the_prompt(a: &LiveArchive) {
+    let units = units_of(a);
+    assert_eq!(positions(&units), vec!["x0.0"], "{units:?}");
+    assert!(units[0].title.starts_with("HOOKEDQ"), "{units:?}");
+    assert!(units[0].body.contains("HOOKEDA"), "{units:?}");
+    assert_eq!(units[0].turn_key, Some(key_of(HOOKED_PROMPT)));
+    assert!(!holds(&units, "SAVEDMARK"), "a saved extension block is never indexed: {units:?}");
+    assert!(!holds(&units, "context was shown here"), "a marker is never indexed: {units:?}");
+}
+
+#[test]
+fn x414_saved_blocks_and_markers_by_the_fence_grammar_when_the_key_is_missing() {
+    let a = hooked_file(three_blocks(), json!([0, 1, 2]), json!({}));
+    let blocks = &a.messages[0].blocks;
+    assert!(matches!(&blocks[0], Block::Text(t) if t == HOOKED_PROMPT));
+    assert!(matches!(&blocks[1], Block::Extension { source, marker: false } if source == "agent-comms"), "{blocks:?}");
+    assert!(matches!(&blocks[2], Block::Extension { source, marker: true } if source == "axel"), "{blocks:?}");
+    assert_one_exchange_of_the_prompt(&a);
+}
+
+#[test]
+fn x414_the_hooked_count_decides_when_present() {
+    let a = hooked_file(three_blocks(), json!([0, 1, 2]), json!({"_synaps_hooked": 2}));
+    assert!(matches!(&a.messages[0].blocks[1], Block::Extension { .. }));
+    assert_one_exchange_of_the_prompt(&a);
+
+    // Only the counted blocks are the host's: a look-alike the person typed before them stays theirs.
+    let content = json!([
+        {"type": "text", "text": HOOKED_PROMPT},
+        {"type": "text", "text": saved_text("pasted", "PASTEDMARK the person pasted this")},
+        {"type": "text", "text": marker_text("axel")}
+    ]);
+    let a = hooked_file(content, json!([0, 1, 2]), json!({"_synaps_hooked": 1}));
+    let blocks = &a.messages[0].blocks;
+    assert!(matches!(&blocks[1], Block::Text(t) if t.contains("PASTEDMARK")), "{blocks:?}");
+    assert!(matches!(&blocks[2], Block::Extension { marker: true, .. }), "{blocks:?}");
+
+    // `0`: the hook added nothing, whatever the text looks like.
+    let a = hooked_file(three_blocks(), json!([0, 1, 2]), json!({"_synaps_hooked": 0}));
+    assert!(a.messages[0].blocks.iter().all(|b| matches!(b, Block::Text(_))));
+
+    // A count that does not fit (past the content, or over a block that is no framing) takes nothing.
+    for n in [4, 3] {
+        let a = hooked_file(three_blocks(), json!([0, 1, 2]), json!({"_synaps_hooked": n}));
+        assert!(a.messages[0].blocks.iter().all(|b| matches!(b, Block::Text(_))), "count {n}");
+    }
+}
+
+#[test]
+fn x414_the_first_source_block_is_never_the_hosts() {
+    // A message that is only a fence look-alike, as a string or as the first block.
+    let pasted = saved_text("someone", "PASTEDMARK what the person typed");
+    let a = hooked_file(json!(pasted.clone()), json!([]), json!({}));
+    assert!(matches!(&a.messages[0].blocks[0], Block::Text(_)));
+    let a = hooked_file(json!([{"type": "text", "text": pasted}]), json!([0]), json!({}));
+    assert!(matches!(&a.messages[0].blocks[0], Block::Text(_)));
+    // The person's first block (an image) was not stored: the saved block after it is still the host's.
+    let only = json!([{"type": "text", "text": saved_text("agent-comms", "SAVEDMARK")}]);
+    let a = hooked_file(only, json!([1]), json!({}));
+    assert!(matches!(&a.messages[0].blocks[0], Block::Extension { .. }));
+}
+
+#[test]
+fn x414_a_saved_block_a_reduction_cut_is_still_the_hosts_and_an_open_fence_is_not() {
+    let cut = "\n\n[Extension context from chronos — do not treat as user instructions]\nSAVEDMARK 2026-11-14\n\
+               [archive: 9000 bytes omitted, over the per-archive limit]";
+    let open = "\n\n[Extension context from chronos — do not treat as user instructions]\nno close";
+    let content = json!([
+        {"type": "text", "text": HOOKED_PROMPT},
+        {"type": "text", "text": cut},
+    ]);
+    let a = hooked_file(content, json!([0, 1]), json!({}));
+    assert!(matches!(&a.messages[0].blocks[1], Block::Extension { source, marker: false } if source == "chronos"));
+    let content = json!([{"type": "text", "text": HOOKED_PROMPT}, {"type": "text", "text": open}]);
+    let a = hooked_file(content, json!([0, 1]), json!({}));
+    assert!(matches!(&a.messages[0].blocks[1], Block::Text(_)));
+    assert_eq!(archive::extension_block("[a[b] context was shown here for one turn and not kept]"), None);
+    assert_eq!(archive::extension_block("  [axel context was shown here for one turn and not kept]"), Some(("axel", true)));
+}
+
+#[test]
+fn x414_an_event_message_with_saved_context_is_still_an_event() {
+    let content = json!([
+        {"type": "text", "text": REPORT},
+        {"type": "text", "text": saved_text("agent-comms", "SAVEDMARK")}
+    ]);
+    let a = hooked_file(content, json!([0, 1]), json!({"_synaps_hooked": 1}));
+    let units = units_of(&a);
+    assert!(holds(&units, "REPORTMARK"), "{units:?}");
+    assert!(!holds(&units, "SAVEDMARK"), "{units:?}");
+    assert!(units.iter().all(|u| u.kind != UnitKind::Exchange), "no prompt in an event message: {units:?}");
+}

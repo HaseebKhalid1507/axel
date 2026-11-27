@@ -2,6 +2,21 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+- **Recall is shown for one turn on a Synaps core with `inject.forget`.** When the core lists
+  `inject.forget` in `initialize` `features` (it saves extension context by default), the
+  `before_message` recall block says `forget: true`: the model sees it for the whole turn and
+  the core leaves its marker in the conversation, not the block. On a core without the
+  feature the hook result is exactly what 0.1.0 sends. The handoff at session start is
+  unchanged.
+- **Extension context in archives is not the person's words.** A saved extension block or a
+  marker on a user message (`[Extension context from <id> — …]` … `[End extension context]`,
+  `[<id> context was shown here for one turn and not kept]`) opens no turn, is never a prompt
+  and is never indexed. The message's `_synaps_hooked` count decides when it is there; without
+  it (an older core, and core's archive files, which keep only `role` and `content`), the
+  trailing blocks that match the fence grammar, never the message's first block.
+
 ## [0.1.0] - 2026-11-14
 
 The first release of Axel (0.1.0): one local brain for Synaps, run as a Synaps extension.
