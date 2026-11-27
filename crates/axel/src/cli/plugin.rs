@@ -39,7 +39,7 @@ pub const MANIFEST_COMMAND: &str = "/path/to/axel";
 /// it is an example, never installed as is.
 pub const MANIFEST: &str = r#"{
   "name": "axel",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Axel: one local brain for Synaps. Recall before each message, search and remember tools, learning from chats, the project forum. Reads Synaps's archive and note files and never writes them. Nothing leaves this machine.",
   "author": "Haseeb Khalid",
   "license": "MIT",

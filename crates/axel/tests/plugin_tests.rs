@@ -39,7 +39,7 @@ fn manifest_constant() {
     let m: Value = serde_json::from_str(MANIFEST).unwrap();
     let ext = &m["extension"];
     assert_eq!(m["name"], "axel");
-    assert_eq!(m["version"], "0.1.0");
+    assert_eq!(m["version"], "0.1.1");
     assert_eq!(ext["protocol_version"], 1);
     assert_eq!(ext["runtime"], "process");
     assert_eq!(ext["command"], MANIFEST_COMMAND);
